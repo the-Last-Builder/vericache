@@ -1,0 +1,25 @@
+default:
+    @just --list
+
+# Verify every proof in vericache-foundation.
+verify:
+    cargo verus verify -p vericache-foundation
+
+# Reject verifier escapes, unverified code, panicking stubs, and unsafe code via tree-sitter-verus ast-grep rules.
+audit:
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-assume-admit-truncate.yml src
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-external-escape.yml src
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-external-body.yml src
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-unsafe.yml src
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-unverified-code.yml src
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-panicking-stubs.yml src
+
+# Format every Rust/Verus source file.
+fmt:
+    find src -name '*.rs' -exec verusfmt {} +
+
+# Check formatting.
+fmt-check:
+    find src -name '*.rs' -exec verusfmt --check {} +
+
+check: verify audit fmt-check

@@ -1,0 +1,32 @@
+id: no-hardware-import-in-core
+valid:
+  - |
+    // transfer::cuda transfer::rdma
+    use transfer::context::*;
+    use transfer::domain::*;
+    use transfer::context::{Knows, Submitted};
+    verus! {
+        fn clean() { let host = 1usize; let cuda = 2usize; }
+    }
+invalid:
+  - |
+    use transfer::cuda::CudaSlice;
+  - |
+    use transfer::{
+        context::*,
+        rdma::RdmaError,
+    };
+  - |
+    verus! {
+        fn bad() { let _ = transfer::nvme::NvmeError(0); }
+    }
+  - |
+    use transfer as tr;
+  - |
+    use transfer::*;
+  - |
+    use transfer::{domain, self as tr};
+  - |
+    use transfer;
+  - |
+    extern crate transfer as tr;

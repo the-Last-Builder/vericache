@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = [
+    "vericache-foundation",
+    "vericache-transfer",
+    "vericache-core",
+]
+exclude = ["vericache-bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+foundation = { package = "vericache-foundation", path = "vericache-foundation" }
+transfer = { package = "vericache-transfer", path = "vericache-transfer" }
+# Pinned Verus source baked into the container image (/opt/vericache).
+vstd = { path = "/opt/vericache/verus/source/vstd" }
+verus_state_machines_macros = { path = "/opt/vericache/verus/source/state_machines_macros" }
+
+[workspace.lints.rust]
+# Verus erases ghost code; ghost-only imports are gated on cfg(verus_only).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)', 'cfg(verus_keep_ghost)', 'cfg(verus_keep_ghost_body)'] }

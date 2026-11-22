@@ -1,0 +1,19 @@
+id: no-cuda-dep
+valid:
+  - |
+    use transfer::host::{self, HostBuffer};
+    use super::super::host::HostBackend;
+    use transfer::nvme::{self, IoUring};
+invalid:
+  - |
+    use transfer::cuda::CudaSlice;
+  - |
+    use super::super::cuda::CudaBackend;
+  - |
+    verus! {
+        fn bad() { let _ = transfer::cuda::CudaError(0); }
+    }
+  - |
+    use transfer as tr;
+  - |
+    use transfer::*;

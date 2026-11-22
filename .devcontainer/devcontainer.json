@@ -1,0 +1,33 @@
+{
+  "name": "VeriCache Dev (CUDA 13.0.2 + Verus + tree-sitter-verus)",
+  "image": "localhost/vericache-dev:13.0.2",
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "runArgs": [
+    "--ulimit",
+    "memlock=-1",
+    "--security-opt",
+    "seccomp=unconfined",
+    "--security-opt",
+    "label=disable"
+  ],
+  "containerEnv": {
+    "RUSTUP_HOME": "/opt/vericache/rustup",
+    "CARGO_HOME": "/opt/vericache/cargo",
+    "CARGO_NET_OFFLINE": "true",
+    "VERUS_Z3_PATH": "/opt/vericache/z3/bin/z3",
+    "VERUS_CVC5_PATH": "/opt/vericache/cvc5/bin/cvc5"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "ast-grep.ast-grep-vscode"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "check",
+        "rust-analyzer.cargo.targetDir": true
+      }
+    }
+  }
+}

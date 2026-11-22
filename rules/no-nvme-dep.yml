@@ -1,0 +1,20 @@
+id: no-nvme-dep
+language: verus
+severity: error
+message: "NVMe backend modules may not be referenced from Host, CUDA, or RDMA backend layers."
+rule:
+  any:
+    - kind: use_declaration
+      regex: '(?s)(transfer|backends|super)::.*\bnvme\b'
+    - kind: scoped_identifier
+      regex: '(^|::)(transfer|backends|super(?:::\s*super)*)::nvme\b'
+    - kind: use_declaration
+      regex: '(?s)(^|\s|::)transfer\s+as\b'
+    - kind: use_declaration
+      regex: '(?s)(^|\s|::)transfer\s*;'
+    - kind: use_declaration
+      regex: '(?s)(^|\s|::)transfer::\*'
+    - kind: use_declaration
+      regex: '(?s)(^|\s|::)transfer::\{[^{}]*\bself\b'
+    - kind: extern_crate_declaration
+      regex: '\btransfer\b'

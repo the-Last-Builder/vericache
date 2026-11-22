@@ -1,0 +1,20 @@
+id: no-hardware-import-in-core
+language: verus
+severity: error
+message: "Hardware backend modules (`transfer::{host,cuda,nvme,rdma,transport}`) may not be referenced from backend-agnostic core layers."
+rule:
+  any:
+    - kind: use_declaration
+      regex: '(?s)transfer::.*\b(host|cuda|nvme|rdma|transport)\b'
+    - kind: use_declaration
+      regex: '(?s)(^|\s|::)transfer\s+as\b'
+    - kind: use_declaration
+      regex: '(?s)(^|\s|::)transfer\s*;'
+    - kind: use_declaration
+      regex: '(?s)(^|\s|::)transfer::\*'
+    - kind: use_declaration
+      regex: '(?s)(^|\s|::)transfer::\{[^{}]*\bself\b'
+    - kind: extern_crate_declaration
+      regex: '\btransfer\b'
+    - kind: scoped_identifier
+      regex: '(^|::)transfer::(host|cuda|nvme|rdma|transport)\b'

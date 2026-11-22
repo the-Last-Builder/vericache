@@ -1,0 +1,20 @@
+id: no-nvme-dep
+valid:
+  - |
+    use transfer::host::{self, HostBuffer};
+    use super::host::HostBackend;
+    use transfer::cuda::CudaBuffer;
+    use transfer::rdma;
+invalid:
+  - |
+    use transfer::nvme::IoUring;
+  - |
+    use super::super::nvme::NvmeBackend;
+  - |
+    verus! {
+        fn bad() { let _ = transfer::nvme::NvmeError(0); }
+    }
+  - |
+    use transfer as tr;
+  - |
+    use transfer::*;

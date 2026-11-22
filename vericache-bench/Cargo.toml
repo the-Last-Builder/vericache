@@ -1,0 +1,20 @@
+[workspace]
+
+[package]
+name = "vericache-bench"
+version = "0.1.0"
+edition = "2024"
+description = "Unverified release benchmark driver for VeriCache Suites 1-4."
+
+[package.metadata.verus]
+verify = false
+
+[dependencies]
+foundation = { package = "vericache-foundation", path = "../vericache-foundation" }
+transfer = { package = "vericache-transfer", path = "../vericache-transfer" }
+vericache-core = { path = "../vericache-core" }
+vstd = { path = "/opt/vericache/verus/source/vstd" }
+clap = { version = "4", features = ["derive"] }
+hdrhistogram = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

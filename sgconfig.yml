@@ -1,0 +1,9 @@
+ruleDirs:
+  - rules
+testConfigs:
+  - testDir: rule-tests
+customLanguages:
+  verus:
+    libraryPath: /opt/vericache/lib/libtree-sitter-verus.so
+    extensions: [rs]
+    expandoChar: _

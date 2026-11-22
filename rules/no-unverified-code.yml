@@ -1,0 +1,39 @@
+id: no-unverified-code
+language: verus
+severity: error
+message: "Executable items outside `verus!`, runtime-only `cfg(not(verus_only))` logic, `macro_rules!`, and `include!` are forbidden in verified sources."
+rule:
+  any:
+    - all:
+        - any:
+            - kind: function_item
+            - kind: impl_item
+            - kind: trait_item
+            - kind: foreign_mod_item
+            - kind: static_item
+        - not:
+            inside:
+              kind: verus_block
+              stopBy: end
+        - not:
+            inside:
+              kind: declaration_with_attrs
+              has:
+                kind: attribute_item
+                regex: '^#\[\s*cfg\s*\(\s*test\s*\)\s*\]$'
+              stopBy: end
+    - all:
+        - kind: declaration_with_attrs
+        - has:
+            kind: attribute_item
+            regex: '^#\[\s*cfg\s*\([^)]*not\s*\(\s*(verus_only|verus_keep_ghost|verus_keep_ghost_body)\s*\)'
+        - not:
+            has:
+              kind: use_declaration
+    - kind: inner_attribute_item
+      regex: '^#!\[\s*cfg\s*\([^)]*not\s*\(\s*(verus_only|verus_keep_ghost|verus_keep_ghost_body)\s*\)'
+    - kind: macro_definition
+    - kind: macro_invocation
+      has:
+        field: macro
+        regex: '^(?:[A-Za-z_][A-Za-z0-9_]*::)?(include|include_str|include_bytes)$'

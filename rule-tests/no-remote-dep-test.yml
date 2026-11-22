@@ -1,0 +1,22 @@
+id: no-remote-dep
+valid:
+  - |
+    use transfer::host::{self, HostBuffer};
+    use super::host::HostBackend;
+    use transfer::cuda::CudaSlice;
+    use transfer::nvme::{self, IoUring};
+invalid:
+  - |
+    use transfer::rdma::RdmaError;
+  - |
+    use transfer::transport::Channel;
+  - |
+    use super::super::rdma::RdmaBackend;
+  - |
+    verus! {
+        fn bad() { let _ = transfer::rdma::RdmaError(0); }
+    }
+  - |
+    use transfer as tr;
+  - |
+    use transfer::*;

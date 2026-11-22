@@ -1,0 +1,51 @@
+image := env("VERICACHE_IMAGE", "localhost/vericache-dev:13.0.2")
+bench_image := env("VERICACHE_BENCH_IMAGE", "localhost/vericache-bench:13.0.2")
+network := env("VERICACHE_BUILD_NETWORK", "")
+proxy := env("VERICACHE_BUILD_PROXY", "")
+
+default:
+    @just --list
+
+build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    args=()
+    [[ -n "{{network}}" ]] && args+=(--network="{{network}}")
+    [[ -n "{{proxy}}" ]] && args+=(--build-arg "http_proxy={{proxy}}" --build-arg "https_proxy={{proxy}}" --build-arg "HTTP_PROXY={{proxy}}" --build-arg "HTTPS_PROXY={{proxy}}")
+    exec podman build "${args[@]}" -t "{{image}}" .
+
+shell:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    podman image exists "{{image}}" || just build
+    args=()
+    [[ -n "{{network}}" ]] && args+=(--network="{{network}}")
+    exec podman run --rm -it \
+        --userns=keep-id \
+        --workdir /workspace \
+        -v "{{justfile_directory()}}/..:/workspace" \
+        --security-opt=label=disable \
+        "${args[@]}" \
+        "{{image}}"
+
+bench-build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    args=()
+    [[ -n "{{network}}" ]] && args+=(--network="{{network}}")
+    [[ -n "{{proxy}}" ]] && args+=(--build-arg "http_proxy={{proxy}}" --build-arg "https_proxy={{proxy}}" --build-arg "HTTP_PROXY={{proxy}}" --build-arg "HTTPS_PROXY={{proxy}}")
+    exec podman build -f Containerfile.bench "${args[@]}" -t "{{bench_image}}" .
+
+bench-shell:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    podman image exists "{{bench_image}}" || just bench-build
+    args=()
+    [[ -n "{{network}}" ]] && args+=(--network="{{network}}")
+    exec podman run --rm -it \
+        --userns=keep-id \
+        --workdir /workspace \
+        -v "{{justfile_directory()}}/..:/workspace" \
+        --security-opt=label=disable \
+        "${args[@]}" \
+        "{{bench_image}}"

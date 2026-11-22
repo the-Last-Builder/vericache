@@ -1,0 +1,18 @@
+[package]
+name = "vericache-foundation"
+version.workspace = true
+edition.workspace = true
+description = "Shared mathematical core of VeriCache: race freedom and read values for asynchronous memory accesses."
+
+[package.metadata.verus]
+verify = true
+
+[lib]
+name = "foundation"
+
+[dependencies]
+vstd.workspace = true
+verus_state_machines_macros.workspace = true
+
+[lints]
+workspace = true

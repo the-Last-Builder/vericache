@@ -1,0 +1,33 @@
+default:
+    @just --list
+
+# Verify every proof in vericache-core with compiler-enforced --no-cheating.
+verify:
+    cargo verus verify --fwd-verus-args-to roots -p vericache-core -- --no-cheating
+
+# Enforce strict zero-TCB, verified coverage, and hardware/backend boundary rules via tree-sitter-verus ast-grep:
+audit:
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-assume-admit-truncate.yml src tests
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-external-escape.yml src tests
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-external-body.yml src tests
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-unsafe.yml src tests
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-unverified-code.yml src
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-panicking-stubs.yml src
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-hardware-import-in-core.yml src/spec.rs src/provenance src/timeline src/frame src/catalog src/kernel
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-cuda-dep.yml src/backends/host src/backends/nvme
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-nvme-dep.yml src/backends/host src/backends/cuda src/backends/rdma
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-remote-dep.yml src/backends/host src/backends/cuda src/backends/nvme
+
+# Format every Rust/Verus source and test file.
+fmt:
+    find src tests -name '*.rs' -exec verusfmt {} +
+
+# Check formatting.
+fmt-check:
+    find src tests -name '*.rs' -exec verusfmt --check {} +
+
+check: verify audit fmt-check
+
+# Run executable tests.
+test:
+    cargo test -p vericache-core

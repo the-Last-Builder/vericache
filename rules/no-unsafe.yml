@@ -1,0 +1,17 @@
+id: no-unsafe
+language: verus
+severity: error
+message: "`unsafe` and foreign ABI blocks are forbidden outside whitelisted FFI boundary files."
+rule:
+  any:
+    - kind: unsafe_block
+    - kind: foreign_mod_item
+    - kind: function_item
+      has:
+        kind: function_modifiers
+        regex: '\bunsafe\b'
+    - kind: trait_item
+      regex: '^\s*(pub(\([^)]*\))?\s+)?unsafe\s+trait\b'
+    - kind: impl_item
+      regex: '^\s*unsafe\s+impl\b'
+    - pattern: unsafe

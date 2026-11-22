@@ -1,0 +1,23 @@
+id: no-unsafe
+valid:
+  - |
+    // unsafe { ... } extern "C"
+    verus! {
+        // unsafe fn inside_comment() {}
+        fn clean() {}
+    }
+invalid:
+  - |
+    unsafe fn bad() {}
+  - |
+    unsafe trait BadTrait {}
+  - |
+    unsafe impl BadTrait for () {}
+  - |
+    unsafe extern "C" { fn f(); }
+  - |
+    extern "C" { fn f(); }
+  - |
+    verus! {
+        fn bad() { unsafe { } }
+    }

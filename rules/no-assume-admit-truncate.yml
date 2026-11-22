@@ -1,0 +1,18 @@
+id: no-assume-admit-truncate
+language: verus
+severity: error
+message: "Verifier escapes (`assume`, `assume_`, `admit`, `assume_specification`, `truncate`, `rlimit(infinity)`, `inline_air_stmt`, `skip`, `axiom`, `internal`) are strictly forbidden."
+rule:
+  any:
+    - kind: assume_expression
+    - kind: call_expression
+      regex: '^(?:[A-Za-z_][A-Za-z0-9_]*::)*(assume|assume_|admit)\s*\('
+    - kind: identifier
+      regex: '^(assume|assume_|admit)$'
+    - pattern: assume_specification
+    - kind: attribute
+      regex: '(?:verifier|verus)\s*::\s*(?:(?:truncate|inline_air_stmt|skip|axiom|internal)\b|rlimit\s*\(\s*infinity\s*\))'
+    - kind: identifier
+      regex: '^axiom$'
+      inside:
+        kind: ERROR

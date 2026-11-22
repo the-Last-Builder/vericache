@@ -1,0 +1,50 @@
+id: no-unverified-code
+valid:
+  - |
+    #[cfg(not(verus_only))]
+    use foo::Bar;
+    verus! {
+        #[cfg_attr(not(verus_only), allow(dead_code))]
+        fn ok() {}
+        impl S { fn m() {} }
+    }
+    #[cfg(test)]
+    mod tests {
+        fn ok_test() {}
+        impl T for S {}
+    }
+    #[cfg(test)]
+    fn unit_test() {}
+invalid:
+  - |
+    fn sneaky() {}
+  - |
+    impl S {}
+  - |
+    trait T {}
+  - |
+    static X: u8 = 0;
+  - |
+    #[cfg(not(test))]
+    fn sneaky() {}
+  - |
+    #[cfg(not(verus_only))]
+    fn diverge() {}
+  - |
+    #[cfg(not(verus_only))]
+    impl S {}
+  - |
+    #[cfg(not(verus_only))]
+    mod m {}
+  - |
+    #![cfg(not(verus_only))]
+    verus! { fn diverge() {} }
+  - |
+    verus! {
+        #[cfg(not(verus_only))]
+        fn diverge() {}
+    }
+  - |
+    macro_rules! m { () => {} }
+  - |
+    include!("hidden.rs");

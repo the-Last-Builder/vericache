@@ -1,0 +1,4 @@
+[toolchain]
+# Must match the toolchain baked into /opt/vericache (see image/artifacts.env and verus.pin).
+channel = "1.99.1"
+components = ["rustc", "rust-std", "cargo", "rustfmt", "clippy"]

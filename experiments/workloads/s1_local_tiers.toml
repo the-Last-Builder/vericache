@@ -1,0 +1,63 @@
+suite = "s1_local_tiers"
+description = "Suite 1: Local Multi-Tier Transfer Efficiency (1A GPU<->Pinned Host 16-block scatter/gather, 1B NVMe O_DIRECT write spill & cold read)"
+
+[defaults]
+num_blocks = 16
+nvme_dir = "/workspace/target/bench-nvme"
+donor_gpu = 0
+warmup_iters = 8
+iters = 64
+
+[[jobs]]
+case = "1a_gpu_to_host_scatter"
+mode = "sync"
+systems = ["vericache", "lmcache"]
+chunk_bytes_list = [65536, 262144, 1048576, 4194304, 16777216]
+concurrency = 1
+warmup_iters = 8
+iters = 48
+
+[[jobs]]
+case = "1a_host_to_gpu_scatter"
+mode = "sync"
+systems = ["vericache", "lmcache"]
+chunk_bytes_list = [65536, 262144, 1048576, 4194304, 16777216]
+concurrency = 1
+warmup_iters = 8
+iters = 48
+
+[[jobs]]
+case = "1b_nvme_write_spill"
+mode = "odirect_qd1"
+systems = ["vericache", "lmcache"]
+chunk_bytes_list = [65536, 262144, 1048576, 4194304, 16777216]
+concurrency = 1
+warmup_iters = 4
+iters = 32
+
+[[jobs]]
+case = "1b_nvme_write_spill"
+mode = "odirect_qd8"
+systems = ["vericache", "lmcache"]
+chunk_bytes_list = [65536, 262144, 1048576, 4194304, 16777216]
+concurrency = 8
+warmup_iters = 8
+iters = 48
+
+[[jobs]]
+case = "1b_nvme_read_cold"
+mode = "odirect_qd1"
+systems = ["vericache", "lmcache"]
+chunk_bytes_list = [65536, 262144, 1048576, 4194304, 16777216]
+concurrency = 1
+warmup_iters = 4
+iters = 32
+
+[[jobs]]
+case = "1b_nvme_read_cold"
+mode = "odirect_qd8"
+systems = ["vericache", "lmcache"]
+chunk_bytes_list = [65536, 262144, 1048576, 4194304, 16777216]
+concurrency = 8
+warmup_iters = 8
+iters = 48

@@ -1,0 +1,94 @@
+id: no-assume-admit-truncate
+valid:
+  - |
+    // assume(false); admit(); assume_specification; #[verifier::truncate]
+    verus! {
+        // assume(false); admit();
+        fn clean(v: &mut Vec<u8>) {
+            v.truncate(4);
+        }
+        #[verifier::exec_allows_no_decreases_clause]
+        fn ok_wait() {}
+        #[verifier::loop_isolation(false)]
+        fn ok_loop() {}
+        #[verifier::when_used_as_spec(clean)]
+        fn ok_spec() {}
+        #[verifier::rlimit(40)]
+        fn ok_rlimit() {}
+        #[cfg_attr(verus_only, verifier::rlimit(40))]
+        fn ok_cfg_rlimit() {}
+        fn ok_ghost(t: Tracked<u8>) {
+            let _ = Tracked::<u8>::assume_new();
+        }
+        fn axiom() {}
+        fn ok_var() {
+            let axiom = 1;
+        }
+    }
+invalid:
+  - |
+    verus! {
+        proof fn bad() { assume(false); }
+    }
+  - |
+    verus! {
+        proof fn bad() { admit(); }
+    }
+  - |
+    verus! {
+        proof fn bad() { vstd::pervasive::admit(); }
+    }
+  - |
+    verus! {
+        proof fn bad() { verus_builtin::assume_(false); }
+    }
+  - |
+    verus! {
+        pub assume_specification[ foo ]() -> u32;
+    }
+  - |
+    verus! {
+        #[verifier::truncate]
+        fn bad(x: u64) -> u32 { x as u32 }
+    }
+  - |
+    verus! {
+        #[verifier::rlimit(infinity)]
+        fn bad() {}
+    }
+  - |
+    verus! {
+        #[verifier::inline_air_stmt]
+        fn bad() {}
+    }
+  - |
+    verus! {
+        #[verifier::skip]
+        fn bad() {}
+    }
+  - |
+    verus! {
+        #[verifier::axiom]
+        proof fn bad() {}
+    }
+  - |
+    verus! {
+        #[verus::internal(spec)]
+        fn bad() {}
+    }
+  - |
+    verus! {
+        axiom fn bad_a();
+    }
+  - |
+    verus! {
+        proof axiom fn bad_b();
+    }
+  - |
+    verus! {
+        pub broadcast axiom fn bad_c();
+    }
+  - |
+    verus! {
+        pub proof axiom fn bad_d() {}
+    }

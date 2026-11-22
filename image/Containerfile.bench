@@ -1,0 +1,90 @@
+FROM localhost/vericache-dev:13.0.2
+
+ARG http_proxy
+ARG https_proxy
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    VIRTUAL_ENV=/opt/vericache/bench-venv \
+    PATH=/opt/vericache/bench-venv/bin:/opt/vericache/bin:/opt/vericache/verus/bin:/opt/vericache/z3/bin:/opt/vericache/cvc5/bin:/opt/vericache/cargo/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# 1. Ubuntu 24.04 runtime/dev packages for benchmarking, RDMA, and Python wheels.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3-venv \
+        python3-pip \
+        python3-dev \
+        numactl \
+        libnuma1 \
+        liburing2 \
+        rdma-core \
+        ibverbs-utils \
+        perftest \
+        iproute2 \
+        procps \
+        libgflags2.2 \
+        libgoogle-glog0v6t64 \
+        libssl3t64 \
+        libcurl4t64 \
+        libibverbs1 \
+        librdmacm1t64 \
+        librdmacm-dev \
+        patchelf \
+    && rm -rf /var/lib/apt/lists/* \
+    && printf '%s\n' \
+        'Defaults:dev secure_path="/opt/vericache/bench-venv/bin:/opt/vericache/bin:/opt/vericache/verus/bin:/opt/vericache/z3/bin:/opt/vericache/cvc5/bin:/opt/vericache/cargo/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
+        'dev ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/dev \
+    && chmod 0440 /etc/sudoers.d/dev \
+    && visudo -cf /etc/sudoers
+
+# 2. Isolated Python 3.12 benchmark venv with CUDA 13.0 PyTorch, Mooncake (CUDA 13), and LMCache.
+# Pin torch==2.14.1 (CUDA 13.0.3 toolkit) for compatibility with NVIDIA Driver 580.178.04
+# (CUDA 13.0) and the CUDA 13.0.2 base container. Use mooncake-transfer-engine-cuda13 so
+# Mooncake links against libcudart.so.13 natively (no CUDA 12/13 mismatch).
+RUN python3 -m venv /opt/vericache/bench-venv \
+    && /opt/vericache/bench-venv/bin/pip install --no-cache-dir --upgrade pip uv \
+    && /opt/vericache/bench-venv/bin/uv pip install --no-cache \
+        --python /opt/vericache/bench-venv/bin/python \
+        "torch==2.14.1" \
+        "mooncake-transfer-engine-cuda13" \
+        "lmcache" \
+        "numpy" \
+        "pyzmq" \
+        "psutil" \
+    && chmod -R a+rX /opt/vericache/bench-venv
+
+# 3. Pre-populate /opt/vericache/cargo for offline vericache-bench builds.
+RUN set -eu \
+    && WORK="/tmp/vericache-bench-prefetch" \
+    && mkdir -p "$WORK/src" \
+    && printf '%s\n' \
+        '[package]' \
+        'name = "vericache-bench-prefetch"' \
+        'version = "0.1.0"' \
+        'edition = "2024"' \
+        '' \
+        '[dependencies]' \
+        'vstd = { path = "/opt/vericache/verus/source/vstd" }' \
+        'verus_state_machines_macros = { path = "/opt/vericache/verus/source/state_machines_macros" }' \
+        'serde = { version = "1", features = ["derive"] }' \
+        'serde_json = "1"' \
+        'clap = { version = "4", features = ["derive"] }' \
+        'hdrhistogram = "7"' \
+        > "$WORK/Cargo.toml" \
+    && touch "$WORK/src/lib.rs" \
+    && cargo fetch --manifest-path "$WORK/Cargo.toml" \
+    && rm -rf "$WORK" \
+    && chmod -R a+rwX /opt/vericache/cargo
+
+# 4. Build-time sanity check (no GPU/RDMA hardware required).
+RUN rustc --version \
+    && cargo --version \
+    && verus --version \
+    && z3 --version \
+    && cvc5 --version | head -n 2 \
+    && python3 -c "import torch, lmcache, lmcache.cuda_ops, mooncake, numpy, zmq, psutil; print('torch:', torch.__version__, 'cuda:', torch.version.cuda, 'numpy:', numpy.__version__, 'zmq:', zmq.__version__, 'psutil:', psutil.__version__)" \
+    && ! ldd /opt/vericache/bench-venv/lib/python3.12/site-packages/mooncake/engine.so | grep 'not found' | grep -v 'libcuda.so.1'
+
+WORKDIR /workspace
+CMD ["bash"]

@@ -1,0 +1,33 @@
+# VeriCache Benchmark Suite Justfile
+# Run inside the benchmark container:
+#   ./image/dev.sh bench-hw <gpu0,gpu1> <uverbs_dev> <rdma_dev> just --justfile experiments/Justfile all
+
+default:
+    @just --list
+
+build-bench:
+    cargo build --release --manifest-path vericache-bench/Cargo.toml --target-dir target --offline
+
+gen-traces:
+    python3 experiments/workloads/gen_trace.py --out-dir /workspace/target/bench-traces
+
+s1:
+    python3 experiments/harness/orchestrate.py --suites s1_local_tiers
+
+s2:
+    python3 experiments/harness/orchestrate.py --suites s2_rdma_ablation
+
+s3:
+    python3 experiments/harness/orchestrate.py --suites s3_trace_replay
+
+s4:
+    python3 experiments/harness/orchestrate.py --suites s4_safety_revoke
+
+s5:
+    python3 experiments/harness/orchestrate.py --suite s5_scaleup_cluster
+
+s5-smoke:
+    python3 experiments/harness/orchestrate.py --suite s5_scaleup_cluster --smoke
+
+all:
+    python3 experiments/harness/orchestrate.py --all

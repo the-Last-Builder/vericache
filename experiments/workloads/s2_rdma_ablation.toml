@@ -1,0 +1,74 @@
+suite = "s2_rdma_ablation"
+description = "Suite 2: Cross-Process RDMA/GPUDirect RDMA & Type-2B MW Isolation-Tax Ablation (mlx5_3, GID 3, GPU0->GPU1)"
+
+[defaults]
+num_blocks = 1
+rdma_dev = "mlx5_3"
+gid_index = 3
+donor_gpu = 0
+initiator_gpu = 1
+warmup_iters = 8
+iters = 64
+
+[[jobs]]
+case = "2a_host_rdma"
+mode = "single_flight"
+systems = ["vericache", "mooncake"]
+chunk_bytes_list = [65536, 262144, 1048576, 4194304, 16777216]
+concurrency = 1
+warmup_iters = 8
+iters = 48
+
+[[jobs]]
+case = "2a_host_rdma"
+mode = "pipelined"
+systems = ["vericache", "mooncake"]
+chunk_bytes_list = [65536, 262144, 1048576, 4194304, 16777216]
+concurrency = 8
+warmup_iters = 8
+iters = 64
+
+[[jobs]]
+case = "2b_gdr_gpu"
+mode = "single_flight"
+systems = ["vericache", "mooncake"]
+chunk_bytes_list = [65536, 262144, 1048576, 4194304, 16777216]
+concurrency = 1
+warmup_iters = 8
+iters = 48
+
+[[jobs]]
+case = "2b_gdr_gpu"
+mode = "pipelined"
+systems = ["vericache", "mooncake"]
+chunk_bytes_list = [65536, 262144, 1048576, 4194304, 16777216]
+concurrency = 8
+warmup_iters = 8
+iters = 64
+
+[[jobs]]
+case = "2c_ablation_raw_mw"
+mode = "raw_mw"
+systems = ["vericache", "mooncake"]
+chunk_bytes_list = [65536, 262144, 1048576, 4194304, 16777216]
+concurrency = 8
+warmup_iters = 8
+iters = 64
+
+[[jobs]]
+case = "2c_ablation_dynamic_single"
+mode = "single_flight"
+systems = ["vericache"]
+chunk_bytes_list = [65536, 262144, 1048576, 4194304, 16777216]
+concurrency = 1
+warmup_iters = 8
+iters = 48
+
+[[jobs]]
+case = "2c_ablation_dynamic_pipelined"
+mode = "pipelined"
+systems = ["vericache"]
+chunk_bytes_list = [65536, 262144, 1048576, 4194304, 16777216]
+concurrency = 8
+warmup_iters = 8
+iters = 64

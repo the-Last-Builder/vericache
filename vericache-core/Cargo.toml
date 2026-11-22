@@ -1,0 +1,19 @@
+[package]
+name = "vericache-core"
+version.workspace = true
+edition.workspace = true
+description = "Verus-verified backend-agnostic cache kernel, pluggable hardware backends, and composable service contract for VeriCache."
+
+[package.metadata.verus]
+verify = true
+
+[lib]
+name = "vericache_core"
+
+[dependencies]
+foundation.workspace = true
+transfer.workspace = true
+vstd.workspace = true
+
+[lints]
+workspace = true

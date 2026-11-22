@@ -1,0 +1,30 @@
+id: no-panicking-stubs
+valid:
+  - |
+    verus! {
+        fn ok() { unreachable!(); }
+    }
+    #[cfg(test)]
+    mod tests {
+        fn t() {
+            panic!("ok in test");
+            let _ = Some(1).expect("ok in test");
+        }
+    }
+invalid:
+  - |
+    verus! {
+        fn bad() { todo!(); }
+    }
+  - |
+    verus! {
+        fn bad() { unimplemented!(); }
+    }
+  - |
+    verus! {
+        fn bad() { panic!("boom"); }
+    }
+  - |
+    verus! {
+        fn bad() { let _ = Some(1).expect("boom"); }
+    }

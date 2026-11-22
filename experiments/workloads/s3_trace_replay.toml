@@ -1,0 +1,89 @@
+suite = "s3_trace_replay"
+description = "Suite 3: Official Mooncake FAST'25 Trace Replay & Controlled Capacity-Ratio Sweep (256 KB & 4 MB, closed-loop & open-loop)"
+
+[defaults]
+num_blocks = 1
+concurrency = 1
+num_shards = 4
+rdma_dev = "mlx5_3"
+gid_index = 3
+nvme_dir = "/workspace/target/bench-nvme"
+
+# Official Mooncake FAST'25 conversation_trace.jsonl (closed-loop saturation)
+[[jobs]]
+case = "3_trace_conversation"
+mode = "closed_loop"
+systems = ["vericache", "mooncake", "lmcache"]
+trace_path = "/workspace/target/bench-traces/conversation_trace.jsonl"
+max_requests = 256
+capacity_ratio = 0.30
+chunk_bytes_list = [262144, 4194304]
+
+# Official Mooncake FAST'25 conversation_trace.jsonl (open-loop timestamp-paced)
+[[jobs]]
+case = "3_trace_conversation"
+mode = "open_loop"
+systems = ["vericache", "mooncake", "lmcache"]
+trace_path = "/workspace/target/bench-traces/conversation_trace.jsonl"
+max_requests = 160
+capacity_ratio = 0.30
+time_scale = 2000.0
+chunk_bytes_list = [262144, 4194304]
+
+# Official Mooncake FAST'25 toolagent_trace.jsonl (closed-loop saturation)
+[[jobs]]
+case = "3_trace_toolagent"
+mode = "closed_loop"
+systems = ["vericache", "mooncake", "lmcache"]
+trace_path = "/workspace/target/bench-traces/toolagent_trace.jsonl"
+max_requests = 256
+capacity_ratio = 0.30
+chunk_bytes_list = [262144, 4194304]
+
+# Official Mooncake FAST'25 toolagent_trace.jsonl (open-loop timestamp-paced)
+[[jobs]]
+case = "3_trace_toolagent"
+mode = "open_loop"
+systems = ["vericache", "mooncake", "lmcache"]
+trace_path = "/workspace/target/bench-traces/toolagent_trace.jsonl"
+max_requests = 160
+capacity_ratio = 0.30
+time_scale = 2000.0
+chunk_bytes_list = [262144, 4194304]
+
+# Controlled capacity-ratio sweep (10%, 30%, 50%, 80%) on synthetic Zipf prefix trace
+[[jobs]]
+case = "3_cap_sweep_10pct"
+mode = "closed_loop"
+systems = ["vericache", "mooncake", "lmcache"]
+trace_path = "/workspace/target/bench-traces/synthetic_zipf_trace.jsonl"
+max_requests = 256
+capacity_ratio = 0.10
+chunk_bytes_list = [262144, 4194304]
+
+[[jobs]]
+case = "3_cap_sweep_30pct"
+mode = "closed_loop"
+systems = ["vericache", "mooncake", "lmcache"]
+trace_path = "/workspace/target/bench-traces/synthetic_zipf_trace.jsonl"
+max_requests = 256
+capacity_ratio = 0.30
+chunk_bytes_list = [262144, 4194304]
+
+[[jobs]]
+case = "3_cap_sweep_50pct"
+mode = "closed_loop"
+systems = ["vericache", "mooncake", "lmcache"]
+trace_path = "/workspace/target/bench-traces/synthetic_zipf_trace.jsonl"
+max_requests = 256
+capacity_ratio = 0.50
+chunk_bytes_list = [262144, 4194304]
+
+[[jobs]]
+case = "3_cap_sweep_80pct"
+mode = "closed_loop"
+systems = ["vericache", "mooncake", "lmcache"]
+trace_path = "/workspace/target/bench-traces/synthetic_zipf_trace.jsonl"
+max_requests = 256
+capacity_ratio = 0.80
+chunk_bytes_list = [262144, 4194304]

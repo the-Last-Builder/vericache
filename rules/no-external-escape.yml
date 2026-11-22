@@ -1,0 +1,10 @@
+id: no-external-escape
+language: verus
+severity: error
+message: "External verifier escapes (`external`, `external_fn_specification`, `external_type_specification`, `external_trait_specification`, `external_trait_extension`, `allow_in_spec`) are forbidden everywhere."
+rule:
+  any:
+    - kind: attribute
+      regex: 'verifier\s*::\s*(external|external_fn_specification|external_type_specification|external_trait_specification|external_trait_extension|allow_in_spec)\b'
+    - kind: identifier
+      regex: '^(external_fn_specification|external_type_specification|external_trait_specification|external_trait_extension|allow_in_spec)$'

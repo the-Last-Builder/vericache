@@ -1,0 +1,25 @@
+id: no-panicking-stubs
+language: verus
+severity: error
+message: "Panicking stubs (`todo!`, `unimplemented!`, `panic!`, `.expect(...)`) are forbidden in production sources outside `#[cfg(test)]`."
+rule:
+  all:
+    - any:
+        - kind: macro_invocation
+          has:
+            field: macro
+            regex: '^(?:[A-Za-z_][A-Za-z0-9_]*::)*(todo|unimplemented|panic)$'
+        - kind: call_expression
+          has:
+            field: function
+            kind: field_expression
+            has:
+              field: field
+              regex: '^expect$'
+    - not:
+        inside:
+          kind: declaration_with_attrs
+          has:
+            kind: attribute_item
+            regex: '^#\[\s*cfg\s*\(\s*test\s*\)\s*\]$'
+          stopBy: end

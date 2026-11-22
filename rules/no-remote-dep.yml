@@ -1,0 +1,20 @@
+id: no-remote-dep
+language: verus
+severity: error
+message: "Remote RDMA/transport modules may not be referenced from local Host, CUDA, or NVMe backend layers."
+rule:
+  any:
+    - kind: use_declaration
+      regex: '(?s)(transfer|backends|super)::.*\b(rdma|transport)\b'
+    - kind: scoped_identifier
+      regex: '(^|::)(transfer|backends|super(?:::\s*super)*)::(rdma|transport)\b'
+    - kind: use_declaration
+      regex: '(?s)(^|\s|::)transfer\s+as\b'
+    - kind: use_declaration
+      regex: '(?s)(^|\s|::)transfer\s*;'
+    - kind: use_declaration
+      regex: '(?s)(^|\s|::)transfer::\*'
+    - kind: use_declaration
+      regex: '(?s)(^|\s|::)transfer::\{[^{}]*\bself\b'
+    - kind: extern_crate_declaration
+      regex: '\btransfer\b'

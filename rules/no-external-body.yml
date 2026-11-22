@@ -1,0 +1,10 @@
+id: no-external-body
+language: verus
+severity: error
+message: "`verifier::external_body` is forbidden outside whitelisted FFI boundary files."
+rule:
+  any:
+    - kind: attribute
+      regex: 'verifier\s*::\s*external_body\b'
+    - kind: identifier
+      regex: '^external_body$'

@@ -1,0 +1,21 @@
+id: no-external-body
+valid:
+  - |
+    // #[verifier::external_body]
+    verus! {
+        fn clean() { let external = 1usize; }
+    }
+invalid:
+  - |
+    verus! {
+        #[verifier::external_body]
+        fn bad() {}
+    }
+  - |
+    #![verifier::external_body]
+    verus! { fn bad() {} }
+  - |
+    verus! {
+        #[cfg_attr(verus_only, verifier::external_body)]
+        fn bad() {}
+    }

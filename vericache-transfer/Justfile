@@ -1,0 +1,34 @@
+default:
+    @just --list
+
+# Verify every proof in vericache-transfer.
+verify:
+    cargo verus verify -p vericache-transfer
+
+# Enforce TCB boundaries via tree-sitter-verus ast-grep rules:
+# 1. No assume/admit/assume_specification/truncate/rlimit/inline_air_stmt/skip/axiom anywhere in src/ or tests/.
+# 2. No non-external_body external verifier escapes anywhere in src/ or tests/.
+# 3. external_body and unsafe allowed ONLY in src/*/ffi.rs.
+# 4. No unverified items outside verus!{}, runtime-only cfg(not(verus_only)) logic, or macros in non-FFI src/.
+# 5. No panicking stubs (todo!, unimplemented!, panic!, .expect) in src/ outside #[cfg(test)].
+audit:
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-assume-admit-truncate.yml src tests
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-external-escape.yml src tests
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-external-body.yml --globs '!src/{context,host,cuda,rdma,nvme,transport}/ffi.rs' src tests
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-unsafe.yml --globs '!src/{context,host,cuda,rdma,nvme,transport}/ffi.rs' src tests
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-unverified-code.yml --globs '!src/{context,host,cuda,rdma,nvme,transport}/ffi.rs' src
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-panicking-stubs.yml src
+
+# Format every Rust/Verus source file.
+fmt:
+    find src tests -name '*.rs' -exec verusfmt {} +
+
+# Check formatting.
+fmt-check:
+    find src tests -name '*.rs' -exec verusfmt --check {} +
+
+check: verify audit fmt-check
+
+# Run the executable suite.
+test:
+    cargo test -p vericache-transfer
