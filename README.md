@@ -43,3 +43,18 @@ The source code and Verus `requires`/`ensures` contracts are the canonical speci
 - [TCB & Audit Gates](docs/tcb-and-audit.md) — dual-SMT + `--no-cheating`, all 10 `tree-sitter-verus` `ast-grep` rules, and the exact FFI/C TCB whitelist.
 - [Development & Hardware Testing](docs/development.md) — container toolchain, `just` recipes, DevContainer setup, and GPU/RDMA device pairing.
 - [Roadmap](docs/roadmap.md) — completed local multi-tier and Milestone 3 distributed RDMA/GDR stack (`PeerSession`, `DistributedEngine`, `distributed_e2e`; `policy.rs` and `engine/shard.rs` decoupled outside the verified core).
+
+## Citation
+
+If you use VeriCache in your research or engineering work, please cite our technical report:
+
+```bibtex
+@misc{lyu2026vericache,
+  title        = {{VeriCache}: Formally Verified, Location-Transparent Distributed {KV} Caching Across {GPU} {HBM}, Host {DRAM}, {NVMe}, and {GPUDirect} {RDMA}},
+  author       = {Lyu, Junfeng},
+  year         = {2026},
+  month        = nov,
+  howpublished = {\url{https://github.com/the-Last-Builder/vericache}},
+  note         = {Technical Report}
+}
+```
