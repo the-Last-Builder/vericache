@@ -1,19 +1,24 @@
 """ctypes handles for Rust-owned host frames and staging buffers."""
 
+from __future__ import annotations
+
 from contextlib import contextmanager, nullcontext
 import ctypes as C
 from functools import lru_cache
 from math import prod
 import os
-from pathlib import Path
+from struct import Struct, error as StructError
 import sys
 from threading import Condition
 from typing import TYPE_CHECKING
 
+from ._ffi import last_error, load_lib
 from .config import VeriCacheConfig
 
 if TYPE_CHECKING:
     import torch
+
+    from . import ObjectKey
 
 _VOID = C.c_void_p
 _SIZE = C.c_size_t
@@ -24,6 +29,8 @@ _PSIZE = C.POINTER(_SIZE)
 _PU64 = C.POINTER(_U64)
 _PI32 = C.POINTER(_I32)
 _BUSY = -4
+_KEY_WORDS = Struct("<4Q")
+_U64_MASK = (1 << 64) - 1
 _EXTENDED_STATS = (
     "dram_hits",
     "nvme_hits",
@@ -40,23 +47,17 @@ class NativeVeriCacheError(RuntimeError):
 
 
 @lru_cache(maxsize=None)
-def _bind(path: str):
-    try:
-        lib = C.CDLL(path)
-    except OSError as error:
-        raise NativeVeriCacheError(
-            f"Could not load VeriCache library {path}: {error}"
-        ) from error
+def _bind_local(lib):
     signatures = {
         "engine_create": (_VOID, _SIZE, _SIZE, _SIZE, _SIZE, C.c_char_p, _SIZE),
         "engine_destroy": (None, _VOID),
         "engine_frame_size": (_SIZE, _VOID),
         "engine_num_shards": (_SIZE, _VOID),
-        "engine_put": (_I32, _VOID, _U64, _VOID, _SIZE),
-        "engine_get": (_I32, _VOID, _U64, _VOID, _SIZE, C.POINTER(_SIZE)),
-        "engine_contains": (_I32, _VOID, _U64),
+        "engine_put_key256": (_I32, _VOID, _PU64, _VOID, _SIZE),
+        "engine_get_key256": (_I32, _VOID, _PU64, _VOID, _SIZE, C.POINTER(_SIZE)),
+        "engine_contains_key256": (_I32, _VOID, _PU64),
         "engine_has_cold_data": (_I32, _VOID),
-        "engine_evict": (_I32, _VOID, _U64),
+        "engine_evict_key256": (_I32, _VOID, _PU64),
         "engine_stats": (_I32, _VOID, *[_PU64] * len(_STATS)),
         "engine_create_with_options": (
             _VOID,
@@ -69,9 +70,9 @@ def _bind(path: str):
             C.c_uint32,
         ),
         "engine_is_slab_cuda_pinned": (_I32, _VOID),
-        "engine_acquire_read_lease": (_I32, _VOID, _U64, _PVOID, _PSIZE, _PU64),
+        "engine_acquire_read_lease_key256": (_I32, _VOID, _PU64, _PVOID, _PSIZE, _PU64),
         "engine_release_read_lease": (_I32, _VOID, _U64),
-        "engine_acquire_read_lease_batch": (
+        "engine_acquire_read_lease_batch_key256": (
             _I32,
             _VOID,
             _PU64,
@@ -82,13 +83,28 @@ def _bind(path: str):
             _PI32,
         ),
         "engine_release_read_lease_batch": (_I32, _VOID, _PU64, _SIZE),
-        "engine_contains_batch": (_I32, _VOID, _PU64, _SIZE, C.POINTER(C.c_uint8)),
-        "engine_put_batch": (_I32, _VOID, _PU64, _PVOID, _PSIZE, _SIZE, _PI32),
-        "engine_get_batch": (_I32, _VOID, _PU64, _PVOID, _PSIZE, _SIZE, _PSIZE, _PI32),
+        "engine_contains_batch_key256": (
+            _I32,
+            _VOID,
+            _PU64,
+            _SIZE,
+            C.POINTER(C.c_uint8),
+        ),
+        "engine_put_batch_key256": (_I32, _VOID, _PU64, _PVOID, _PSIZE, _SIZE, _PI32),
+        "engine_get_batch_key256": (
+            _I32,
+            _VOID,
+            _PU64,
+            _PVOID,
+            _PSIZE,
+            _SIZE,
+            _PSIZE,
+            _PI32,
+        ),
         "engine_poll_writeback": (_I32, _VOID),
         "engine_set_writeback_policy": (_I32, _VOID, _SIZE),
         "engine_extended_stats": (_I32, _VOID, *[_PU64] * len(_EXTENDED_STATS)),
-        "engine_drain_evictions": (_I32, _VOID, _PU64, _SIZE),
+        "engine_drain_evictions_key256": (C.c_ssize_t, _VOID, _PU64, _SIZE),
         "staging_alloc": (_VOID, _SIZE, _I32),
         "staging_ptr": (_VOID, _VOID),
         "staging_len": (_SIZE, _VOID),
@@ -103,20 +119,38 @@ def _bind(path: str):
 
 
 def _library(path=None):
-    path = path or os.getenv("VERICACHE_VLLM_LIB_PATH")
-    if path is None:
-        installed = Path(__file__).with_name("libvericache_vllm.so")
-        checkout = (
-            Path(__file__).resolve().parents[2] / "target/release/libvericache_vllm.so"
-        )
-        path = installed if installed.is_file() else checkout
-    return _bind(str(Path(path).expanduser().resolve()))
+    try:
+        return _bind_local(load_lib(path))
+    except OSError as error:
+        raise NativeVeriCacheError(
+            f"Could not load VeriCache library: {error}"
+        ) from error
+
+
+def _splitmix64(key: int) -> int:
+    key = (key + 0x9E3779B97F4A7C15) & _U64_MASK
+    key = ((key ^ (key >> 30)) * 0xBF58476D1CE4E5B9) & _U64_MASK
+    key = ((key ^ (key >> 27)) * 0x94D049BB133111EB) & _U64_MASK
+    return key ^ (key >> 31)
+
+
+def _key_words(key: ObjectKey | int) -> ObjectKey:
+    if isinstance(key, int) and 0 <= key <= _U64_MASK:
+        # Match Rust object_key(u64), including when batches mix tuples and ints.
+        h1 = _splitmix64(key ^ 0x9E3779B97F4A7C15)
+        h2 = _splitmix64(h1 ^ 0xBF58476D1CE4E5B9)
+        h3 = _splitmix64(h2 ^ 0x94D049BB133111EB)
+        return key, h1, h2, h3
+    if isinstance(key, tuple) and len(key) == 4:
+        return key
+    raise ValueError("key must be four unsigned 64-bit words or a legacy uint64")
 
 
 def _key(key):
-    if not isinstance(key, int) or not 0 <= key < (1 << 64):
-        raise ValueError("key must fit in an unsigned 64-bit integer")
-    return key
+    try:
+        return (_U64 * 4).from_buffer_copy(_KEY_WORDS.pack(*_key_words(key)))
+    except StructError as error:
+        raise ValueError("key words must be unsigned 64-bit integers") from error
 
 
 def _check(status, operation):
@@ -131,7 +165,7 @@ class _StagingAllocation:
         self.handle = lib.vericache_staging_alloc(size, prefer_cuda_pinned)
         if not self.handle:
             raise NativeVeriCacheError(
-                f"Could not allocate {size} bytes of host staging memory"
+                f"Could not allocate {size} bytes of host staging memory: {last_error(lib)}"
             )
 
     def __del__(self):
@@ -319,8 +353,14 @@ class ReadLease:
 
 
 def _keys(keys):
-    keys = tuple(map(_key, keys))
-    return (_U64 * len(keys))(*keys)
+    keys = tuple(keys)
+    packed = bytearray(len(keys) * _KEY_WORDS.size)
+    try:
+        for i, key in enumerate(keys):
+            _KEY_WORDS.pack_into(packed, i * _KEY_WORDS.size, *_key_words(key))
+    except StructError as error:
+        raise ValueError("key words must be unsigned 64-bit integers") from error
+    return (_U64 * (len(keys) * 4)).from_buffer(packed), len(keys)
 
 
 def _pointer_batch(ptrs, lengths, count):
@@ -371,7 +411,7 @@ class NativeVeriCacheEngine:
                 else "DRAM"
             )
             raise NativeVeriCacheError(
-                f"Could not create the VeriCache engine with {kind}"
+                f"Could not create the VeriCache engine with {kind}: {last_error(self._lib)}"
             )
         self.frame_size = self._lib.vericache_engine_frame_size(self._handle)
         self.num_shards = self._lib.vericache_engine_num_shards(self._handle)
@@ -432,37 +472,40 @@ class NativeVeriCacheEngine:
         with self._borrow() as handle:
             return bool(self._lib.vericache_engine_has_cold_data(handle))
 
-    def put(self, key: int, data) -> None:
+    def put(self, key: ObjectKey | int, data) -> None:
         payload = bytes(data)
         ptr = C.cast(C.c_char_p(payload), _VOID)
         with self._borrow() as handle:
             _check(
-                self._lib.vericache_engine_put(handle, _key(key), ptr, len(payload)),
+                self._lib.vericache_engine_put_key256(
+                    handle, _key(key), ptr, len(payload)
+                ),
                 "put",
             )
 
-    def get(self, key: int) -> bytes | None:
+    def get(self, key: ObjectKey | int) -> bytes | None:
         data = (C.c_uint8 * self.frame_size)()
         length = self._get(key, data)
         return None if length is None else bytes(memoryview(data).cast("B")[:length])
 
-    def contains(self, key: int) -> bool:
+    def contains(self, key: ObjectKey | int) -> bool:
         with self._borrow() as handle:
             return bool(
                 _check(
-                    self._lib.vericache_engine_contains(handle, _key(key)), "contains"
+                    self._lib.vericache_engine_contains_key256(handle, _key(key)),
+                    "contains",
                 )
             )
 
     def contains_batch(self, keys) -> list[bool]:
-        keys = _keys(keys)
-        present = (C.c_uint8 * len(keys))()
+        keys, count = _keys(keys)
+        present = (C.c_uint8 * count)()
         with self._borrow() as handle:
             _check(
-                self._lib.vericache_engine_contains_batch(
+                self._lib.vericache_engine_contains_batch_key256(
                     handle,
                     keys,
-                    len(keys),
+                    count,
                     present,
                 ),
                 "contains batch",
@@ -471,17 +514,17 @@ class NativeVeriCacheEngine:
 
     def put_batch(self, keys, ptrs, lens) -> list[int]:
         """Write from borrowed addresses and return one native status per key."""
-        keys = _keys(keys)
-        ptrs, lens = _pointer_batch(ptrs, lens, len(keys))
-        statuses = (_I32 * len(keys))()
+        keys, count = _keys(keys)
+        ptrs, lens = _pointer_batch(ptrs, lens, count)
+        statuses = (_I32 * count)()
         with self._borrow() as handle:
             _check(
-                self._lib.vericache_engine_put_batch(
+                self._lib.vericache_engine_put_batch_key256(
                     handle,
                     keys,
                     ptrs,
                     lens,
-                    len(keys),
+                    count,
                     statuses,
                 ),
                 "put batch",
@@ -490,17 +533,17 @@ class NativeVeriCacheEngine:
 
     def get_batch(self, keys, ptrs, caps) -> tuple[list[int], list[int]]:
         """Read into disjoint borrowed buffers and return lengths and statuses."""
-        keys = _keys(keys)
-        ptrs, caps = _pointer_batch(ptrs, caps, len(keys))
-        lengths, statuses = (_SIZE * len(keys))(), (_I32 * len(keys))()
+        keys, count = _keys(keys)
+        ptrs, caps = _pointer_batch(ptrs, caps, count)
+        lengths, statuses = (_SIZE * count)(), (_I32 * count)()
         with self._borrow() as handle:
             _check(
-                self._lib.vericache_engine_get_batch(
+                self._lib.vericache_engine_get_batch_key256(
                     handle,
                     keys,
                     ptrs,
                     caps,
-                    len(keys),
+                    count,
                     lengths,
                     statuses,
                 ),
@@ -514,11 +557,11 @@ class NativeVeriCacheEngine:
             self._leases[lease_id] = owner
         return ReadLease(owner)
 
-    def acquire_read_lease(self, key: int) -> ReadLease | None:
+    def acquire_read_lease(self, key: ObjectKey | int) -> ReadLease | None:
         ptr, length, lease_id = _VOID(), _SIZE(), _U64()
         with self._borrow() as handle:
             status = _check(
-                self._lib.vericache_engine_acquire_read_lease(
+                self._lib.vericache_engine_acquire_read_lease_key256(
                     handle,
                     _key(key),
                     C.byref(ptr),
@@ -535,13 +578,12 @@ class NativeVeriCacheEngine:
 
     def acquire_read_lease_batch(self, keys, *, with_statuses=False):
         """Return leases in key order. Missing keys have a None entry."""
-        keys = _keys(keys)
-        count = len(keys)
+        keys, count = _keys(keys)
         ptrs, lengths = (_VOID * count)(), (_SIZE * count)()
         ids, statuses = (_U64 * count)(), (_I32 * count)()
         with self._borrow() as handle:
             _check(
-                self._lib.vericache_engine_acquire_read_lease_batch(
+                self._lib.vericache_engine_acquire_read_lease_batch_key256(
                     handle,
                     keys,
                     count,
@@ -599,7 +641,12 @@ class NativeVeriCacheEngine:
             self._release_ready((owner.id,))
 
     def release_read_lease_batch(self, lease_ids) -> None:
-        ids = tuple(map(_key, lease_ids))
+        ids = tuple(lease_ids)
+        if any(
+            not isinstance(lease_id, int) or not 0 <= lease_id <= _U64_MASK
+            for lease_id in ids
+        ):
+            raise ValueError("lease IDs must be unsigned 64-bit integers")
         ready = []
         with self._cv:
             for lease_id in ids:
@@ -631,21 +678,24 @@ class NativeVeriCacheEngine:
                 "set writeback policy",
             )
 
-    def drain_evictions(self) -> list[int]:
-        buf = (_U64 * 256)()
+    def drain_evictions(self) -> list[ObjectKey]:
+        capacity = 256
+        buf = (_U64 * (capacity * 4))()
         result = []
         with self._borrow() as handle:
             while True:
                 count = _check(
-                    self._lib.vericache_engine_drain_evictions(
-                        handle,
-                        buf,
-                        len(buf),
+                    self._lib.vericache_engine_drain_evictions_key256(
+                        handle, buf, capacity
                     ),
                     "drain evictions",
                 )
-                result.extend(buf[:count])
-                if count < len(buf):
+                result.extend(
+                    _KEY_WORDS.iter_unpack(
+                        memoryview(buf).cast("B")[: count * _KEY_WORDS.size]
+                    )
+                )
+                if count < capacity:
                     return result
 
     def extended_stats(self) -> dict[str, int]:
@@ -660,10 +710,12 @@ class NativeVeriCacheEngine:
             )
         return {name: value.value for name, value in zip(_EXTENDED_STATS, values)}
 
-    def evict(self, key: int) -> bool:
+    def evict(self, key: ObjectKey | int) -> bool:
         with self._borrow() as handle:
             return (
-                _check(self._lib.vericache_engine_evict(handle, _key(key)), "evict")
+                _check(
+                    self._lib.vericache_engine_evict_key256(handle, _key(key)), "evict"
+                )
                 == 0
             )
 
@@ -676,14 +728,14 @@ class NativeVeriCacheEngine:
         return {name: value.value for name, value in zip(_STATS, values)}
 
     def put_from_staging(
-        self, key: int, staging: PinnedStagingBuffer, length=None
+        self, key: ObjectKey | int, staging: PinnedStagingBuffer, length=None
     ) -> None:
         data = staging._storage()
         length = len(data) if length is None else length
         if not 0 <= length <= len(data):
             raise ValueError("payload length exceeds staging capacity")
         with self._borrow() as handle:
-            status = self._lib.vericache_engine_put(
+            status = self._lib.vericache_engine_put_key256(
                 handle, _key(key), C.addressof(data), length
             )
             _check(status, "put")
@@ -691,7 +743,7 @@ class NativeVeriCacheEngine:
     def _get(self, key, data):
         length = _SIZE()
         with self._borrow() as handle:
-            status = self._lib.vericache_engine_get(
+            status = self._lib.vericache_engine_get_key256(
                 handle,
                 _key(key),
                 C.addressof(data),
@@ -702,10 +754,14 @@ class NativeVeriCacheEngine:
                 raise ValueError(f"payload requires {length.value} bytes")
             return None if _check(status, "get") == 1 else length.value
 
-    def get_into_staging(self, key: int, staging: PinnedStagingBuffer) -> int | None:
+    def get_into_staging(
+        self, key: ObjectKey | int, staging: PinnedStagingBuffer
+    ) -> int | None:
         return self._get(key, staging._storage())
 
-    def put_tensor(self, key: int, tensor: "torch.Tensor", staging=None) -> None:
+    def put_tensor(
+        self, key: ObjectKey | int, tensor: "torch.Tensor", staging=None
+    ) -> None:
         length = tensor.numel() * tensor.element_size()
         if length > self.frame_size:
             raise ValueError("tensor exceeds engine frame size")
@@ -719,7 +775,9 @@ class NativeVeriCacheEngine:
                 event.synchronize()
             self.put_from_staging(key, stage, length)
 
-    def get_tensor(self, key: int, tensor: "torch.Tensor", staging=None) -> bool:
+    def get_tensor(
+        self, key: ObjectKey | int, tensor: "torch.Tensor", staging=None
+    ) -> bool:
         expected = tensor.numel() * tensor.element_size()
         with self.make_staging() if staging is None else nullcontext(staging) as stage:
             size = self.get_into_staging(key, stage)

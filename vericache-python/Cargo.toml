@@ -4,12 +4,22 @@
 name = "vericache-python"
 version = "0.1.0"
 edition = "2024"
-description = "Zero-external-dependency C ABI / Python binding and vLLM v1 KVConnector for VeriCache."
+description = "Shared C ABI for the Distributed and Local VeriCache Python backends."
 
 [lib]
 name = "vericache_python"
 crate-type = ["cdylib", "rlib"]
 
+[package.metadata.verus]
+verify = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)', 'cfg(verus_keep_ghost)', 'cfg(verus_keep_ghost_body)'] }
+
 [dependencies]
 vericache = { path = "../vericache" }
 vericache-core = { path = "../vericache-core" }
+foundation = { package = "vericache-foundation", path = "../vericache-foundation" }
+transfer = { package = "vericache-transfer", path = "../vericache-transfer" }
+vstd = { path = "/opt/vericache/verus/source/vstd" }
+rayon = "1.11"

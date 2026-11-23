@@ -18,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
+from . import ObjectKey
 from ._native import _BUSY, NativeVeriCacheEngine, NativeVeriCacheError, copy_tensor
 from .config import VeriCacheConfig
 from .hashing import compute_prefix_block_hashes, derive_layer_block_key
@@ -50,7 +51,7 @@ def _shared_engine(engine_id, config):
 
 @dataclass(frozen=True)
 class BlockTransfer:
-    block_hash: int
+    block_hash: bytes
     block_id: int
 
 
@@ -62,7 +63,7 @@ class VeriCacheConnectorMetadata(KVConnectorMetadata):
 
 @dataclass
 class _RequestState:
-    hashes: list[int]
+    hashes: list[bytes]
     block_ids: list[int]
     external_tokens: int = 0
 
@@ -116,7 +117,7 @@ class _StagingSlot:
 @dataclass
 class _LayerLoad:
     errors: set[int] = field(default_factory=set)
-    missing: list[int] = field(default_factory=list)
+    missing: list[ObjectKey] = field(default_factory=list)
     retry: list[tuple[BlockTransfer, int]] = field(default_factory=list)
     leases: list = field(default_factory=list)
     event: object = None
@@ -265,7 +266,7 @@ class VeriCacheV1Connector(KVConnectorBase_V1):
     def engine(self):
         return self._store.native if self._store is not None else None
 
-    def _layer_key(self, block_hash, layer):
+    def _layer_key(self, block_hash: bytes, layer: str) -> ObjectKey:
         if self._tp_rank is not None:
             layer = f"{self._tp_rank}:{self._world_size}:{layer}"
         return derive_layer_block_key(block_hash, layer)

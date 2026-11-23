@@ -1,4 +1,5 @@
-use crate::shard_cap::ShardCapabilityBundle;
+use super::shard_cap::ShardCapabilityBundle;
+use crate::{backend_mode, set_last_error};
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -165,7 +166,7 @@ struct Directory {
     host_capacity: usize,
     nvme_capacity: usize,
     high_watermark: usize,
-    evicted: Option<VecDeque<u64>>,
+    evicted: Option<VecDeque<ObjectKey>>,
     stats: Stats,
     extended: ExtendedStats,
 }
@@ -264,6 +265,10 @@ impl VericacheVllmEngine {
         shards
             .try_reserve_exact(num_shards)
             .map_err(|_| Error::Invalid)?;
+        if let Err(error) = backend_mode::claim_local() {
+            set_last_error(error);
+            return Err(Error::Backend);
+        }
         let pin_cuda = options.pin_cuda && cuda::device_count().is_ok_and(|n| n != 0);
         let mut cuda_pinned = pin_cuda;
         let cold_shards = Arc::new(AtomicUsize::new(0));
@@ -313,8 +318,10 @@ impl VericacheVllmEngine {
         self.cuda_pinned
     }
 
-    fn shard_index(&self, key: u64) -> usize {
-        (splitmix64(key) % self.shards.len() as u64) as usize
+    fn shard_index(&self, key: ObjectKey) -> usize {
+        let [a, b, c, d] = key.0;
+        let mixed = splitmix64(a ^ splitmix64(b ^ splitmix64(c ^ splitmix64(d))));
+        (mixed % self.shards.len() as u64) as usize
     }
 
     fn lock_shard(&self, index: usize) -> Result<MutexGuard<'_, ShardInstance>, Error> {
@@ -325,7 +332,7 @@ impl VericacheVllmEngine {
             .map_err(|_| Error::Backend)
     }
 
-    pub(crate) fn put(&self, key: u64, src: &[u8]) -> Result<(), Error> {
+    pub(crate) fn put(&self, key: ObjectKey, src: &[u8]) -> Result<(), Error> {
         if src.len() > self.frame_size {
             return Err(Error::Invalid);
         }
@@ -338,33 +345,33 @@ impl VericacheVllmEngine {
                 } else {
                     SPILL_DEPTH
                 };
-                dir.put(engine, caps, object_key(key), src, depth)
+                dir.put(engine, caps, key, src, depth)
             })
     }
 
-    pub(crate) fn get(&self, key: u64, dst: &mut [u8]) -> Result<Option<usize>, Error> {
+    pub(crate) fn get(&self, key: ObjectKey, dst: &mut [u8]) -> Result<Option<usize>, Error> {
         self.lock_shard(self.shard_index(key))?
-            .with_engine(|engine, caps, dir| dir.get(engine, caps, object_key(key), dst))
+            .with_engine(|engine, caps, dir| dir.get(engine, caps, key, dst))
     }
 
-    pub(crate) fn contains(&self, key: u64) -> Result<bool, Error> {
+    pub(crate) fn contains(&self, key: ObjectKey) -> Result<bool, Error> {
         Ok(self
             .lock_shard(self.shard_index(key))?
             .data
             .entries
-            .contains_key(&object_key(key)))
+            .contains_key(&key))
     }
 
-    pub(crate) fn evict(&self, key: u64) -> Result<bool, Error> {
+    pub(crate) fn evict(&self, key: ObjectKey) -> Result<bool, Error> {
         self.lock_shard(self.shard_index(key))?
-            .with_engine(|engine, caps, dir| dir.remove(engine, caps, object_key(key), true))
+            .with_engine(|engine, caps, dir| dir.remove(engine, caps, key, true))
     }
 
-    pub(crate) fn acquire(&self, key: u64) -> Result<Option<Lease>, Error> {
+    pub(crate) fn acquire(&self, key: ObjectKey) -> Result<Option<Lease>, Error> {
         self.lock_shard(self.shard_index(key))?
             .with_engine(|engine, caps, dir| {
                 dir.poll(engine, caps)?;
-                dir.acquire(engine, caps, object_key(key), None)
+                dir.acquire(engine, caps, key, None)
             })
     }
 
@@ -377,13 +384,13 @@ impl VericacheVllmEngine {
         (id % self.num_shards() as u64) as usize
     }
 
-    fn batch<T: Send, R: Send>(
+    fn batch<K: Copy + Send, T: Send, R: Send>(
         &self,
-        items: impl IntoIterator<Item = (u64, T)>,
-        index: impl Fn(u64) -> usize,
+        items: impl IntoIterator<Item = (K, T)>,
+        index: impl Fn(K) -> usize,
         parallel: bool,
-        read_maintenance: bool,
-        op: impl Fn(&mut ShardInstance, u64, T, Option<&HashSet<ObjectKey>>) -> Result<R, Error> + Sync,
+        read_key: Option<fn(K) -> ObjectKey>,
+        op: impl Fn(&mut ShardInstance, K, T, Option<&HashSet<ObjectKey>>) -> Result<R, Error> + Sync,
     ) -> Vec<Result<R, Error>> {
         let mut groups: Vec<Vec<_>> = (0..self.num_shards()).map(|_| Vec::new()).collect();
         let mut results = Vec::new();
@@ -398,15 +405,15 @@ impl VericacheVllmEngine {
             .enumerate()
             .filter(|(_, group)| !group.is_empty())
             .collect();
-        let run = |(shard_index, group): (_, Vec<(usize, u64, T)>)| {
+        let run = |(shard_index, group): (_, Vec<(usize, K, T)>)| {
             let mut shard = self.lock_shard(shard_index).and_then(|mut shard| {
                 let mut requested = None;
-                if read_maintenance {
+                if let Some(read_key) = read_key {
                     shard.with_engine(|engine, caps, dir| {
                         dir.poll(engine, caps)?;
                         if group.len() > 1 && !dir.nvme_only.is_empty() {
                             let keys: Vec<_> =
-                                group.iter().map(|(_, key, _)| object_key(*key)).collect();
+                                group.iter().map(|(_, key, _)| read_key(*key)).collect();
                             let batch_keys = keys.iter().copied().collect();
                             dir.prewarm(engine, caps, &keys, &batch_keys)?;
                             requested = Some(batch_keys);
@@ -465,64 +472,68 @@ impl VericacheVllmEngine {
         self.cold_shards.load(Ordering::Relaxed) != 0
     }
 
-    pub(crate) fn contains_batch(&self, keys: &[u64]) -> Vec<Result<bool, Error>> {
+    pub(crate) fn contains_batch(
+        &self,
+        keys: impl ExactSizeIterator<Item = ObjectKey>,
+    ) -> Vec<Result<bool, Error>> {
         self.batch(
-            keys.iter().map(|&key| (key, ())),
+            keys.map(|key| (key, ())),
             |key| self.shard_index(key),
             false,
-            false,
-            |shard, key, (), _| Ok(shard.data.entries.contains_key(&object_key(key))),
+            None,
+            |shard, key, (), _| Ok(shard.data.entries.contains_key(&key)),
         )
     }
 
     pub(crate) fn put_batch(
         &self,
-        keys: &[u64],
+        keys: impl ExactSizeIterator<Item = ObjectKey>,
         sources: Vec<Option<&[u8]>>,
     ) -> Vec<Result<(), Error>> {
+        let parallel = keys.len().saturating_mul(self.frame_size) >= PARALLEL_BATCH_BYTES;
         self.batch(
-            keys.iter().copied().zip(sources),
+            keys.zip(sources),
             |key| self.shard_index(key),
-            keys.len().saturating_mul(self.frame_size) >= PARALLEL_BATCH_BYTES,
-            false,
+            parallel,
+            None,
             |shard, key, src, _| {
                 let src = src
                     .filter(|src| src.len() <= self.frame_size)
                     .ok_or(Error::Invalid)?;
-                shard.with_engine(|engine, caps, dir| {
-                    dir.put(engine, caps, object_key(key), src, SPILL_DEPTH)
-                })
+                shard.with_engine(|engine, caps, dir| dir.put(engine, caps, key, src, SPILL_DEPTH))
             },
         )
     }
 
     pub(crate) fn get_batch(
         &self,
-        keys: &[u64],
+        keys: impl ExactSizeIterator<Item = ObjectKey>,
         destinations: Vec<Option<&mut [u8]>>,
     ) -> Vec<Result<Option<usize>, Error>> {
+        let parallel = keys.len().saturating_mul(self.frame_size) >= PARALLEL_BATCH_BYTES;
         self.batch(
-            keys.iter().copied().zip(destinations),
+            keys.zip(destinations),
             |key| self.shard_index(key),
-            keys.len().saturating_mul(self.frame_size) >= PARALLEL_BATCH_BYTES,
-            false,
+            parallel,
+            None,
             |shard, key, dst, _| {
                 let dst = dst.ok_or(Error::Invalid)?;
-                shard.with_engine(|engine, caps, dir| dir.get(engine, caps, object_key(key), dst))
+                shard.with_engine(|engine, caps, dir| dir.get(engine, caps, key, dst))
             },
         )
     }
 
-    pub(crate) fn acquire_batch(&self, keys: &[u64]) -> Vec<Result<Option<Lease>, Error>> {
+    pub(crate) fn acquire_batch(
+        &self,
+        keys: impl ExactSizeIterator<Item = ObjectKey>,
+    ) -> Vec<Result<Option<Lease>, Error>> {
         self.batch(
-            keys.iter().map(|&key| (key, ())),
+            keys.map(|key| (key, ())),
             |key| self.shard_index(key),
             self.has_cold_data(),
-            self.has_nvme,
+            self.has_nvme.then_some(std::convert::identity),
             |shard, key, (), requested| {
-                shard.with_engine(|engine, caps, dir| {
-                    dir.acquire(engine, caps, object_key(key), requested)
-                })
+                shard.with_engine(|engine, caps, dir| dir.acquire(engine, caps, key, requested))
             },
         )
     }
@@ -532,7 +543,7 @@ impl VericacheVllmEngine {
             ids.iter().map(|&id| (id, ())),
             |id| self.lease_shard(id),
             false,
-            false,
+            None,
             |shard, id, (), _| shard.with_engine(|engine, caps, dir| dir.release(engine, caps, id)),
         )
         .into_iter()
@@ -572,16 +583,20 @@ impl VericacheVllmEngine {
         Ok(())
     }
 
-    pub(crate) fn drain_evictions(&self, out: &mut [u64]) -> Result<usize, Error> {
+    pub(crate) fn drain_evictions(
+        &self,
+        capacity: usize,
+        mut write: impl FnMut(usize, ObjectKey),
+    ) -> Result<usize, Error> {
         let mut count = 0;
         for index in 0..self.num_shards() {
             if let Some(evicted) = &mut self.lock_shard(index)?.data.evicted {
-                let n = (out.len() - count).min(evicted.len());
+                let n = (capacity - count).min(evicted.len());
                 for key in evicted.drain(..n) {
-                    out[count] = key;
+                    write(count, key);
                     count += 1;
                 }
-                if count == out.len() {
+                if count == capacity {
                     break;
                 }
             }
@@ -788,7 +803,7 @@ impl Directory {
     fn record_eviction(&mut self, key: ObjectKey) {
         self.stats.evictions += 1;
         if let Some(evicted) = &mut self.evicted {
-            evicted.push_back(key.0[0]);
+            evicted.push_back(key);
         }
     }
 
@@ -1332,7 +1347,7 @@ fn lock_file(path: &str) -> Result<File, Error> {
     Ok(file)
 }
 
-fn object_key(key: u64) -> ObjectKey {
+pub(super) fn object_key(key: u64) -> ObjectKey {
     let h1 = splitmix64(key ^ 0x9e37_79b9_7f4a_7c15);
     let h2 = splitmix64(h1 ^ 0xbf58_476d_1ce4_e5b9);
     let h3 = splitmix64(h2 ^ 0x94d0_49bb_1331_11eb);

@@ -1,4 +1,5 @@
-use crate::shard_cap::ShardCapabilityBundle;
+use super::shard_cap::ShardCapabilityBundle;
+use crate::{backend_mode, set_last_error};
 use std::sync::{Mutex, OnceLock};
 use transfer::context::SlotToken;
 use transfer::cuda::{self, CudaHostBuffer};
@@ -87,6 +88,10 @@ impl StagingAllocator {
 impl StagingBuffer {
     pub(crate) fn allocate(len: usize, prefer_cuda: bool) -> Option<Self> {
         if len == 0 || len > isize::MAX as usize {
+            return None;
+        }
+        if let Err(error) = backend_mode::claim_local() {
+            set_last_error(error);
             return None;
         }
         ALLOCATOR

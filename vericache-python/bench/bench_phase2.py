@@ -13,12 +13,14 @@ from uuid import uuid4
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
-from vericache_vllm import (
+from vericache import (
     NativeVeriCacheEngine,
     VeriCacheConfig,
+    compute_prefix_block_hashes,
     derive_layer_block_key,
 )
-from vericache_vllm.connector import (
+from vericache._native import _splitmix64
+from vericache.vllm_v1_connector import (
     BlockTransfer,
     VeriCacheConnectorMetadata,
     VeriCacheV1Connector,
@@ -29,11 +31,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 
 def _shard(key, count):
     # Match native shard routing so a DRAM-resident run fits on every shard.
-    mask = (1 << 64) - 1
-    key = (key + 0x9E3779B97F4A7C15) & mask
-    key = ((key ^ (key >> 30)) * 0xBF58476D1CE4E5B9) & mask
-    key = ((key ^ (key >> 27)) * 0x94D049BB133111EB) & mask
-    return (key ^ (key >> 31)) % count
+    a, b, c, d = key
+    return _splitmix64(a ^ _splitmix64(b ^ _splitmix64(c ^ _splitmix64(d)))) % count
 
 
 def _latency(run):
@@ -43,9 +42,10 @@ def _latency(run):
 
 
 def _phase1(options, sources, outputs, blocks, keys):
-    with NativeVeriCacheEngine(
-        VeriCacheConfig(**options)
-    ) as engine, engine.make_staging() as stage:
+    with (
+        NativeVeriCacheEngine(VeriCacheConfig(**options)) as engine,
+        engine.make_staging() as stage,
+    ):
         # Scalar admissions wait for one spill at a time with eager writeback off.
         engine.set_writeback_policy(0)
 
@@ -140,7 +140,8 @@ def main():
         parser.error("NVMe is required for the pressure run")
     torch.set_num_threads(1)
     layers = [f"layer.{i}" for i in range(args.layers)]
-    blocks = [BlockTransfer(i + 1, i) for i in range(args.blocks)]
+    hashes = compute_prefix_block_hashes(range(args.blocks * 16), 16, "benchmark")
+    blocks = [BlockTransfer(digest, i) for i, digest in enumerate(hashes)]
     keys = {
         layer: [derive_layer_block_key(block.block_hash, layer) for block in blocks]
         for layer in layers

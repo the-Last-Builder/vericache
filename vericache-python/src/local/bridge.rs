@@ -1,9 +1,11 @@
 //! The C handles are opaque. See the safety contract on each export.
-use crate::engine::{Error, Lease, Options};
-use crate::{StagingBuffer, VericacheVllmEngine};
+use super::engine::{Error, Lease, Options, object_key};
+use super::{StagingBuffer, VericacheVllmEngine};
+use crate::set_last_error;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::slice;
+use vericache_core::spec::ObjectKey;
 
 const INVALID: i32 = -1;
 const BACKEND: i32 = -2;
@@ -34,6 +36,7 @@ pub unsafe extern "C" fn vericache_engine_create(
     nvme_path_ptr: *const u8,
     nvme_path_len: usize,
 ) -> *mut VericacheVllmEngine {
+    set_last_error("");
     boundary(ptr::null_mut(), || {
         let Ok(path) = (unsafe { path_from_raw(nvme_path_ptr, nvme_path_len) }) else {
             return ptr::null_mut();
@@ -81,6 +84,31 @@ pub unsafe extern "C" fn vericache_engine_put(
     src_ptr: *const u8,
     len: usize,
 ) -> i32 {
+    unsafe { put_impl(engine, object_key(key), src_ptr, len) }
+}
+
+/// # Safety
+/// Follows the contract of `vericache_engine_put`. The key
+/// pointer must address four readable, aligned little-endian u64 words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vericache_engine_put_key256(
+    engine: *mut VericacheVllmEngine,
+    key4_ptr: *const u64,
+    src_ptr: *const u8,
+    len: usize,
+) -> i32 {
+    let Some(key) = (unsafe { read_key256(key4_ptr) }) else {
+        return INVALID;
+    };
+    unsafe { put_impl(engine, key, src_ptr, len) }
+}
+
+unsafe fn put_impl(
+    engine: *mut VericacheVllmEngine,
+    key: ObjectKey,
+    src_ptr: *const u8,
+    len: usize,
+) -> i32 {
     boundary(BACKEND, || {
         let Some(engine) = (unsafe { engine.as_ref() }) else {
             return INVALID;
@@ -105,6 +133,33 @@ pub unsafe extern "C" fn vericache_engine_put(
 pub unsafe extern "C" fn vericache_engine_get(
     engine: *mut VericacheVllmEngine,
     key: u64,
+    dst_ptr: *mut u8,
+    dst_cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    unsafe { get_impl(engine, object_key(key), dst_ptr, dst_cap, out_len) }
+}
+
+/// # Safety
+/// Follows the contract of `vericache_engine_get`. The key
+/// pointer must address four readable, aligned little-endian u64 words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vericache_engine_get_key256(
+    engine: *mut VericacheVllmEngine,
+    key4_ptr: *const u64,
+    dst_ptr: *mut u8,
+    dst_cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    let Some(key) = (unsafe { read_key256(key4_ptr) }) else {
+        return INVALID;
+    };
+    unsafe { get_impl(engine, key, dst_ptr, dst_cap, out_len) }
+}
+
+unsafe fn get_impl(
+    engine: *mut VericacheVllmEngine,
+    key: ObjectKey,
     dst_ptr: *mut u8,
     dst_cap: usize,
     out_len: *mut usize,
@@ -145,6 +200,24 @@ pub unsafe extern "C" fn vericache_engine_contains(
     engine: *mut VericacheVllmEngine,
     key: u64,
 ) -> i32 {
+    unsafe { contains_impl(engine, object_key(key)) }
+}
+
+/// # Safety
+/// Follows the contract of `vericache_engine_contains`. The key
+/// pointer must address four readable, aligned little-endian u64 words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vericache_engine_contains_key256(
+    engine: *mut VericacheVllmEngine,
+    key4_ptr: *const u64,
+) -> i32 {
+    let Some(key) = (unsafe { read_key256(key4_ptr) }) else {
+        return INVALID;
+    };
+    unsafe { contains_impl(engine, key) }
+}
+
+unsafe fn contains_impl(engine: *mut VericacheVllmEngine, key: ObjectKey) -> i32 {
     boundary(BACKEND, || {
         let Some(engine) = (unsafe { engine.as_ref() }) else {
             return INVALID;
@@ -164,6 +237,24 @@ pub unsafe extern "C" fn vericache_engine_has_cold_data(engine: *const Vericache
 /// A nonnull engine must stay live for this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vericache_engine_evict(engine: *mut VericacheVllmEngine, key: u64) -> i32 {
+    unsafe { evict_impl(engine, object_key(key)) }
+}
+
+/// # Safety
+/// Follows the contract of `vericache_engine_evict`. The key
+/// pointer must address four readable, aligned little-endian u64 words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vericache_engine_evict_key256(
+    engine: *mut VericacheVllmEngine,
+    key4_ptr: *const u64,
+) -> i32 {
+    let Some(key) = (unsafe { read_key256(key4_ptr) }) else {
+        return INVALID;
+    };
+    unsafe { evict_impl(engine, key) }
+}
+
+unsafe fn evict_impl(engine: *mut VericacheVllmEngine, key: ObjectKey) -> i32 {
     boundary(BACKEND, || {
         let Some(engine) = (unsafe { engine.as_ref() }) else {
             return INVALID;
@@ -228,6 +319,7 @@ pub extern "C" fn vericache_staging_alloc(
     size: usize,
     prefer_cuda_pinned: i32,
 ) -> *mut StagingBuffer {
+    set_last_error("");
     boundary(ptr::null_mut(), || {
         StagingBuffer::allocate(size, prefer_cuda_pinned != 0)
             .map_or(ptr::null_mut(), |buf| Box::into_raw(Box::new(buf)))
@@ -295,6 +387,7 @@ pub unsafe extern "C" fn vericache_engine_create_with_options(
     path_len: usize,
     flags: u32,
 ) -> *mut VericacheVllmEngine {
+    set_last_error("");
     boundary(ptr::null_mut(), || {
         let Ok(path) = (unsafe { path_from_raw(path, path_len) }) else {
             return ptr::null_mut();
@@ -363,6 +456,33 @@ pub unsafe extern "C" fn vericache_engine_acquire_read_lease(
     out_len: *mut usize,
     out_lease_id: *mut u64,
 ) -> i32 {
+    unsafe { acquire_read_lease_impl(engine, object_key(key), out_ptr, out_len, out_lease_id) }
+}
+
+/// # Safety
+/// Follows the contract of `vericache_engine_acquire_read_lease`. The key
+/// pointer must address four readable, aligned little-endian u64 words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vericache_engine_acquire_read_lease_key256(
+    engine: *mut VericacheVllmEngine,
+    key4_ptr: *const u64,
+    out_ptr: *mut *const u8,
+    out_len: *mut usize,
+    out_lease_id: *mut u64,
+) -> i32 {
+    let Some(key) = (unsafe { read_key256(key4_ptr) }) else {
+        return INVALID;
+    };
+    unsafe { acquire_read_lease_impl(engine, key, out_ptr, out_len, out_lease_id) }
+}
+
+unsafe fn acquire_read_lease_impl(
+    engine: *mut VericacheVllmEngine,
+    key: ObjectKey,
+    out_ptr: *mut *const u8,
+    out_len: *mut usize,
+    out_lease_id: *mut u64,
+) -> i32 {
     boundary(BACKEND, || {
         let Some(engine) = (unsafe { engine.as_ref() }) else {
             return INVALID;
@@ -390,7 +510,31 @@ pub unsafe extern "C" fn vericache_engine_release_read_lease(
 }
 
 fn valid_array<T>(ptr: *const T, count: usize) -> bool {
-    count == 0 || (!ptr.is_null() && count <= (isize::MAX as usize) / size_of::<T>())
+    count == 0
+        || (!ptr.is_null() && ptr.is_aligned() && count <= (isize::MAX as usize) / size_of::<T>())
+}
+
+trait AbiKey: Copy {
+    fn into_key(self) -> ObjectKey;
+}
+
+impl AbiKey for u64 {
+    fn into_key(self) -> ObjectKey {
+        object_key(self)
+    }
+}
+
+impl AbiKey for [u64; 4] {
+    fn into_key(self) -> ObjectKey {
+        ObjectKey(self.map(u64::from_le))
+    }
+}
+
+unsafe fn read_key256(key: *const u64) -> Option<ObjectKey> {
+    if key.is_null() || !key.is_aligned() {
+        return None;
+    }
+    Some(unsafe { key.cast::<[u64; 4]>().read() }.into_key())
 }
 
 unsafe fn input_array<'a, T>(ptr: *const T, count: usize) -> Option<&'a [T]> {
@@ -417,6 +561,54 @@ pub unsafe extern "C" fn vericache_engine_acquire_read_lease_batch(
     out_lease_ids: *mut u64,
     out_statuses: *mut i32,
 ) -> i32 {
+    unsafe {
+        acquire_read_lease_batch_impl(
+            engine,
+            keys_ptr,
+            count,
+            out_ptrs,
+            out_lens,
+            out_lease_ids,
+            out_statuses,
+        )
+    }
+}
+
+/// # Safety
+/// Follows the contract of `vericache_engine_acquire_read_lease_batch`, using
+/// `count` contiguous keys of four little-endian u64 words each.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vericache_engine_acquire_read_lease_batch_key256(
+    engine: *mut VericacheVllmEngine,
+    keys4_ptr: *const u64,
+    count: usize,
+    out_ptrs: *mut *const u8,
+    out_lens: *mut usize,
+    out_lease_ids: *mut u64,
+    out_statuses: *mut i32,
+) -> i32 {
+    unsafe {
+        acquire_read_lease_batch_impl(
+            engine,
+            keys4_ptr.cast::<[u64; 4]>(),
+            count,
+            out_ptrs,
+            out_lens,
+            out_lease_ids,
+            out_statuses,
+        )
+    }
+}
+
+unsafe fn acquire_read_lease_batch_impl<K: AbiKey>(
+    engine: *mut VericacheVllmEngine,
+    keys_ptr: *const K,
+    count: usize,
+    out_ptrs: *mut *const u8,
+    out_lens: *mut usize,
+    out_lease_ids: *mut u64,
+    out_statuses: *mut i32,
+) -> i32 {
     boundary(BACKEND, || {
         let Some(engine) = (unsafe { engine.as_ref() }) else {
             return INVALID;
@@ -431,7 +623,11 @@ pub unsafe extern "C" fn vericache_engine_acquire_read_lease_batch(
         {
             return INVALID;
         }
-        for (i, lease) in engine.acquire_batch(keys).into_iter().enumerate() {
+        for (i, lease) in engine
+            .acquire_batch(keys.iter().copied().map(AbiKey::into_key))
+            .into_iter()
+            .enumerate()
+        {
             unsafe {
                 let code = write_lease(
                     lease,
@@ -476,6 +672,28 @@ pub unsafe extern "C" fn vericache_engine_contains_batch(
     count: usize,
     out_present: *mut u8,
 ) -> i32 {
+    unsafe { contains_batch_impl(engine, keys_ptr, count, out_present) }
+}
+
+/// # Safety
+/// Follows the contract of `vericache_engine_contains_batch`, using
+/// `count` contiguous keys of four little-endian u64 words each.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vericache_engine_contains_batch_key256(
+    engine: *mut VericacheVllmEngine,
+    keys4_ptr: *const u64,
+    count: usize,
+    out_present: *mut u8,
+) -> i32 {
+    unsafe { contains_batch_impl(engine, keys4_ptr.cast::<[u64; 4]>(), count, out_present) }
+}
+
+unsafe fn contains_batch_impl<K: AbiKey>(
+    engine: *mut VericacheVllmEngine,
+    keys_ptr: *const K,
+    count: usize,
+    out_present: *mut u8,
+) -> i32 {
     boundary(BACKEND, || {
         let Some(engine) = (unsafe { engine.as_ref() }) else {
             return INVALID;
@@ -486,7 +704,11 @@ pub unsafe extern "C" fn vericache_engine_contains_batch(
         if !valid_array(out_present, count) {
             return INVALID;
         }
-        for (i, present) in engine.contains_batch(keys).into_iter().enumerate() {
+        for (i, present) in engine
+            .contains_batch(keys.iter().copied().map(AbiKey::into_key))
+            .into_iter()
+            .enumerate()
+        {
             match present {
                 Ok(present) => unsafe { out_present.add(i).write(u8::from(present)) },
                 Err(error) => return status(error),
@@ -503,6 +725,41 @@ pub unsafe extern "C" fn vericache_engine_contains_batch(
 pub unsafe extern "C" fn vericache_engine_put_batch(
     engine: *mut VericacheVllmEngine,
     keys_ptr: *const u64,
+    src_ptrs: *const *const u8,
+    lens_ptr: *const usize,
+    count: usize,
+    out_statuses: *mut i32,
+) -> i32 {
+    unsafe { put_batch_impl(engine, keys_ptr, src_ptrs, lens_ptr, count, out_statuses) }
+}
+
+/// # Safety
+/// Follows the contract of `vericache_engine_put_batch`, using
+/// `count` contiguous keys of four little-endian u64 words each.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vericache_engine_put_batch_key256(
+    engine: *mut VericacheVllmEngine,
+    keys4_ptr: *const u64,
+    src_ptrs: *const *const u8,
+    lens_ptr: *const usize,
+    count: usize,
+    out_statuses: *mut i32,
+) -> i32 {
+    unsafe {
+        put_batch_impl(
+            engine,
+            keys4_ptr.cast::<[u64; 4]>(),
+            src_ptrs,
+            lens_ptr,
+            count,
+            out_statuses,
+        )
+    }
+}
+
+unsafe fn put_batch_impl<K: AbiKey>(
+    engine: *mut VericacheVllmEngine,
+    keys_ptr: *const K,
     src_ptrs: *const *const u8,
     lens_ptr: *const usize,
     count: usize,
@@ -534,7 +791,11 @@ pub unsafe extern "C" fn vericache_engine_put_batch(
                 unsafe { input_array(ptr, len) }
             })
             .collect();
-        for (i, result) in engine.put_batch(keys, sources).into_iter().enumerate() {
+        for (i, result) in engine
+            .put_batch(keys.iter().copied().map(AbiKey::into_key), sources)
+            .into_iter()
+            .enumerate()
+        {
             unsafe {
                 out_statuses
                     .add(i)
@@ -552,6 +813,54 @@ pub unsafe extern "C" fn vericache_engine_put_batch(
 pub unsafe extern "C" fn vericache_engine_get_batch(
     engine: *mut VericacheVllmEngine,
     keys_ptr: *const u64,
+    dst_ptrs: *const *mut u8,
+    dst_caps: *const usize,
+    count: usize,
+    out_lens: *mut usize,
+    out_statuses: *mut i32,
+) -> i32 {
+    unsafe {
+        get_batch_impl(
+            engine,
+            keys_ptr,
+            dst_ptrs,
+            dst_caps,
+            count,
+            out_lens,
+            out_statuses,
+        )
+    }
+}
+
+/// # Safety
+/// Follows the contract of `vericache_engine_get_batch`, using
+/// `count` contiguous keys of four little-endian u64 words each.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vericache_engine_get_batch_key256(
+    engine: *mut VericacheVllmEngine,
+    keys4_ptr: *const u64,
+    dst_ptrs: *const *mut u8,
+    dst_caps: *const usize,
+    count: usize,
+    out_lens: *mut usize,
+    out_statuses: *mut i32,
+) -> i32 {
+    unsafe {
+        get_batch_impl(
+            engine,
+            keys4_ptr.cast::<[u64; 4]>(),
+            dst_ptrs,
+            dst_caps,
+            count,
+            out_lens,
+            out_statuses,
+        )
+    }
+}
+
+unsafe fn get_batch_impl<K: AbiKey>(
+    engine: *mut VericacheVllmEngine,
+    keys_ptr: *const K,
     dst_ptrs: *const *mut u8,
     dst_caps: *const usize,
     count: usize,
@@ -587,7 +896,11 @@ pub unsafe extern "C" fn vericache_engine_get_batch(
                 }
             })
             .collect();
-        for (i, result) in engine.get_batch(keys, destinations).into_iter().enumerate() {
+        for (i, result) in engine
+            .get_batch(keys.iter().copied().map(AbiKey::into_key), destinations)
+            .into_iter()
+            .enumerate()
+        {
             let (len, code) = match result {
                 Ok(Some(len)) => (len, 0),
                 Ok(None) => (0, 1),
@@ -695,15 +1008,33 @@ pub unsafe extern "C" fn vericache_engine_drain_evictions(
         if !valid_array(out, capacity) || capacity > i32::MAX as usize {
             return INVALID;
         }
-        // The caller may pass uninitialized storage.
-        let mut keys = vec![0; capacity];
-        match engine.drain_evictions(&mut keys) {
-            Ok(0) => 0,
-            Ok(count) => {
-                unsafe { ptr::copy_nonoverlapping(keys.as_ptr(), out, count) };
-                count as i32
-            }
-            Err(error) => status(error),
+        engine
+            .drain_evictions(capacity, |i, key| unsafe { out.add(i).write(key.0[0]) })
+            .map_or_else(status, |count| count as i32)
+    })
+}
+
+/// # Safety
+/// The engine must stay live. The exclusive output has room for `max_count`
+/// keys of four little-endian u64 words each, and may be uninitialized.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vericache_engine_drain_evictions_key256(
+    engine: *mut VericacheVllmEngine,
+    out_keys4: *mut u64,
+    max_count: usize,
+) -> isize {
+    boundary(BACKEND as isize, || {
+        let Some(engine) = (unsafe { engine.as_ref() }) else {
+            return INVALID as isize;
+        };
+        let out = out_keys4.cast::<[u64; 4]>();
+        if !valid_array(out, max_count) {
+            return INVALID as isize;
         }
+        engine
+            .drain_evictions(max_count, |i, key| unsafe {
+                out.add(i).write(key.0.map(u64::to_le));
+            })
+            .map_or_else(|error| status(error) as isize, |count| count as isize)
     })
 }

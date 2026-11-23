@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 from .hashing import derive_layer_block_key
 
 _HEADER = struct.Struct("!I")
+_KEY_WORDS = struct.Struct("<4Q")
 _MAX_MESSAGE = 16 * 1024 * 1024
 
 
@@ -60,6 +61,29 @@ def _read(stream):
     if len(payload) != length:
         raise ConnectionError("truncated VeriCache metadata payload")
     return json.loads(payload)
+
+
+def _encode_hash(digest):
+    if not isinstance(digest, bytes) or len(digest) != _KEY_WORDS.size:
+        raise ValueError("prefix hash must be a 32-byte digest")
+    return digest.hex()
+
+
+def _decode_hash(encoded):
+    if not isinstance(encoded, str) or len(encoded) != 2 * _KEY_WORDS.size:
+        raise ValueError("expected a 64-character lowercase hex digest")
+    digest = bytes.fromhex(encoded)
+    if digest.hex() != encoded:
+        raise ValueError("expected a 64-character lowercase hex digest")
+    return digest
+
+
+def _encode_key(key):
+    return _KEY_WORDS.pack(*key).hex()
+
+
+def _decode_key(encoded):
+    return _KEY_WORDS.unpack(_decode_hash(encoded))
 
 
 class _Rank:
@@ -282,13 +306,23 @@ class MetadataServer:
             return self._index.register_worker(*args, session=session)
         if op == "saved":
             rank, saved, evicted = args
+            rows = [
+                (_decode_hash(block), layer, _decode_key(key))
+                for block, layer, key in saved
+            ]
             return self._index.mark_saved_batch(
-                rank, saved, evicted=evicted, session=session
+                rank, rows, evicted=tuple(map(_decode_key, evicted)), session=session
             )
         if op == "evicted":
-            return self._index.mark_evicted(*args, session=session)
+            rank, keys = args
+            return self._index.mark_evicted(
+                rank, tuple(map(_decode_key, keys)), session=session
+            )
         if op == "query":
-            return self._index.query_prefix_hits(*args)
+            blocks, world_size, layers = args
+            return self._index.query_prefix_hits(
+                tuple(map(_decode_hash, blocks)), world_size, layers
+            )
         raise ValueError(f"unknown metadata operation {op!r}")
 
 
@@ -364,15 +398,25 @@ class MetadataClient:
         self.mark_saved_batch(tp_rank, [(block_hash, layer_name, key)])
 
     def mark_saved_batch(self, tp_rank, saved, *, evicted=()):
-        self._call("saved", tp_rank, list(saved), list(evicted))
+        rows = []
+        for block, layer, *keys in saved:
+            if len(keys) > 1:
+                raise ValueError("expected a single key per saved layer")
+            key = (
+                keys[0]
+                if keys and keys[0] is not None
+                else derive_layer_block_key(block, layer)
+            )
+            rows.append((_encode_hash(block), layer, _encode_key(key)))
+        self._call("saved", tp_rank, rows, list(map(_encode_key, evicted)))
 
     def mark_evicted(self, tp_rank, keys):
-        self._call("evicted", tp_rank, list(keys))
+        self._call("evicted", tp_rank, list(map(_encode_key, keys)))
 
     def query_prefix_hits(self, block_hashes, expected_world_size, expected_layers=()):
         return self._call(
             "query",
-            list(block_hashes),
+            list(map(_encode_hash, block_hashes)),
             expected_world_size,
             list(expected_layers or ()),
         )

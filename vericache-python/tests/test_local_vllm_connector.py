@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import ctypes
+import struct
 from types import SimpleNamespace
 
 import pytest
@@ -23,10 +24,17 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 
-from vericache_vllm import NativeVeriCacheEngine, PinnedStagingBuffer, VeriCacheConfig
-from vericache_vllm._native import NativeVeriCacheError
-from vericache_vllm.connector import VeriCacheConnectorMetadata, VeriCacheV1Connector
-from vericache_vllm.hashing import compute_prefix_block_hashes, derive_layer_block_key
+from vericache import (
+    MetadataClient,
+    MetadataServer,
+    NativeVeriCacheEngine,
+    PinnedStagingBuffer,
+    VeriCacheConfig,
+    register_vericache_connector,
+)
+from vericache._native import NativeVeriCacheError
+from vericache.vllm_v1_connector import VeriCacheConnectorMetadata, VeriCacheV1Connector
+from vericache.hashing import compute_prefix_block_hashes, derive_layer_block_key
 
 
 def test_aligned_staging_aliases_rust_and_survives_close():
@@ -154,7 +162,7 @@ def test_prefix_chain_and_layer_keys():
     tokens = [1, 2, 3, 4, 5, 6, 7]
     base = compute_prefix_block_hashes(tokens, 2, "model")
     assert len(base) == 3
-    assert all(0 < h < 2**64 for h in base)
+    assert all(isinstance(h, bytes) and len(h) == 32 for h in base)
     assert base == compute_prefix_block_hashes(tuple(tokens), 2, "model")
     assert base[:2] == compute_prefix_block_hashes(tokens[:4], 2, "model")
     assert base == compute_prefix_block_hashes(tokens[:-1] + [8], 2, "model")
@@ -164,7 +172,10 @@ def test_prefix_chain_and_layer_keys():
     layer_keys = {
         derive_layer_block_key(h, layer) for h in base for layer in ("l0", "l1")
     }
-    assert len(layer_keys) == 6 and 0 not in layer_keys
+    assert len(layer_keys) == 6
+    assert all(
+        len(key) == 4 and all(0 <= word < 2**64 for word in key) for key in layer_keys
+    )
     assert derive_layer_block_key(base[0], "l0") == derive_layer_block_key(
         base[0], "l0"
     )
@@ -183,7 +194,7 @@ def test_config_reads_vllm_extras():
                 "frame_size": 256,
                 "nvme_path": "/example/cache",
                 "prefer_cuda_pinned": False,
-                "lib_path": "/example/libvericache_vllm.so",
+                "lib_path": "/example/libvericache.so",
                 "model_tag": "model",
                 "block_axis": 1,
             }
@@ -196,7 +207,7 @@ def test_config_reads_vllm_extras():
         256,
         "/example/cache",
         False,
-        "/example/libvericache_vllm.so",
+        "/example/libvericache.so",
         "model",
         1,
     )
@@ -206,7 +217,7 @@ BLOCK_SIZE = 16
 NUM_BLOCKS = 16
 LAYERS = ("model.layers.0.attn", "model.layers.1.attn")
 CONNECTOR = "VeriCacheV1Connector"
-MODULE = "vericache_vllm.connector"
+MODULE = "vericache.vllm_v1_connector"
 
 
 def _connector_pair(monkeypatch, registration, *, prefer_pinned=False):
@@ -215,7 +226,7 @@ def _connector_pair(monkeypatch, registration, *, prefer_pinned=False):
     registry.pop(CONNECTOR, None)
     monkeypatch.setattr(KVConnectorFactory, "_registry", registry)
     if registration == "registry":
-        KVConnectorFactory.register_connector(CONNECTOR, MODULE, CONNECTOR)
+        register_vericache_connector()
     extras = {
         "num_shards": 2,
         "host_frames_per_shard": 32,
@@ -815,3 +826,56 @@ def test_multiprocess_tp2_prefix_requires_both_ranks_and_restores_each_slice(tmp
                 process.join()
             pipe.close()
     assert all(process.exitcode == 0 for process, _ in processes)
+
+
+def test_key256_same_low_word_survives_native_batches_and_ipc(tmp_path):
+    first, second = (42, 1, 0, 0), (42, 2, 0, 0)
+    keys = [first, second]
+    hashes = [struct.pack("<4Q", *key) for key in keys]
+    endpoint = f"unix://{tmp_path / 'key256.sock'}"
+    with (
+        MetadataServer(endpoint),
+        MetadataClient(endpoint) as client,
+        NativeVeriCacheEngine(
+            num_shards=4,
+            host_frames_per_shard=4,
+            frame_size=32,
+            prefer_cuda_pinned=False,
+            ipc_endpoint=endpoint,
+        ) as engine,
+    ):
+        client.register_worker(0, ["layer"])
+        values = [
+            ctypes.create_string_buffer(b"first"),
+            ctypes.create_string_buffer(b"second"),
+        ]
+        assert engine.put_batch(keys, list(map(ctypes.addressof, values)), [5, 6]) == [
+            0,
+            0,
+        ]
+        assert engine.contains_batch([first, second, 42]) == [True, True, False]
+        buffers = [ctypes.create_string_buffer(32), ctypes.create_string_buffer(32)]
+        assert engine.get_batch(
+            keys, list(map(ctypes.addressof, buffers)), [32, 32]
+        ) == ([5, 6], [0, 0])
+        assert [buf.value for buf in buffers] == [b"first", b"second"]
+        leases = engine.acquire_read_lease_batch(keys)
+        try:
+            assert [bytes(lease.memoryview) for lease in leases] == [
+                b"first",
+                b"second",
+            ]
+        finally:
+            engine.release_read_lease_batch(lease.lease_id for lease in leases)
+
+        client.mark_saved_batch(
+            0, [(digest, "layer", key) for digest, key in zip(hashes, keys)]
+        )
+        assert client.query_prefix_hits(hashes, 1) == 2
+        assert engine.evict(first)
+        evicted = engine.drain_evictions()
+        assert evicted == [first]
+        client.mark_evicted(0, evicted)
+        assert client.query_prefix_hits(hashes, 1) == 0
+        assert client.query_prefix_hits(hashes[1:], 1) == 1
+        assert engine.get(second) == b"second"

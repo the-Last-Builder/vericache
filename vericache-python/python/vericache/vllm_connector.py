@@ -22,11 +22,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-import hashlib
-import struct
 from typing import Any, Callable, Optional, Sequence
 
 from . import HitInfo, HitLocation, ObjectKey, VeriCacheClient
+from .hashing import hash_prefix_blocks as hash_prefix_blocks
+from .hashing import layer_block_key as layer_block_key
 
 try:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # type: ignore
@@ -58,36 +58,6 @@ except ImportError:
         def _get_connector_metadata(self) -> KVConnectorMetadata:
             assert self._connector_metadata is not None
             return self._connector_metadata
-
-
-# ---------------------------------------------------------------------------
-# Prefix-chained deterministic hashing for (token_prefix, layer_name) -> ObjectKey
-# ---------------------------------------------------------------------------
-
-
-def hash_prefix_blocks(token_ids: Sequence[int], block_size: int) -> list[bytes]:
-    """Compute chained SHA-256 prefix digests for every full `block_size` chunk."""
-    num_full = len(token_ids) // block_size
-    digests: list[bytes] = []
-    parent = b"\x00" * 32
-    for blk_idx in range(num_full):
-        start = blk_idx * block_size
-        chunk = token_ids[start : start + block_size]
-        h = hashlib.sha256()
-        h.update(parent)
-        h.update(struct.pack(f"<{block_size}Q", *[t & 0xFFFFFFFFFFFFFFFF for t in chunk]))
-        parent = h.digest()
-        digests.append(parent)
-    return digests
-
-
-def layer_block_key(prefix_digest: bytes, layer_name: str) -> ObjectKey:
-    """Derive a 256-bit VeriCache ObjectKey for `(prefix_digest, layer_name)`."""
-    h = hashlib.sha256()
-    h.update(prefix_digest)
-    h.update(b"::")
-    h.update(layer_name.encode("utf-8"))
-    return struct.unpack("<4Q", h.digest())
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +109,15 @@ class VeriCacheConnector(KVConnectorBase_V1):
         remote_lookup_fn: Optional[Callable[[Sequence[ObjectKey]], Sequence[bool]]] = None,
         on_save_keys_fn: Optional[Callable[[Sequence[ObjectKey]], None]] = None,
     ) -> None:
-        super().__init__(vllm_config, role)
+        if vllm_config is None:
+            # Direct clients can use the connector without constructing vLLM.
+            self._vllm_config = None
+            self._kv_transfer_config = None
+            self._kv_cache_config = None
+            self._connector_metadata = None
+            self._role = role
+        else:
+            super().__init__(vllm_config, role)
         self.client = client
         self.block_size = int(block_size)
         self.probe_layer_name = probe_layer_name

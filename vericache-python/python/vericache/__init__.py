@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 import hashlib
 import struct
-from typing import Iterable, Sequence
+from typing import TYPE_CHECKING, Sequence
 
 from ._ffi import (
     VeriCacheConfigC,
@@ -17,6 +17,22 @@ from ._ffi import (
     last_error,
     load_lib,
 )
+from ._native import (
+    NativeVeriCacheEngine,
+    NativeVeriCacheError,
+    PinnedStagingBuffer,
+    ReadLease,
+)
+from .config import VeriCacheConfig
+from .hashing import compute_prefix_block_hashes, derive_layer_block_key
+from .ipc import MetadataClient, MetadataServer
+
+if TYPE_CHECKING:
+    from .vllm_v1_connector import (
+        VeriCacheConnectorMetadata,
+        VeriCacheV1Connector,
+        register_vericache_connector,
+    )
 
 ObjectKey = tuple[int, int, int, int]
 
@@ -429,4 +445,28 @@ __all__ = [
     "VersionId",
     "key_from_bytes",
     "key_from_u64",
+    "NativeVeriCacheEngine",
+    "NativeVeriCacheError",
+    "PinnedStagingBuffer",
+    "ReadLease",
+    "MetadataClient",
+    "MetadataServer",
+    "VeriCacheConfig",
+    "VeriCacheV1Connector",
+    "VeriCacheConnectorMetadata",
+    "register_vericache_connector",
+    "compute_prefix_block_hashes",
+    "derive_layer_block_key",
 ]
+
+
+def __getattr__(name: str):
+    if name in (
+        "VeriCacheConnectorMetadata",
+        "VeriCacheV1Connector",
+        "register_vericache_connector",
+    ):
+        from . import vllm_v1_connector
+
+        return getattr(vllm_v1_connector, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

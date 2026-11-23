@@ -1,8 +1,0 @@
-[env]
-CUDA_HOME = { value = "target/cuda-link", relative = true }
-
-[target.x86_64-unknown-linux-gnu]
-rustflags = [
-  "-C", "link-arg=-L/home/handshaker/miniconda3/lib/python3.13/site-packages/nvidia/cuda_runtime/lib",
-  "-C", "link-arg=-Wl,-rpath,/home/handshaker/miniconda3/lib/python3.13/site-packages/nvidia/cuda_runtime/lib",
-]

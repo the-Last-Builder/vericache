@@ -9,7 +9,11 @@
 //!   `cache.poll()` every ~500 us so inbound remote RDMA/GDR `FetchRequest`s are
 //!   served concurrently with Python/PyTorch forward passes without blocking on GIL.
 
+mod backend_mode;
 mod cuda_copy;
+mod local;
+
+pub use local::*;
 
 use core::ffi::{CStr, c_char};
 use std::cell::RefCell;
@@ -599,6 +603,19 @@ pub unsafe extern "C" fn vericache_create(cfg: *const VeriCacheConfigC) -> *mut 
         return core::ptr::null_mut();
     }
     let c = unsafe { &*cfg };
+    if c.frame_size == 0
+        || c.dram_frames == 0
+        || c.frame_size
+            .checked_mul(c.dram_frames as usize)
+            .is_none_or(|size| size > isize::MAX as usize)
+    {
+        set_last_error("invalid frame_size or dram_frames");
+        return core::ptr::null_mut();
+    }
+    if c.num_peers > (isize::MAX as usize) / size_of::<VeriCachePeerSpecC>() {
+        set_last_error("num_peers exceeds the addressable peer array size");
+        return core::ptr::null_mut();
+    }
     let mut storage = StorageConfig::new(c.node_id, c.frame_size, c.dram_frames);
     if c.gpu_device_id >= 0 && c.hbm_frames > 0 {
         storage = storage.with_gpu(GpuConfig::new(c.gpu_device_id as u32, c.hbm_frames));
@@ -614,7 +631,7 @@ pub unsafe extern "C" fn vericache_create(cfg: *const VeriCacheConfigC) -> *mut 
         }
     }
 
-    let mut peers = Vec::with_capacity(c.num_peers);
+    let mut peers = Vec::new();
     if c.num_peers > 0 {
         if c.peers.is_null() {
             set_last_error("num_peers > 0 but peers pointer is null");
@@ -659,6 +676,11 @@ pub unsafe extern "C" fn vericache_create(cfg: *const VeriCacheConfigC) -> *mut 
                 psn_hint: if p.psn_hint == 0 { 0x1000 } else { p.psn_hint },
             });
         }
+    }
+
+    if let Err(error) = backend_mode::claim_distributed() {
+        set_last_error(error);
+        return core::ptr::null_mut();
     }
 
     let frame_size = c.frame_size;

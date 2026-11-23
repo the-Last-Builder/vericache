@@ -1,5 +1,5 @@
+use super::engine::{Error, object_key};
 use super::*;
-use crate::engine::Error;
 use std::fs;
 use std::path::PathBuf;
 use std::ptr;
@@ -9,23 +9,26 @@ use std::thread;
 #[test]
 fn reports_exact_lengths_and_supports_replacement_and_empty_payload() {
     let engine = VericacheVllmEngine::new(1, 2, 0, 32, None).unwrap();
-    engine.put(7, b"hello").unwrap();
-    assert_eq!(engine.get(7, &mut [0; 4]), Err(Error::Capacity(5)));
+    engine.put(object_key(7), b"hello").unwrap();
+    assert_eq!(
+        engine.get(object_key(7), &mut [0; 4]),
+        Err(Error::Capacity(5))
+    );
     let mut small = [0; 5];
-    assert_eq!(engine.get(7, &mut small).unwrap(), Some(5));
+    assert_eq!(engine.get(object_key(7), &mut small).unwrap(), Some(5));
     assert_eq!(&small, b"hello");
 
-    engine.put(7, b"new").unwrap();
+    engine.put(object_key(7), b"new").unwrap();
     let mut frame = [42; 32];
-    assert_eq!(engine.get(7, &mut frame).unwrap(), Some(3));
+    assert_eq!(engine.get(object_key(7), &mut frame).unwrap(), Some(3));
     assert_eq!(&frame[..3], b"new");
-    engine.put(8, &[]).unwrap();
-    assert_eq!(engine.get(8, &mut []).unwrap(), Some(0));
-    assert_eq!(engine.put(9, &[0; 33]), Err(Error::Invalid));
-    assert!(engine.evict(7).unwrap());
-    assert!(!engine.evict(7).unwrap());
-    assert!(!engine.contains(7).unwrap());
-    assert_eq!(engine.get(7, &mut frame).unwrap(), None);
+    engine.put(object_key(8), &[]).unwrap();
+    assert_eq!(engine.get(object_key(8), &mut []).unwrap(), Some(0));
+    assert_eq!(engine.put(object_key(9), &[0; 33]), Err(Error::Invalid));
+    assert!(engine.evict(object_key(7)).unwrap());
+    assert!(!engine.evict(object_key(7)).unwrap());
+    assert!(!engine.contains(object_key(7)).unwrap());
+    assert_eq!(engine.get(object_key(7), &mut frame).unwrap(), None);
 
     let stats = engine.stats().unwrap();
     assert_eq!(
@@ -42,11 +45,11 @@ fn reports_exact_lengths_and_supports_replacement_and_empty_payload() {
 fn sustained_writes_reclaim_host_frames() {
     let engine = VericacheVllmEngine::new(1, 3, 0, 8, None).unwrap();
     for key in 0u64..300 {
-        engine.put(key, &key.to_le_bytes()).unwrap();
+        engine.put(object_key(key), &key.to_le_bytes()).unwrap();
     }
     for key in 0u64..300 {
         let mut dst = [0; 8];
-        let result = engine.get(key, &mut dst).unwrap();
+        let result = engine.get(object_key(key), &mut dst).unwrap();
         if key < 297 {
             assert_eq!(result, None);
         } else {
@@ -92,18 +95,18 @@ fn nvme_spill_and_reads_preserve_host_capacity() {
     assert_eq!(fs::metadata(&file.0).unwrap().len(), 8192);
     assert!(VericacheVllmEngine::new(1, 1, 2, 37, Some(file.path())).is_err());
     for key in 1..=3 {
-        engine.put(key, &[key as u8; 37]).unwrap();
+        engine.put(object_key(key), &[key as u8; 37]).unwrap();
     }
     for key in [1, 3, 2, 1, 3] {
         let mut dst = [0; 37];
-        assert_eq!(engine.get(key, &mut dst).unwrap(), Some(37));
+        assert_eq!(engine.get(object_key(key), &mut dst).unwrap(), Some(37));
         assert_eq!(dst, [key as u8; 37]);
     }
     assert_eq!(engine.stats().unwrap().evictions, 0);
-    engine.put(4, b"new").unwrap();
-    assert!(!engine.contains(2).unwrap());
-    assert!(engine.evict(1).unwrap());
-    assert!(engine.contains(3).unwrap());
+    engine.put(object_key(4), b"new").unwrap();
+    assert!(!engine.contains(object_key(2)).unwrap());
+    assert!(engine.evict(object_key(1)).unwrap());
+    assert!(engine.contains(object_key(3)).unwrap());
     drop(engine);
     assert!(VericacheVllmEngine::new(1, 1, 2, 37, Some(file.path())).is_ok());
 }
@@ -121,9 +124,9 @@ fn nvme_shards_use_independent_backing_files() {
         );
     }
     for key in 0u64..200 {
-        engine.put(key, &key.to_be_bytes()).unwrap();
+        engine.put(object_key(key), &key.to_be_bytes()).unwrap();
         let mut dst = [0; 8];
-        assert_eq!(engine.get(key, &mut dst).unwrap(), Some(8));
+        assert_eq!(engine.get(object_key(key), &mut dst).unwrap(), Some(8));
         assert_eq!(dst, key.to_be_bytes());
     }
     assert_eq!(engine.stats().unwrap().evictions, 194);
@@ -139,9 +142,9 @@ fn concurrent_reads_and_writes_share_an_engine() {
                 for index in 0..200 {
                     let key = worker * 200 + index;
                     let data = key.to_le_bytes().repeat(4);
-                    engine.put(key, &data).unwrap();
+                    engine.put(object_key(key), &data).unwrap();
                     let mut dst = [0; 32];
-                    assert_eq!(engine.get(key, &mut dst).unwrap(), Some(32));
+                    assert_eq!(engine.get(object_key(key), &mut dst).unwrap(), Some(32));
                     assert_eq!(dst.as_slice(), data);
                 }
             });
@@ -226,21 +229,21 @@ fn writable_staging_uses_the_same_rust_and_c_storage() {
 #[test]
 fn leases_alias_slab_and_prevent_eviction_or_replacement() {
     let engine = VericacheVllmEngine::new(1, 2, 0, 4096, None).unwrap();
-    engine.put(1, b"first").unwrap();
-    engine.put(2, b"second").unwrap();
-    let lease = engine.acquire(1).unwrap().unwrap();
+    engine.put(object_key(1), b"first").unwrap();
+    engine.put(object_key(2), b"second").unwrap();
+    let lease = engine.acquire(object_key(1)).unwrap().unwrap();
     assert!(engine.slab_range(0).contains(&lease.address));
     assert_eq!(lease.address % 4096, 0);
-    let duplicate = engine.acquire(1).unwrap().unwrap();
+    let duplicate = engine.acquire(object_key(1)).unwrap().unwrap();
     assert_eq!(lease.address, duplicate.address);
     assert_ne!(lease.id, duplicate.id);
-    assert_eq!(engine.evict(1), Err(Error::Busy));
-    assert_eq!(engine.put(1, b"replacement"), Err(Error::Busy));
+    assert_eq!(engine.evict(object_key(1)), Err(Error::Busy));
+    assert_eq!(engine.put(object_key(1), b"replacement"), Err(Error::Busy));
     engine.release(lease.id).unwrap();
-    assert_eq!(engine.evict(1), Err(Error::Busy));
-    engine.get(2, &mut [0; 6]).unwrap();
-    engine.put(3, b"third").unwrap();
-    assert!(!engine.contains(2).unwrap());
+    assert_eq!(engine.evict(object_key(1)), Err(Error::Busy));
+    engine.get(object_key(2), &mut [0; 6]).unwrap();
+    engine.put(object_key(3), b"third").unwrap();
+    assert!(!engine.contains(object_key(2)).unwrap());
     let bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(
             ptr::with_exposed_provenance(duplicate.address),
@@ -250,27 +253,27 @@ fn leases_alias_slab_and_prevent_eviction_or_replacement() {
     assert_eq!(bytes, b"first");
     engine.release_batch(&[duplicate.id]).unwrap();
     assert_eq!(engine.extended_stats().unwrap().active_leases, 0);
-    assert!(engine.evict(1).unwrap());
+    assert!(engine.evict(object_key(1)).unwrap());
     assert_eq!(engine.release(duplicate.id), Err(Error::Invalid));
     // The destructor must also return any leases abandoned by C callers.
-    assert!(engine.acquire(3).unwrap().is_some());
+    assert!(engine.acquire(object_key(3)).unwrap().is_some());
 }
 
 #[test]
 fn reads_and_leases_refresh_lru() {
     let engine = VericacheVllmEngine::new(1, 2, 0, 8, None).unwrap();
-    engine.put(1, b"one").unwrap();
-    engine.put(2, b"two").unwrap();
-    assert_eq!(engine.get(1, &mut [0; 3]), Ok(Some(3)));
-    engine.put(3, b"three").unwrap();
-    assert!(engine.contains(1).unwrap());
-    assert!(!engine.contains(2).unwrap());
+    engine.put(object_key(1), b"one").unwrap();
+    engine.put(object_key(2), b"two").unwrap();
+    assert_eq!(engine.get(object_key(1), &mut [0; 3]), Ok(Some(3)));
+    engine.put(object_key(3), b"three").unwrap();
+    assert!(engine.contains(object_key(1)).unwrap());
+    assert!(!engine.contains(object_key(2)).unwrap());
 
-    let lease = engine.acquire(1).unwrap().unwrap();
+    let lease = engine.acquire(object_key(1)).unwrap().unwrap();
     engine.release(lease.id).unwrap();
-    engine.put(4, b"four").unwrap();
-    assert!(engine.contains(1).unwrap());
-    assert!(!engine.contains(3).unwrap());
+    engine.put(object_key(4), b"four").unwrap();
+    assert!(engine.contains(object_key(1)).unwrap());
+    assert!(!engine.contains(object_key(3)).unwrap());
 }
 
 #[test]
@@ -278,10 +281,10 @@ fn completed_writeback_enables_clean_eviction_and_promotion() {
     let file = TestFile::new();
     let engine = VericacheVllmEngine::new(1, 4, 8, 4096, Some(file.path())).unwrap();
     engine.set_writeback_policy(75).unwrap();
-    engine.put(1, b"one").unwrap();
-    engine.put(2, b"two").unwrap();
+    engine.put(object_key(1), b"one").unwrap();
+    engine.put(object_key(2), b"two").unwrap();
     assert_eq!(engine.poll_writeback(), Ok(0));
-    engine.put(3, b"three").unwrap();
+    engine.put(object_key(3), b"three").unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         engine.poll_writeback().unwrap();
@@ -295,16 +298,16 @@ fn completed_writeback_enables_clean_eviction_and_promotion() {
         thread::yield_now();
     }
 
-    engine.put(4, b"four").unwrap();
-    engine.put(5, b"five").unwrap();
+    engine.put(object_key(4), b"four").unwrap();
+    engine.put(object_key(5), b"five").unwrap();
     assert!(engine.extended_stats().unwrap().clean_dram_evictions > 0);
     let mut dst = [0; 3];
-    assert_eq!(engine.get(1, &mut dst).unwrap(), Some(3));
+    assert_eq!(engine.get(object_key(1), &mut dst).unwrap(), Some(3));
     assert_eq!(&dst, b"one");
     let promoted = engine.extended_stats().unwrap();
     assert_eq!(promoted.nvme_promotions, 1);
     assert_eq!(promoted.nvme_hits, 1);
-    let lease = engine.acquire(1).unwrap().unwrap();
+    let lease = engine.acquire(object_key(1)).unwrap().unwrap();
     engine.release(lease.id).unwrap();
     let reread = engine.extended_stats().unwrap();
     assert_eq!(reread.dram_hits, promoted.dram_hits + 1);
@@ -413,9 +416,9 @@ fn batch_abi_preserves_positions_and_exact_lengths() {
 fn concurrent_leases_stay_immutable_during_reclamation() {
     let engine = VericacheVllmEngine::new(4, 16, 0, 32, None).unwrap();
     for key in 0..8 {
-        engine.put(key, &[key as u8; 32]).unwrap();
+        engine.put(object_key(key), &[key as u8; 32]).unwrap();
     }
-    let permanently_pinned = engine.acquire_batch(&(0..8).collect::<Vec<_>>());
+    let permanently_pinned = engine.acquire_batch((0..8).map(|key| object_key(key as u64)));
     let permanently_pinned: Vec<_> = permanently_pinned
         .into_iter()
         .map(|lease| lease.unwrap().unwrap().id)
@@ -425,10 +428,10 @@ fn concurrent_leases_stay_immutable_during_reclamation() {
             let engine = &engine;
             scope.spawn(move || {
                 for i in 0..300 {
-                    let lease = engine.acquire(worker).unwrap().unwrap();
+                    let lease = engine.acquire(object_key(worker)).unwrap().unwrap();
                     let key = 8 + worker * 300 + i;
-                    engine.put(key, &[key as u8; 32]).unwrap();
-                    assert_eq!(engine.evict(worker), Err(Error::Busy));
+                    engine.put(object_key(key), &[key as u8; 32]).unwrap();
+                    assert_eq!(engine.evict(object_key(worker)), Err(Error::Busy));
                     let leased: &[u8] = unsafe {
                         std::slice::from_raw_parts(
                             ptr::with_exposed_provenance(lease.address),
@@ -437,7 +440,7 @@ fn concurrent_leases_stay_immutable_during_reclamation() {
                     };
                     assert_eq!(leased, &[worker as u8; 32]);
                     engine.release(lease.id).unwrap();
-                    engine.evict(key).unwrap();
+                    engine.evict(object_key(key)).unwrap();
                 }
             });
         }
@@ -452,7 +455,7 @@ fn lease_batch_promotes_multiple_cold_frames_on_one_shard() {
     let engine = VericacheVllmEngine::new(1, 4, 8, 4096, Some(file.path())).unwrap();
     engine.set_writeback_policy(0).unwrap();
     for key in 1..=8 {
-        engine.put(key, &[key as u8; 64]).unwrap();
+        engine.put(object_key(key), &[key as u8; 64]).unwrap();
     }
     engine.set_writeback_policy(75).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -467,7 +470,7 @@ fn lease_batch_promotes_multiple_cold_frames_on_one_shard() {
 
     let before = engine.extended_stats().unwrap();
     let keys = [3, 1, 4, 2];
-    let leases = engine.acquire_batch(&keys);
+    let leases = engine.acquire_batch(keys.iter().copied().map(object_key));
     let mut ids = Vec::new();
     for (key, lease) in keys.into_iter().zip(leases) {
         let lease = lease.unwrap().unwrap();
@@ -490,7 +493,7 @@ fn scans_reuse_promotion_frames_and_keep_requested_probation() {
     let engine = VericacheVllmEngine::new(1, 4, 16, 4096, Some(file.path())).unwrap();
     engine.set_writeback_policy(0).unwrap();
     for key in 1..=12 {
-        engine.put(key, &[key as u8]).unwrap();
+        engine.put(object_key(key), &[key as u8]).unwrap();
     }
     engine.set_writeback_policy(75).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -501,7 +504,7 @@ fn scans_reuse_promotion_frames_and_keep_requested_probation() {
     }
 
     let ids: Vec<_> = engine
-        .acquire_batch(&[1, 2, 3, 4])
+        .acquire_batch([1, 2, 3, 4].into_iter().map(object_key))
         .into_iter()
         .map(|lease| lease.unwrap().unwrap().id)
         .collect();
@@ -509,7 +512,7 @@ fn scans_reuse_promotion_frames_and_keep_requested_probation() {
     let mut ids = Vec::new();
     for (key, lease) in [5, 6, 7, 8, 4]
         .into_iter()
-        .zip(engine.acquire_batch(&[5, 6, 7, 8, 4]))
+        .zip(engine.acquire_batch([5, 6, 7, 8, 4].into_iter().map(object_key)))
     {
         if key == 8 {
             assert!(matches!(lease, Err(Error::Busy)));
@@ -524,12 +527,12 @@ fn scans_reuse_promotion_frames_and_keep_requested_probation() {
     }
     engine.release_batch(&ids).unwrap();
     let mut dst = [0; 1];
-    assert_eq!(engine.get(8, &mut dst), Ok(Some(1)));
+    assert_eq!(engine.get(object_key(8), &mut dst), Ok(Some(1)));
     assert_eq!(dst, [8]);
 
     let before = engine.extended_stats().unwrap();
     for key in [4, 9, 10, 11, 12] {
-        assert_eq!(engine.get(key, &mut dst), Ok(Some(1)));
+        assert_eq!(engine.get(object_key(key), &mut dst), Ok(Some(1)));
         assert_eq!(dst, [key as u8]);
     }
     let after = engine.extended_stats().unwrap();
@@ -543,21 +546,93 @@ fn reads_do_not_start_writeback() {
     let engine = VericacheVllmEngine::new(1, 4, 8, 4096, Some(file.path())).unwrap();
     engine.set_writeback_policy(0).unwrap();
     for key in 1..=5 {
-        engine.put(key, &[key as u8]).unwrap();
+        engine.put(object_key(key), &[key as u8]).unwrap();
     }
     engine.set_writeback_policy(75).unwrap();
     let mut dst = [0; 1];
-    assert_eq!(engine.get(5, &mut dst), Ok(Some(1)));
+    assert_eq!(engine.get(object_key(5), &mut dst), Ok(Some(1)));
     engine
-        .release(engine.acquire(5).unwrap().unwrap().id)
+        .release(engine.acquire(object_key(5)).unwrap().unwrap().id)
         .unwrap();
     let ids: Vec<_> = engine
-        .acquire_batch(&[1, 5])
+        .acquire_batch([1, 5].into_iter().map(object_key))
         .into_iter()
         .map(|lease| lease.unwrap().unwrap().id)
         .collect();
     engine.release_batch(&ids).unwrap();
     // Eviction waits for any existing spill of this dirty key.
-    assert_eq!(engine.evict(5), Ok(true));
+    assert_eq!(engine.evict(object_key(5)), Ok(true));
     assert_eq!(engine.extended_stats().unwrap().async_writebacks, 0);
+}
+
+#[test]
+fn key256_abi_distinguishes_keys_with_the_same_first_word() {
+    let first = [42u64, 1, 0, 0].map(u64::to_le);
+    let second = [42u64, 2, 0, 0].map(u64::to_le);
+    unsafe {
+        let engine = vericache_engine_create_with_options(1, 3, 0, 32, ptr::null(), 0, 2);
+        assert!(!engine.is_null());
+        assert_eq!(
+            vericache_engine_put_key256(engine, first.as_ptr(), b"first".as_ptr(), 5),
+            0
+        );
+        assert_eq!(
+            vericache_engine_put_key256(engine, second.as_ptr(), b"second".as_ptr(), 6),
+            0
+        );
+
+        let mut dst = [0; 32];
+        let mut len = 0;
+        assert_eq!(
+            vericache_engine_get_key256(
+                engine,
+                first.as_ptr(),
+                dst.as_mut_ptr(),
+                dst.len(),
+                &mut len
+            ),
+            0
+        );
+        assert_eq!(&dst[..len], b"first");
+
+        let mut address = ptr::null();
+        let mut lease = 0;
+        assert_eq!(
+            vericache_engine_acquire_read_lease_key256(
+                engine,
+                second.as_ptr(),
+                &mut address,
+                &mut len,
+                &mut lease,
+            ),
+            0
+        );
+        assert_eq!(std::slice::from_raw_parts(address, len), b"second");
+        assert_eq!(vericache_engine_evict_key256(engine, second.as_ptr()), -4);
+        assert_eq!(vericache_engine_evict_key256(engine, first.as_ptr()), 0);
+        assert_eq!(vericache_engine_contains_key256(engine, first.as_ptr()), 0);
+        assert_eq!(vericache_engine_contains_key256(engine, second.as_ptr()), 1);
+
+        let mut evicted = [[0; 4]; 2];
+        let out = evicted.as_mut_ptr().cast();
+        assert_eq!(vericache_engine_drain_evictions_key256(engine, out, 2), 1);
+        assert_eq!(evicted[0], first);
+        assert_eq!(vericache_engine_release_read_lease(engine, lease), 0);
+        assert_eq!(vericache_engine_evict_key256(engine, second.as_ptr()), 0);
+        assert_eq!(vericache_engine_drain_evictions_key256(engine, out, 2), 1);
+        assert_eq!(evicted[0], second);
+
+        // The legacy and wide entry points agree on the canonical legacy key.
+        let legacy = object_key(42).0.map(u64::to_le);
+        assert_eq!(vericache_engine_put(engine, 42, b"legacy".as_ptr(), 6), 0);
+        assert_eq!(vericache_engine_contains_key256(engine, legacy.as_ptr()), 1);
+        assert_eq!(vericache_engine_evict_key256(engine, legacy.as_ptr()), 0);
+        let mut legacy_evicted = 0;
+        assert_eq!(
+            vericache_engine_drain_evictions(engine, &mut legacy_evicted, 1),
+            1
+        );
+        assert_eq!(legacy_evicted, 42);
+        vericache_engine_destroy(engine);
+    }
 }

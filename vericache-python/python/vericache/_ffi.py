@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import os
 from pathlib import Path
+from threading import Lock
 
 
 class VeriCachePeerSpecC(ctypes.Structure):
@@ -57,15 +58,18 @@ class VeriCacheStatsC(ctypes.Structure):
 
 
 _LIB: ctypes.CDLL | None = None
+_LIB_PATH: Path | None = None
+_LIB_LOCK = Lock()
 
 
 def _find_library() -> Path:
-    env_path = os.environ.get("VERICACHE_PYTHON_LIB")
-    if env_path:
-        p = Path(env_path)
-        if p.is_file():
-            return p
-        raise FileNotFoundError(f"VERICACHE_PYTHON_LIB={env_path} does not exist")
+    for name in ("VERICACHE_PYTHON_LIB", "VERICACHE_VLLM_LIB_PATH"):
+        env_path = os.environ.get(name)
+        if env_path:
+            path = Path(env_path).expanduser()
+            if path.is_file():
+                return path
+            raise FileNotFoundError(f"{name}={env_path} does not exist")
 
     pkg_dir = Path(__file__).resolve().parent
     crate_root = pkg_dir.parent.parent
@@ -84,13 +88,27 @@ def _find_library() -> Path:
     )
 
 
-def load_lib() -> ctypes.CDLL:
-    global _LIB
-    if _LIB is not None:
-        return _LIB
+def load_lib(path: str | os.PathLike[str] | None = None) -> ctypes.CDLL:
+    global _LIB, _LIB_PATH
+    with _LIB_LOCK:
+        if _LIB is not None and path is None:
+            return _LIB
+        resolved = (
+            _find_library() if path is None else Path(path).expanduser()
+        ).resolve()
+        if _LIB is not None:
+            if resolved != _LIB_PATH:
+                raise OSError(
+                    f"VeriCache library {_LIB_PATH} is already loaded in this process"
+                )
+            return _LIB
+        lib = ctypes.CDLL(str(resolved))
+        _bind_distributed(lib)
+        _LIB, _LIB_PATH = lib, resolved
+        return lib
 
-    lib = ctypes.CDLL(str(_find_library()))
 
+def _bind_distributed(lib: ctypes.CDLL) -> None:
     lib.vericache_last_error.argtypes = []
     lib.vericache_last_error.restype = ctypes.c_char_p
 
@@ -190,9 +208,6 @@ def load_lib() -> ctypes.CDLL:
         ctypes.POINTER(VeriCacheStatsC),
     ]
     lib.vericache_stats.restype = ctypes.c_int32
-
-    _LIB = lib
-    return lib
 
 
 def last_error(lib: ctypes.CDLL) -> str:
