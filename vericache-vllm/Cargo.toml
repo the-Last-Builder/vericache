@@ -1,0 +1,24 @@
+[workspace]
+
+[package]
+name = "vericache-vllm"
+version = "0.1.0"
+edition = "2024"
+description = "VeriCache DRAM and NVMe KV cache bridge for vLLM V1"
+
+[lib]
+name = "vericache_vllm"
+crate-type = ["cdylib", "rlib"]
+
+[package.metadata.verus]
+verify = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)', 'cfg(verus_keep_ghost)', 'cfg(verus_keep_ghost_body)'] }
+
+[dependencies]
+foundation = { package = "vericache-foundation", path = "../vericache-foundation" }
+rayon = "1.11"
+transfer = { package = "vericache-transfer", path = "../vericache-transfer" }
+vericache-core = { path = "../vericache-core" }
+vstd = { path = "/opt/vericache/verus/source/vstd" }
