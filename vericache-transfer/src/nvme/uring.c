@@ -2,11 +2,13 @@
 #define _FILE_OFFSET_BITS 64
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/fs.h>
 #include <linux/io_uring.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -34,12 +36,7 @@ static int named_temp(const char *dir) {
     return fd;
 }
 
-int vc_nvme_create(const char *dir, uint64_t len) {
-    if (len > INT64_MAX) return -EFBIG;
-    int fd = open(dir, O_TMPFILE | O_RDWR | O_DIRECT | O_CLOEXEC, 0600);
-    if (fd < 0 && (errno == EOPNOTSUPP || errno == EISDIR || errno == EINVAL))
-        fd = named_temp(dir);
-    if (fd < 0) return -errno;
+static int verify_dio_align(int fd) {
 #ifdef STATX_DIOALIGN
     struct statx stx = {0};
     if (statx(fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &stx) == 0 &&
@@ -48,16 +45,76 @@ int vc_nvme_create(const char *dir, uint64_t len) {
              (stx.stx_dio_mem_align > 4096 || 4096 % stx.stx_dio_mem_align != 0)) ||
             (stx.stx_dio_offset_align != 0 &&
              (stx.stx_dio_offset_align > 4096 || 4096 % stx.stx_dio_offset_align != 0))) {
-            close(fd);
             return -EINVAL;
         }
     }
 #endif
+    return 0;
+}
+
+static int ensure_regular_size(int fd, uint64_t len) {
     if (fallocate(fd, 0, 0, (off_t)len) == 0 ||
-        (errno == EOPNOTSUPP && ftruncate(fd, (off_t)len) == 0)) return fd;
-    int error = errno;
+        (errno == EOPNOTSUPP && ftruncate(fd, (off_t)len) == 0)) return 0;
+    return -errno;
+}
+
+int vc_nvme_create(const char *dir, uint64_t len) {
+    if (len == 0) return -EINVAL;
+    if (len > INT64_MAX) return -EFBIG;
+    int fd = open(dir, O_TMPFILE | O_RDWR | O_DIRECT | O_CLOEXEC, 0600);
+    if (fd < 0 && (errno == EOPNOTSUPP || errno == EISDIR || errno == EINVAL))
+        fd = named_temp(dir);
+    if (fd < 0) return -errno;
+    int rc = verify_dio_align(fd);
+    if (rc == 0) rc = ensure_regular_size(fd, len);
+    if (rc < 0) {
+        close(fd);
+        return rc;
+    }
+    return fd;
+}
+
+int vc_nvme_open_path(const char *path, uint64_t len, int create_if_missing) {
+    if (!path || len == 0) return -EINVAL;
+    if (len > INT64_MAX) return -EFBIG;
+    int flags = O_RDWR | O_DIRECT | O_CLOEXEC | (create_if_missing ? O_CREAT : 0);
+    int fd = open(path, flags, 0600);
+    if (fd < 0) return -errno;
+    int rc = verify_dio_align(fd);
+    if (rc < 0) {
+        close(fd);
+        return rc;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        int error = errno;
+        close(fd);
+        return -error;
+    }
+    if (S_ISBLK(st.st_mode)) {
+        uint64_t dev_bytes = 0;
+        if (ioctl(fd, BLKGETSIZE64, &dev_bytes) < 0) {
+            int error = errno;
+            close(fd);
+            return -error;
+        }
+        if (dev_bytes < len) {
+            close(fd);
+            return -ENOSPC;
+        }
+        return fd;
+    }
+    if (S_ISREG(st.st_mode)) {
+        if (st.st_size >= 0 && (uint64_t)st.st_size >= len) return fd;
+        rc = ensure_regular_size(fd, len);
+        if (rc < 0) {
+            close(fd);
+            return rc;
+        }
+        return fd;
+    }
     close(fd);
-    return -error;
+    return -EINVAL;
 }
 
 // The CQE only echoes one word. Its cookie retains the full caller ID and

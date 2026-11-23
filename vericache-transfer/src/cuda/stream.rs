@@ -6,7 +6,7 @@ broadcast use {vstd::imap::group_imap_lemmas, vstd::iset::group_iset_lemmas};
 
 #[cfg_attr(not(verus_only), allow(dead_code))]
 pub struct CudaStream {
-    pub(super) raw: *mut u8,
+    pub(super) raw: ffi::RawStreamGuard,
     pub(super) device: DeviceId,
     source: Tracked<EventSourceToken>,
     tail: Ghost<ISet<TransferEvent>>,
@@ -85,13 +85,13 @@ impl CudaStream {
     }
 
     pub fn destroy(self) -> Result<(), CudaError> {
-        ffi::raw_stream_destroy(&self)
+        ffi::raw_stream_destroy(self.device, self.raw)
     }
 }
 
 #[cfg_attr(not(verus_only), allow(dead_code))]
 pub struct CudaEvent {
-    pub(super) raw: *mut u8,
+    pub(super) raw: ffi::RawEventGuard,
     pub(super) device: DeviceId,
     observer: Ghost<NodeId>,
     recorded: Ghost<ISet<TransferEvent>>,
@@ -147,7 +147,7 @@ impl CudaEvent {
     }
 
     pub fn destroy(self) -> Result<(), CudaError> {
-        ffi::raw_event_destroy(&self)
+        ffi::raw_event_destroy(self.device, self.raw)
     }
 }
 

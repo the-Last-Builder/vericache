@@ -21,7 +21,7 @@ pub mod distributed;
 mod gpu_routes;
 mod routes;
 
-pub use distributed::{DistributedEngine, DistributedEvent, PendingReadGrant};
+pub use distributed::{CudaAttachment, DistributedEngine, DistributedEvent, PendingReadGrant};
 
 verus! {
 

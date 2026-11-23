@@ -13,7 +13,7 @@ broadcast use {
 
 pub(super) proof fn lemma_nvme_init_state(
     bitmap: SlidingBitmap,
-    in_flight_ops: [Option<PendingOperation>; 512],
+    in_flight_ops: [Option<PendingOperation>; BITMAP_SLOTS],
     pending_transfers: Seq<Option<InFlightNvmeOp>>,
     ring: IoUring,
     core: &CacheCore,
@@ -41,7 +41,7 @@ pub(super) proof fn lemma_nvme_init_state(
 
 pub(super) proof fn lemma_nvme_after_submit(
     bitmap: SlidingBitmap,
-    in_flight_ops: [Option<PendingOperation>; 512],
+    in_flight_ops: [Option<PendingOperation>; BITMAP_SLOTS],
     pending_transfers: Seq<Option<InFlightNvmeOp>>,
     old_ring: IoUring,
     new_ring: IoUring,
@@ -63,7 +63,7 @@ pub(super) proof fn lemma_nvme_after_submit(
 
 pub(super) proof fn lemma_nvme_state_after_hop_rollback(
     bitmap: SlidingBitmap,
-    in_flight_ops: [Option<PendingOperation>; 512],
+    in_flight_ops: [Option<PendingOperation>; BITMAP_SLOTS],
     pending_transfers: Seq<Option<InFlightNvmeOp>>,
     ring: IoUring,
     before_core: &CacheCore,
@@ -120,7 +120,7 @@ pub(super) proof fn lemma_nvme_state_after_hop_rollback(
 
 pub(super) proof fn lemma_nvme_seq_not_pending(
     bitmap: SlidingBitmap,
-    in_flight_ops: [Option<PendingOperation>; 512],
+    in_flight_ops: [Option<PendingOperation>; BITMAP_SLOTS],
     ring: IoUring,
     core: &CacheCore,
     timeline: u8,
@@ -141,7 +141,7 @@ pub(super) proof fn lemma_nvme_seq_not_pending(
 
 pub(super) proof fn lemma_nvme_stage_unfold_window(
     bitmap: SlidingBitmap,
-    in_flight_ops: [Option<PendingOperation>; 512],
+    in_flight_ops: [Option<PendingOperation>; BITMAP_SLOTS],
     pending_transfers: Seq<Option<InFlightNvmeOp>>,
     ring: IoUring,
     core: &CacheCore,
@@ -171,15 +171,16 @@ pub(super) proof fn lemma_nvme_stage_unfold_window(
         assert(ring_event_map(ring).contains_key(p.sequence));
         assert(core.timelines.confirmed_seq[timeline as int] < p.sequence < seq);
         assert(p.sequence % BITMAP_CAPACITY != seq % BITMAP_CAPACITY) by {
-            assert(p.sequence == 512 * (p.sequence / 512) + p.sequence % 512);
-            assert(seq == 512 * (seq / 512) + seq % 512);
+            assert(p.sequence == BITMAP_CAPACITY * (p.sequence / BITMAP_CAPACITY) + p.sequence
+                % BITMAP_CAPACITY);
+            assert(seq == BITMAP_CAPACITY * (seq / BITMAP_CAPACITY) + seq % BITMAP_CAPACITY);
         }
     }
 }
 
 pub(super) proof fn lemma_nvme_pack_window(
     bitmap: SlidingBitmap,
-    in_flight_ops: [Option<PendingOperation>; 512],
+    in_flight_ops: [Option<PendingOperation>; BITMAP_SLOTS],
     ring: IoUring,
     core: &CacheCore,
     timeline: u8,
@@ -196,7 +197,7 @@ pub(super) proof fn lemma_nvme_pack_window(
 
 pub(super) proof fn lemma_nvme_poll_unfold(
     bitmap: SlidingBitmap,
-    in_flight_ops: [Option<PendingOperation>; 512],
+    in_flight_ops: [Option<PendingOperation>; BITMAP_SLOTS],
     pending_transfers: Seq<Option<InFlightNvmeOp>>,
     before_ring: IoUring,
     after_ring: IoUring,
@@ -254,8 +255,9 @@ pub(super) proof fn lemma_nvme_poll_unfold(
         < core.timelines.next_seq[timeline as int]);
     assert(core.timelines.confirmed_seq[timeline as int] < seq
         < core.timelines.next_seq[timeline as int]);
-    assert(op.ticket.sequence() == 512 * (op.ticket.sequence() / 512) + op.ticket.sequence() % 512);
-    assert(seq == 512 * (seq / 512) + seq % 512);
+    assert(op.ticket.sequence() == BITMAP_CAPACITY * (op.ticket.sequence() / BITMAP_CAPACITY)
+        + op.ticket.sequence() % BITMAP_CAPACITY);
+    assert(seq == BITMAP_CAPACITY * (seq / BITMAP_CAPACITY) + seq % BITMAP_CAPACITY);
 }
 
 } // verus!

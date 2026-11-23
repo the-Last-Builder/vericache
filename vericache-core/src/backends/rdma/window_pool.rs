@@ -128,6 +128,9 @@ impl<'a> WindowPool<'a> {
             pool.node() == node,
             pool.len() == windows.len(),
             pool.free@.len() == windows.len(),
+            forall|j: int|
+                0 <= j < pool.slots@.len() ==> (#[trigger] pool.slots@[j]).state
+                    == MwSlotState::Free,
     {
         let len = windows.len();
         let mut slots = Vec::<MwPoolSlot<'a>>::with_capacity(len);
@@ -237,6 +240,11 @@ impl<'a> WindowPool<'a> {
                 0 <= j < final(self).slots.len() ==> (#[trigger] final(self).slots[j]).window
                     == old(self).slots[j].window,
             r.is_err() ==> *final(self) == *old(self),
+            r.is_ok() <==> (old(self).slots[i as int].generation == generation && !(old(
+                self,
+            ).slots[i as int].state is Free || old(self).slots[i as int].state is Vacant || old(
+                self,
+            ).slots[i as int].state is Quarantined)),
             r.is_ok() ==> {
                 &&& final(self).slots[i as int].state == MwSlotState::Free
                 &&& final(self).slots[i as int].generation == old(self).slots[i as int].generation

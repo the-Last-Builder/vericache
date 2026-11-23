@@ -34,10 +34,12 @@ pub struct FrameTable {
     pub num_tiers: usize,
     pub bindings: Vec<(ObjectKey, TierId)>,
     pub metas: Vec<FrameSyncMeta>,
+    pub overflow_seqs: Vec<[u64; MAX_TIMELINES]>,
     pub ghosts: Tracked<Map<nat, FrameGhost>>,
     pub ready_queue: Vec<Vec<FrameId>>,
     pub draining_queue: Vec<Vec<FrameId>>,
     pub frame_size: usize,
+    pub tier_frame_sizes: Vec<usize>,
     pub versions: Ghost<Map<VersionId, Seq<u8>>>,
     pub draining_cursor: Vec<usize>,
 }
@@ -70,8 +72,7 @@ impl KernelView {
         &&& t.count >= prior.count
         &&& forall|i: int|
             0 <= i < prior.count ==> #[trigger] t.confirmed_seq[i] >= prior.confirmed_seq[i]
-                && t.next_seq[i] >= prior.next_seq[i] && t.overflow_watermark[i]
-                >= prior.overflow_watermark[i] && t.kinds[i] == prior.kinds[i]
+                && t.next_seq[i] >= prior.next_seq[i] && t.kinds[i] == prior.kinds[i]
         &&& forall|u: u8, s: u64|
             prior.issued(u, s) ==> #[trigger] t.events@[(u, s)] == prior.events@[(u, s)]
     }
@@ -86,6 +87,26 @@ impl FrameTable {
         self.metas[f.0 as int]
     }
 
+    pub open spec fn ovf(&self, f: FrameId) -> [u64; MAX_TIMELINES] {
+        self.overflow_seqs[f.0 as int]
+    }
+
+    pub open spec fn tier_frame_size(&self, t: TierId) -> usize {
+        self.tier_frame_sizes[t.index() as int]
+    }
+
+    #[verifier::when_used_as_spec(tier_frame_size)]
+    pub fn tier_size(&self, t: TierId) -> (s: usize)
+        requires
+            self.shape(),
+            t.valid(self.num_tiers),
+        ensures
+            s == self.tier_frame_size(t),
+            0 < s <= u64::MAX,
+    {
+        self.tier_frame_sizes[t.as_index()]
+    }
+
     pub open spec fn bindings_match(&self) -> bool {
         &&& self.bindings.len() == self.metas.len()
         &&& forall|i: nat|
@@ -98,8 +119,12 @@ impl FrameTable {
 
     pub open spec fn shape(&self) -> bool {
         &&& self.bindings_match()
+        &&& self.overflow_seqs.len() == self.metas.len()
         &&& self.num_tiers <= MAX_TIERS
-        &&& 0 < self.frame_size
+        &&& 0 < self.frame_size <= u64::MAX
+        &&& self.tier_frame_sizes.len() == self.num_tiers
+        &&& forall|t: int|
+            0 <= t < self.num_tiers ==> 0 < #[trigger] self.tier_frame_sizes[t] <= u64::MAX
         &&& self.metas.len() <= u32::MAX
         &&& self.ready_queue.len() == self.num_tiers
         &&& self.draining_queue.len() == self.num_tiers
@@ -126,7 +151,7 @@ impl FrameTable {
                 let f = #[trigger] ready[i];
                 f.0 < self.metas.len() && self.frame(f).tier.index() == t && self.meta(f).state
                     == STATE_EMPTY && self.meta(f).queued() && !self.meta(f).overflow()
-                    && self.meta(f).reusable(table)
+                    && self.meta(f).reusable(self.ovf(f), table)
             }
         &&& forall|i: int|
             0 <= i < draining.len() ==> {
@@ -153,8 +178,9 @@ impl FrameTable {
         &&& forall|i: nat|
             i < self.metas.len() ==> #[trigger] self.ghosts@[i].valid(
                 self.metas[i as int],
+                self.overflow_seqs[i as int],
                 self.num_tiers,
-                self.frame_size,
+                self.tier_frame_size(self.ghosts@[i].tier),
                 id,
                 node,
                 table,
@@ -175,8 +201,9 @@ impl FrameTable {
     pub open spec fn valid_frame(&self, f: FrameId, v: KernelView) -> bool {
         self.frame(f).version_agrees(self.versions@) && self.frame(f).valid(
             self.meta(f),
+            self.ovf(f),
             self.num_tiers,
-            self.frame_size,
+            self.tier_frame_size(self.frame(f).tier),
             v.id(),
             v.node,
             &v.timelines,
@@ -192,8 +219,9 @@ impl FrameTable {
         &&& forall|i: nat|
             i < self.metas.len() && i != f.0 ==> #[trigger] self.ghosts@[i].valid(
                 self.metas[i as int],
+                self.overflow_seqs[i as int],
                 self.num_tiers,
-                self.frame_size,
+                self.tier_frame_size(self.ghosts@[i].tier),
                 v.id(),
                 v.node,
                 &v.timelines,
@@ -252,6 +280,24 @@ impl FrameTable {
         cursors
     }
 
+    fn new_tier_sizes(num_tiers: usize, frame_size: usize) -> (r: Vec<usize>)
+        requires
+            0 < frame_size,
+        ensures
+            r.len() == num_tiers,
+            forall|t: int| 0 <= t < num_tiers ==> #[trigger] r[t] == frame_size,
+    {
+        let mut sizes: Vec<usize> = Vec::new();
+        for _t in 0..num_tiers
+            invariant
+                sizes.len() == _t,
+                forall|j: int| 0 <= j < _t ==> #[trigger] sizes[j] == frame_size,
+        {
+            sizes.push(frame_size);
+        }
+        sizes
+    }
+
     pub fn new(num_tiers: usize, frame_size: usize) -> (r: Self)
         requires
             num_tiers <= MAX_TIERS,
@@ -262,17 +308,22 @@ impl FrameTable {
             r.versions@ == Map::empty(),
             r.separated(),
             r.frame_size == frame_size,
+            r.tier_frame_sizes.len() == num_tiers,
+            forall|t: int| 0 <= t < num_tiers ==> #[trigger] r.tier_frame_sizes[t] == frame_size,
             r.metas.len() == 0,
             r.empty_queues(),
     {
         let ready = Self::new_queues(num_tiers);
         let draining = Self::new_queues(num_tiers);
         let cursors = Self::new_cursors(num_tiers);
+        let tier_frame_sizes = Self::new_tier_sizes(num_tiers, frame_size);
         let r = Self {
             num_tiers,
             frame_size,
+            tier_frame_sizes,
             bindings: Vec::new(),
             metas: Vec::new(),
+            overflow_seqs: Vec::new(),
             versions: Ghost(Map::empty()),
             ghosts: Tracked(Map::tracked_empty()),
             ready_queue: ready,
@@ -287,18 +338,21 @@ impl FrameTable {
         r
     }
 
-    pub fn add_tier(&mut self, Ghost(v): Ghost<KernelView>) -> (tier: TierId)
+    pub fn add_tier_with_size(&mut self, size: usize, Ghost(v): Ghost<KernelView>) -> (tier: TierId)
         requires
             old(self).consistent(v),
             old(self).num_tiers < MAX_TIERS,
+            0 < size,
         ensures
             final(self).consistent(v),
             tier == TierId(old(self).num_tiers as u16),
             final(self).num_tiers == old(self).num_tiers + 1,
             final(self).frame_size == old(self).frame_size,
+            final(self).tier_frame_sizes@ == old(self).tier_frame_sizes@.push(size),
             final(self).versions == old(self).versions,
             final(self).bindings == old(self).bindings,
             final(self).metas == old(self).metas,
+            final(self).overflow_seqs == old(self).overflow_seqs,
             final(self).ghosts == old(self).ghosts,
             final(self).ready_queue[old(self).num_tiers as int]@.len() == 0,
             final(self).draining_queue[old(self).num_tiers as int]@.len() == 0,
@@ -309,14 +363,16 @@ impl FrameTable {
     {
         let idx = self.num_tiers;
         self.num_tiers = idx + 1;
+        self.tier_frame_sizes.push(size);
         self.ready_queue.push(Vec::new());
         self.draining_queue.push(Vec::new());
         self.draining_cursor.push(0);
         proof {
             assert forall|i: nat| i < self.metas.len() implies #[trigger] self.ghosts@[i].valid(
                 self.metas[i as int],
+                self.overflow_seqs[i as int],
                 self.num_tiers,
-                self.frame_size,
+                self.tier_frame_size(self.ghosts@[i].tier),
                 v.id(),
                 v.node,
                 &v.timelines,
@@ -324,8 +380,9 @@ impl FrameTable {
             ) by {
                 assert(old(self).ghosts@[i].valid(
                     old(self).metas[i as int],
+                    old(self).overflow_seqs[i as int],
                     old(self).num_tiers,
-                    self.frame_size,
+                    old(self).tier_frame_size(old(self).ghosts@[i].tier),
                     v.id(),
                     v.node,
                     &v.timelines,
@@ -344,6 +401,87 @@ impl FrameTable {
         TierId(idx as u16)
     }
 
+    pub fn add_tier(&mut self, Ghost(v): Ghost<KernelView>) -> (tier: TierId)
+        requires
+            old(self).consistent(v),
+            old(self).num_tiers < MAX_TIERS,
+        ensures
+            final(self).consistent(v),
+            tier == TierId(old(self).num_tiers as u16),
+            final(self).num_tiers == old(self).num_tiers + 1,
+            final(self).frame_size == old(self).frame_size,
+            final(self).tier_frame_sizes@ == old(self).tier_frame_sizes@.push(old(self).frame_size),
+            final(self).versions == old(self).versions,
+            final(self).bindings == old(self).bindings,
+            final(self).metas == old(self).metas,
+            final(self).overflow_seqs == old(self).overflow_seqs,
+            final(self).ghosts == old(self).ghosts,
+            final(self).ready_queue[old(self).num_tiers as int]@.len() == 0,
+            final(self).draining_queue[old(self).num_tiers as int]@.len() == 0,
+            forall|t: int|
+                0 <= t < old(self).num_tiers ==> (#[trigger] final(self).ready_queue[t]) == old(
+                    self,
+                ).ready_queue[t] && final(self).draining_queue[t] == old(self).draining_queue[t],
+    {
+        self.add_tier_with_size(self.frame_size, Ghost(v))
+    }
+
+    pub(super) proof fn prove_valid_frames_unchanged(
+        &self,
+        before: Self,
+        except: Option<nat>,
+        id: InstanceId,
+        node: NodeId,
+        table: &TimelineTable,
+        ledger: &KnowledgeLedger,
+    )
+        requires
+            before.well_formed(id, node, table, ledger),
+            self.num_tiers == before.num_tiers,
+            self.tier_frame_sizes == before.tier_frame_sizes,
+            before.metas.len() <= self.metas.len(),
+            self.overflow_seqs.len() == self.metas.len(),
+            forall|i: nat|
+                i < before.metas.len() && except != Some(i) ==> #[trigger] self.ghosts@[i]
+                    == before.ghosts@[i] && self.metas[i as int] == before.metas[i as int]
+                    && self.overflow_seqs[i as int] == before.overflow_seqs[i as int],
+        ensures
+            forall|i: nat|
+                i < before.metas.len() && except != Some(i) ==> #[trigger] self.ghosts@[i].valid(
+                    self.metas[i as int],
+                    self.overflow_seqs[i as int],
+                    self.num_tiers,
+                    self.tier_frame_size(self.ghosts@[i].tier),
+                    id,
+                    node,
+                    table,
+                    ledger,
+                ),
+    {
+        assert forall|i: nat|
+            i < before.metas.len() && except != Some(i) implies #[trigger] self.ghosts@[i].valid(
+            self.metas[i as int],
+            self.overflow_seqs[i as int],
+            self.num_tiers,
+            self.tier_frame_size(self.ghosts@[i].tier),
+            id,
+            node,
+            table,
+            ledger,
+        ) by {
+            assert(before.ghosts@[i].valid(
+                before.metas[i as int],
+                before.overflow_seqs[i as int],
+                before.num_tiers,
+                before.tier_frame_size(before.ghosts@[i].tier),
+                id,
+                node,
+                table,
+                ledger,
+            ));
+        }
+    }
+
     pub(super) proof fn restore_frame(&self, before: Self, f: FrameId, v: KernelView)
         requires
             before.except_frame(f, v),
@@ -351,7 +489,9 @@ impl FrameTable {
             before.versions@.submap_of(self.versions@),
             self.num_tiers == before.num_tiers,
             self.metas.len() == before.metas.len(),
+            self.overflow_seqs.len() == self.metas.len(),
             self.frame_size == before.frame_size,
+            self.tier_frame_sizes == before.tier_frame_sizes,
             self.ghosts@.dom() == before.ghosts@.dom(),
             self.ready_queue.len() == self.num_tiers,
             self.draining_queue.len() == self.num_tiers,
@@ -362,7 +502,8 @@ impl FrameTable {
             self.queues(&v.timelines),
             forall|i: nat|
                 i < self.metas.len() && i != f.0 ==> #[trigger] self.ghosts@[i] == before.ghosts@[i]
-                    && self.metas[i as int] == before.metas[i as int],
+                    && self.metas[i as int] == before.metas[i as int]
+                    && self.overflow_seqs[i as int] == before.overflow_seqs[i as int],
         ensures
             self.consistent(v),
     {
@@ -381,8 +522,9 @@ impl FrameTable {
         }
         assert forall|i: nat| i < self.metas.len() implies #[trigger] self.ghosts@[i].valid(
             self.metas[i as int],
+            self.overflow_seqs[i as int],
             self.num_tiers,
-            self.frame_size,
+            self.tier_frame_size(self.ghosts@[i].tier),
             v.id(),
             v.node,
             &v.timelines,
@@ -391,8 +533,9 @@ impl FrameTable {
             if i != f.0 {
                 assert(before.ghosts@[i].valid(
                     before.metas[i as int],
-                    self.num_tiers,
-                    self.frame_size,
+                    before.overflow_seqs[i as int],
+                    before.num_tiers,
+                    before.tier_frame_size(before.ghosts@[i].tier),
                     v.id(),
                     v.node,
                     &v.timelines,
@@ -404,6 +547,7 @@ impl FrameTable {
 
     pub(super) proof fn queues_unchanged_off_frame(&self, before: Self, f: FrameId, v: KernelView)
         requires
+            before.shape(),
             before.queues(&v.timelines),
             self.num_tiers == before.num_tiers,
             !before.meta(f).queued(),
@@ -413,9 +557,10 @@ impl FrameTable {
             self.ready_queue == before.ready_queue,
             self.draining_queue == before.draining_queue,
             self.metas.len() == before.metas.len(),
+            self.overflow_seqs.len() == self.metas.len(),
             forall|j: FrameId|
                 j != f && j.0 < self.metas.len() ==> #[trigger] self.meta(j) == before.meta(j)
-                    && self.frame(j).tier == before.frame(j).tier,
+                    && self.ovf(j) == before.ovf(j) && self.frame(j).tier == before.frame(j).tier,
         ensures
             self.queues(&v.timelines),
     {
@@ -426,13 +571,21 @@ impl FrameTable {
             assert(before.tier_queues(t, &v.timelines));
             assert forall|i: int| 0 <= i < self.ready_queue[t].len() implies self.meta(
                 #[trigger] self.ready_queue[t][i],
-            ) == before.meta(self.ready_queue[t][i]) by {
-                assert(before.ready_queue[t][i] != f);
+            ) == before.meta(self.ready_queue[t][i]) && self.ovf(self.ready_queue[t][i])
+                == before.ovf(self.ready_queue[t][i]) by {
+                let q = self.ready_queue[t][i];
+                assert(q == before.ready_queue[t][i]);
+                assert(q != f);
+                assert(q.0 < before.metas.len());
+                assert(self.meta(q) == before.meta(q));
+                assert(self.ovf(q) == before.ovf(q));
             }
             assert forall|i: int| 0 <= i < self.draining_queue[t].len() implies self.meta(
                 #[trigger] self.draining_queue[t][i],
             ) == before.meta(self.draining_queue[t][i]) by {
-                assert(before.draining_queue[t][i] != f);
+                let q = before.draining_queue[t][i];
+                assert(q != f);
+                assert(q.0 < before.metas.len());
             }
         }
     }
@@ -445,7 +598,9 @@ impl FrameTable {
             self.num_tiers == before.num_tiers,
             f.0 < before.metas.len(),
             self.metas.len() == before.metas.len(),
+            self.overflow_seqs.len() == self.metas.len(),
             self.frame_size == before.frame_size,
+            self.tier_frame_sizes == before.tier_frame_sizes,
             self.ghosts@.dom() == before.ghosts@.dom(),
             self.ready_queue == before.ready_queue,
             self.draining_queue == before.draining_queue,
@@ -458,7 +613,8 @@ impl FrameTable {
             self.meta(f).flags == before.meta(f).flags,
             forall|i: nat|
                 i < self.metas.len() && i != f.0 ==> #[trigger] self.ghosts@[i] == before.ghosts@[i]
-                    && self.metas[i as int] == before.metas[i as int],
+                    && self.metas[i as int] == before.metas[i as int]
+                    && self.overflow_seqs[i as int] == before.overflow_seqs[i as int],
         ensures
             self.consistent(v),
     {
@@ -474,6 +630,7 @@ impl FrameTable {
     proof fn lemma_frame_timeline_progress(
         g: FrameGhost,
         m: FrameSyncMeta,
+        ovf: [u64; MAX_TIMELINES],
         num_tiers: usize,
         size: usize,
         before: KernelView,
@@ -483,6 +640,7 @@ impl FrameTable {
             before.timelines.well_formed(before.id(), before.node, &before.ledger),
             g.valid(
                 m,
+                ovf,
                 num_tiers,
                 size,
                 before.id(),
@@ -492,7 +650,7 @@ impl FrameTable {
             ),
             v.extends(before),
         ensures
-            g.valid(m, num_tiers, size, v.id(), v.node, &v.timelines, &v.ledger),
+            g.valid(m, ovf, num_tiers, size, v.id(), v.node, &v.timelines, &v.ledger),
     {
         let a = before.timelines;
         let b = v.timelines;
@@ -508,6 +666,15 @@ impl FrameTable {
         }
         assert(g.binding(m, &b));
         assert(g.authority(m, v.id()));
+        assert(FrameSyncMeta::ovf_bounded(ovf, &b)) by {
+            assert forall|t: int| 0 <= t < b.count implies #[trigger] ovf[t] < b.next_seq[t] by {
+                if t < a.count {
+                    assert(ovf[t] < a.next_seq[t]);
+                } else {
+                    assert(ovf[t] == 0);
+                }
+            }
+        }
         if g.token is Some {
             if let Some(w) = g.frontier().last_writer {
                 if !v.ledger.citations(v.node).contains(w) {
@@ -531,24 +698,23 @@ impl FrameTable {
                     r,
                 ) implies exists|t: u8, s: u64|
                 b.issued(t, s) && #[trigger] b.events@[(t, s)] == r && m.bounds_reader(
-                    &b,
+                    ovf,
                     t,
                     s,
                 ) by {
                 assert(!before.ledger.citations(before.node).contains(r));
                 let (t, s) = choose|t: u8, s: u64|
                     a.issued(t, s) && #[trigger] a.events@[(t, s)] == r && m.bounds_reader(
-                        &a,
+                        ovf,
                         t,
                         s,
                     );
                 assert(b.confirmed_seq[t as int] >= a.confirmed_seq[t as int]);
-                assert(b.overflow_watermark[t as int] >= a.overflow_watermark[t as int]);
                 assert(b.events@[(t, s)] == r);
-                assert(m.bounds_reader(&b, t, s));
+                assert(m.bounds_reader(ovf, t, s));
             }
         }
-        assert(g.covered(m, &b, v.node, &v.ledger));
+        assert(g.covered(m, ovf, &b, v.node, &v.ledger));
     }
 
     pub proof fn lemma_timeline_progress(&self, before: KernelView, v: KernelView)
@@ -562,8 +728,9 @@ impl FrameTable {
         let b = v.timelines;
         assert forall|i: nat| i < self.metas.len() implies #[trigger] self.ghosts@[i].valid(
             self.metas[i as int],
+            self.overflow_seqs[i as int],
             self.num_tiers,
-            self.frame_size,
+            self.tier_frame_size(self.ghosts@[i].tier),
             v.id(),
             v.node,
             &b,
@@ -572,8 +739,9 @@ impl FrameTable {
             Self::lemma_frame_timeline_progress(
                 self.ghosts@[i],
                 self.metas[i as int],
+                self.overflow_seqs[i as int],
                 self.num_tiers,
-                self.frame_size,
+                self.tier_frame_size(self.ghosts@[i].tier),
                 before,
                 v,
             );
@@ -585,10 +753,10 @@ impl FrameTable {
             assert(self.tier_queues(u, &a));
             assert forall|i: int| 0 <= i < self.ready_queue[u].len() implies self.meta(
                 #[trigger] self.ready_queue[u][i],
-            ).reusable(&b) by {
+            ).reusable(self.ovf(self.ready_queue[u][i]), &b) by {
                 let f = self.ready_queue[u][i];
                 let m = self.meta(f);
-                assert(m.reusable(&a));
+                assert(m.reusable(self.ovf(f), &a));
                 assert(self.valid_frame(f, before));
                 assert forall|j: int| 0 <= j < 5 implies b.retired(#[trigger] m.ticket(j)) by {
                     let k = m.ticket(j);
@@ -609,14 +777,15 @@ impl FrameTable {
         requires
             v.timelines.well_formed(v.id(), v.node, &v.ledger),
             self.frame(f).cert.is_some() ==> before.frame(f).cert.is_some(),
-            before.frame(f).covered(before.meta(f), &v.timelines, v.node, &v.ledger),
+            before.frame(f).covered(before.meta(f), before.ovf(f), &v.timelines, v.node, &v.ledger),
             self.frame(f).slot == before.frame(f).slot,
             self.frame(f).token == before.frame(f).token,
             self.meta(f).last_write_ticket == before.meta(f).last_write_ticket,
             self.meta(f).inline_read_tickets == before.meta(f).inline_read_tickets,
             self.meta(f).overflow() == before.meta(f).overflow(),
+            self.ovf(f) == before.ovf(f),
         ensures
-            self.frame(f).covered(self.meta(f), &v.timelines, v.node, &v.ledger),
+            self.frame(f).covered(self.meta(f), self.ovf(f), &v.timelines, v.node, &v.ledger),
     {
         assert forall|j: int| 0 <= j < 5 implies v.timelines.valid_ticket(
             #[trigger] self.meta(f).ticket(j),
@@ -626,7 +795,9 @@ impl FrameTable {
         self.frame(f).preserve_readers(
             before.frame(f),
             self.meta(f),
+            self.ovf(f),
             before.meta(f),
+            before.ovf(f),
             &v.timelines,
             &v.timelines,
             v.node,
@@ -637,8 +808,8 @@ impl FrameTable {
     pub open spec fn preserves_initializing(&self, before: &Self, except: Option<FrameId>) -> bool {
         forall|g: FrameId|
             Some(g) != except && g.0 < before.metas.len() && (#[trigger] before.meta(g)).state
-                == STATE_INITIALIZING ==> self.meta(g) == before.meta(g) && self.frame(g)
-                == before.frame(g)
+                == STATE_INITIALIZING ==> self.meta(g) == before.meta(g) && self.ovf(g)
+                == before.ovf(g) && self.frame(g) == before.frame(g)
     }
 
     pub open spec fn published(&self, f: FrameId) -> Option<
@@ -661,7 +832,8 @@ impl FrameTable {
 
     pub open spec fn same_layout(&self, before: &Self) -> bool {
         &&& self.num_tiers == before.num_tiers && self.frame_size == before.frame_size
-            && self.metas.len() == before.metas.len()
+            && self.tier_frame_sizes == before.tier_frame_sizes && self.metas.len()
+            == before.metas.len()
         &&& forall|f: FrameId|
             f.0 < self.metas.len() ==> (#[trigger] self.frame(f)).slot == before.frame(f).slot
                 && self.frame(f).tier == before.frame(f).tier
@@ -669,7 +841,8 @@ impl FrameTable {
 
     pub open spec fn same_directory(&self, before: &Self) -> bool {
         &&& self.num_tiers == before.num_tiers && self.versions == before.versions
-            && self.frame_size == before.frame_size && self.metas.len() == before.metas.len()
+            && self.frame_size == before.frame_size && self.tier_frame_sizes
+            == before.tier_frame_sizes && self.metas.len() == before.metas.len()
         &&& forall|f: FrameId|
             f.0 < self.metas.len() ==> {
                 &&& (#[trigger] self.frame(f)).slot == before.frame(f).slot

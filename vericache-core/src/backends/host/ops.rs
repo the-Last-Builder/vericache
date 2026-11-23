@@ -18,7 +18,7 @@ impl HostBackend {
             old(self).well_formed(old(core)),
             instance.id() == old(core).instance_id(),
             old(core).timelines.next_seq[old(self).timeline as int] <= MAX_TICKET_SEQ,
-            data@.len() == old(core).frames.frame_size,
+            data@.len() == old(core).frames.tier_frame_size(old(self).tier),
             old(self).owns(frame),
             frame.0 < old(core).frames.metas.len(),
             old(core).frames.meta(frame).state == STATE_INITIALIZING,
@@ -183,7 +183,7 @@ impl HostBackend {
         hide(CacheCore::well_formed);
         hide(replica_valid);
         hide(complete_receipts);
-        if data.len() != core.frames.frame_size {
+        if data.len() != core.tier_frame_size(self.tier) {
             return Err(CoreError::InvalidArgument);
         }
         let (handle, Tracked(mut tok)) = core.begin_write(self.tier, key)?;
@@ -283,7 +283,7 @@ impl HostBackend {
         hide(CacheCore::well_formed);
         hide(replica_valid);
         hide(complete_receipts);
-        if dst.len() != core.frames.frame_size {
+        if dst.len() != core.tier_frame_size(self.tier) {
             return Err(CoreError::InvalidArgument);
         }
         if !self.owns_frame(frame) {
@@ -429,6 +429,7 @@ impl HostBackend {
             old(core).frames.frame(hop.dst_frame).bound_key == Some(hop.key),
             old(core).frames.frame(hop.dst_frame).bound_version == Some(hop.version),
             old(core).frames.frame(hop.dst_frame).token is None,
+            hop.src_slot@.slot_len == hop.dst_slot@.slot_len,
             src_cap.is_local(),
             src_cap.instance_id() == old(core).instance_id(),
             src_cap.loc() == hop.src_slot@.loc,

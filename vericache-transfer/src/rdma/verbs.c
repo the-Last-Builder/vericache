@@ -124,6 +124,8 @@ struct wide_cookie {
     uint32_t kind;
 };
 
+_Static_assert(_Alignof(struct wide_cookie) >= 4, "wide_cookie alignment");
+
 static int pack_wr_id(uint64_t *id, enum work_kind kind) {
     if (*id <= (UINT64_MAX >> 2)) {
         *id = (*id << 2) | kind;
@@ -275,9 +277,12 @@ struct ibv_cq *vc_create_cq(struct ibv_context *ctx, int depth) {
 }
 
 int vc_destroy_cq(struct ibv_cq *cq) {
-    void *buf = cq->cq_context;
+    struct poll_buffer *buf = cq->cq_context;
     int rc = ibv_destroy_cq(cq);
-    if (!rc) free(buf);
+    if (!rc && buf) {
+        for (int i = buf->first; i < buf->end; ++i) release_cookie(buf->wcs[i].wr_id);
+        free(buf);
+    }
     return rc;
 }
 

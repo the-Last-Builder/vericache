@@ -6,18 +6,30 @@ default:
 
 # Verify every proof across the entire workspace (Z3 — fast daily check).
 verify:
-    cargo verus verify -p vericache-foundation
-    cargo verus verify -p vericache-transfer
-    cargo verus verify --fwd-verus-args-to roots -p vericache-core -- --no-cheating
+    cargo verus verify --fwd-verus-args-to roots -p vericache-foundation -- -V spinoff-all
+    cargo verus verify --fwd-verus-args-to roots -p vericache-transfer -- -V spinoff-all
+    cargo verus verify --fwd-verus-args-to roots -p vericache-core -- -V spinoff-all --no-cheating
 
-# Verify every proof across the entire workspace using CVC5 (isolated target dir + roots-only so vstd isn't re-verified under cvc5).
+# Verify every proof across the entire workspace using CVC5 (isolated target dir + spinoff-all multi-core parallelism).
 verify-cvc5:
-    cargo verus verify --target-dir target/cvc5 --fwd-verus-args-to roots -p vericache-foundation -- -V cvc5
-    cargo verus verify --target-dir target/cvc5 --fwd-verus-args-to roots -p vericache-transfer -- -V cvc5
-    cargo verus verify --target-dir target/cvc5 --fwd-verus-args-to roots -p vericache-core -- -V cvc5 --rlimit 60 --no-cheating
+    cargo verus verify --target-dir target/cvc5 --fwd-verus-args-to roots -p vericache-foundation -- -V cvc5 -V spinoff-all
+    cargo verus verify --target-dir target/cvc5 --fwd-verus-args-to roots -p vericache-transfer -- -V cvc5 -V spinoff-all
+    cargo verus verify --target-dir target/cvc5 --fwd-verus-args-to roots -p vericache-core -- -V cvc5 -V spinoff-all --rlimit 160 --no-cheating
 
 # Verify every proof with BOTH Z3 and CVC5 (AND cross-verification).
 verify-dual: verify verify-cvc5
+
+# Fast inner-loop Z3 check on a single module (and optional extra args such as `--verify-function <pat>`).
+focus crate mod *args:
+    cargo verus focus --target-dir target/focus -p {{crate}} -- -V spinoff-all --time-expanded --verify-module {{mod}} {{args}}
+
+# Fast inner-loop CVC5 check on a single module (and optional `--verify-function <pat>`).
+focus-cvc5 crate mod *args:
+    cargo verus focus --target-dir target/focus-cvc5 -p {{crate}} -- -V cvc5 -V spinoff-all --rlimit 160 --time-expanded --verify-module {{mod}} {{args}}
+
+# Quantifier instantiation profiler for a slow CVC5 function.
+profile-cvc5 crate mod fn:
+    cargo verus focus --target-dir target/focus-cvc5 -p {{crate}} -- -V cvc5 --rlimit 160 --profile --time-expanded --verify-only-module {{mod}} --verify-function {{fn}}
 
 # Run tree-sitter-verus ast-grep rule regression tests.
 audit-rules:
@@ -47,3 +59,7 @@ check-dual: verify-dual audit fmt-check
 # Check erased-build compilation across all targets.
 cargo-check:
     cargo check --workspace --tests
+
+# Compile the English technical report PDF using Tectonic.
+report:
+    tectonic docs/tech-report/vericache-tech-report.tex

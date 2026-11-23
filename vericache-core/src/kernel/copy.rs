@@ -54,6 +54,8 @@ impl CacheCore {
             after_lease.frames.frame(src_frame).bound_key == Some(key),
             after_lease.frames.frame(src_frame).bound_version == Some(version),
             after_lease.frames.frame(src_frame).cert == Some(src_cert),
+            after_lease.frames.tier_frame_size(after_lease.frames.frame(src_frame).tier)
+                == after_lease.frames.tier_frame_size(self.frames.frame(dst_frame).tier),
             after_lease.frames.returned_reads(
                 src_frame,
                 src_cap,
@@ -65,8 +67,14 @@ impl CacheCore {
             self.frames.same_directory(&before.frames),
             self.frames.preserves_initializing(&before.frames, None),
             self.frames.preserves_remote_leases(&before.frames),
+            before.frames.meta(dst_frame).state != STATE_INITIALIZING,
             src_frame != dst_frame,
             self.frames.frame(src_frame).slot.loc != self.frames.frame(dst_frame).slot.loc,
+            self.frames.frame(src_frame).slot.slot_len == self.frames.frame(
+                dst_frame,
+            ).slot.slot_len,
+            self.frames.tier_frame_size(self.frames.frame(src_frame).tier)
+                == self.frames.tier_frame_size(self.frames.frame(dst_frame).tier),
             self.frames.meta(src_frame).state == STATE_PUBLISHED,
             self.frames.frame(src_frame).slot == after_lease.frames.frame(src_frame).slot,
             self.frames.frame(src_frame).tier == after_lease.frames.frame(src_frame).tier,
@@ -85,6 +93,7 @@ impl CacheCore {
         }
         assert(self.frames.published(src_frame) == after_lease.frames.published(src_frame));
         assert(self.frames.valid_frame(src_frame, self.kernel_view()));
+        assert(self.frames.valid_frame(dst_frame, self.kernel_view()));
         assert forall|g: FrameId| g.0 < self.frames.metas.len() implies {
             &&& (#[trigger] self.frames.frame(g)).slot == before.frames.frame(g).slot
             &&& self.frames.frame(g).tier == before.frames.frame(g).tier
@@ -286,6 +295,9 @@ impl CacheCore {
             src_frame.0 < before.frames.metas.len(),
             old(self).frames.meta(src_frame).state == STATE_PUBLISHED,
             old(self).frames.frame(src_frame).tier == src_tier,
+            old(self).frames.tier_frame_size(src_tier) == old(self).frames.tier_frame_size(
+                dst_tier,
+            ),
             old(self).frames.frame(src_frame).bound_key == Some(key),
             old(self).frames.frame(src_frame).bound_version == Some(version),
             old(self).frames.frame(src_frame).cert == Some(src_cert),
@@ -357,9 +369,12 @@ impl CacheCore {
                 &&& before.frames.meta(hop.dst_frame).state != STATE_INITIALIZING
                 &&& hop.src_slot@ == final(self).frames.frame(hop.src_frame).slot
                 &&& hop.dst_slot@ == final(self).frames.frame(hop.dst_frame).slot
+                &&& hop.src_slot@.slot_len == hop.dst_slot@.slot_len
                 &&& hop.src_slot@.loc != hop.dst_slot@.loc
                 &&& final(self).frames.meta(hop.src_frame).state == STATE_PUBLISHED
                 &&& final(self).frames.frame(hop.src_frame).tier == hop.src_tier
+                &&& final(self).frames.tier_frame_size(hop.src_tier)
+                    == final(self).frames.tier_frame_size(hop.dst_tier)
                 &&& final(self).frames.frame(hop.src_frame).bound_key == Some(hop.key)
                 &&& final(self).frames.frame(hop.src_frame).bound_version == Some(hop.version)
                 &&& final(self).frames.frame(hop.src_frame).cert == Some(hop.src_cert@)
@@ -409,11 +424,28 @@ impl CacheCore {
                 )
             },
     {
+        hide(CacheCore::well_formed);
+        hide(replica_valid);
+        hide(FrameTable::same_directory);
+        hide(FrameTable::preserves_initializing);
+        hide(FrameTable::same_other_pins);
+        hide(FrameTable::preserves_remote_leases);
         let ghost after_lease = *self;
+        proof {
+            assert(after_lease.frames.metas.len() == before.frames.metas.len()
+                && after_lease.frames.tier_frame_sizes == before.frames.tier_frame_sizes) by {
+                reveal(FrameTable::same_directory);
+            };
+        }
         let ghost src_slot = self.frames.frame(src_frame).slot;
         match self.begin_write_version(dst_tier, key, version) {
             Ok((dst_handle, dst_tok)) => {
                 proof {
+                    assert(self.frames.metas.len() == after_lease.frames.metas.len()
+                        && self.frames.versions == after_lease.frames.versions
+                        && self.frames.tier_frame_sizes == after_lease.frames.tier_frame_sizes) by {
+                        reveal(FrameTable::same_directory);
+                    };
                     self.lemma_copy_hop_reserved(
                         before,
                         after_lease,
@@ -453,6 +485,9 @@ impl CacheCore {
                     Tracked(instance),
                 ).unwrap();
                 proof {
+                    assert(self.frames.metas.len() == after_lease.frames.metas.len()) by {
+                        reveal(FrameTable::same_directory);
+                    };
                     self.lemma_copy_hop_rolled_back(
                         before,
                         after_lease,
@@ -514,9 +549,12 @@ impl CacheCore {
                 &&& old(self).frames.meta(hop.dst_frame).state != STATE_INITIALIZING
                 &&& hop.src_slot@ == final(self).frames.frame(hop.src_frame).slot
                 &&& hop.dst_slot@ == final(self).frames.frame(hop.dst_frame).slot
+                &&& hop.src_slot@.slot_len == hop.dst_slot@.slot_len
                 &&& hop.src_slot@.loc != hop.dst_slot@.loc
                 &&& final(self).frames.meta(hop.src_frame).state == STATE_PUBLISHED
                 &&& final(self).frames.frame(hop.src_frame).tier == hop.src_tier
+                &&& final(self).frames.tier_frame_size(hop.src_tier)
+                    == final(self).frames.tier_frame_size(hop.dst_tier)
                 &&& final(self).frames.frame(hop.src_frame).bound_key == Some(hop.key)
                 &&& final(self).frames.frame(hop.src_frame).bound_version == Some(hop.version)
                 &&& final(self).frames.frame(hop.src_frame).cert == Some(hop.src_cert@)
@@ -566,6 +604,20 @@ impl CacheCore {
                 )
             },
     {
+        if dst_tier.as_index() >= self.tiers.len() {
+            return Err(CoreError::UnsupportedTier);
+        }
+        if src_frame.0 as usize >= self.frames.metas.len()
+            || self.frames.metas[src_frame.0 as usize].state != STATE_PUBLISHED {
+            return Err(CoreError::StaleReplica);
+        }
+        let (_, src_tier) = self.frames.bindings[src_frame.0 as usize];
+        proof {
+            assert(self.frames.valid_frame(src_frame, self.kernel_view()));
+        }
+        if self.frames.tier_size(src_tier) != self.frames.tier_size(dst_tier) {
+            return Err(CoreError::InvalidArgument);
+        }
         let ghost before = *self;
         let (src_lease, version, Ghost(src_cert), Tracked(src_cap)) = self.acquire_local_lease(
             src_frame,

@@ -4,7 +4,7 @@ use std::sync::{Mutex, OnceLock};
 use transfer::context::*;
 use transfer::domain::SlotLoc;
 use transfer::host::{self, HostBuffer, HostContext, HostSlice};
-use transfer::nvme::{Completed, IoUring, NvmeFile, NvmeSlice, DIRECT_IO_ALIGNMENT};
+use transfer::nvme::{Completed, IoUring, NvmeError, NvmeFile, NvmeSlice, DIRECT_IO_ALIGNMENT};
 use vstd::prelude::*;
 #[cfg(verus_only)]
 use vstd::tokens::KeyValueToken;
@@ -80,6 +80,53 @@ impl Fixture {
             self.tokens.borrow_mut().tracked_insert(file.slot_loc(0), tok);
         }
         assert_eq!(file.len(), len as u64);
+        file
+    }
+
+    fn try_open_path(&mut self, path: &str, len: usize, create_if_missing: bool) -> Result<
+        NvmeFile,
+        NvmeError,
+    > {
+        let (file, Tracked(tok)) = NvmeFile::open_path(
+            &self.host,
+            Tracked(self.instance.borrow()),
+            Tracked(self.allocations.borrow_mut()),
+            path,
+            len as u64,
+            create_if_missing,
+        )?;
+        proof {
+            self.tokens.borrow_mut().tracked_insert(file.slot_loc(0), tok);
+        }
+        assert_eq!(file.len(), len as u64);
+        Ok(file)
+    }
+
+    fn open_path_slab(
+        &mut self,
+        path: &str,
+        num_slots: usize,
+        slot_len: usize,
+        create_if_missing: bool,
+    ) -> NvmeFile {
+        let (file, Tracked(mut tokens)) = NvmeFile::open_path_slab(
+            &self.host,
+            Tracked(self.instance.borrow()),
+            Tracked(self.allocations.borrow_mut()),
+            path,
+            num_slots,
+            slot_len as u64,
+            create_if_missing,
+        ).unwrap();
+        proof {
+            let mut i: usize = 0;
+            while i < num_slots {
+                let tracked tok = tokens.tracked_remove(i);
+                self.tokens.borrow_mut().tracked_insert(file.slot_loc(i as nat), tok);
+                i = (i + 1) as usize;
+            }
+        }
+        assert_eq!(file.len(), (num_slots * slot_len) as u64);
         file
     }
 
@@ -372,6 +419,112 @@ impl Fixture {
     }
 }
 
+#[cfg_attr(not(verus_only), allow(dead_code))]
+struct FileOnlyFixture {
+    instance: &'static Tracked<TransferInstance>,
+    host: HostContext,
+    allocations: Tracked<AllocSource>,
+    infos: Tracked<SubmittedMap>,
+    knows: Tracked<Knows>,
+}
+
+impl FileOnlyFixture {
+    fn new() -> Self {
+        let (instance, supplies) = NODE.get_or_init(
+            ||
+                {
+                    let (instance, alloc, events, shares) = NodeContext::bootstrap(
+                        0,
+                    ).into_sources();
+                    (instance, Mutex::new((alloc, events, shares)))
+                },
+        );
+        #[allow(unused_mut)]
+        let mut supplies = supplies.lock().unwrap();
+        let tracked allocations = supplies.0.borrow_mut().split();
+        let tracked mut events = supplies.1.borrow_mut().split();
+        drop(supplies);
+        let host = HostContext::new(Tracked(events.mint(EventSourceKind::Host)));
+        Self {
+            instance,
+            host,
+            allocations: Tracked(allocations),
+            infos: Tracked(SubmittedMap::empty(instance@.id())),
+            knows: Tracked(Knows::empty(instance@.id())),
+        }
+    }
+
+    fn open_and_close(&mut self, path: &str, len: usize, create_if_missing: bool) -> Result<
+        (),
+        NvmeError,
+    > {
+        let (file, Tracked(tok)) = NvmeFile::open_path(
+            &self.host,
+            Tracked(self.instance.borrow()),
+            Tracked(self.allocations.borrow_mut()),
+            path,
+            len as u64,
+            create_if_missing,
+        )?;
+        assert_eq!(file.len(), len as u64);
+        NvmeFile::close(
+            &mut self.host,
+            Tracked(self.instance.borrow()),
+            file,
+            Tracked(tok),
+            Tracked(self.infos.borrow()),
+            Tracked(self.knows.borrow()),
+            Ghost(self.infos@.dom()),
+        );
+        Ok(())
+    }
+
+    fn open_and_drop(&mut self, path: &str, len: usize, create_if_missing: bool) -> Result<
+        (),
+        NvmeError,
+    > {
+        let (file, _) = NvmeFile::open_path(
+            &self.host,
+            Tracked(self.instance.borrow()),
+            Tracked(self.allocations.borrow_mut()),
+            path,
+            len as u64,
+            create_if_missing,
+        )?;
+        assert_eq!(file.len(), len as u64);
+        Ok(())
+    }
+
+    fn open_slab_and_close(
+        &mut self,
+        path: &str,
+        num_slots: usize,
+        slot_len: usize,
+        create_if_missing: bool,
+    ) -> Result<(), NvmeError> {
+        let (file, Tracked(tokens)) = NvmeFile::open_path_slab(
+            &self.host,
+            Tracked(self.instance.borrow()),
+            Tracked(self.allocations.borrow_mut()),
+            path,
+            num_slots,
+            slot_len as u64,
+            create_if_missing,
+        )?;
+        assert_eq!(file.len(), (num_slots * slot_len) as u64);
+        NvmeFile::close_slab(
+            &mut self.host,
+            Tracked(self.instance.borrow()),
+            file,
+            Tracked(tokens),
+            Tracked(self.infos.borrow()),
+            Tracked(self.knows.borrow()),
+            Ghost(self.infos@.dom()),
+        );
+        Ok(())
+    }
+}
+
 } // verus!
 impl Fixture {
     fn submit_batch(&mut self, count: usize) {
@@ -484,4 +637,130 @@ fn nvme_concurrent_shared_read() {
     f.check(&second, &bytes);
     f.give_back(lent, &file);
     f.finish(file, [first, second]);
+}
+
+struct RemoveOnDrop(std::path::PathBuf);
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[test]
+fn nvme_open_path_persists_across_reopen() {
+    let dir = std::env::var("VERICACHE_NVME_DIR").unwrap_or_else(|_| ".".to_owned());
+    let path = std::path::PathBuf::from(&dir).join(format!(
+        ".vericache-open-path-test-{}.dat",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let _cleanup = RemoveOnDrop(path.clone());
+    let path_str = path.to_str().unwrap();
+
+    let len = 65536usize;
+    let bytes = pattern(len);
+
+    // 1. Opening a missing file with create_if_missing=false fails with ENOENT (2).
+    {
+        let mut f = Fixture::new(1);
+        let err = match f.try_open_path(path_str, len, false) {
+            Ok(_) => panic!("expected ENOENT for missing file with create_if_missing=false"),
+            Err(e) => e,
+        };
+        assert_eq!(err, NvmeError(2));
+        f.ring.destroy();
+    }
+
+    // 2. Create with create_if_missing=true, write pattern via O_DIRECT io_uring, then close.
+    {
+        let mut f = Fixture::new(1);
+        let buf = f.buffer(len);
+        let file = f.try_open_path(path_str, len, true).unwrap();
+        f.fill(&buf, &bytes);
+        f.stage(&buf.as_slice(), &file.as_slice(), 101, true);
+        f.submit_batch(1);
+        f.reap_batch(&[101], len, false);
+        f.finish(file, [buf]);
+    }
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), len as u64);
+
+    // 3. Reopen existing file with create_if_missing=false (and verify no fallocate/truncation
+    //    clobbers data even when reopening a prefix with create_if_missing=true), then read via io_uring.
+    {
+        let mut f = Fixture::new(1);
+        let buf = f.buffer(len);
+        let file = f.try_open_path(path_str, len, false).unwrap();
+        f.fill(&buf, &vec![0x5a; len]);
+        f.stage(&buf.as_slice(), &file.as_slice(), 102, false);
+        f.submit_batch(1);
+        f.reap_batch(&[102], len, false);
+        f.check(&buf, &bytes);
+        f.finish(file, [buf]);
+    }
+
+    // 4. Reopen with create_if_missing=true and smaller requested length as a 2-slot slab;
+    //    file size remains `len` (not truncated) and existing bytes at both slots stay intact.
+    {
+        let slot_len = len / 4;
+        let mut f = Fixture::new(2);
+        let buf = f.buffer_slab(2, slot_len);
+        let file = f.open_path_slab(path_str, 2, slot_len, true);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len as u64);
+        for i in 0..2 {
+            f.fill_slice(&buf.slot_slice(i), &vec![0x3c; slot_len]);
+            f.stage(
+                &buf.slot_slice(i),
+                &file.slot_slice(i),
+                200 + i as u64,
+                false,
+            );
+        }
+        f.submit_batch(2);
+        f.reap_batch(&[200, 201], slot_len, false);
+        for i in 0..2 {
+            f.check_slice(&buf.slot_slice(i), &bytes[i * slot_len..(i + 1) * slot_len]);
+        }
+        f.finish_slab(file, buf);
+    }
+}
+
+#[test]
+fn nvme_open_path_reopen_preserves_bytes_and_size() {
+    let dir = std::env::var("VERICACHE_NVME_DIR").unwrap_or_else(|_| ".".to_owned());
+    let path = std::path::PathBuf::from(&dir).join(format!(
+        ".vericache-open-path-reopen-{}.dat",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let _cleanup = RemoveOnDrop(path.clone());
+    let path_str = path.to_str().unwrap();
+
+    let len = 65536usize;
+    let bytes = pattern(len);
+    let mut f = FileOnlyFixture::new();
+
+    // Missing file with create_if_missing=false fails with ENOENT (2).
+    assert_eq!(f.open_and_close(path_str, len, false), Err(NvmeError(2)));
+
+    // Create persistent O_DIRECT file of `len` bytes.
+    f.open_and_close(path_str, len, true).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), len as u64);
+
+    // Populate recognizable payload, then reopen with both create_if_missing=false and true.
+    std::fs::write(&path, &bytes).unwrap();
+    f.open_and_close(path_str, len, false).unwrap();
+    f.open_and_close(path_str, len, true).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), len as u64);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+    // Reopen a smaller prefix as a 2-slot slab; size and contents must not be truncated/zeroed.
+    f.open_slab_and_close(path_str, 2, len / 4, true).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), len as u64);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+    // Exercise RAII Drop of NvmeFile (NvmeFdGuard) repeatedly without leaking or clobbering.
+    for _ in 0..32 {
+        f.open_and_drop(path_str, len, false).unwrap();
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
 }

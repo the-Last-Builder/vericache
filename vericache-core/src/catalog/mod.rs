@@ -1,9 +1,10 @@
 use crate::{frame::*, spec::*};
 mod lifecycle;
-use std::collections::HashMap;
 use vstd::prelude::*;
 
 verus! {
+
+pub const DEFAULT_BUCKETS: usize = 4096;
 
 #[derive(Clone, Copy)]
 pub struct CatalogEntry {
@@ -13,67 +14,12 @@ pub struct CatalogEntry {
 
 pub struct Catalog {
     num_tiers: usize,
-    buckets: HashMap<u128, Vec<(ObjectKey, CatalogEntry)>>,
-    collision_indices: HashMap<u128, HashMap<u128, usize>>,
+    num_buckets: usize,
+    buckets: Vec<Vec<(ObjectKey, CatalogEntry)>>,
     _positions: Ghost<Map<ObjectKey, usize>>,
 }
 
 impl ObjectKey {
-    #[verifier::opaque]
-    pub open spec fn bucket(self) -> u128 {
-        ((self.0[1] as u128) << 64) | self.0[0] as u128
-    }
-
-    fn bucket_number(&self) -> (n: u128)
-        ensures
-            n == self.bucket(),
-    {
-        proof {
-            reveal(ObjectKey::bucket);
-        }
-        ((self.0[1] as u128) << 64) | self.0[0] as u128
-    }
-
-    #[verifier::opaque]
-    pub open spec fn upper(self) -> u128 {
-        ((self.0[3] as u128) << 64) | self.0[2] as u128
-    }
-
-    fn upper_half(&self) -> (value: u128)
-        ensures
-            value == self.upper(),
-    {
-        proof {
-            reveal(ObjectKey::upper);
-        }
-        ((self.0[3] as u128) << 64) | self.0[2] as u128
-    }
-
-    proof fn halves_identify(a: Self, b: Self)
-        requires
-            a.bucket() == b.bucket(),
-            a.upper() == b.upper(),
-        ensures
-            a == b,
-    {
-        reveal(ObjectKey::bucket);
-        reveal(ObjectKey::upper);
-        Self::unpack_half(a.0[0], a.0[1]);
-        Self::unpack_half(b.0[0], b.0[1]);
-        Self::unpack_half(a.0[2], a.0[3]);
-        Self::unpack_half(b.0[2], b.0[3]);
-        assert(a.0 =~= b.0);
-    }
-
-    proof fn unpack_half(lo: u64, hi: u64)
-        ensures
-            (((hi as u128) << 64) | lo as u128) as u64 == lo,
-            ((((hi as u128) << 64) | lo as u128) >> 64) as u64 == hi,
-    {
-        assert((((hi as u128) << 64) | lo as u128) as u64 == lo && ((((hi as u128) << 64)
-            | lo as u128) >> 64) as u64 == hi) by (bit_vector);
-    }
-
     fn same_key(&self, other: &Self) -> (b: bool)
         ensures
             b == (*self == *other),
@@ -97,38 +43,49 @@ impl Catalog {
         self.num_tiers
     }
 
+    pub open spec fn bucket_index_spec(key: ObjectKey, num_buckets: usize) -> usize {
+        (((key.0[0] ^ key.0[1]) as usize) % num_buckets) as usize
+    }
+
+    fn bucket_idx(&self, key: &ObjectKey) -> (idx: usize)
+        requires
+            self.num_buckets > 0,
+            self.buckets@.len() == self.num_buckets,
+        ensures
+            idx == Self::bucket_index_spec(*key, self.num_buckets),
+            idx < self.buckets@.len(),
+    {
+        ((key.0[0] ^ key.0[1]) as usize) % self.num_buckets
+    }
+
     pub closed spec fn view(&self) -> Map<ObjectKey, CatalogEntry> {
         Map::new(
             self._positions@.dom(),
-            |k: ObjectKey| self.buckets@[k.bucket()][self._positions@[k] as int].1,
+            |k: ObjectKey|
+                {
+                    let b = Self::bucket_index_spec(k, self.num_buckets) as int;
+                    self.buckets@[b]@[self._positions@[k] as int].1
+                },
         )
     }
 
     pub closed spec fn indexed(&self) -> bool {
         &&& self.num_tiers <= MAX_TIERS
+        &&& self.num_buckets > 0
+        &&& self.buckets@.len() == self.num_buckets
         &&& forall|k: ObjectKey| #[trigger]
             self._positions@.contains_key(k) ==> {
+                let b = Self::bucket_index_spec(k, self.num_buckets) as int;
                 let i = self._positions@[k] as int;
-                &&& self.buckets@.contains_key(k.bucket())
-                &&& i < self.buckets@[k.bucket()].len()
-                &&& self.buckets@[k.bucket()][i].0 == k
+                &&& i < self.buckets@[b]@.len()
+                &&& self.buckets@[b]@[i].0 == k
             }
-        &&& self.collisions_indexed()
-        &&& forall|b: u128, i: int|
-            self.buckets@.contains_key(b) && 0 <= i < self.buckets@[b].len() ==> {
-                let k = (#[trigger] self.buckets@[b][i]).0;
-                &&& k.bucket() == b
+        &&& forall|b: int, i: int|
+            0 <= b < self.num_buckets && 0 <= i < self.buckets@[b]@.len() ==> {
+                let k = (#[trigger] self.buckets@[b]@[i]).0;
+                &&& Self::bucket_index_spec(k, self.num_buckets) == b
                 &&& self._positions@.contains_key(k)
                 &&& self._positions@[k] == i
-            }
-    }
-
-    closed spec fn collisions_indexed(&self) -> bool {
-        forall|k: ObjectKey| #[trigger]
-            self._positions@.contains_key(k) && self.buckets@[k.bucket()].len() > 1 ==> {
-                &&& self.collision_indices@.contains_key(k.bucket())
-                &&& self.collision_indices@[k.bucket()]@.contains_key(k.upper())
-                &&& self.collision_indices@[k.bucket()]@[k.upper()] == self._positions@[k]
             }
     }
 
@@ -172,6 +129,29 @@ impl Catalog {
                 0 <= t < self.num_tiers() && #[trigger] self.slot(k, t).is_some()
     }
 
+    pub fn with_capacity(num_tiers: usize, num_buckets: usize) -> (c: Self)
+        requires
+            num_tiers <= MAX_TIERS,
+            num_buckets > 0,
+        ensures
+            c.indexed(),
+            c.num_tiers() == num_tiers,
+            c.view() == Map::<ObjectKey, CatalogEntry>::empty(),
+    {
+        let mut buckets = Vec::<Vec<(ObjectKey, CatalogEntry)>>::with_capacity(num_buckets);
+        while buckets.len() < num_buckets
+            invariant
+                buckets@.len() <= num_buckets,
+                forall|b: int| 0 <= b < buckets@.len() ==> (#[trigger] buckets@[b])@.len() == 0,
+            decreases num_buckets - buckets@.len(),
+        {
+            buckets.push(Vec::new());
+        }
+        let c = Self { num_tiers, num_buckets, buckets, _positions: Ghost(Map::empty()) };
+        assert(c.view() =~= Map::empty());
+        c
+    }
+
     pub fn new(num_tiers: usize) -> (c: Self)
         requires
             num_tiers <= MAX_TIERS,
@@ -180,14 +160,7 @@ impl Catalog {
             c.num_tiers() == num_tiers,
             c.view() == Map::<ObjectKey, CatalogEntry>::empty(),
     {
-        let c = Self {
-            num_tiers,
-            buckets: HashMap::new(),
-            collision_indices: HashMap::new(),
-            _positions: Ghost(Map::empty()),
-        };
-        assert(c.view() =~= Map::empty());
-        c
+        Self::with_capacity(num_tiers, DEFAULT_BUCKETS)
     }
 
     pub fn add_tier(&mut self)
@@ -203,6 +176,46 @@ impl Catalog {
         assert(self.view() =~= old(self).view());
     }
 
+    fn position_in_bucket(&self, b: usize, key: ObjectKey) -> (r: Option<usize>)
+        requires
+            self.indexed(),
+            b == Self::bucket_index_spec(key, self.num_buckets),
+        ensures
+            r == if self._positions@.contains_key(key) {
+                Some(self._positions@[key])
+            } else {
+                None
+            },
+    {
+        let bucket = &self.buckets[b];
+        let len = bucket.len();
+        let mut idx: usize = 0;
+        while idx < len
+            invariant
+                self.indexed(),
+                b == Self::bucket_index_spec(key, self.num_buckets),
+                b < self.buckets@.len(),
+                bucket@ == self.buckets@[b as int]@,
+                len == bucket@.len(),
+                idx <= len,
+                forall|j: int| 0 <= j < idx ==> (#[trigger] bucket@[j]).0 != key,
+            decreases len - idx,
+        {
+            if bucket[idx].0.same_key(&key) {
+                assert(self.buckets@[b as int]@[idx as int].0 == key);
+                return Some(idx);
+            }
+            idx = idx + 1;
+        }
+        proof {
+            if self._positions@.contains_key(key) {
+                let pos = self._positions@[key] as int;
+                assert(bucket@[pos].0 == key);
+            }
+        }
+        None
+    }
+
     fn position(&self, key: ObjectKey) -> (r: Option<usize>)
         requires
             self.indexed(),
@@ -213,19 +226,8 @@ impl Catalog {
                 None
             },
     {
-        let number = key.bucket_number();
-        let bucket = self.buckets.get(&number)?;
-        let i = if bucket.len() == 1 {
-            0
-        } else {
-            let index = self.collision_indices.get(&number)?;
-            *index.get(&key.upper_half())?
-        };
-        if i < bucket.len() && bucket[i].0.same_key(&key) {
-            Some(i)
-        } else {
-            None
-        }
+        let b = self.bucket_idx(&key);
+        self.position_in_bucket(b, key)
     }
 
     pub fn lookup(&self, key: ObjectKey) -> (r: Option<&CatalogEntry>)
@@ -235,8 +237,9 @@ impl Catalog {
             r.is_some() == self.view().contains_key(key),
             r matches Some(entry) ==> *entry == self.view()[key],
     {
-        let i = self.position(key)?;
-        Some(&self.buckets.get(&key.bucket_number()).unwrap()[i].1)
+        let b = self.bucket_idx(&key);
+        let i = self.position_in_bucket(b, key)?;
+        Some(&self.buckets[b][i].1)
     }
 
     pub fn lookup_tier(&self, key: ObjectKey, tier: TierId) -> (r: Option<(VersionId, FrameId)>)
@@ -301,9 +304,10 @@ impl Catalog {
         None
     }
 
-    fn replace_existing(&mut self, key: ObjectKey, i: usize, value: CatalogEntry)
+    fn replace_existing(&mut self, b: usize, key: ObjectKey, i: usize, value: CatalogEntry)
         requires
             old(self).indexed(),
+            b == Self::bucket_index_spec(key, old(self).num_buckets),
             old(self)._positions@.contains_key(key),
             old(self)._positions@[key] == i,
         ensures
@@ -311,123 +315,117 @@ impl Catalog {
             final(self).num_tiers() == old(self).num_tiers(),
             final(self).view() == old(self).view().insert(key, value),
     {
-        let b = key.bucket_number();
-        let mut bucket = self.buckets.remove(&b).unwrap();
-        let ghost original = bucket@;
-        bucket.set(i, (key, value));
-        self.buckets.insert(b, bucket);
+        let ghost original = self.buckets@[b as int]@;
+        self.buckets[b].set(i, (key, value));
         proof {
+            let ghost updated = self.buckets@[b as int]@;
             assert forall|k: ObjectKey| #[trigger] self._positions@.contains_key(k) implies {
+                let bk = Self::bucket_index_spec(k, self.num_buckets) as int;
                 let idx = self._positions@[k] as int;
-                &&& self.buckets@.contains_key(k.bucket())
-                &&& idx < self.buckets@[k.bucket()].len()
-                &&& self.buckets@[k.bucket()][idx].0 == k
+                &&& idx < self.buckets@[bk]@.len()
+                &&& self.buckets@[bk]@[idx].0 == k
             } by {
-                if k != key && k.bucket() == b {
-                    let idx = old(self)._positions@[k] as int;
+                let bk = Self::bucket_index_spec(k, self.num_buckets) as int;
+                let idx = old(self)._positions@[k] as int;
+                if bk == b as int && k != key {
                     assert(original[idx].0 == k);
+                    assert(original[i as int].0 == key);
+                    assert(idx != i as int);
+                    assert(updated[idx] == original[idx]);
                 }
             }
-            assert(self.collisions_indexed()) by {
-                assert forall|k: ObjectKey| #[trigger]
-                    self._positions@.contains_key(k) && self.buckets@[k.bucket()].len()
-                        > 1 implies {
-                    &&& self.collision_indices@.contains_key(k.bucket())
-                    &&& self.collision_indices@[k.bucket()]@.contains_key(k.upper())
-                    &&& self.collision_indices@[k.bucket()]@[k.upper()] == self._positions@[k]
-                } by {
-                    if k.bucket() == b {
-                        assert(old(self).buckets@[b].len() > 1);
-                    }
+            assert forall|b2: int, j: int|
+                0 <= b2 < self.num_buckets && 0 <= j < self.buckets@[b2]@.len() implies {
+                let k = (#[trigger] self.buckets@[b2]@[j]).0;
+                &&& Self::bucket_index_spec(k, self.num_buckets) == b2
+                &&& self._positions@.contains_key(k)
+                &&& self._positions@[k] == j
+            } by {
+                if b2 == b as int && j != i as int {
+                    assert(updated[j] == original[j]);
+                    assert(old(self).buckets@[b2]@[j].0 == updated[j].0);
                 }
             }
             assert(self.view() =~= old(self).view().insert(key, value)) by {
                 assert forall|k: ObjectKey|
                     k != key && self._positions@.contains_key(k) implies #[trigger] self.view()[k]
                     == old(self).view()[k] by {
-                    if k.bucket() == b {
-                        assert(original[old(self)._positions@[k] as int].0 == k);
+                    if Self::bucket_index_spec(k, self.num_buckets) == b {
+                        let idx = old(self)._positions@[k] as int;
+                        assert(original[idx].0 == k);
+                        assert(original[i as int].0 == key);
+                        assert(idx != i as int);
                     }
                 }
             }
         }
     }
 
-    fn insert_new(&mut self, key: ObjectKey, value: CatalogEntry)
+    fn insert_new(&mut self, b: usize, key: ObjectKey, value: CatalogEntry)
         requires
             old(self).indexed(),
+            b == Self::bucket_index_spec(key, old(self).num_buckets),
             !old(self)._positions@.contains_key(key),
         ensures
             final(self).indexed(),
             final(self).num_tiers() == old(self).num_tiers(),
             final(self).view() == old(self).view().insert(key, value),
     {
-        let b = key.bucket_number();
-        let mut bucket = match self.buckets.remove(&b) {
-            Some(bucket) => bucket,
-            None => Vec::new(),
-        };
-        let ghost original = bucket@;
-        let mut index = self.collision_indices.remove(&b).unwrap_or(HashMap::new());
-        let i = bucket.len();
-        if i == 1 {
-            index.insert(bucket[0].0.upper_half(), 0);
-        }
-        if i > 0 {
-            index.insert(key.upper_half(), i);
-        }
-        bucket.push((key, value));
+        let ghost original = self.buckets@[b as int]@;
+        let i = self.buckets[b].len();
+        self.buckets[b].push((key, value));
         proof {
             self._positions = Ghost(self._positions@.insert(key, i));
-        }
-        if bucket.len() > 1 {
-            self.collision_indices.insert(b, index);
-        }
-        self.buckets.insert(b, bucket);
-        proof {
+            let ghost updated = self.buckets@[b as int]@;
             assert forall|k: ObjectKey| #[trigger] self._positions@.contains_key(k) implies {
+                let bk = Self::bucket_index_spec(k, self.num_buckets) as int;
                 let idx = self._positions@[k] as int;
-                &&& self.buckets@.contains_key(k.bucket())
-                &&& idx < self.buckets@[k.bucket()].len()
-                &&& self.buckets@[k.bucket()][idx].0 == k
+                &&& idx < self.buckets@[bk]@.len()
+                &&& self.buckets@[bk]@[idx].0 == k
             } by {
-                if k != key && k.bucket() == b {
+                if k != key && Self::bucket_index_spec(k, self.num_buckets) == b {
                     let idx = old(self)._positions@[k] as int;
                     assert(original[idx].0 == k);
+                    assert(updated[idx] == original[idx]);
                 }
             }
-            assert(self.collisions_indexed()) by {
-                assert forall|k: ObjectKey| #[trigger]
-                    self._positions@.contains_key(k) && self.buckets@[k.bucket()].len()
-                        > 1 implies {
-                    &&& self.collision_indices@.contains_key(k.bucket())
-                    &&& self.collision_indices@[k.bucket()]@.contains_key(k.upper())
-                    &&& self.collision_indices@[k.bucket()]@[k.upper()] == self._positions@[k]
-                } by {
-                    if k.bucket() == b && k != key {
-                        if k.upper() == key.upper() {
-                            ObjectKey::halves_identify(k, key);
-                        }
-                        let idx = old(self)._positions@[k] as int;
-                        assert(original[idx].0 == k);
-                    }
+            assert forall|b2: int, j: int|
+                0 <= b2 < self.num_buckets && 0 <= j < self.buckets@[b2]@.len() implies {
+                let k = (#[trigger] self.buckets@[b2]@[j]).0;
+                &&& Self::bucket_index_spec(k, self.num_buckets) == b2
+                &&& self._positions@.contains_key(k)
+                &&& self._positions@[k] == j
+            } by {
+                if b2 != b as int {
+                    let k = old(self).buckets@[b2]@[j].0;
+                    assert(Self::bucket_index_spec(k, self.num_buckets) == b2);
+                    assert(k != key);
+                } else if j < i as int {
+                    assert(updated[j] == original[j]);
+                    let k = original[j].0;
+                    assert(old(self).buckets@[b as int]@[j].0 == k);
+                    assert(old(self)._positions@.contains_key(k));
+                    assert(k != key);
                 }
             }
             assert(self.view() =~= old(self).view().insert(key, value)) by {
                 assert forall|k: ObjectKey|
                     k != key && self._positions@.contains_key(k) implies #[trigger] self.view()[k]
                     == old(self).view()[k] by {
-                    if k.bucket() == b {
-                        assert(original[old(self)._positions@[k] as int].0 == k);
+                    if Self::bucket_index_spec(k, self.num_buckets) == b {
+                        let idx = old(self)._positions@[k] as int;
+                        assert(original[idx].0 == k);
+                        assert(updated[idx] == original[idx]);
                     }
                 }
             }
         }
     }
 
-    fn remove_existing(&mut self, key: ObjectKey, i: usize)
+    fn remove_existing(&mut self, b: usize, key: ObjectKey, i: usize)
         requires
             old(self).indexed(),
+            b == Self::bucket_index_spec(key, old(self).num_buckets),
             old(self)._positions@.contains_key(key),
             old(self)._positions@[key] == i,
         ensures
@@ -435,72 +433,79 @@ impl Catalog {
             final(self).num_tiers() == old(self).num_tiers(),
             final(self).view() == old(self).view().remove(key),
     {
-        let b = key.bucket_number();
-        let mut bucket = self.buckets.remove(&b).unwrap();
-        let ghost original = bucket@;
-        let mut index = self.collision_indices.remove(&b).unwrap_or(HashMap::new());
-        let last = bucket.len() - 1;
-        let moved = bucket[last].0;
-        if last > 1 {
-            index.remove(&key.upper_half());
-            if i != last {
-                index.insert(moved.upper_half(), i);
-            }
-        }
-        bucket.swap_remove(i);
+        let ghost original = self.buckets@[b as int]@;
+        let last = self.buckets[b].len() - 1;
+        let moved = self.buckets[b][last].0;
+        let _ = self.buckets[b].swap_remove(i);
         proof {
+            assert(old(self).buckets@[b as int]@[last as int].0 == moved);
+            assert(old(self)._positions@.contains_key(moved));
+            assert(old(self)._positions@[moved] == last);
             if i != last {
+                assert(moved != key);
                 self._positions = Ghost(self._positions@.insert(moved, i));
             }
             self._positions = Ghost(self._positions@.remove(key));
-        }
-        let ghost updated = bucket@;
-        if bucket.len() > 1 {
-            self.collision_indices.insert(b, index);
-        }
-        if !bucket.is_empty() {
-            self.buckets.insert(b, bucket);
-        }
-        proof {
+            let ghost updated = self.buckets@[b as int]@;
             assert forall|k: ObjectKey| #[trigger] self._positions@.contains_key(k) implies {
+                let bk = Self::bucket_index_spec(k, self.num_buckets) as int;
                 let idx = self._positions@[k] as int;
-                &&& self.buckets@.contains_key(k.bucket())
-                &&& idx < self.buckets@[k.bucket()].len()
-                &&& self.buckets@[k.bucket()][idx].0 == k
+                &&& idx < self.buckets@[bk]@.len()
+                &&& self.buckets@[bk]@[idx].0 == k
             } by {
-                if k.bucket() == b {
-                    let idx = old(self)._positions@[k] as int;
-                    assert(original[idx].0 == k);
-                    assert(updated[self._positions@[k] as int].0 == k);
-                }
-            }
-            assert(self.collisions_indexed()) by {
-                assert forall|k: ObjectKey| #[trigger]
-                    self._positions@.contains_key(k) && self.buckets@[k.bucket()].len()
-                        > 1 implies {
-                    &&& self.collision_indices@.contains_key(k.bucket())
-                    &&& self.collision_indices@[k.bucket()]@.contains_key(k.upper())
-                    &&& self.collision_indices@[k.bucket()]@[k.upper()] == self._positions@[k]
-                } by {
-                    if k.bucket() == b {
-                        if k.upper() == key.upper() {
-                            ObjectKey::halves_identify(k, key);
-                        }
+                if Self::bucket_index_spec(k, self.num_buckets) == b {
+                    if i != last && k == moved {
+                        assert(updated[i as int] == original[last as int]);
+                    } else {
                         let idx = old(self)._positions@[k] as int;
                         assert(original[idx].0 == k);
-                        if moved.upper() == k.upper() {
-                            assert(original[last as int].0.bucket() == b);
-                            ObjectKey::halves_identify(k, moved);
-                        }
+                        assert(original[i as int].0 == key);
+                        assert(idx != i as int);
+                        assert(idx < last as int);
+                        assert(updated[idx] == original[idx]);
                     }
+                } else {
+                    assert(Self::bucket_index_spec(moved, self.num_buckets) == b);
+                    assert(k != moved);
+                }
+            }
+            assert forall|b2: int, j: int|
+                0 <= b2 < self.num_buckets && 0 <= j < self.buckets@[b2]@.len() implies {
+                let k = (#[trigger] self.buckets@[b2]@[j]).0;
+                &&& Self::bucket_index_spec(k, self.num_buckets) == b2
+                &&& self._positions@.contains_key(k)
+                &&& self._positions@[k] == j
+            } by {
+                if b2 != b as int {
+                    let k = old(self).buckets@[b2]@[j].0;
+                    assert(Self::bucket_index_spec(k, self.num_buckets) == b2);
+                    assert(Self::bucket_index_spec(moved, self.num_buckets) == b);
+                    assert(k != key && k != moved);
+                } else if i != last && j == i as int {
+                    assert(updated[j] == original[last as int]);
+                } else {
+                    assert(updated[j] == original[j]);
+                    let k = original[j].0;
+                    assert(old(self).buckets@[b as int]@[j].0 == k);
+                    assert(old(self)._positions@.contains_key(k));
+                    assert(k != key && k != moved);
                 }
             }
             assert(self.view() =~= old(self).view().remove(key)) by {
                 assert forall|k: ObjectKey|
                     k != key && self._positions@.contains_key(k) implies #[trigger] self.view()[k]
                     == old(self).view()[k] by {
-                    if k.bucket() == b {
-                        assert(original[old(self)._positions@[k] as int].0 == k);
+                    if Self::bucket_index_spec(k, self.num_buckets) == b {
+                        if i != last && k == moved {
+                            assert(updated[i as int] == original[last as int]);
+                        } else {
+                            let idx = old(self)._positions@[k] as int;
+                            assert(original[idx].0 == k);
+                            assert(updated[idx] == original[idx]);
+                        }
+                    } else {
+                        assert(Self::bucket_index_spec(moved, self.num_buckets) == b);
+                        assert(k != moved);
                     }
                 }
             }
@@ -519,10 +524,11 @@ impl Catalog {
                 None => old(self).view().remove(key),
             },
     {
-        match (self.position(key), entry) {
-            (Some(i), Some(value)) => self.replace_existing(key, i, value),
-            (None, Some(value)) => self.insert_new(key, value),
-            (Some(i), None) => self.remove_existing(key, i),
+        let b = self.bucket_idx(&key);
+        match (self.position_in_bucket(b, key), entry) {
+            (Some(i), Some(value)) => self.replace_existing(b, key, i, value),
+            (None, Some(value)) => self.insert_new(b, key, value),
+            (Some(i), None) => self.remove_existing(b, key, i),
             (None, None) => {
                 assert(self.view() =~= old(self).view().remove(key));
             },
@@ -541,11 +547,21 @@ mod tests {
         let tier_dram = TierId(0);
         let tier_nvme = TierId(1);
         let tier_custom = TierId(12);
+        // All keys map to the same bucket as `0x1234 ^ 0x5678 = 0x444C`:
+        // - identical low halves (differing in [2], [3])
+        // - distinct low halves with identical XOR (`(0x1234 ^ 0xAAAA) ^ (0x5678 ^ 0xAAAA)`)
+        // - distinct XOR colliding modulo `DEFAULT_BUCKETS` (`0x0234 ^ 0x5678 = 0x544C = 0x444C + 4096`)
         let keys = [
             ObjectKey([0x1234, 0x5678, 1, 2]),
             ObjectKey([0x1234, 0x5678, 1, 3]),
             ObjectKey([0x1234, 0x5678, 4, 2]),
+            ObjectKey([0x1234 ^ 0xAAAA, 0x5678 ^ 0xAAAA, 7, 8]),
+            ObjectKey([0x0234, 0x5678, 9, 10]),
         ];
+        let expected_bucket = catalog.bucket_idx(&keys[0]);
+        for key in keys {
+            assert_eq!(catalog.bucket_idx(&key), expected_bucket);
+        }
         for (i, key) in keys.into_iter().enumerate() {
             let mut slots = [None; MAX_TIERS];
             slots[tier_dram.as_index()] = Some(FrameId(i as u32));
@@ -562,10 +578,11 @@ mod tests {
                 }),
             );
         }
+        assert_eq!(catalog.buckets[expected_bucket].len(), keys.len());
         assert!(catalog.lookup(ObjectKey([0x1234, 0x5678, 8, 9])).is_none());
         catalog.set_entry(keys[1], None);
         assert!(catalog.lookup(keys[1]).is_none());
-        for i in [0usize, 2] {
+        for i in [0usize, 2, 3, 4] {
             let version = VersionId {
                 origin_node: 0,
                 seq: i as u64 + 1,
@@ -587,7 +604,87 @@ mod tests {
             );
             catalog.set_entry(keys[i], None);
         }
-        assert!(catalog.buckets.is_empty());
-        assert!(catalog.collision_indices.is_empty());
+        assert_eq!(catalog.buckets.len(), DEFAULT_BUCKETS);
+        assert!(catalog.buckets.iter().all(|b| b.is_empty()));
+    }
+
+    #[test]
+    fn with_capacity_stress_and_empty_after_removal() {
+        for num_buckets in [1usize, 16usize] {
+            let mut catalog = Catalog::with_capacity(4, num_buckets);
+            assert_eq!(catalog.buckets.len(), num_buckets);
+            let count = 200usize;
+            for i in 0..count {
+                let key = ObjectKey([i as u64, (i as u64).wrapping_mul(0x9e37_79b9), 1, 2]);
+                let mut slots = [None; MAX_TIERS];
+                slots[0] = Some(FrameId(i as u32));
+                catalog.set_entry(
+                    key,
+                    Some(CatalogEntry {
+                        version: VersionId {
+                            origin_node: 1,
+                            seq: i as u64 + 1,
+                        },
+                        slots,
+                    }),
+                );
+            }
+            // Overwrite even keys in place and verify updated version/frame.
+            for i in (0..count).step_by(2) {
+                let key = ObjectKey([i as u64, (i as u64).wrapping_mul(0x9e37_79b9), 1, 2]);
+                let mut slots = [None; MAX_TIERS];
+                slots[1] = Some(FrameId(1000 + i as u32));
+                catalog.set_entry(
+                    key,
+                    Some(CatalogEntry {
+                        version: VersionId {
+                            origin_node: 2,
+                            seq: i as u64 + 100,
+                        },
+                        slots,
+                    }),
+                );
+            }
+            for i in 0..count {
+                let key = ObjectKey([i as u64, (i as u64).wrapping_mul(0x9e37_79b9), 1, 2]);
+                if i % 2 == 0 {
+                    assert_eq!(
+                        catalog.lookup_tier(key, TierId(1)),
+                        Some((
+                            VersionId {
+                                origin_node: 2,
+                                seq: i as u64 + 100,
+                            },
+                            FrameId(1000 + i as u32),
+                        ))
+                    );
+                    assert!(catalog.lookup_tier(key, TierId(0)).is_none());
+                } else {
+                    assert_eq!(
+                        catalog.lookup_tier(key, TierId(0)),
+                        Some((
+                            VersionId {
+                                origin_node: 1,
+                                seq: i as u64 + 1,
+                            },
+                            FrameId(i as u32),
+                        ))
+                    );
+                }
+            }
+            // Remove in mixed order (first evens backwards, then odds forwards).
+            for i in (0..count).step_by(2).rev() {
+                let key = ObjectKey([i as u64, (i as u64).wrapping_mul(0x9e37_79b9), 1, 2]);
+                catalog.set_entry(key, None);
+                assert!(catalog.lookup(key).is_none());
+            }
+            for i in (1..count).step_by(2) {
+                let key = ObjectKey([i as u64, (i as u64).wrapping_mul(0x9e37_79b9), 1, 2]);
+                catalog.set_entry(key, None);
+                assert!(catalog.lookup(key).is_none());
+            }
+            assert_eq!(catalog.buckets.len(), num_buckets);
+            assert!(catalog.buckets.iter().all(|b| b.is_empty()));
+        }
     }
 }

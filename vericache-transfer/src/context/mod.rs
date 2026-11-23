@@ -66,6 +66,13 @@ impl TransferInstance {
         self.inner.id()
     }
 
+    pub proof fn duplicate(tracked &self) -> (tracked out: Self)
+        ensures
+            out == *self,
+    {
+        Self { inner: self.inner }
+    }
+
     /// Lend one owned slot out as a single read share (`ShareCap` in `Unbound` state).
     pub proof fn lend_slot(
         tracked &self,
@@ -938,6 +945,15 @@ impl TransferInstance {
         assert(share.map.dom() =~= ISet::empty().insert((loc, id)));
         result
     }
+}
+
+pub fn clone_transfer_instance(Tracked(i): Tracked<&TransferInstance>) -> (out: Tracked<
+    TransferInstance,
+>)
+    ensures
+        out@ == *i,
+{
+    Tracked(i.duplicate())
 }
 
 } // verus!

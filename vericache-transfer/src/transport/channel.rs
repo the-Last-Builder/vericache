@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 
 verus! {
 
@@ -8,14 +9,136 @@ broadcast use {
     vstd::map::group_map_lemmas,
 };
 
+#[derive(Clone, Copy)]
+enum RecvMode {
+    OnlyOp(u8),
+    DataFrame,
+    EndpointOrData,
+}
+
+#[cfg_attr(not(verus_only), allow(dead_code))]
+struct GrantTracker {
+    sent_ghost: Ghost<Map<GrantTag, GrantKind>>,
+    received_ghost: Ghost<Map<GrantTag, GrantKind>>,
+    sent_exec: HashMap<GrantTag, u8>,
+    received_exec: HashMap<GrantTag, u8>,
+}
+
+impl GrantTracker {
+    #[verifier::type_invariant]
+    spec fn valid(&self) -> bool {
+        tag_map_matches(self.sent_exec@, self.sent_ghost@) && tag_map_matches(
+            self.received_exec@,
+            self.received_ghost@,
+        )
+    }
+
+    spec fn sent(self) -> Map<GrantTag, GrantKind> {
+        self.sent_ghost@
+    }
+
+    spec fn received(self) -> Map<GrantTag, GrantKind> {
+        self.received_ghost@
+    }
+
+    fn empty() -> (t: Self)
+        ensures
+            t.sent() == Map::<GrantTag, GrantKind>::empty(),
+            t.received() == Map::<GrantTag, GrantKind>::empty(),
+    {
+        Self {
+            sent_ghost: Ghost(Map::empty()),
+            received_ghost: Ghost(Map::empty()),
+            sent_exec: HashMap::new(),
+            received_exec: HashMap::new(),
+        }
+    }
+
+    fn record_sent_grant(self, tag: GrantTag, op: u8, Ghost(kind): Ghost<GrantKind>) -> (out: Self)
+        requires
+            op == grant_kind_op(kind),
+        ensures
+            out.sent() == self.sent().insert(tag, kind),
+            out.received() == self.received(),
+    {
+        proof {
+            use_type_invariant(&self);
+        }
+        let mut sent_exec = self.sent_exec;
+        sent_exec.insert(tag, op);
+        Self {
+            sent_ghost: Ghost(self.sent_ghost@.insert(tag, kind)),
+            received_ghost: self.received_ghost,
+            sent_exec,
+            received_exec: self.received_exec,
+        }
+    }
+
+    fn remove_sent_grant(self, tag: GrantTag) -> (out: Self)
+        ensures
+            out.sent() == self.sent().remove(tag),
+            out.received() == self.received(),
+    {
+        proof {
+            use_type_invariant(&self);
+        }
+        let mut sent_exec = self.sent_exec;
+        sent_exec.remove(&tag);
+        Self {
+            sent_ghost: Ghost(self.sent_ghost@.remove(tag)),
+            received_ghost: self.received_ghost,
+            sent_exec,
+            received_exec: self.received_exec,
+        }
+    }
+
+    fn record_received_grant(self, tag: GrantTag, op: u8, Ghost(kind): Ghost<GrantKind>) -> (out:
+        Self)
+        requires
+            op == grant_kind_op(kind),
+        ensures
+            out.sent() == self.sent(),
+            out.received() == self.received().insert(tag, kind),
+    {
+        proof {
+            use_type_invariant(&self);
+        }
+        let mut received_exec = self.received_exec;
+        received_exec.insert(tag, op);
+        Self {
+            sent_ghost: self.sent_ghost,
+            received_ghost: Ghost(self.received_ghost@.insert(tag, kind)),
+            sent_exec: self.sent_exec,
+            received_exec,
+        }
+    }
+
+    fn remove_received_grant(self, tag: GrantTag) -> (out: Self)
+        ensures
+            out.sent() == self.sent(),
+            out.received() == self.received().remove(tag),
+    {
+        proof {
+            use_type_invariant(&self);
+        }
+        let mut received_exec = self.received_exec;
+        received_exec.remove(&tag);
+        Self {
+            sent_ghost: self.sent_ghost,
+            received_ghost: Ghost(self.received_ghost@.remove(tag)),
+            sent_exec: self.sent_exec,
+            received_exec,
+        }
+    }
+}
+
 pub struct Channel<T: ByteTransport, M: ChannelAttachment = ()> {
     transport: T,
     local_node: NodeId,
     peer_node: NodeId,
     #[cfg_attr(not(verus_only), allow(dead_code))]
     instance_id: Ghost<InstanceId>,
-    sent_grants: Ghost<Map<GrantTag, GrantKind>>,
-    received_grants: Ghost<Map<GrantTag, GrantKind>>,
+    tags: GrantTracker,
     closed: bool,
     _marker: core::marker::PhantomData<M>,
 }
@@ -34,11 +157,11 @@ impl<T: ByteTransport, M: ChannelAttachment> Channel<T, M> {
     }
 
     pub closed spec fn sent(&self) -> Map<GrantTag, GrantKind> {
-        self.sent_grants@
+        self.tags.sent()
     }
 
     pub closed spec fn received(&self) -> Map<GrantTag, GrantKind> {
-        self.received_grants@
+        self.tags.received()
     }
 
     pub closed spec fn closed(&self) -> bool {
@@ -92,8 +215,7 @@ impl<T: ByteTransport, M: ChannelAttachment> Channel<T, M> {
             local_node,
             peer_node,
             instance_id: Ghost(instance.id()),
-            sent_grants: Ghost(Map::empty()),
-            received_grants: Ghost(Map::empty()),
+            tags: GrantTracker::empty(),
             closed: false,
             _marker: core::marker::PhantomData,
         }
@@ -139,12 +261,16 @@ impl<T: ByteTransport, M: ChannelAttachment> Channel<T, M> {
             self.closed = true;
             return Err((ChannelError::Transport(e), Tracked(None)));
         }
-        proof {
-            if h.grant() {
-                self.sent_grants = Ghost(self.sent().insert(h.tag, a.kind->Some_0));
-            } else if h.op < NOTICE {
-                self.received_grants = Ghost(self.received().remove(h.tag));
-            }
+        if h.op == READ_GRANT || h.op == WRITE_GRANT {
+            let mut tmp = GrantTracker::empty();
+            core::mem::swap(&mut self.tags, &mut tmp);
+            tmp = tmp.record_sent_grant(h.tag, h.op, Ghost(a.kind->Some_0));
+            core::mem::swap(&mut self.tags, &mut tmp);
+        } else if h.op < NOTICE {
+            let mut tmp = GrantTracker::empty();
+            core::mem::swap(&mut self.tags, &mut tmp);
+            tmp = tmp.remove_received_grant(h.tag);
+            core::mem::swap(&mut self.tags, &mut tmp);
         }
         Ok(())
     }
@@ -226,90 +352,96 @@ impl<T: ByteTransport, M: ChannelAttachment> Channel<T, M> {
         }
     }
 
-    fn recv_endpoint(&mut self, Tracked(instance): Tracked<&TransferInstance>) -> (r: Result<
-        QueuePairEndpoint,
-        ChannelError<T::Error>,
-    >)
-        requires
-            old(self).id() == instance.id(),
-        ensures
-            final(self).same_session(*old(self)),
-            r.is_ok() ==> !final(self).closed(),
-            r.is_err() ==> final(self).closed(),
-            final(self).sent() == old(self).sent(),
-            final(self).received() == old(self).received(),
-            r matches Ok(e) ==> e.node() == old(self).peer(),
-    {
-        if self.closed {
-            return Err(ChannelError::Closed);
-        }
-        let (h, user_bytes, Tracked(a)) = match ffi::recv::<T, M>(
-            &mut self.transport,
-            M::magic_exec(),
-            Ghost(self.instance_id@),
-            self.local_node,
-            self.peer_node,
-            self.sent_grants,
-            self.received_grants,
-        ) {
-            Ok(Some(v)) => v,
-            Ok(None) => {
-                self.closed = true;
-                return Err(ChannelError::InvalidFrame);
-            },
-            Err(e) => {
-                self.closed = true;
-                return Err(ChannelError::Transport(e));
-            },
-        };
-        if h.op != ENDPOINT {
-            self.closed = true;
-            return Err(ChannelError::InvalidFrame);
-        }
-        match decode_endpoint(&user_bytes, Ghost(a.endpoint->Some_0)) {
-            Some(peer) => Ok(peer),
-            None => {
-                self.closed = true;
-                Err(ChannelError::InvalidFrame)
-            },
+    pub open spec fn frame_delivery(before: Self, after: Self, frame: ReceivedFrame<M>) -> bool {
+        match frame {
+            ReceivedFrame::ReadGrant(v) => Self::delivery(before, after, 1, v),
+            ReceivedFrame::ReadRelease(v) => Self::delivery(before, after, 2, v),
+            ReceivedFrame::WriteGrant(v) => Self::delivery(before, after, 3, v),
+            ReceivedFrame::WriteRelease(v) => Self::delivery(before, after, 4, v),
+            ReceivedFrame::Notice(v) => Self::delivery(before, after, 5, v),
         }
     }
 
-    fn recv_matching(
+    fn recv_poll_internal(
         &mut self,
-        expected: Option<u8>,
+        blocking: bool,
+        mode: RecvMode,
         Tracked(instance): Tracked<&TransferInstance>,
-    ) -> (r: Result<(u8, Received<M>), ChannelError<T::Error>>)
+    ) -> (r: Result<Option<EndpointOrFrame<M>>, ChannelError<T::Error>>)
         requires
             old(self).id() == instance.id(),
-            expected matches Some(wanted) ==> READ_GRANT <= wanted <= NOTICE,
+            mode matches RecvMode::OnlyOp(wanted) ==> (1 <= wanted <= ENDPOINT),
         ensures
             final(self).same_session(*old(self)),
-            r.is_ok() ==> !final(self).closed(),
+            r matches Ok(None) ==> !blocking && !final(self).closed() && final(self).sent() == old(
+                self,
+            ).sent() && final(self).received() == old(self).received(),
+            r matches Ok(Some(item)) ==> {
+                &&& !final(self).closed()
+                &&& match mode {
+                    RecvMode::OnlyOp(wanted) => match item {
+                        EndpointOrFrame::Endpoint(_) => wanted == ENDPOINT,
+                        EndpointOrFrame::Frame(f) => match f {
+                            ReceivedFrame::ReadGrant(_) => wanted == 1,
+                            ReceivedFrame::ReadRelease(_) => wanted == 2,
+                            ReceivedFrame::WriteGrant(_) => wanted == 3,
+                            ReceivedFrame::WriteRelease(_) => wanted == 4,
+                            ReceivedFrame::Notice(_) => wanted == 5,
+                        },
+                    },
+                    RecvMode::DataFrame => item is Frame,
+                    RecvMode::EndpointOrData => true,
+                }
+                &&& match item {
+                    EndpointOrFrame::Endpoint(e) => e.node() == old(self).peer()
+                        && final(self).sent() == old(self).sent() && final(self).received() == old(
+                        self,
+                    ).received(),
+                    EndpointOrFrame::Frame(frame) => Self::frame_delivery(
+                        *old(self),
+                        *final(self),
+                        frame,
+                    ),
+                }
+            },
             r.is_err() ==> final(self).closed() && final(self).sent() == old(self).sent()
                 && final(self).received() == old(self).received(),
-            r matches Ok((op, v)) ==> {
-                &&& match expected {
-                    Some(wanted) => op == wanted,
-                    None => READ_GRANT <= op <= NOTICE,
-                }
-                &&& Self::delivery(*old(self), *final(self), op, v)
-            },
     {
+        proof {
+            use_type_invariant(&self.tags);
+        }
         if self.closed {
             return Err(ChannelError::Closed);
         }
-        let (h, user_bytes, Tracked(a)) = match ffi::recv::<T, M>(
-            &mut self.transport,
-            M::magic_exec(),
-            Ghost(self.instance_id@),
-            self.local_node,
-            self.peer_node,
-            self.sent_grants,
-            self.received_grants,
-        ) {
-            Ok(Some(v)) => v,
-            Ok(None) => {
+        let poll_res = if blocking {
+            ffi::recv::<T, M>(
+                &mut self.transport,
+                M::magic_exec(),
+                Ghost(self.instance_id@),
+                self.local_node,
+                self.peer_node,
+                &self.tags.sent_exec,
+                &self.tags.received_exec,
+                self.tags.sent_ghost,
+                self.tags.received_ghost,
+            )
+        } else {
+            ffi::try_recv::<T, M>(
+                &mut self.transport,
+                M::magic_exec(),
+                Ghost(self.instance_id@),
+                self.local_node,
+                self.peer_node,
+                &self.tags.sent_exec,
+                &self.tags.received_exec,
+                self.tags.sent_ghost,
+                self.tags.received_ghost,
+            )
+        };
+        let (h, user_bytes, Tracked(a)) = match poll_res {
+            Ok(RecvPoll::Frame(h, user_bytes, t)) => (h, user_bytes, t),
+            Ok(RecvPoll::Empty) => return Ok(None),
+            Ok(RecvPoll::Invalid) => {
                 self.closed = true;
                 return Err(ChannelError::InvalidFrame);
             },
@@ -319,13 +451,23 @@ impl<T: ByteTransport, M: ChannelAttachment> Channel<T, M> {
             },
         };
         let op = h.op;
-        let accepted = match expected {
-            Some(wanted) => op == wanted,
-            None => READ_GRANT <= op && op <= NOTICE,
+        let accepted = match mode {
+            RecvMode::OnlyOp(wanted) => op == wanted,
+            RecvMode::DataFrame => READ_GRANT <= op && op <= NOTICE,
+            RecvMode::EndpointOrData => op == ENDPOINT || (READ_GRANT <= op && op <= NOTICE),
         };
         if !accepted {
             self.closed = true;
             return Err(ChannelError::InvalidFrame);
+        }
+        if op == ENDPOINT {
+            return match decode_endpoint(&user_bytes, Ghost(a.endpoint->Some_0)) {
+                Some(peer) => Ok(Some(EndpointOrFrame::Endpoint(peer))),
+                None => {
+                    self.closed = true;
+                    Err(ChannelError::InvalidFrame)
+                },
+            };
         }
         let capability = if op == READ_GRANT || op == WRITE_GRANT {
             Some(RemoteCapability::from_wire(h.addr, h.len, h.rkey, Ghost(a.cap->Some_0)))
@@ -343,12 +485,16 @@ impl<T: ByteTransport, M: ChannelAttachment> Channel<T, M> {
         );
         let tracked new_statement = Statement { knows, ..s };
         let tracked extra = a.extra.tracked_unwrap();
-        proof {
-            if h.grant() {
-                self.received_grants = Ghost(self.received().insert(h.tag, a.kind->Some_0));
-            } else if op < NOTICE {
-                self.sent_grants = Ghost(self.sent().remove(h.tag));
-            }
+        if op == READ_GRANT || op == WRITE_GRANT {
+            let mut tmp = GrantTracker::empty();
+            core::mem::swap(&mut self.tags, &mut tmp);
+            tmp = tmp.record_received_grant(h.tag, op, Ghost(a.kind->Some_0));
+            core::mem::swap(&mut self.tags, &mut tmp);
+        } else if op < NOTICE {
+            let mut tmp = GrantTracker::empty();
+            core::mem::swap(&mut self.tags, &mut tmp);
+            tmp = tmp.remove_sent_grant(h.tag);
+            core::mem::swap(&mut self.tags, &mut tmp);
         }
         let received = Received {
             endpoint: Ghost(a.endpoint),
@@ -377,7 +523,37 @@ impl<T: ByteTransport, M: ChannelAttachment> Channel<T, M> {
                 orig_s,
             ));
         }
-        Ok((op, received))
+        let frame = match op {
+            READ_GRANT => ReceivedFrame::ReadGrant(received),
+            READ_RELEASE => ReceivedFrame::ReadRelease(received),
+            WRITE_GRANT => ReceivedFrame::WriteGrant(received),
+            WRITE_RELEASE => ReceivedFrame::WriteRelease(received),
+            _ => ReceivedFrame::Notice(received),
+        };
+        Ok(Some(EndpointOrFrame::Frame(frame)))
+    }
+
+    fn recv_endpoint(&mut self, Tracked(instance): Tracked<&TransferInstance>) -> (r: Result<
+        QueuePairEndpoint,
+        ChannelError<T::Error>,
+    >)
+        requires
+            old(self).id() == instance.id(),
+        ensures
+            final(self).same_session(*old(self)),
+            r.is_ok() ==> !final(self).closed(),
+            r.is_err() ==> final(self).closed(),
+            final(self).sent() == old(self).sent(),
+            final(self).received() == old(self).received(),
+            r matches Ok(e) ==> e.node() == old(self).peer(),
+    {
+        match self.recv_poll_internal(true, RecvMode::OnlyOp(ENDPOINT), Tracked(instance))? {
+            Some(EndpointOrFrame::Endpoint(peer)) => Ok(peer),
+            _ => {
+                assert(false);
+                Err(ChannelError::InvalidFrame)
+            },
+        }
     }
 
     fn recv(&mut self, op: u8, Tracked(instance): Tracked<&TransferInstance>) -> (r: Result<
@@ -394,8 +570,19 @@ impl<T: ByteTransport, M: ChannelAttachment> Channel<T, M> {
                 && final(self).received() == old(self).received(),
             r matches Ok(v) ==> Self::delivery(*old(self), *final(self), op, v),
     {
-        let (_, received) = self.recv_matching(Some(op), Tracked(instance))?;
-        Ok(received)
+        match self.recv_poll_internal(true, RecvMode::OnlyOp(op), Tracked(instance))? {
+            Some(EndpointOrFrame::Frame(frame)) => match frame {
+                ReceivedFrame::ReadGrant(v)
+                | ReceivedFrame::ReadRelease(v)
+                | ReceivedFrame::WriteGrant(v)
+                | ReceivedFrame::WriteRelease(v)
+                | ReceivedFrame::Notice(v) => Ok(v),
+            },
+            _ => {
+                assert(false);
+                Err(ChannelError::InvalidFrame)
+            },
+        }
     }
 
     /// Receive the next grant, release, or completion notice on this session.
@@ -410,24 +597,95 @@ impl<T: ByteTransport, M: ChannelAttachment> Channel<T, M> {
             r.is_ok() ==> !final(self).closed(),
             r.is_err() ==> final(self).closed() && final(self).sent() == old(self).sent()
                 && final(self).received() == old(self).received(),
-            r matches Ok(frame) ==> match frame {
-                ReceivedFrame::ReadGrant(v) => Self::delivery(*old(self), *final(self), 1, v),
-                ReceivedFrame::ReadRelease(v) => Self::delivery(*old(self), *final(self), 2, v),
-                ReceivedFrame::WriteGrant(v) => Self::delivery(*old(self), *final(self), 3, v),
-                ReceivedFrame::WriteRelease(v) => Self::delivery(*old(self), *final(self), 4, v),
-                ReceivedFrame::Notice(v) => Self::delivery(*old(self), *final(self), 5, v),
-            },
+            r matches Ok(frame) ==> Self::frame_delivery(*old(self), *final(self), frame),
     {
-        let (op, received) = self.recv_matching(None, Tracked(instance))?;
-        Ok(
-            match op {
-                READ_GRANT => ReceivedFrame::ReadGrant(received),
-                READ_RELEASE => ReceivedFrame::ReadRelease(received),
-                WRITE_GRANT => ReceivedFrame::WriteGrant(received),
-                WRITE_RELEASE => ReceivedFrame::WriteRelease(received),
-                _ => ReceivedFrame::Notice(received),
+        match self.recv_poll_internal(true, RecvMode::DataFrame, Tracked(instance))? {
+            Some(EndpointOrFrame::Frame(frame)) => Ok(frame),
+            _ => {
+                assert(false);
+                Err(ChannelError::InvalidFrame)
             },
-        )
+        }
+    }
+
+    /// Non-blocking variant of `recv_any`. Returns `Ok(None)` without closing
+    /// the channel if the underlying transport has no complete frame ready.
+    pub fn try_recv_any(&mut self, Tracked(instance): Tracked<&TransferInstance>) -> (r: Result<
+        Option<ReceivedFrame<M>>,
+        ChannelError<T::Error>,
+    >)
+        requires
+            old(self).id() == instance.id(),
+        ensures
+            final(self).same_session(*old(self)),
+            r matches Ok(None) ==> !final(self).closed() && final(self).sent() == old(self).sent()
+                && final(self).received() == old(self).received(),
+            r matches Ok(Some(frame)) ==> !final(self).closed() && Self::frame_delivery(
+                *old(self),
+                *final(self),
+                frame,
+            ),
+            r.is_err() ==> final(self).closed() && final(self).sent() == old(self).sent()
+                && final(self).received() == old(self).received(),
+    {
+        match self.recv_poll_internal(false, RecvMode::DataFrame, Tracked(instance))? {
+            Some(EndpointOrFrame::Frame(frame)) => Ok(Some(frame)),
+            None => Ok(None),
+            _ => {
+                assert(false);
+                Err(ChannelError::InvalidFrame)
+            },
+        }
+    }
+
+    /// Receive either a peer QP endpoint advertisement or any grant/release/notice.
+    pub fn recv_endpoint_or_any(&mut self, Tracked(instance): Tracked<&TransferInstance>) -> (r:
+        Result<EndpointOrFrame<M>, ChannelError<T::Error>>)
+        requires
+            old(self).id() == instance.id(),
+        ensures
+            final(self).same_session(*old(self)),
+            r.is_ok() ==> !final(self).closed(),
+            r.is_err() ==> final(self).closed() && final(self).sent() == old(self).sent()
+                && final(self).received() == old(self).received(),
+            r matches Ok(EndpointOrFrame::Endpoint(e)) ==> e.node() == old(self).peer()
+                && final(self).sent() == old(self).sent() && final(self).received() == old(
+                self,
+            ).received(),
+            r matches Ok(EndpointOrFrame::Frame(frame)) ==> Self::frame_delivery(
+                *old(self),
+                *final(self),
+                frame,
+            ),
+    {
+        match self.recv_poll_internal(true, RecvMode::EndpointOrData, Tracked(instance))? {
+            Some(item) => Ok(item),
+            None => {
+                assert(false);
+                Err(ChannelError::InvalidFrame)
+            },
+        }
+    }
+
+    /// Non-blocking variant of `recv_endpoint_or_any`, allowing callers to drain
+    /// interleaved pre-barrier frames while waiting for a reconnect `Endpoint`.
+    pub fn try_recv_endpoint_or_any(&mut self, Tracked(instance): Tracked<&TransferInstance>) -> (r:
+        Result<Option<EndpointOrFrame<M>>, ChannelError<T::Error>>)
+        requires
+            old(self).id() == instance.id(),
+        ensures
+            final(self).same_session(*old(self)),
+            r matches Ok(None) ==> !final(self).closed() && final(self).sent() == old(self).sent()
+                && final(self).received() == old(self).received(),
+            r matches Ok(Some(EndpointOrFrame::Endpoint(e))) ==> !final(self).closed() && e.node()
+                == old(self).peer() && final(self).sent() == old(self).sent()
+                && final(self).received() == old(self).received(),
+            r matches Ok(Some(EndpointOrFrame::Frame(frame))) ==> !final(self).closed()
+                && Self::frame_delivery(*old(self), *final(self), frame),
+            r.is_err() ==> final(self).closed() && final(self).sent() == old(self).sent()
+                && final(self).received() == old(self).received(),
+    {
+        self.recv_poll_internal(false, RecvMode::EndpointOrData, Tracked(instance))
     }
 
     pub open spec fn delivery(before: Self, after: Self, op: u8, v: Received<M>) -> bool {
@@ -564,6 +822,40 @@ impl<T: ByteTransport, M: ChannelAttachment> Channel<T, M> {
         self.recv(NOTICE, Tracked(instance))
     }
 
+    /// Advertise this node's QP endpoint without blocking for the peer's response.
+    pub fn send_endpoint(&mut self, endpoint: &QueuePairEndpoint) -> (r: Result<
+        (),
+        ChannelError<T::Error>,
+    >)
+        requires
+            endpoint.node() == old(self).local(),
+        ensures
+            final(self).same_session(*old(self)),
+            r.is_ok() ==> !final(self).closed(),
+            r.is_err() ==> final(self).closed(),
+            final(self).sent() == old(self).sent(),
+            final(self).received() == old(self).received(),
+    {
+        let h = Header { op: ENDPOINT, tag: 0, addr: 0, len: 0, rkey: 0 };
+        let bytes = encode_endpoint(endpoint);
+        let tracked s = Statement::empty(self.instance_id@);
+        let tracked a = Attachment {
+            endpoint: Some(*endpoint),
+            header: h,
+            user: bytes@,
+            kind: None,
+            cap: None,
+            statement: s,
+            slot: None,
+            share: None,
+            extra: None,
+        };
+        match self.send(h, &bytes, Tracked(a)) {
+            Ok(()) => Ok(()),
+            Err((e, _)) => Err(e),
+        }
+    }
+
     /// Both peers advertise their own QP before receiving the peer's address.
     pub fn exchange_queue_pair_endpoint(
         &mut self,
@@ -581,23 +873,7 @@ impl<T: ByteTransport, M: ChannelAttachment> Channel<T, M> {
             final(self).received() == old(self).received(),
             r matches Ok(e) ==> e.node() == old(self).peer(),
     {
-        let h = Header { op: ENDPOINT, tag: 0, addr: 0, len: 0, rkey: 0 };
-        let bytes = encode_endpoint(endpoint);
-        let tracked s = Statement::empty(instance.id());
-        let tracked a = Attachment {
-            endpoint: Some(*endpoint),
-            header: h,
-            user: bytes@,
-            kind: None,
-            cap: None,
-            statement: s,
-            slot: None,
-            share: None,
-            extra: None,
-        };
-        if let Err((e, _)) = self.send(h, &bytes, Tracked(a)) {
-            return Err(e);
-        }
+        self.send_endpoint(endpoint)?;
         self.recv_endpoint(Tracked(instance))
     }
 
@@ -836,8 +1112,7 @@ impl<T: ByteTransport> Channel<T, ()> {
             local_node,
             peer_node,
             instance_id: Ghost(instance.id()),
-            sent_grants: Ghost(Map::empty()),
-            received_grants: Ghost(Map::empty()),
+            tags: GrantTracker::empty(),
             closed: false,
             _marker: core::marker::PhantomData,
         }

@@ -44,6 +44,7 @@ impl<'a> RdmaBackend<'a> {
 
     /// Atomically record the accepted prefix returned by `rdma::post_send_batch`
     /// into `self.in_flight_ops`, `core.timelines`, and `core.ledger` (M7!).
+    #[verifier::rlimit(80)]
     pub fn record_data_batch(
         &mut self,
         core: &mut CacheCore,
@@ -66,11 +67,21 @@ impl<'a> RdmaBackend<'a> {
             old(self).cq.infos().instance_id() == old(core).instance_id(),
             old(self).window_pool.well_formed(),
             old(self).window_pool.node() == old(core).node(),
+            !(old(self).host_mr is Some && old(self).shared_host_mr is Some),
+            !(old(self).gpu_mr is Some && old(self).shared_gpu_mr is Some),
             old(self).host_mr matches Some(ref s) ==> s.well_formed(
                 old(core),
                 old(self).window_pool.pd(),
             ),
             old(self).gpu_mr matches Some(ref s) ==> s.well_formed(
+                old(core),
+                old(self).window_pool.pd(),
+            ),
+            old(self).shared_host_mr matches Some(s) ==> s.well_formed_shared(
+                old(core),
+                old(self).window_pool.pd(),
+            ),
+            old(self).shared_gpu_mr matches Some(s) ==> s.well_formed_shared(
                 old(core),
                 old(self).window_pool.pd(),
             ),
@@ -80,6 +91,20 @@ impl<'a> RdmaBackend<'a> {
                 &old(self).qp,
                 old(core),
             ),
+            rdma_control_leases_match_cq(
+                old(self).active_leases@,
+                &old(self).window_pool,
+                rdma::CqSnapshot::of(old(self).cq),
+                old(self).next_control_wr_id,
+            ),
+            rdma_pool_slots_owned_by_leases(old(self).active_leases@, &old(self).window_pool),
+            completed_pulls_wf(
+                old(self).completed_pulls,
+                &old(core).timelines,
+                old(self).timeline_id,
+                old(self).cq.observer(),
+                &old(core).ledger@,
+            ),
             old(self).bitmap.well_formed(),
             old(self).bitmap.observations(
                 &old(core).timelines,
@@ -87,7 +112,7 @@ impl<'a> RdmaBackend<'a> {
                 old(core).node(),
                 &old(core).ledger@,
             ),
-            CONTROL_WR_ID_BASE <= old(self).next_control_wr_id,
+            CONTROL_WR_ID_BASE <= old(self).next_control_wr_id <= CONTROL_WR_ID_LIMIT,
             forall|s: u64|
                 old(self).cq.in_flight().contains_key(s) && !((#[trigger] old(
                     self,
@@ -147,7 +172,11 @@ impl<'a> RdmaBackend<'a> {
             final(self).window_pool == old(self).window_pool,
             final(self).host_mr == old(self).host_mr,
             final(self).gpu_mr == old(self).gpu_mr,
+            final(self).shared_host_mr == old(self).shared_host_mr,
+            final(self).shared_gpu_mr == old(self).shared_gpu_mr,
             final(self).active_leases == old(self).active_leases,
+            final(self).next_control_wr_id == old(self).next_control_wr_id,
+            final(self).completed_pulls == old(self).completed_pulls,
             final(core).ledger@.knows == old(core).ledger@.knows,
             final(core).ledger@.succeeded == old(core).ledger@.succeeded,
             final(core).ledger@.revoked == old(core).ledger@.revoked,
@@ -182,6 +211,7 @@ impl<'a> RdmaBackend<'a> {
         let n = posted.len();
         if n == 0 {
             proof {
+                reveal(rdma_leases_valid);
                 lemma_core_wf_facts(core);
                 lemma_core_timelines_wf(core);
                 reveal(rdma_window_wf);
@@ -241,11 +271,13 @@ impl<'a> RdmaBackend<'a> {
                 core.timelines.count == before_core.timelines.count,
                 core.timelines.kinds == before_core.timelines.kinds,
                 core.timelines.confirmed_seq == before_core.timelines.confirmed_seq,
-                core.timelines.overflow_watermark == before_core.timelines.overflow_watermark,
                 core.timelines.next_seq@ == before_core.timelines.next_seq@.update(
                     t as int,
                     (base + tickets.len()) as u64,
                 ),
+                forall|q: u64|
+                    before_core.timelines.issued(t, q) ==> #[trigger] core.timelines.events@[(t, q)]
+                        == before_core.timelines.events@[(t, q)],
                 before_core.ledger@.submitted.map().submap_of(core.ledger@.submitted.map()),
                 core.ledger@.knows == before_core.ledger@.knows,
                 core.ledger@.succeeded == before_core.ledger@.succeeded,
@@ -394,6 +426,7 @@ impl<'a> RdmaBackend<'a> {
             }
         }
         proof {
+            reveal(rdma_leases_valid);
             lemma_core_wf_facts(core);
             lemma_core_timelines_wf(core);
             reveal(rdma_window_wf);
@@ -419,9 +452,20 @@ impl<'a> RdmaBackend<'a> {
                 &before_core,
                 core,
             );
-            lemma_rdma_slabs_same_directory(
+            lemma_completed_pulls_after_step(
+                self.completed_pulls,
+                &before_core.timelines,
+                &core.timelines,
+                t,
+                self.cq.observer(),
+                &before_core.ledger@,
+                &core.ledger@,
+            );
+            lemma_rdma_all_slabs_same_directory(
                 &self.host_mr,
                 &self.gpu_mr,
+                self.shared_host_mr,
+                self.shared_gpu_mr,
                 &before_core,
                 core,
                 self.window_pool.pd(),

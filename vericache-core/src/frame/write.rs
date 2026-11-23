@@ -5,8 +5,9 @@ verus! {
 impl FrameTable {
     pub open spec fn replaced_token(&self, before: Self, f: FrameId) -> bool {
         &&& self.num_tiers == before.num_tiers && self.bindings == before.bindings && self.metas
-            == before.metas && self.versions == before.versions && self.frame_size
-            == before.frame_size
+            == before.metas && self.overflow_seqs == before.overflow_seqs && self.versions
+            == before.versions && self.frame_size == before.frame_size && self.tier_frame_sizes
+            == before.tier_frame_sizes
         &&& self.ready_queue == before.ready_queue && self.draining_queue == before.draining_queue
             && self.draining_cursor == before.draining_cursor
         &&& self.ghosts@.dom() == before.ghosts@.dom()
@@ -182,15 +183,18 @@ impl FrameTable {
             !final(self).meta(f).overflow(),
             final(self).frame(f) == (FrameGhost { token: Some(tok), ..old(self).frame(f) }),
             final(self).bindings == old(self).bindings,
+            final(self).ovf(f) == [0u64;MAX_TIMELINES],
             forall|other: FrameId|
                 other.0 < old(self).metas.len() && other != f ==> #[trigger] final(self).meta(other)
-                    == old(self).meta(other) && final(self).frame(other) == old(self).frame(other),
+                    == old(self).meta(other) && final(self).ovf(other) == old(self).ovf(other)
+                    && final(self).frame(other) == old(self).frame(other),
     {
         let ghost before = *self;
         let m = &mut self.metas[f.0 as usize];
         m.last_write_ticket = writer;
         m.inline_read_tickets = [Ticket::NONE;4];
         m.flags = 0;
+        self.overflow_seqs.set(f.0 as usize, [0;MAX_TIMELINES]);
         assert(0u8 & 1u8 == 0u8 && 0u8 & 2u8 == 0u8) by (bit_vector);
         proof {
             assert(before.valid_frame(f, v));

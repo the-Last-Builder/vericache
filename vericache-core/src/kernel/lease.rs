@@ -361,7 +361,7 @@ impl CacheCore {
         let _lease = self.active_leases[idx].take().unwrap();
         self.free_lease_slots.push(handle.slot);
         self.frames.unpin_local_share(
-            &mut self.timelines,
+            &self.timelines,
             handle.frame,
             Tracked(cap),
             read_ticket,
@@ -604,7 +604,7 @@ impl CacheCore {
     {
         let ghost v_before = self.kernel_view();
         let res = self.frames.unpin_remote_lease(
-            &mut self.timelines,
+            &self.timelines,
             f,
             slot,
             generation,

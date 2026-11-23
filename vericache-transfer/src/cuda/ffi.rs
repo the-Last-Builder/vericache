@@ -57,7 +57,116 @@ const ERROR_INVALID_DEVICE: i32 = 101;
 const ERROR_NOT_READY: i32 = 600;
 const ERROR_PEER_ACCESS_ALREADY_ENABLED: i32 = 704;
 
+fn disarm_cuda_ptr(slot: &mut *mut u8) -> *mut u8 {
+    let raw = *slot;
+    *slot = ptr::null_mut();
+    raw
+}
+
+fn drop_cuda_ptr(slot: &mut *mut u8, destroy: unsafe extern "C" fn(*mut c_void) -> i32) {
+    let raw = disarm_cuda_ptr(slot);
+    if !raw.is_null() {
+        let _ = unsafe { destroy(raw.cast()) };
+    }
+}
+
 verus! {
+
+#[verifier::external_body]
+pub(super) struct RawStreamGuard(*mut u8);
+
+impl RawStreamGuard {
+    #[verifier::external_body]
+    pub(super) fn new(raw: *mut u8) -> Self {
+        Self(raw)
+    }
+
+    #[verifier::external_body]
+    pub(super) fn as_ptr(&self) -> *mut u8 {
+        self.0
+    }
+
+    #[verifier::external_body]
+    pub(super) fn into_raw(mut self) -> *mut u8 {
+        let raw = disarm_cuda_ptr(&mut self.0);
+        std::mem::forget(self);
+        raw
+    }
+}
+
+impl Drop for RawStreamGuard {
+    #[verifier::external_body]
+    fn drop(&mut self)
+        opens_invariants none
+        no_unwind
+    {
+        drop_cuda_ptr(&mut self.0, cudaStreamDestroy);
+    }
+}
+
+#[verifier::external_body]
+pub(super) struct RawEventGuard(*mut u8);
+
+impl RawEventGuard {
+    #[verifier::external_body]
+    pub(super) fn new(raw: *mut u8) -> Self {
+        Self(raw)
+    }
+
+    #[verifier::external_body]
+    pub(super) fn as_ptr(&self) -> *mut u8 {
+        self.0
+    }
+
+    #[verifier::external_body]
+    pub(super) fn into_raw(mut self) -> *mut u8 {
+        let raw = disarm_cuda_ptr(&mut self.0);
+        std::mem::forget(self);
+        raw
+    }
+}
+
+impl Drop for RawEventGuard {
+    #[verifier::external_body]
+    fn drop(&mut self)
+        opens_invariants none
+        no_unwind
+    {
+        drop_cuda_ptr(&mut self.0, cudaEventDestroy);
+    }
+}
+
+#[verifier::external_body]
+pub(super) struct RawHostRegGuard(*mut u8);
+
+impl RawHostRegGuard {
+    #[verifier::external_body]
+    pub(super) fn new(raw: *mut u8) -> Self {
+        Self(raw)
+    }
+
+    #[verifier::external_body]
+    pub(super) fn as_ptr(&self) -> *mut u8 {
+        self.0
+    }
+
+    #[verifier::external_body]
+    pub(super) fn into_raw(mut self) -> *mut u8 {
+        let raw = disarm_cuda_ptr(&mut self.0);
+        std::mem::forget(self);
+        raw
+    }
+}
+
+impl Drop for RawHostRegGuard {
+    #[verifier::external_body]
+    fn drop(&mut self)
+        opens_invariants none
+        no_unwind
+    {
+        drop_cuda_ptr(&mut self.0, cudaHostUnregister);
+    }
+}
 
 fn status(code: i32) -> (r: Result<(), CudaError>)
     ensures
@@ -192,7 +301,7 @@ pub(super) fn raw_alloc_host(len: usize) -> (r: Result<*mut u8, CudaError>)
 
 /// Coverage: pin the existing CPU byte range in place.
 #[verifier::external_body]
-pub(super) fn raw_host_register(buffer: &HostBuffer) -> Result<(), CudaError>
+pub(super) fn raw_host_register(buffer: &HostBuffer) -> Result<RawHostRegGuard, CudaError>
     requires
         buffer.well_formed(),
 {
@@ -200,43 +309,46 @@ pub(super) fn raw_host_register(buffer: &HostBuffer) -> Result<(), CudaError>
     if len == 0 {
         return Err(CudaError::INVALID_VALUE);
     }
-    status(unsafe { cudaHostRegister(ptr.cast(), len, HOST_REGISTER_PORTABLE) })
+    status(unsafe { cudaHostRegister(ptr.cast(), len, HOST_REGISTER_PORTABLE) })?;
+    Ok(RawHostRegGuard::new(ptr))
 }
 
 /// Precedence: non-blocking FIFO, independent of the legacy default stream.
 #[verifier::external_body]
-pub(super) fn raw_stream_create(device: DeviceId) -> Result<*mut u8, CudaError> {
+pub(super) fn raw_stream_create(device: DeviceId) -> Result<RawStreamGuard, CudaError> {
     set_device(device)?;
     let mut stream = ptr::null_mut();
     status(unsafe { cudaStreamCreateWithFlags(&mut stream, STREAM_NON_BLOCKING) })?;
-    Ok(stream.cast())
+    Ok(RawStreamGuard::new(stream.cast()))
 }
 
 #[verifier::external_body]
-pub(super) fn raw_event_create(device: DeviceId) -> Result<*mut u8, CudaError> {
+pub(super) fn raw_event_create(device: DeviceId) -> Result<RawEventGuard, CudaError> {
     set_device(device)?;
     let mut event = ptr::null_mut();
     status(unsafe { cudaEventCreateWithFlags(&mut event, EVENT_DISABLE_TIMING) })?;
-    Ok(event.cast())
+    Ok(RawEventGuard::new(event.cast()))
 }
 
 #[verifier::external_body]
-pub(super) fn raw_stream_destroy(stream: &CudaStream) -> Result<(), CudaError> {
-    set_device(stream.device)?;
-    status(unsafe { cudaStreamDestroy(stream.raw.cast()) })
+pub(super) fn raw_stream_destroy(device: DeviceId, guard: RawStreamGuard) -> Result<(), CudaError> {
+    set_device(device)?;
+    let raw = guard.into_raw();
+    status(unsafe { cudaStreamDestroy(raw.cast()) })
 }
 
 #[verifier::external_body]
-pub(super) fn raw_event_destroy(event: &CudaEvent) -> Result<(), CudaError> {
-    set_device(event.device)?;
-    status(unsafe { cudaEventDestroy(event.raw.cast()) })
+pub(super) fn raw_event_destroy(device: DeviceId, guard: RawEventGuard) -> Result<(), CudaError> {
+    set_device(device)?;
+    let raw = guard.into_raw();
+    status(unsafe { cudaEventDestroy(raw.cast()) })
 }
 
 /// Precedence: capture exactly the work preceding this record.
 #[verifier::external_body]
 pub(super) fn raw_event_record(event: &CudaEvent, stream: &CudaStream) -> Result<(), CudaError> {
     set_device(stream.device)?;
-    status(unsafe { cudaEventRecord(event.raw.cast(), stream.raw.cast()) })
+    status(unsafe { cudaEventRecord(event.raw.as_ptr().cast(), stream.raw.as_ptr().cast()) })
 }
 
 /// Precedence: order future stream work after the recording current at this call.
@@ -246,14 +358,14 @@ pub(super) fn raw_stream_wait_event(stream: &CudaStream, event: &CudaEvent) -> R
     CudaError,
 > {
     set_device(stream.device)?;
-    status(unsafe { cudaStreamWaitEvent(stream.raw.cast(), event.raw.cast(), 0) })
+    status(unsafe { cudaStreamWaitEvent(stream.raw.as_ptr().cast(), event.raw.as_ptr().cast(), 0) })
 }
 
 /// Observation: only success establishes host visibility of the recorded work.
 #[verifier::external_body]
 pub(super) fn raw_event_query(event: &CudaEvent) -> Result<bool, CudaError> {
     set_device(event.device)?;
-    match unsafe { cudaEventQuery(event.raw.cast()) } {
+    match unsafe { cudaEventQuery(event.raw.as_ptr().cast()) } {
         0 => Ok(true),
         ERROR_NOT_READY => Ok(false),
         code => Err(CudaError(code)),
@@ -264,7 +376,7 @@ pub(super) fn raw_event_query(event: &CudaEvent) -> Result<bool, CudaError> {
 #[verifier::external_body]
 pub(super) fn raw_stream_synchronize(stream: &CudaStream) -> Result<(), CudaError> {
     set_device(stream.device)?;
-    status(unsafe { cudaStreamSynchronize(stream.raw.cast()) })
+    status(unsafe { cudaStreamSynchronize(stream.raw.as_ptr().cast()) })
 }
 
 /// Enable the stream GPU to access the remote allocation when the topology
@@ -324,7 +436,7 @@ pub(super) fn raw_memcpy_async(stream: &CudaStream, dst: &CudaSlice, src: &CudaS
                 src.memory.ptr.cast(),
                 src.memory.len,
                 MEMCPY_DEFAULT,
-                stream.raw.cast(),
+                stream.raw.as_ptr().cast(),
             )
         },
     )?;
@@ -408,8 +520,7 @@ pub(super) fn raw_host_unregister(buf: &CudaHostRegistration<'_>) -> (r: Result<
             identity_effect_slab()
         }),
 {
-    let (ptr, _) = buf.buffer.raw_parts();
-    status(unsafe { cudaHostUnregister(ptr.cast()) })?;
+    status(unsafe { cudaHostUnregister(buf.guard.as_ptr().cast()) })?;
     Ok(
         Tracked(
             CompletedAccess {

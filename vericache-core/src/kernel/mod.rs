@@ -92,6 +92,22 @@ impl CacheCore {
         self.ledger@.citations(self.node())
     }
 
+    pub open spec fn tier_frame_size_spec(&self, t: TierId) -> usize {
+        self.frames.tier_frame_size(t)
+    }
+
+    #[verifier::when_used_as_spec(tier_frame_size_spec)]
+    pub fn tier_frame_size(&self, t: TierId) -> (s: usize)
+        requires
+            self.well_formed(),
+            t.valid(self.tiers.len()),
+        ensures
+            s == self.frames.tier_frame_size(t),
+            0 < s <= u64::MAX,
+    {
+        self.frames.tier_size(t)
+    }
+
     pub open spec fn frame_slot(&self, f: FrameId) -> SlotRef {
         self.frames.frame(f).slot
     }
@@ -246,6 +262,7 @@ impl CacheCore {
                 &&& reg.source.id() == reg.instance.id()
                 &&& reg.source.node() == self.node()
                 &&& reg.source.min_seq() <= self.next_version_seq as nat
+                &&& reg.source.max_seq() matches Some(lim) ==> lim >= self.version_seq_limit as nat
                 &&& forall|v: VersionId| #[trigger]
                     reg.bindings.contains_key(v) ==> {
                         &&& reg.bindings[v].instance_id() == reg.instance.id()
@@ -330,6 +347,7 @@ impl CacheCore {
             core.free_lease_slots.len() == max_leases,
             core.spec@.versions == Map::empty(),
             core.spec@.catalog == Map::empty(),
+            !core.has_version_registry(),
     {
         Self::new_with_version_range(
             node_id,
@@ -372,6 +390,7 @@ impl CacheCore {
             core.free_lease_slots.len() == max_leases,
             core.spec@.versions == Map::empty(),
             core.spec@.catalog == Map::empty(),
+            !core.has_version_registry(),
     {
         let num_tiers = tiers.len();
         let timelines = TimelineTable::new();
@@ -433,6 +452,60 @@ impl CacheCore {
         core
     }
 
+    pub fn from_shard_versions(
+        node_id: u16,
+        frame_size: usize,
+        tiers: Vec<TierDescriptor>,
+        max_leases: usize,
+        version_seq_start: u64,
+        version_seq_limit: u64,
+        Tracked(instance): Tracked<&TransferInstance>,
+        Tracked(ver_inst): Tracked<&VersionInstance>,
+        Tracked(ver_src): Tracked<VersionSource>,
+    ) -> (core: Self)
+        requires
+            0 < frame_size,
+            tiers.len() <= MAX_TIERS,
+            forall|i: int| 0 <= i < tiers.len() ==> (#[trigger] tiers[i]).id.0 as usize == i,
+            max_leases <= u32::MAX,
+            1 <= version_seq_start <= version_seq_limit <= MAX_VERSION_SEQ + 1,
+            ver_inst.id() == cluster_version_instance_id(),
+            ver_src.well_formed(),
+            ver_src.id() == ver_inst.id(),
+            ver_src.node() == node_id as NodeId,
+            ver_src.min_seq() <= version_seq_start as nat,
+            ver_src.max_seq() matches Some(lim) ==> lim >= version_seq_limit as nat,
+        ensures
+            core.well_formed(),
+            core.has_version_registry(),
+            core.node_id == node_id,
+            core.instance_id() == instance.id(),
+            core.frames.frame_size == frame_size,
+            core.tiers@ == tiers@,
+            core.frames.metas.len() == 0,
+            core.timelines.count == 0,
+            core.version_seq_start == version_seq_start,
+            core.next_version_seq == version_seq_start,
+            core.version_seq_limit == version_seq_limit,
+            core.active_leases.len() == max_leases,
+            core.free_lease_slots.len() == max_leases,
+            core.spec@.versions == Map::empty(),
+            core.spec@.catalog == Map::empty(),
+    {
+        let mut core = Self::new_with_version_range(
+            node_id,
+            frame_size,
+            tiers,
+            max_leases,
+            version_seq_start,
+            version_seq_limit,
+            Tracked(instance),
+        );
+        let tracked dup_inst = ver_inst.duplicate();
+        core.enable_version_registry(Tracked(dup_inst), Tracked(ver_src));
+        core
+    }
+
     /// Attach an optional cluster-wide write-once version registry to this `CacheCore`.
     pub fn enable_version_registry(
         &mut self,
@@ -447,6 +520,9 @@ impl CacheCore {
             version_source.id() == version_instance.id(),
             version_source.node() == old(self).node(),
             version_source.min_seq() <= old(self).next_version_seq as nat,
+            version_source.max_seq() matches Some(lim) ==> lim >= old(
+                self,
+            ).version_seq_limit as nat,
         ensures
             final(self).well_formed(),
             final(self).has_version_registry(),
@@ -522,6 +598,50 @@ impl CacheCore {
             );
             out = version_binding_duplicate(&binding);
             reg.bindings.tracked_insert(version, binding);
+            self.version_registry = Tracked(Some(reg));
+        }
+        Tracked(out)
+    }
+
+    /// Mint a cluster-wide `VersionBinding` for an in-flight locally originated version
+    /// (`version.seq < self.next_version_seq`) before the frame is published into `self.frames.versions`.
+    pub fn prebind_local_version(&mut self, version: VersionId, Ghost(bytes): Ghost<Seq<u8>>) -> (r:
+        Tracked<VersionBinding>)
+        requires
+            old(self).well_formed(),
+            old(self).has_version_registry(),
+            version.origin_node == old(self).node_id,
+            version.seq as nat >= old(self).version_registry@->Some_0.source.min_seq(),
+            version.seq < old(self).next_version_seq,
+        ensures
+            final(self).well_formed(),
+            final(self).has_version_registry(),
+            forall|v: VersionId|
+                old(self).has_version_binding(v) <==> #[trigger] final(self).has_version_binding(v),
+            r@.instance_id() == cluster_version_instance_id(),
+            r@.key() == (version.origin_node as NodeId, version.seq),
+            r@.value() == bytes,
+            final(self).node_id == old(self).node_id,
+            final(self).tiers == old(self).tiers,
+            final(self).timelines == old(self).timelines,
+            final(self).frames == old(self).frames,
+            final(self).catalog == old(self).catalog,
+            final(self).ledger == old(self).ledger,
+            final(self).version_seq_start == old(self).version_seq_start,
+            final(self).next_version_seq == old(self).next_version_seq,
+            final(self).version_seq_limit == old(self).version_seq_limit,
+            final(self).active_leases == old(self).active_leases,
+            final(self).free_lease_slots == old(self).free_lease_slots,
+            final(self).lease_generation == old(self).lease_generation,
+            final(self).spec == old(self).spec,
+    {
+        let tracked out;
+        proof {
+            let tracked mut reg_opt: Option<VersionRegistry> = None;
+            vstd::modes::tracked_swap(self.version_registry.borrow_mut(), &mut reg_opt);
+            let tracked mut reg = reg_opt.tracked_unwrap();
+            let tracked unused = reg.source.take_seq(version.seq);
+            out = reg.instance.bind((version.origin_node as NodeId, version.seq), bytes, unused);
             self.version_registry = Tracked(Some(reg));
         }
         Tracked(out)
@@ -665,7 +785,6 @@ impl CacheCore {
                     && final(self).timelines.kinds[t as int] == kind
                     && final(self).timelines.next_seq[t as int] == 1
                     && final(self).timelines.confirmed_seq[t as int] == 0
-                    && final(self).timelines.overflow_watermark[t as int] == 0
                     && final(self).kernel_view().extends(old(self).kernel_view()),
             },
     {
@@ -675,8 +794,7 @@ impl CacheCore {
             assert forall|i: int|
                 0 <= i < before.timelines.count implies #[trigger] self.timelines.confirmed_seq[i]
                 >= before.timelines.confirmed_seq[i] && self.timelines.next_seq[i]
-                >= before.timelines.next_seq[i] && self.timelines.overflow_watermark[i]
-                >= before.timelines.overflow_watermark[i] && self.timelines.kinds[i]
+                >= before.timelines.next_seq[i] && self.timelines.kinds[i]
                 == before.timelines.kinds[i] by {
                 assert(self.timelines.kinds[i] == before.timelines.kinds[i]);
             }
@@ -725,8 +843,10 @@ impl CacheCore {
             slots@.len() == num_frames,
             forall|i: usize|
                 i < num_frames ==> tokens.contains_key(i) && (#[trigger] slots@[i as int]).is_full()
-                    && slots@[i as int].slot_len == old(self).frames.frame_size
-                    && slots@[i as int].loc.node == old(self).node() && slot_owned(
+                    && (tier.valid(old(self).tiers.len()) ==> slots@[i as int].slot_len == old(
+                    self,
+                ).frames.tier_frame_size(tier)) && slots@[i as int].loc.node == old(self).node()
+                    && slot_owned(
                     tokens[i],
                     old(self).instance_id(),
                     slots@[i as int].loc,
@@ -743,6 +863,8 @@ impl CacheCore {
             final(self).well_formed(),
             final(self).node_id == old(self).node_id,
             final(self).tiers == old(self).tiers,
+            final(self).frames.frame_size == old(self).frames.frame_size,
+            final(self).frames.tier_frame_sizes == old(self).frames.tier_frame_sizes,
             final(self).timelines == old(self).timelines,
             final(self).catalog == old(self).catalog,
             final(self).ledger == old(self).ledger,
@@ -816,21 +938,23 @@ impl CacheCore {
         Ok(FrameId(first))
     }
 
-    /// Dynamically register a new storage tier and its initial slab of frames.
-    pub fn register_tier(
+    /// Dynamically register a new storage tier with an explicit per-tier frame size and initial slab.
+    pub fn register_tier_with_frame_size(
         &mut self,
         desc: TierDescriptor,
+        tier_frame_size: usize,
         slots: Ghost<Seq<SlotRef>>,
         num_frames: u32,
         Tracked(tokens): Tracked<Map<usize, SlotToken>>,
     ) -> (r: Result<(TierId, FrameId), CoreError>)
         requires
             old(self).well_formed(),
+            0 < tier_frame_size,
             slots@.len() == num_frames,
             forall|i: usize|
                 i < num_frames ==> tokens.contains_key(i) && (#[trigger] slots@[i as int]).is_full()
-                    && slots@[i as int].slot_len == old(self).frames.frame_size
-                    && slots@[i as int].loc.node == old(self).node() && slot_owned(
+                    && slots@[i as int].slot_len == tier_frame_size && slots@[i as int].loc.node
+                    == old(self).node() && slot_owned(
                     tokens[i],
                     old(self).instance_id(),
                     slots@[i as int].loc,
@@ -856,6 +980,7 @@ impl CacheCore {
             final(self).lease_generation == old(self).lease_generation,
             final(self).spec == old(self).spec,
             final(self).version_registry == old(self).version_registry,
+            final(self).frames.frame_size == old(self).frames.frame_size,
             r.is_ok() == (old(self).tiers.len() < MAX_TIERS && num_frames > 0 && old(
                 self,
             ).frames.metas.len() + num_frames <= u32::MAX),
@@ -870,6 +995,9 @@ impl CacheCore {
                         id: tier,
                         ..desc
                     })
+                    &&& final(self).frames.tier_frame_sizes@ == old(
+                        self,
+                    ).frames.tier_frame_sizes@.push(tier_frame_size)
                     &&& first.0 == old(self).frames.metas.len()
                     &&& final(self).frames.metas.len() == old(self).frames.metas.len() + num_frames
                     &&& final(self).frames.ready_queue[tier.index() as int].len() == num_frames
@@ -906,7 +1034,7 @@ impl CacheCore {
             return Err(CoreError::CapacityExhausted);
         }
         let ghost v = self.kernel_view();
-        let tier = self.frames.add_tier(Ghost(v));
+        let tier = self.frames.add_tier_with_size(tier_frame_size, Ghost(v));
         self.catalog.add_tier();
         let mut stored = desc;
         stored.id = tier;
@@ -979,6 +1107,117 @@ impl CacheCore {
         Ok((tier, first))
     }
 
+    /// Dynamically register a new storage tier using the node default `frame_size`.
+    pub fn register_tier(
+        &mut self,
+        desc: TierDescriptor,
+        slots: Ghost<Seq<SlotRef>>,
+        num_frames: u32,
+        Tracked(tokens): Tracked<Map<usize, SlotToken>>,
+    ) -> (r: Result<(TierId, FrameId), CoreError>)
+        requires
+            old(self).well_formed(),
+            slots@.len() == num_frames,
+            forall|i: usize|
+                i < num_frames ==> tokens.contains_key(i) && (#[trigger] slots@[i as int]).is_full()
+                    && slots@[i as int].slot_len == old(self).frames.frame_size
+                    && slots@[i as int].loc.node == old(self).node() && slot_owned(
+                    tokens[i],
+                    old(self).instance_id(),
+                    slots@[i as int].loc,
+                    untouched(),
+                ),
+            forall|i: int, j: int|
+                0 <= i < j < num_frames ==> (#[trigger] slots@[i]).loc != (
+                #[trigger] slots@[j]).loc,
+            forall|i: nat, j: int|
+                i < old(self).frames.metas.len() && 0 <= j < num_frames ==> (#[trigger] old(
+                    self,
+                ).frames.ghosts@[i].slot).loc != (#[trigger] slots@[j]).loc,
+        ensures
+            final(self).well_formed(),
+            final(self).node_id == old(self).node_id,
+            final(self).timelines == old(self).timelines,
+            final(self).ledger == old(self).ledger,
+            final(self).version_seq_start == old(self).version_seq_start,
+            final(self).next_version_seq == old(self).next_version_seq,
+            final(self).version_seq_limit == old(self).version_seq_limit,
+            final(self).active_leases == old(self).active_leases,
+            final(self).free_lease_slots == old(self).free_lease_slots,
+            final(self).lease_generation == old(self).lease_generation,
+            final(self).spec == old(self).spec,
+            final(self).version_registry == old(self).version_registry,
+            final(self).frames.frame_size == old(self).frames.frame_size,
+            r.is_ok() == (old(self).tiers.len() < MAX_TIERS && num_frames > 0 && old(
+                self,
+            ).frames.metas.len() + num_frames <= u32::MAX),
+            match r {
+                Err(_) => *final(self) == *old(self),
+                Ok((tier, first)) => {
+                    &&& old(self).tiers.len() < MAX_TIERS
+                    &&& num_frames > 0
+                    &&& tier == TierId(old(self).tiers.len() as u16)
+                    &&& final(self).tiers.len() == old(self).tiers.len() + 1
+                    &&& final(self).tiers[tier.index() as int] == (TierDescriptor {
+                        id: tier,
+                        ..desc
+                    })
+                    &&& final(self).frames.tier_frame_sizes@ == old(
+                        self,
+                    ).frames.tier_frame_sizes@.push(old(self).frames.frame_size)
+                    &&& first.0 == old(self).frames.metas.len()
+                    &&& final(self).frames.metas.len() == old(self).frames.metas.len() + num_frames
+                    &&& final(self).frames.ready_queue[tier.index() as int].len() == num_frames
+                    &&& forall|j: nat|
+                        j < old(self).frames.metas.len()
+                            ==> #[trigger] final(self).frames.ghosts@[j] == old(
+                            self,
+                        ).frames.ghosts@[j] && final(self).frames.metas[j as int] == old(
+                            self,
+                        ).frames.metas[j as int]
+                    &&& forall|j: int|
+                        0 <= j < num_frames ==> {
+                            (#[trigger] final(self).frames.frame(
+                                FrameId((first.0 + j) as u32),
+                            )).tier == tier && final(self).frames.frame(
+                                FrameId((first.0 + j) as u32),
+                            ).slot == slots@[j] && final(self).frames.meta(
+                                FrameId((first.0 + j) as u32),
+                            ).state == STATE_EMPTY && final(self).frames.meta(
+                                FrameId((first.0 + j) as u32),
+                            ).queued()
+                        }
+                },
+            },
+    {
+        let r = self.register_tier_with_frame_size(
+            desc,
+            self.frames.frame_size,
+            slots,
+            num_frames,
+            Tracked(tokens),
+        );
+        proof {
+            if let Ok((tier, first)) = r {
+                assert(self.frames.tier_frame_sizes@ =~= old(self).frames.tier_frame_sizes@.push(
+                    old(self).frames.frame_size,
+                ));
+                assert forall|j: nat| j < old(self).frames.metas.len() implies {
+                    &&& (#[trigger] self.frames.ghosts@[j]) == old(self).frames.ghosts@[j]
+                    &&& self.frames.metas[j as int] == old(self).frames.metas[j as int]
+                } by {};
+                assert forall|j: int| 0 <= j < num_frames implies (#[trigger] self.frames.frame(
+                    FrameId((first.0 + j) as u32),
+                )).tier == tier && self.frames.frame(FrameId((first.0 + j) as u32)).slot
+                    == slots@[j] && self.frames.meta(FrameId((first.0 + j) as u32)).state
+                    == STATE_EMPTY && self.frames.meta(
+                    FrameId((first.0 + j) as u32),
+                ).queued() by {};
+            }
+        }
+        r
+    }
+
     proof fn preserve_after_slab_append(
         &self,
         before: Self,
@@ -1011,6 +1250,7 @@ impl CacheCore {
             ),
             self.frames.num_tiers == before.frames.num_tiers,
             self.frames.frame_size == before.frames.frame_size,
+            self.frames.tier_frame_sizes == before.frames.tier_frame_sizes,
             self.frames.versions == before.frames.versions,
             self.frames.metas.len() == before.frames.metas.len() + num_frames,
             forall|j: nat|

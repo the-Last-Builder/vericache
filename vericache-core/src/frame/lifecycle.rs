@@ -110,6 +110,16 @@ impl FrameTable {
         ) by {
             assert(old(self).tier_queues(u, &v.timelines));
         }
+        proof {
+            self.prove_valid_frames_unchanged(
+                *old(self),
+                None,
+                v.id(),
+                v.node,
+                &v.timelines,
+                &v.ledger,
+            );
+        }
         f
     }
 
@@ -139,7 +149,9 @@ impl FrameTable {
         let last = self.metas[f.0 as usize].last_write_ticket;
         let mut m = FrameSyncMeta::empty();
         m.last_write_ticket = last;
+        let ovf = [0u64;MAX_TIMELINES];
         self.metas.set(f.0 as usize, m);
+        self.overflow_seqs.set(f.0 as usize, ovf);
         self.ready_queue[t].push(f);
         proof {
             let tracked g = self.ghosts.borrow_mut().tracked_borrow_mut(f.0 as nat);
@@ -158,7 +170,7 @@ impl FrameTable {
                 v.ledger.citations(v.node).union(ISet::empty()),
             ));
         }
-        assert(self.frame(f).covered(m, &v.timelines, v.node, &v.ledger));
+        assert(self.frame(f).covered(m, ovf, &v.timelines, v.node, &v.ledger));
         assert(self.valid_frame(f, v));
         assert forall|u: int| 0 <= u < self.num_tiers implies #[trigger] self.tier_queues(
             u,
@@ -190,6 +202,16 @@ impl FrameTable {
         ) by {
             assert(old(self).tier_queues(u, &v.timelines));
         }
+        proof {
+            self.prove_valid_frames_unchanged(
+                *old(self),
+                None,
+                v.id(),
+                v.node,
+                &v.timelines,
+                &v.ledger,
+            );
+        }
     }
 
     pub fn alloc_ready_frame(&mut self, tier: TierId, Ghost(v): Ghost<KernelView>) -> (r: Option<
@@ -211,8 +233,10 @@ impl FrameTable {
             r matches Some(f) ==> f.0 < final(self).metas.len() && f == old(
                 self,
             ).ready_queue[tier.index() as int]@.last() && final(self).meta(f).state == STATE_EMPTY
-                && !final(self).meta(f).queued() && final(self).meta(f).reusable(&v.timelines)
-                && final(self).frame(f).tier == tier,
+                && !final(self).meta(f).queued() && final(self).meta(f).reusable(
+                final(self).ovf(f),
+                &v.timelines,
+            ) && final(self).frame(f).tier == tier,
     {
         let t = tier.as_index();
         assert(self.tier_queues(t as int, &v.timelines));
@@ -271,8 +295,8 @@ impl FrameTable {
             final(self).meta(f).inline_read_tickets == old(self).meta(f).inline_read_tickets,
             f.0 < old(self).metas.len() && old(self).meta(f).state == STATE_EMPTY && !old(
                 self,
-            ).meta(f).queued() && old(self).meta(f).reusable(table) && version != VersionId::NONE
-                ==> r.is_ok(),
+            ).meta(f).queued() && old(self).meta(f).reusable(old(self).ovf(f), table) && version
+                != VersionId::NONE ==> r.is_ok(),
             final(self).consistent(v),
             r.is_err() ==> *final(self) == *old(self),
             r.is_ok() ==> final(self).meta(f).state == STATE_INITIALIZING && final(self).frame(
@@ -382,11 +406,12 @@ impl FrameTable {
             cert.writer == v.timelines.events@[(writer.timeline_id(), writer.sequence())],
             old(self).frame(f).tier.valid(old(self).num_tiers),
             cert.slot.loc.node == v.node,
-            cert.slot.slot_len == old(self).frame_size,
+            cert.slot.slot_len == old(self).tier_frame_size(old(self).frame(f).tier),
             cert.slot.is_full(),
         ensures
             final(self).num_tiers == old(self).num_tiers,
             final(self).frame_size == old(self).frame_size,
+            final(self).tier_frame_sizes == old(self).tier_frame_sizes,
             final(self).versions@ == old(self).versions@.insert(
                 old(self).frame(f).bound_version.unwrap(),
                 cert.bytes,
@@ -401,7 +426,9 @@ impl FrameTable {
             forall|g: FrameId|
                 g != f && g.0 < old(self).metas.len() ==> #[trigger] final(self).meta(g) == old(
                     self,
-                ).meta(g) && final(self).frame(g) == old(self).frame(g),
+                ).meta(g) && final(self).ovf(g) == old(self).ovf(g) && final(self).frame(g) == old(
+                    self,
+                ).frame(g),
             old(self).versions@.submap_of(final(self).versions@),
             final(self).versions@[final(self).frame(f).bound_version->Some_0] == cert.bytes,
             final(self).meta(f).state == STATE_PUBLISHED,
@@ -418,6 +445,7 @@ impl FrameTable {
         m.last_write_ticket = writer;
         m.inline_read_tickets = [Ticket::NONE;4];
         m.flags = 0;
+        self.overflow_seqs.set(f.0 as usize, [0;MAX_TIMELINES]);
         proof {
             self.ghosts.borrow_mut().tracked_borrow_mut(f.0 as nat).cert = Some(cert);
             assert(self.ghosts@.dom() =~= old(self).ghosts@.dom());
@@ -455,6 +483,7 @@ impl FrameTable {
         ensures
             final(self).num_tiers == old(self).num_tiers,
             final(self).frame_size == old(self).frame_size,
+            final(self).tier_frame_sizes == old(self).tier_frame_sizes,
             final(self).versions@ == old(self).versions@.insert(
                 old(self).frame(f).bound_version.unwrap(),
                 cert.bytes,
@@ -473,7 +502,9 @@ impl FrameTable {
             forall|g: FrameId|
                 g != f && g.0 < old(self).metas.len() ==> #[trigger] final(self).meta(g) == old(
                     self,
-                ).meta(g) && final(self).frame(g) == old(self).frame(g),
+                ).meta(g) && final(self).ovf(g) == old(self).ovf(g) && final(self).frame(g) == old(
+                    self,
+                ).frame(g),
             old(self).versions@.submap_of(final(self).versions@),
             final(self).versions@[final(self).frame(f).bound_version->Some_0] == cert.bytes,
             final(self).meta(f).state == STATE_PUBLISHED,
@@ -492,9 +523,28 @@ impl FrameTable {
             assert(self.values_agree());
             assert(self.separated());
             self.queues_unchanged_off_frame(*old(self), f, v);
+            self.prove_valid_frames_unchanged(
+                *old(self),
+                Some(f.0 as nat),
+                v.id(),
+                v.node,
+                &v.timelines,
+                &v.ledger,
+            );
             assert(self.except_frame(f, v));
         }
+        let ghost mid = *self;
         self.publish_frame(f, writer, Ghost(cert), Ghost(v));
+        proof {
+            assert forall|g: FrameId|
+                g != f && g.0 < old(self).metas.len() implies #[trigger] self.meta(g) == old(
+                self,
+            ).meta(g) && self.ovf(g) == old(self).ovf(g) && self.frame(g) == old(self).frame(g) by {
+                assert(mid.meta(g) == old(self).meta(g));
+                assert(mid.ovf(g) == old(self).ovf(g));
+                assert(mid.frame(g) == old(self).frame(g));
+            }
+        }
     }
 
     pub fn evict_frame(&mut self, f: FrameId, tier: TierId, Ghost(v): Ghost<KernelView>) -> (r:
@@ -507,6 +557,8 @@ impl FrameTable {
             final(self).num_tiers == old(self).num_tiers,
             final(self).versions == old(self).versions,
             final(self).frame_size == old(self).frame_size,
+            final(self).tier_frame_sizes == old(self).tier_frame_sizes,
+            final(self).overflow_seqs == old(self).overflow_seqs,
             final(self).metas.len() == old(self).metas.len(),
             final(self).consistent(v),
             final(self).bindings == old(self).bindings,
@@ -580,13 +632,20 @@ impl FrameTable {
                 return Err(CoreError::WouldConflict);
             }
         }
-        if m.flags & FLAG_READ_OVERFLOW != 0 && !table.overflow_all_retired() {
+        if m.flags & FLAG_READ_OVERFLOW != 0 && !self.frame_overflow_retired(table, f) {
             return Err(CoreError::WouldConflict);
         }
         let t = tier.as_index();
         proof {
             assert(m.ticket(4) == m.last_write_ticket);
-            self.frame(f).prove_frontier_ordered(*m, table, v.node, &v.ledger, ISet::empty());
+            self.frame(f).prove_frontier_ordered(
+                *m,
+                self.ovf(f),
+                table,
+                v.node,
+                &v.ledger,
+                ISet::empty(),
+            );
             assert(self.tier_queues(t as int, table));
         }
         self.return_to_ready(f, t, Ghost(v));

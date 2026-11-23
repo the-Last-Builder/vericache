@@ -84,10 +84,19 @@ impl FrameSyncMeta {
         forall|i: int| 0 <= i < 5 ==> table.valid_ticket(#[trigger] self.ticket(i))
     }
 
-    pub open spec fn reusable(self, table: &TimelineTable) -> bool {
+    pub open spec fn ovf_bounded(ovf: [u64; MAX_TIMELINES], table: &TimelineTable) -> bool {
+        &&& forall|t: int| 0 <= t < table.count ==> #[trigger] ovf[t] < table.next_seq[t]
+        &&& forall|t: int| table.count <= t < MAX_TIMELINES ==> #[trigger] ovf[t] == 0
+    }
+
+    pub open spec fn overflow_retired(ovf: [u64; MAX_TIMELINES], table: &TimelineTable) -> bool {
+        forall|i: int| 0 <= i < table.count ==> ovf[i] <= #[trigger] table.confirmed_seq[i]
+    }
+
+    pub open spec fn reusable(self, ovf: [u64; MAX_TIMELINES], table: &TimelineTable) -> bool {
         &&& self.available() && table.retired(self.last_write_ticket)
         &&& if self.overflow() {
-            table.overflow_retired()
+            Self::overflow_retired(ovf, table)
         } else {
             forall|i: int| 0 <= i < 4 ==> table.retired(#[trigger] self.inline_read_tickets[i])
         }
@@ -95,6 +104,7 @@ impl FrameSyncMeta {
 
     pub open spec fn accounts(
         self,
+        ovf: [u64; MAX_TIMELINES],
         table: &TimelineTable,
         node: NodeId,
         ledger: &KnowledgeLedger,
@@ -102,25 +112,25 @@ impl FrameSyncMeta {
     ) -> bool {
         ledger.citations(node).contains(r) || exists|t: u8, s: u64|
             table.issued(t, s) && #[trigger] table.events@[(t, s)] == r && self.bounds_reader(
-                table,
+                ovf,
                 t,
                 s,
             )
     }
 
-    pub open spec fn bounds_reader(self, table: &TimelineTable, t: u8, s: u64) -> bool {
-        Self::read_bounds(self.overflow(), self.inline_read_tickets, table, t, s)
+    pub open spec fn bounds_reader(self, ovf: [u64; MAX_TIMELINES], t: u8, s: u64) -> bool {
+        Self::read_bounds(self.overflow(), ovf, self.inline_read_tickets, t, s)
     }
 
     pub open spec fn read_bounds(
         overflow: bool,
+        ovf: [u64; MAX_TIMELINES],
         slots: [Ticket; 4],
-        table: &TimelineTable,
         t: u8,
         s: u64,
     ) -> bool {
         if overflow {
-            s <= table.overflow_watermark[t as int]
+            s <= ovf[t as int]
         } else {
             exists|i: int|
                 0 <= i < 4 && {
@@ -204,16 +214,47 @@ impl FrameSyncMeta {
         candidate
     }
 
-    pub(super) fn note_read(&mut self, table: &mut TimelineTable, k: Ticket)
+    fn record_ovf(ovf: &mut [u64; MAX_TIMELINES], table: &TimelineTable, k: Ticket)
         requires
-            old(table).bounds(),
-            old(self).valid_tickets(old(table)),
-            old(table).valid_ticket(k),
+            table.bounds(),
+            table.valid_ticket(k),
+            Self::ovf_bounded(*old(ovf), table),
+        ensures
+            Self::ovf_bounded(*final(ovf), table),
+            forall|i: int|
+                0 <= i < MAX_TIMELINES ==> #[trigger] final(ovf)[i] == if k != Ticket::NONE && i
+                    == k.timeline_id() {
+                    vstd::math::max(old(ovf)[i] as int, k.sequence() as int)
+                } else {
+                    old(ovf)[i] as int
+                },
+    {
+        if !k.is_none() {
+            let i = k.timeline() as usize;
+            let s = k.seq();
+            if ovf[i] < s {
+                ovf[i] = s;
+            }
+        }
+    }
+
+    pub(super) fn note_read(
+        &mut self,
+        ovf: &mut [u64; MAX_TIMELINES],
+        table: &TimelineTable,
+        k: Ticket,
+    )
+        requires
+            table.bounds(),
+            Self::ovf_bounded(*old(ovf), table),
+            old(self).valid_tickets(table),
+            table.valid_ticket(k),
             k != Ticket::NONE,
         ensures
-            final(table).only_watermarks(old(table)),
-            final(self).valid_tickets(final(table)),
-            final(self).bounds_reader(final(table), k.timeline_id(), k.sequence()),
+            Self::ovf_bounded(*final(ovf), table),
+            final(self).valid_tickets(table),
+            final(self).bounds_reader(*final(ovf), k.timeline_id(), k.sequence()),
+            !old(self).overflow() && !final(self).overflow() ==> *final(ovf) == *old(ovf),
             final(self).state == old(self).state,
             final(self).last_write_ticket == old(self).last_write_ticket,
             final(self).queued() == old(self).queued(),
@@ -223,12 +264,12 @@ impl FrameSyncMeta {
             final(self).mw_gen == old(self).mw_gen,
             final(self).version_packed == old(self).version_packed,
             forall|t: u8, s: u64|
-                old(table).issued(t, s) && old(self).bounds_reader(old(table), t, s)
-                    ==> #[trigger] final(self).bounds_reader(final(table), t, s) || s
-                    <= final(table).confirmed_seq[t as int],
+                table.issued(t, s) && old(self).bounds_reader(*old(ovf), t, s)
+                    ==> #[trigger] final(self).bounds_reader(*final(ovf), t, s) || s
+                    <= table.confirmed_seq[t as int],
     {
         if self.flags & FLAG_READ_OVERFLOW != 0 {
-            table.record_overflow(k);
+            Self::record_ovf(ovf, table, k);
             return;
         }
         let index = self.read_slot(table, k.timeline());
@@ -237,15 +278,15 @@ impl FrameSyncMeta {
             if prev.is_none() || prev.timeline() != k.timeline() || prev.seq() < k.seq() {
                 self.inline_read_tickets[index] = k;
             }
-            assert(self.bounds_reader(table, k.timeline_id(), k.sequence())) by {
+            assert(self.bounds_reader(*ovf, k.timeline_id(), k.sequence())) by {
                 assert(self.inline_read_tickets[index as int].sequence() >= k.sequence());
             }
             assert forall|t: u8, s: u64|
-                old(table).issued(t, s) && old(self).bounds_reader(
-                    old(table),
+                table.issued(t, s) && old(self).bounds_reader(
+                    *old(ovf),
                     t,
                     s,
-                ) implies #[trigger] self.bounds_reader(table, t, s) || s
+                ) implies #[trigger] self.bounds_reader(*ovf, t, s) || s
                 <= table.confirmed_seq[t as int] by {
                 let i = choose|i: int|
                     0 <= i < 4 && {
@@ -266,49 +307,49 @@ impl FrameSyncMeta {
         }
         for i in 0..4
             invariant
-                table.only_watermarks(old(table)),
+                table.bounds(),
+                Self::ovf_bounded(*ovf, table),
+                self.valid_tickets(table),
+                forall|t: int| 0 <= t < MAX_TIMELINES ==> #[trigger] ovf[t] >= old(ovf)[t],
                 forall|j: int|
                     0 <= j < i ==> {
                         let p = #[trigger] self.inline_read_tickets[j];
-                        p == Ticket::NONE || p.sequence()
-                            <= table.overflow_watermark[p.timeline_id() as int]
+                        p == Ticket::NONE || p.sequence() <= ovf[p.timeline_id() as int]
                     },
         {
             let p = self.dependency(i);
-            let ghost before = *table;
-            table.record_overflow(p);
+            let ghost before_ovf = *ovf;
+            Self::record_ovf(ovf, table, p);
             assert forall|j: int| 0 <= j <= i implies {
                 let q = #[trigger] self.inline_read_tickets[j];
-                q == Ticket::NONE || q.sequence()
-                    <= table.overflow_watermark[q.timeline_id() as int]
+                q == Ticket::NONE || q.sequence() <= ovf[q.timeline_id() as int]
             } by {
                 let q = self.ticket(j);
-                assert(old(table).valid_ticket(q));
+                assert(table.valid_ticket(q));
                 if j < i && q != Ticket::NONE {
-                    assert(q.sequence() <= before.overflow_watermark[q.timeline_id() as int]);
+                    assert(q.sequence() <= before_ovf[q.timeline_id() as int]);
                 }
             }
         }
-        table.record_overflow(k);
+        Self::record_ovf(ovf, table, k);
         let flags = self.flags;
         self.flags = flags | FLAG_READ_OVERFLOW;
         self.inline_read_tickets = [Ticket::NONE;4];
-        assert(old(table).valid_ticket(old(self).ticket(4)));
+        assert(table.valid_ticket(old(self).ticket(4)));
         assert(((flags | 1u8) & 1u8) != 0u8 && ((flags | 1u8) & 2u8) == (flags & 2u8))
             by (bit_vector);
         assert forall|t: u8, s: u64|
-            old(table).issued(t, s) && old(self).bounds_reader(
-                old(table),
+            table.issued(t, s) && old(self).bounds_reader(
+                *old(ovf),
                 t,
                 s,
-            ) implies #[trigger] self.bounds_reader(table, t, s) by {
+            ) implies #[trigger] self.bounds_reader(*ovf, t, s) by {
             let i = choose|i: int|
                 0 <= i < 4 && {
                     let p = #[trigger] old(self).inline_read_tickets[i];
                     p != Ticket::NONE && p.timeline_id() == t && s <= p.sequence()
                 };
-            assert(old(self).inline_read_tickets[i].sequence()
-                <= table.overflow_watermark[t as int]);
+            assert(old(self).inline_read_tickets[i].sequence() <= ovf[t as int]);
         }
     }
 }
@@ -414,11 +455,13 @@ impl FrameGhost {
     pub open spec fn covered(
         self,
         m: FrameSyncMeta,
+        ovf: [u64; MAX_TIMELINES],
         table: &TimelineTable,
         node: NodeId,
         ledger: &KnowledgeLedger,
     ) -> bool {
         &&& m.valid_tickets(table)
+        &&& FrameSyncMeta::ovf_bounded(ovf, table)
         &&& self.token is Some ==> {
             let f = self.frontier();
             &&& f.last_writer matches Some(w) ==> ledger.citations(node).contains(w) || (
@@ -426,13 +469,15 @@ impl FrameGhost {
                 m.last_write_ticket.timeline_id(),
                 m.last_write_ticket.sequence(),
             )]) || (self.cert.is_none() && table.ticket_covers(m.last_write_ticket, w))
-            &&& forall|r| #[trigger] f.readers.contains(r) ==> m.accounts(table, node, ledger, r)
+            &&& forall|r| #[trigger]
+                f.readers.contains(r) ==> m.accounts(ovf, table, node, ledger, r)
         }
     }
 
     pub open spec fn valid(
         self,
         m: FrameSyncMeta,
+        ovf: [u64; MAX_TIMELINES],
         num_tiers: usize,
         size: usize,
         id: InstanceId,
@@ -442,7 +487,13 @@ impl FrameGhost {
     ) -> bool {
         &&& self.tier.valid(num_tiers) && self.slot.loc.node == node && self.slot.is_full()
             && self.slot.slot_len == size
-        &&& self.binding(m, table) && self.authority(m, id) && self.covered(m, table, node, ledger)
+        &&& self.binding(m, table) && self.authority(m, id) && self.covered(
+            m,
+            ovf,
+            table,
+            node,
+            ledger,
+        )
     }
 
     pub open spec fn writable(
@@ -506,6 +557,7 @@ impl FrameGhost {
     pub(super) proof fn prove_frontier_ordered(
         self,
         m: FrameSyncMeta,
+        ovf: [u64; MAX_TIMELINES],
         table: &TimelineTable,
         node: NodeId,
         ledger: &KnowledgeLedger,
@@ -515,11 +567,11 @@ impl FrameGhost {
             table.well_formed(ledger.submitted.instance_id(), node, ledger),
             self.token is Some,
             self.authority(m, ledger.submitted.instance_id()),
-            self.covered(m, table, node, ledger),
+            self.covered(m, ovf, table, node, ledger),
             m.active_local_reads == 0,
             m.active_remote_leases == 0,
             m.ordered(table, after),
-            m.overflow() ==> table.overflow_retired(),
+            m.overflow() ==> FrameSyncMeta::overflow_retired(ovf, table),
         ensures
             self.writable(ledger.submitted.instance_id(), node, ledger, after),
     {
@@ -544,13 +596,14 @@ impl FrameGhost {
             if !ledger.citations(node).contains(e) {
                 let (t, s) = choose|t: u8, s: u64|
                     table.issued(t, s) && #[trigger] table.events@[(t, s)] == e && m.bounds_reader(
-                        table,
+                        ovf,
                         t,
                         s,
                     );
                 assert(table.events@.contains_key((t, s)));
                 if m.overflow() {
-                    table.lemma_overflow_all_retired(id, node, ledger, t, s);
+                    assert(s <= table.confirmed_seq[t as int]);
+                    assert(table.observed(t, s, node, ledger.knows));
                 } else {
                     let i = choose|i: int|
                         0 <= i < 4 && {
@@ -572,7 +625,9 @@ impl FrameGhost {
         self,
         prior: Self,
         m: FrameSyncMeta,
+        ovf: [u64; MAX_TIMELINES],
         old_meta: FrameSyncMeta,
+        old_ovf: [u64; MAX_TIMELINES],
         table: &TimelineTable,
         before: &TimelineTable,
         node: NodeId,
@@ -582,17 +637,17 @@ impl FrameGhost {
             self.cert.is_some() ==> prior.cert.is_some(),
             table.only_watermarks(before),
             table.well_formed(ledger.submitted.instance_id(), node, ledger),
-            prior.covered(old_meta, before, node, ledger),
+            prior.covered(old_meta, old_ovf, before, node, ledger),
             m.valid_tickets(table),
+            FrameSyncMeta::ovf_bounded(ovf, table),
             m.last_write_ticket == old_meta.last_write_ticket,
             self.slot == prior.slot,
             self.token is Some ==> prior.token is Some && self.frontier() == prior.frontier(),
             forall|t: u8, s: u64|
-                before.issued(t, s) && old_meta.bounds_reader(before, t, s)
-                    ==> #[trigger] m.bounds_reader(table, t, s) || s
-                    <= table.confirmed_seq[t as int],
+                before.issued(t, s) && old_meta.bounds_reader(old_ovf, t, s)
+                    ==> #[trigger] m.bounds_reader(ovf, t, s) || s <= table.confirmed_seq[t as int],
         ensures
-            self.covered(m, table, node, ledger),
+            self.covered(m, ovf, table, node, ledger),
     {
         if self.token is Some {
             assert(prior.frontier() == self.frontier());
@@ -601,14 +656,14 @@ impl FrameGhost {
                     r,
                 ) implies exists|t: u8, s: u64|
                 table.issued(t, s) && #[trigger] table.events@[(t, s)] == r && m.bounds_reader(
-                    table,
+                    ovf,
                     t,
                     s,
                 ) by {
                 let (t, s) = choose|t: u8, s: u64|
                     before.issued(t, s) && #[trigger] before.events@[(t, s)] == r
-                        && old_meta.bounds_reader(before, t, s);
-                if !m.bounds_reader(table, t, s) {
+                        && old_meta.bounds_reader(old_ovf, t, s);
+                if !m.bounds_reader(ovf, t, s) {
                     assert(table.observed(t, s, node, ledger.knows));
                     assert(table.events@.contains_key((t, s)));
                 }

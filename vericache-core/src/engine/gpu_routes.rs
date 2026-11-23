@@ -45,7 +45,9 @@ impl<'a> LocalEngine<'a> {
             dst.well_formed(),
             dst.instance_id() == old(self).core.instance_id(),
             dst.slot_ref().loc.node == old(self).core.node(),
-            dst.slot_ref().sub_len == old(self).core.frames.frame_size,
+            old(self).cuda matches Some(c) ==> dst.slot_ref().sub_len == old(
+                self,
+            ).core.frames.tier_frame_size(c.gpu_tier),
             old(self).cuda matches Some(c) ==> (dst.slot_ref().loc.space is GpuAlloc
                 ==> dst.slot_ref().loc.space->GpuAlloc_device == c.device),
             slot_is_owned(*old(dst_tok), old(self).core.instance_id(), dst.slot_ref().loc),
@@ -217,7 +219,9 @@ impl<'a> LocalEngine<'a> {
             dst.well_formed(),
             dst.instance_id() == old(self).core.instance_id(),
             dst.slot_ref().loc.node == old(self).core.node(),
-            dst.slot_ref().sub_len == old(self).core.frames.frame_size,
+            old(self).cuda matches Some(c) ==> dst.slot_ref().sub_len == old(
+                self,
+            ).core.frames.tier_frame_size(c.gpu_tier),
             old(self).cuda matches Some(c) ==> (dst.slot_ref().loc.space is GpuAlloc
                 ==> dst.slot_ref().loc.space->GpuAlloc_device == c.device),
             slot_is_owned(*old(dst_tok), old(self).core.instance_id(), dst.slot_ref().loc),
@@ -303,7 +307,11 @@ impl<'a> LocalEngine<'a> {
             old(shares).well_formed(),
             old(shares).id() == old(self).core.instance_id(),
             old(shares).node() == old(self).core.node(),
-            scatter_offsets_valid(dsts@, offsets, old(self).core.frames.frame_size),
+            old(self).cuda matches Some(c) ==> scatter_offsets_valid(
+                dsts@,
+                offsets,
+                old(self).core.frames.tier_frame_size(c.gpu_tier),
+            ),
             forall|i: int|
                 0 <= i < dsts@.len() ==> {
                     &&& (#[trigger] dsts@[i]).instance_id() == old(self).core.instance_id()
@@ -507,7 +515,11 @@ impl<'a> LocalEngine<'a> {
             old(shares).well_formed(),
             old(shares).id() == old(self).core.instance_id(),
             old(shares).node() == old(self).core.node(),
-            scatter_offsets_valid(dsts@, offsets, old(self).core.frames.frame_size),
+            old(self).cuda matches Some(c) ==> scatter_offsets_valid(
+                dsts@,
+                offsets,
+                old(self).core.frames.tier_frame_size(c.gpu_tier),
+            ),
             forall|i: int|
                 0 <= i < dsts@.len() ==> {
                     &&& (#[trigger] dsts@[i]).instance_id() == old(self).core.instance_id()

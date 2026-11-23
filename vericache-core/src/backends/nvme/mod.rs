@@ -132,7 +132,7 @@ pub struct NvmeBackend {
     pub first_frame: FrameId,
     pub num_frames: u32,
     pub bitmap: SlidingBitmap,
-    pub in_flight_ops: [Option<PendingOperation>; 512],
+    pub in_flight_ops: [Option<PendingOperation>; BITMAP_SLOTS],
     pub pending_transfers: Vec<Option<InFlightNvmeOp>>,
 }
 
@@ -153,7 +153,7 @@ pub open spec fn nvme_pending_disjoint(pending_transfers: Seq<Option<InFlightNvm
 #[verifier::opaque]
 pub open spec fn nvme_pending_valid(
     pending_transfers: Seq<Option<InFlightNvmeOp>>,
-    in_flight_ops: [Option<PendingOperation>; 512],
+    in_flight_ops: [Option<PendingOperation>; BITMAP_SLOTS],
     ring: IoUring,
     core: &CacheCore,
     timeline: u8,
@@ -178,7 +178,7 @@ pub open spec fn ring_event_map(ring: IoUring) -> Map<u64, TransferEvent> {
 #[verifier::opaque]
 pub open spec fn nvme_window_wf(
     bitmap: SlidingBitmap,
-    in_flight_ops: [Option<PendingOperation>; 512],
+    in_flight_ops: [Option<PendingOperation>; BITMAP_SLOTS],
     ring: IoUring,
     core: &CacheCore,
     timeline: u8,
@@ -194,7 +194,7 @@ impl NvmeBackend {
         &&& self.file.instance_id() == core.instance_id()
         &&& self.file.node() == core.node()
         &&& self.file.num_slots() == self.num_frames as usize
-        &&& self.file.slot_len() == core.frames.frame_size as u64
+        &&& self.file.slot_len() == core.frames.tier_frame_size(self.tier) as u64
         &&& 0 < self.file.slot_len() <= MAX_IO_LEN
         &&& self.file.slot_len() % DIRECT_IO_ALIGNMENT == 0
         &&& self.ring.well_formed()
@@ -228,9 +228,185 @@ impl NvmeBackend {
         self.first_frame.0 <= frame.0 && frame.0 < self.first_frame.0 + self.num_frames
     }
 
-    /// Create an `O_DIRECT` temporary NVMe slab file, initialize its `io_uring`,
-    /// and register its `TierKind::LocalNvme` tier and `TimelineKind::IoUring`
-    /// timeline in `core`.
+    fn validate_init(core: &CacheCore, num_frames: u32, ring_entries: u32, frame_size: usize) -> (r:
+        BackendResult<(usize, u64)>)
+        requires
+            core.well_formed(),
+        ensures
+            r matches Ok((count, slot_len)) ==> {
+                &&& num_frames > 0 && ring_entries > 0
+                &&& count == num_frames as usize
+                &&& slot_len == frame_size as u64
+                &&& 0 < slot_len <= MAX_IO_LEN
+                &&& slot_len % DIRECT_IO_ALIGNMENT == 0
+                &&& (count as nat) * (slot_len as nat) <= u64::MAX
+                &&& core.tiers.len() < MAX_TIERS
+                &&& core.timelines.count < MAX_TIMELINES
+                &&& core.frames.metas.len() + count <= u32::MAX
+            },
+    {
+        hide(CacheCore::well_formed);
+        proof {
+            lemma_core_wf_facts(core);
+        }
+        if frame_size == 0 || num_frames == 0 || ring_entries == 0 || frame_size > MAX_IO_LEN || (
+        frame_size as u64) % DIRECT_IO_ALIGNMENT != 0 {
+            return Err(CoreError::InvalidArgument);
+        }
+        let count = num_frames as usize;
+        let slot_len = frame_size as u64;
+        if (count as u64) > u64::MAX / slot_len {
+            return Err(CoreError::InvalidArgument);
+        }
+        if core.tiers.len() >= MAX_TIERS || core.timelines.count >= MAX_TIMELINES || count > (
+        u32::MAX as usize) - core.frames.metas.len() {
+            return Err(CoreError::CapacityExhausted);
+        }
+        proof {
+            vstd::arithmetic::div_mod::lemma_fundamental_div_mod(u64::MAX as int, slot_len as int);
+            vstd::arithmetic::mul::lemma_mul_inequality(
+                count as int,
+                (u64::MAX / slot_len) as int,
+                slot_len as int,
+            );
+            assert((count as nat) * (slot_len as nat) <= u64::MAX);
+        }
+        Ok((count, slot_len))
+    }
+
+    fn finish_init(
+        core: &mut CacheCore,
+        Tracked(instance): Tracked<&TransferInstance>,
+        Tracked(alloc): Tracked<&AllocSource>,
+        file: NvmeFile,
+        ring: IoUring,
+        Tracked(tokens): Tracked<Map<usize, SlotToken>>,
+        Ghost(before_alloc): Ghost<AllocSource>,
+        frame_size: usize,
+        num_frames: u32,
+    ) -> (r: Self)
+        requires
+            old(core).well_formed(),
+            instance.id() == old(core).instance_id(),
+            before_alloc.well_formed(),
+            before_alloc.id() == old(core).instance_id(),
+            before_alloc.node() == old(core).node(),
+            alloc_fresh_for_core(before_alloc, old(core)),
+            alloc.well_formed(),
+            alloc.id() == old(core).instance_id(),
+            alloc.node() == old(core).node(),
+            alloc.names() == before_alloc.names().tail(),
+            !alloc.names().contains(before_alloc.next_alloc_id()),
+            file.well_formed(),
+            file.instance_id() == old(core).instance_id(),
+            file.node() == old(core).node(),
+            file.space().alloc_id() == before_alloc.next_alloc_id(),
+            file.num_slots() == num_frames as usize,
+            file.slot_len() == frame_size as u64,
+            0 < file.slot_len() <= MAX_IO_LEN,
+            file.slot_len() % DIRECT_IO_ALIGNMENT == 0,
+            alloc.allocated_slab(before_alloc, file.space(), num_frames as usize, tokens),
+            ring.well_formed(),
+            ring.instance_id() == old(core).instance_id(),
+            ring.node() == old(core).node(),
+            ring.source().source() is IoUring,
+            ring.pending() == Map::empty(),
+            num_frames > 0,
+            old(core).tiers.len() < MAX_TIERS,
+            old(core).timelines.count < MAX_TIMELINES,
+            old(core).frames.metas.len() + (num_frames as usize) <= u32::MAX,
+        ensures
+            final(core).well_formed(),
+            alloc_fresh_for_core(*alloc, final(core)),
+            final(core).node_id == old(core).node_id,
+            final(core).ledger == old(core).ledger,
+            final(core).spec == old(core).spec,
+            r.well_formed(final(core)),
+            r.num_frames == num_frames,
+            r.tier == TierId(old(core).tiers.len() as u16),
+            r.first_frame.0 == old(core).frames.metas.len(),
+            r.timeline == old(core).timelines.count,
+            final(core).frames.tier_frame_size(r.tier) == frame_size,
+    {
+        hide(CacheCore::well_formed);
+        hide(replica_valid);
+        hide(complete_receipts);
+        let count = num_frames as usize;
+        let ghost slots;
+        proof {
+            slots =
+            lemma_allocated_slab_disjoint_with_size(
+                before_alloc,
+                *alloc,
+                core,
+                file.space(),
+                count,
+                frame_size,
+                tokens,
+            );
+        }
+        let timeline = core.register_timeline(TimelineKind::IoUring).unwrap();
+        let ghost after_tl = *core;
+        let desc = TierDescriptor {
+            id: TierId(0),
+            kind: TierKind::LocalNvme,
+            device_id: None,
+            host_accessible: false,
+            rdma_capable: false,
+        };
+        let (tier, first_frame) = core.register_tier_with_frame_size(
+            desc,
+            frame_size,
+            Ghost(slots),
+            num_frames,
+            Tracked(tokens),
+        ).unwrap();
+        let bitmap = SlidingBitmap::new();
+        let in_flight_ops: [Option<PendingOperation>; BITMAP_SLOTS] = [None;BITMAP_SLOTS];
+        let mut pending_transfers: Vec<Option<InFlightNvmeOp>> = Vec::with_capacity(BITMAP_SLOTS);
+        let mut i: usize = 0;
+        while i < BITMAP_SLOTS
+            invariant
+                i <= BITMAP_SLOTS,
+                pending_transfers.len() == i,
+                forall|k: int| 0 <= k < i ==> (#[trigger] pending_transfers[k]).is_none(),
+            decreases BITMAP_SLOTS - i,
+        {
+            pending_transfers.push(None);
+            i += 1;
+        }
+        proof {
+            lemma_core_wf_facts(&after_tl);
+            lemma_core_wf_facts(core);
+            lemma_after_register_tier(
+                before_alloc,
+                *alloc,
+                &after_tl,
+                core,
+                tier,
+                first_frame,
+                num_frames,
+                file.space(),
+                slots,
+            );
+            lemma_nvme_init_state(bitmap, in_flight_ops, pending_transfers@, ring, core, timeline);
+        }
+        Self {
+            file,
+            ring,
+            tier,
+            timeline,
+            first_frame,
+            num_frames,
+            bitmap,
+            in_flight_ops,
+            pending_transfers,
+        }
+    }
+
+    /// Create an `O_DIRECT` temporary NVMe slab file using the node default `frame_size`,
+    /// initialize its `io_uring`, and register its `TierKind::LocalNvme` tier and
+    /// `TimelineKind::IoUring` timeline in `core`.
     pub fn new(
         core: &mut CacheCore,
         host_ctx: &HostContext,
@@ -270,38 +446,72 @@ impl NvmeBackend {
                     &&& b.tier == TierId(old(core).tiers.len() as u16)
                     &&& b.first_frame.0 == old(core).frames.metas.len()
                     &&& b.timeline == old(core).timelines.count
+                    &&& final(core).frames.tier_frame_size(b.tier) == old(core).frames.frame_size
+                },
+            },
+    {
+        let frame_size = core.frames.frame_size;
+        Self::new_with_frame_size(
+            core,
+            host_ctx,
+            Tracked(instance),
+            Tracked(alloc),
+            Tracked(ring_source),
+            dir,
+            num_frames,
+            ring_entries,
+            frame_size,
+        )
+    }
+
+    /// Create an `O_DIRECT` temporary NVMe slab file with an explicit per-tier
+    /// `frame_size`, initialize its `io_uring`, and register its tier in `core`.
+    pub fn new_with_frame_size(
+        core: &mut CacheCore,
+        host_ctx: &HostContext,
+        Tracked(instance): Tracked<&TransferInstance>,
+        Tracked(alloc): Tracked<&mut AllocSource>,
+        Tracked(ring_source): Tracked<EventSourceToken>,
+        dir: &str,
+        num_frames: u32,
+        ring_entries: u32,
+        frame_size: usize,
+    ) -> (r: BackendResult<Self>)
+        requires
+            old(core).well_formed(),
+            instance.id() == old(core).instance_id(),
+            host_ctx.ready(old(core).instance_id(), old(core).node()),
+            old(alloc).well_formed(),
+            old(alloc).id() == old(core).instance_id(),
+            old(alloc).node() == old(core).node(),
+            alloc_fresh_for_core(*old(alloc), old(core)),
+            ring_source.well_formed(),
+            ring_source.id() == old(core).instance_id(),
+            ring_source.node() == old(core).node(),
+            ring_source.source() is IoUring,
+        ensures
+            final(core).well_formed(),
+            final(alloc).well_formed(),
+            final(alloc).id() == old(alloc).id(),
+            final(alloc).node() == old(alloc).node(),
+            alloc_fresh_for_core(*final(alloc), final(core)),
+            final(core).node_id == old(core).node_id,
+            final(core).ledger == old(core).ledger,
+            final(core).spec == old(core).spec,
+            match r {
+                Err(_) => *final(core) == *old(core) && *final(alloc) == *old(alloc),
+                Ok(b) => {
+                    &&& b.well_formed(final(core))
+                    &&& b.num_frames == num_frames
+                    &&& b.tier == TierId(old(core).tiers.len() as u16)
+                    &&& b.first_frame.0 == old(core).frames.metas.len()
+                    &&& b.timeline == old(core).timelines.count
+                    &&& final(core).frames.tier_frame_size(b.tier) == frame_size
                 },
             },
     {
         hide(CacheCore::well_formed);
-        hide(replica_valid);
-        hide(complete_receipts);
-        let frame_size = core.frames.frame_size;
-        proof {
-            lemma_core_wf_facts(core);
-        }
-        if num_frames == 0 || ring_entries == 0 || frame_size > MAX_IO_LEN || (frame_size as u64)
-            % DIRECT_IO_ALIGNMENT != 0 {
-            return Err(CoreError::InvalidArgument);
-        }
-        let count = num_frames as usize;
-        let slot_len = frame_size as u64;
-        if (count as u64) > u64::MAX / slot_len {
-            return Err(CoreError::InvalidArgument);
-        }
-        if core.tiers.len() >= MAX_TIERS || core.timelines.count >= MAX_TIMELINES || count > (
-        u32::MAX as usize) - core.frames.metas.len() {
-            return Err(CoreError::CapacityExhausted);
-        }
-        proof {
-            vstd::arithmetic::div_mod::lemma_fundamental_div_mod(u64::MAX as int, slot_len as int);
-            vstd::arithmetic::mul::lemma_mul_inequality(
-                count as int,
-                (u64::MAX / slot_len) as int,
-                slot_len as int,
-            );
-            assert((count as nat) * (slot_len as nat) <= u64::MAX);
-        }
+        let (count, slot_len) = Self::validate_init(core, num_frames, ring_entries, frame_size)?;
         let ring = match IoUring::new(Tracked(ring_source), ring_entries) {
             Ok(ring) => ring,
             Err((e, _)) => return Err(nvme_error(e)),
@@ -321,76 +531,102 @@ impl NvmeBackend {
                 return Err(nvme_error(e));
             },
         };
-        let ghost slots;
-        proof {
-            slots =
-            lemma_allocated_slab_disjoint(before_alloc, *alloc, core, file.space(), count, tokens);
-        }
-        let timeline = core.register_timeline(TimelineKind::IoUring).unwrap();
-        let ghost after_tl = *core;
-        let desc = TierDescriptor {
-            id: TierId(0),
-            kind: TierKind::LocalNvme,
-            device_id: None,
-            host_accessible: false,
-            rdma_capable: false,
+        Ok(
+            Self::finish_init(
+                core,
+                Tracked(instance),
+                Tracked(alloc),
+                file,
+                ring,
+                Tracked(tokens),
+                Ghost(before_alloc),
+                frame_size,
+                num_frames,
+            ),
+        )
+    }
+
+    /// Open or create an `O_DIRECT` NVMe slab file at an explicit filesystem `path`
+    /// with per-tier `frame_size`, initialize its `io_uring`, and register its tier in `core`.
+    pub fn new_with_path(
+        core: &mut CacheCore,
+        host_ctx: &HostContext,
+        Tracked(instance): Tracked<&TransferInstance>,
+        Tracked(alloc): Tracked<&mut AllocSource>,
+        Tracked(ring_source): Tracked<EventSourceToken>,
+        path: &str,
+        num_frames: u32,
+        ring_entries: u32,
+        create_if_missing: bool,
+        frame_size: usize,
+    ) -> (r: BackendResult<Self>)
+        requires
+            old(core).well_formed(),
+            instance.id() == old(core).instance_id(),
+            host_ctx.ready(old(core).instance_id(), old(core).node()),
+            old(alloc).well_formed(),
+            old(alloc).id() == old(core).instance_id(),
+            old(alloc).node() == old(core).node(),
+            alloc_fresh_for_core(*old(alloc), old(core)),
+            ring_source.well_formed(),
+            ring_source.id() == old(core).instance_id(),
+            ring_source.node() == old(core).node(),
+            ring_source.source() is IoUring,
+        ensures
+            final(core).well_formed(),
+            final(alloc).well_formed(),
+            final(alloc).id() == old(alloc).id(),
+            final(alloc).node() == old(alloc).node(),
+            alloc_fresh_for_core(*final(alloc), final(core)),
+            final(core).node_id == old(core).node_id,
+            final(core).ledger == old(core).ledger,
+            final(core).spec == old(core).spec,
+            match r {
+                Err(_) => *final(core) == *old(core) && *final(alloc) == *old(alloc),
+                Ok(b) => {
+                    &&& b.well_formed(final(core))
+                    &&& b.num_frames == num_frames
+                    &&& b.tier == TierId(old(core).tiers.len() as u16)
+                    &&& b.first_frame.0 == old(core).frames.metas.len()
+                    &&& b.timeline == old(core).timelines.count
+                    &&& final(core).frames.tier_frame_size(b.tier) == frame_size
+                },
+            },
+    {
+        hide(CacheCore::well_formed);
+        let (count, slot_len) = Self::validate_init(core, num_frames, ring_entries, frame_size)?;
+        let ring = match IoUring::new(Tracked(ring_source), ring_entries) {
+            Ok(ring) => ring,
+            Err((e, _)) => return Err(nvme_error(e)),
         };
-        let (tier, first_frame) = match core.register_tier(
-            desc,
-            Ghost(slots),
-            num_frames,
-            Tracked(tokens),
+        let ghost before_alloc = *alloc;
+        let (file, Tracked(tokens)) = match NvmeFile::open_path_slab(
+            host_ctx,
+            Tracked(instance),
+            Tracked(alloc),
+            path,
+            count,
+            slot_len,
+            create_if_missing,
         ) {
             Ok(pair) => pair,
             Err(e) => {
-                assert(false);
-                return Err(e);
+                let _ = ring.destroy();
+                return Err(nvme_error(e));
             },
         };
-        let bitmap = SlidingBitmap::new();
-        let in_flight_ops: [Option<PendingOperation>; 512] = [None;512];
-        let mut pending_transfers: Vec<Option<InFlightNvmeOp>> = Vec::with_capacity(
-            BITMAP_CAPACITY as usize,
-        );
-        let mut i: usize = 0;
-        while i < BITMAP_CAPACITY as usize
-            invariant
-                i <= BITMAP_CAPACITY as usize,
-                pending_transfers.len() == i,
-                forall|k: int| 0 <= k < i ==> (#[trigger] pending_transfers[k]).is_none(),
-            decreases (BITMAP_CAPACITY as usize) - i,
-        {
-            pending_transfers.push(None);
-            i += 1;
-        }
-        proof {
-            lemma_core_wf_facts(&after_tl);
-            lemma_core_wf_facts(core);
-            lemma_after_register_tier(
-                before_alloc,
-                *alloc,
-                &after_tl,
-                core,
-                tier,
-                first_frame,
-                num_frames,
-                file.space(),
-                slots,
-            );
-            lemma_nvme_init_state(bitmap, in_flight_ops, pending_transfers@, ring, core, timeline);
-        }
         Ok(
-            Self {
+            Self::finish_init(
+                core,
+                Tracked(instance),
+                Tracked(alloc),
                 file,
                 ring,
-                tier,
-                timeline,
-                first_frame,
+                Tracked(tokens),
+                Ghost(before_alloc),
+                frame_size,
                 num_frames,
-                bitmap,
-                in_flight_ops,
-                pending_transfers,
-            },
+            ),
         )
     }
 

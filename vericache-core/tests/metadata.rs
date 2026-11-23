@@ -506,14 +506,14 @@ fn sliding_bitmap_out_of_order_stress() {
     let mut prefix = 0;
     let mut expected = 0;
     for window in 0..10 {
-        let mut offsets: Vec<u64> = (1..=512).collect();
+        let mut offsets: Vec<u64> = (1..=4096).collect();
         match window % 3 {
             0 => offsets.reverse(),
             1 => offsets.sort_by_key(|n| (n % 2, *n)),
-            _ => offsets.sort_by_key(|n| (n * 193) % 512),
+            _ => offsets.sort_by_key(|n| (n * 193) % 4096),
         }
         for n in offsets {
-            let completed = window * 512 + n;
+            let completed = window * 4096 + n;
             pending.insert(completed);
             let before = expected;
             while pending.remove(&(expected + 1)) {
@@ -523,7 +523,7 @@ fn sliding_bitmap_out_of_order_stress() {
             assert_eq!((prefix, advanced), (expected, expected - before));
         }
     }
-    assert_eq!(prefix, 5120);
+    assert_eq!(prefix, 40960);
 }
 
 #[test]

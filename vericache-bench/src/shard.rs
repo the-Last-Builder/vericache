@@ -1,4 +1,134 @@
+use std::sync::{Mutex, OnceLock};
+use transfer::context::{
+    AllocSource, EventSourceAllocator, EventSourceKind, EventSourceToken, NodeContext,
+    ShardAllocator, ShardSources, ShareSource, TransferInstance, VersionInstance, VersionSource,
+};
+use vericache_core::kernel::CacheCore;
 use vericache_core::spec::ObjectKey;
+use vstd::prelude::{Tracked, verus};
+
+/// Default per-shard version sequence budget (`2^40` versions per shard, allowing over
+/// 16 million independent share-nothing shards per OS process without exhausting `u64::MAX`).
+pub const DEFAULT_SHARD_VERSION_QUOTA: u64 = 1u64 << 40;
+
+static BENCH_NODE_ALLOCATOR: OnceLock<Mutex<(u64, ShardAllocator)>> = OnceLock::new();
+
+/// Initialize the process-wide `ShardAllocator` for `node_id` at most once per OS process.
+pub fn ensure_bench_node_allocator(node_id: u64) {
+    let lock = BENCH_NODE_ALLOCATOR.get_or_init(|| {
+        let ctx = NodeContext::try_bootstrap(node_id)
+            .expect("NodeContext::try_bootstrap once per OS process");
+        Mutex::new((node_id, ShardAllocator::from_node_context(ctx)))
+    });
+    let guard = lock.lock().expect("bench shard allocator mutex");
+    assert_eq!(
+        guard.0, node_id,
+        "process already bootstrapped for node_id {}, cannot switch to {}",
+        guard.0, node_id
+    );
+}
+
+/// Carve an independent share-nothing `ShardSources` bundle with `version_quota` local version IDs.
+pub fn take_bench_shard_with_quota(node_id: u64, version_quota: u64) -> ShardSources {
+    let lock = BENCH_NODE_ALLOCATOR.get_or_init(|| {
+        let ctx = NodeContext::try_bootstrap(node_id)
+            .expect("NodeContext::try_bootstrap once per OS process");
+        Mutex::new((node_id, ShardAllocator::from_node_context(ctx)))
+    });
+    let mut guard = lock.lock().expect("bench shard allocator mutex");
+    assert_eq!(
+        guard.0, node_id,
+        "process already bootstrapped for node_id {}, cannot request {}",
+        guard.0, node_id
+    );
+    guard
+        .1
+        .split_shard(version_quota)
+        .expect("sufficient bench version quota remaining in ShardAllocator")
+}
+
+verus! {
+
+/// Per-shard linear capability bundle backed by `ShardAllocator::split_shard` with zero forged capabilities.
+#[cfg_attr(not(verus_only), allow(dead_code))]
+pub struct ShardCapabilityBundle {
+    pub node: u64,
+    pub instance: Tracked<TransferInstance>,
+    pub alloc: Tracked<AllocSource>,
+    pub events: Tracked<EventSourceAllocator>,
+    pub shares: Tracked<ShareSource>,
+    pub version_instance: Tracked<VersionInstance>,
+    pub versions: Option<Tracked<VersionSource>>,
+    pub version_start: u64,
+    pub version_limit: u64,
+}
+
+impl ShardCapabilityBundle {
+    pub fn from_sources(shard: ShardSources) -> Self {
+        Self {
+            node: shard.node,
+            instance: shard.instance,
+            alloc: shard.alloc,
+            events: shard.events,
+            shares: shard.shares,
+            version_instance: shard.version_instance,
+            versions: Some(shard.versions),
+            version_start: shard.version_start,
+            version_limit: shard.version_limit,
+        }
+    }
+
+    pub fn take(node_id: u64) -> Self {
+        Self::from_sources(take_bench_shard_with_quota(node_id, DEFAULT_SHARD_VERSION_QUOTA))
+    }
+
+    pub fn mint_host(&mut self) -> Tracked<EventSourceToken> {
+        Tracked(self.events.borrow_mut().mint(EventSourceKind::Host))
+    }
+
+    pub fn mint_cuda(&mut self) -> Tracked<EventSourceToken> {
+        Tracked(self.events.borrow_mut().mint(EventSourceKind::CudaStream))
+    }
+
+    pub fn mint_nvme(&mut self) -> Tracked<EventSourceToken> {
+        Tracked(self.events.borrow_mut().mint(EventSourceKind::IoUring))
+    }
+
+    pub fn mint_rdma(&mut self) -> Tracked<EventSourceToken> {
+        Tracked(self.events.borrow_mut().mint(EventSourceKind::RdmaQueuePair))
+    }
+
+    /// Construct a shard-isolated `CacheCore` over `[version_start, version_limit)` for local engines.
+    pub fn make_local_core(&self, frame_size: usize, max_leases: usize) -> CacheCore {
+        CacheCore::new_with_version_range(
+            self.node as u16,
+            frame_size,
+            Vec::new(),
+            max_leases,
+            self.version_start,
+            self.version_limit,
+            Tracked(self.instance.borrow()),
+        )
+    }
+
+    /// Construct a shard-isolated `CacheCore` with an attached bounded `VersionSource` for RDMA engines.
+    pub fn make_versioned_core(&mut self, frame_size: usize, max_leases: usize) -> CacheCore {
+        let ver_src = self.versions.take().expect("shard VersionSource already consumed");
+        CacheCore::from_shard_versions(
+            self.node as u16,
+            frame_size,
+            Vec::new(),
+            max_leases,
+            self.version_start,
+            self.version_limit,
+            Tracked(self.instance.borrow()),
+            Tracked(self.version_instance.borrow()),
+            ver_src,
+        )
+    }
+}
+
+} // verus!
 
 /// Deterministically map a 64-bit trace `hash_id` to a 256-bit VeriCache `ObjectKey`.
 #[inline]
@@ -86,7 +216,10 @@ pub fn stamp_checksummed_frame(buf: &mut [u8], hash_id: u64, version_seq: u64) {
 
 /// Verify magic, expected `hash_id` (if `Some`), and full-payload checksum.
 /// Returns `Ok(version_seq)` on intact frame, `Err(reason)` on corruption/tearing.
-pub fn verify_checksummed_frame(buf: &[u8], expected_hash_id: Option<u64>) -> Result<u64, &'static str> {
+pub fn verify_checksummed_frame(
+    buf: &[u8],
+    expected_hash_id: Option<u64>,
+) -> Result<u64, &'static str> {
     if buf.len() < 32 {
         return Err("short_frame");
     }

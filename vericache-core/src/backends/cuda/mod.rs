@@ -34,6 +34,11 @@ pub use copy::caller_stream_valid;
 #[cfg(verus_only)]
 use proofs::*;
 #[cfg(verus_only)]
+pub use proofs::{
+    lemma_cuda_puts_bindings_empty, lemma_cuda_puts_bindings_extract,
+    lemma_cuda_puts_bindings_push_abort, lemma_cuda_puts_bindings_push_publish,
+};
+#[cfg(verus_only)]
 pub use put::scatter_offsets_valid;
 #[cfg(verus_only)]
 use put_park::{cuda_backend_pre_park_wf, put_gpu_committed_ready};
@@ -140,12 +145,9 @@ impl PendingGpuWrite {
                     &&& core.frames.frame(self.frame).bound_version == Some(version)
                     &&& (version.origin_node != core.node_id || version.seq < core.next_version_seq
                         || version.seq >= core.version_seq_limit)
-                    &&& if only_if_current {
-                        core.frames.versions@.contains_key(version)
-                            && core.frames.versions@[version] == cert.bytes
-                    } else {
-                        !core.frames.versions@.contains_key(version)
-                    }
+                    &&& (only_if_current ==> core.frames.versions@.contains_key(version))
+                    &&& (core.frames.versions@.contains_key(version)
+                        ==> core.frames.versions@[version] == cert.bytes)
                     &&& cert.slot == self.slot@
                     &&& cert.bytes.len() == self.slot@.slot_len
                     &&& cert.writer == core.timelines.events@[(timeline, s)]
@@ -153,7 +155,6 @@ impl PendingGpuWrite {
                     &&& slot_frontier(tok).readers.is_empty()
                     &&& proof@.pending(core.ledger@, core.node())
                     &&& cuda_put_events_covered(proof@.events, core.timelines.events@, timeline, s)
-                    &&& (only_if_current || true)
                 },
             }
         }
@@ -186,6 +187,23 @@ pub open spec fn cuda_puts_valid(
     &&& forall|i: int| 0 <= i < puts.len() ==> (#[trigger] puts[i]).valid(core, timeline)
 }
 
+#[verifier::opaque]
+pub open spec fn cuda_puts_bindings_covered(
+    puts: Seq<PendingGpuWrite>,
+    bindings: Map<VersionId, VersionBinding>,
+) -> bool {
+    forall|i: int|
+        0 <= i < puts.len() ==> match (#[trigger] puts[i]).action {
+            PendingGpuAction::Publish { version, proof, only_if_current: false, .. } => {
+                &&& bindings.contains_key(version)
+                &&& bindings[version].instance_id() == cluster_version_instance_id()
+                &&& bindings[version].key() == (version.origin_node as NodeId, version.seq)
+                &&& bindings[version].value() == proof@.certificate.bytes
+            },
+            _ => true,
+        }
+}
+
 /// Optional CUDA-registered pinned host DRAM slab for H2D/D2H transfers.
 pub struct PinnedHostSlab<'a> {
     pub reg: CudaHostRegistration<'a>,
@@ -202,7 +220,7 @@ impl<'a> PinnedHostSlab<'a> {
         &&& self.reg.node() == core.node()
         &&& !(self.reg.space() is GpuAlloc)
         &&& self.reg.num_slots() == self.num_frames as usize
-        &&& self.reg.slot_len() == core.frames.frame_size
+        &&& self.reg.slot_len() == core.frames.tier_frame_size(self.tier)
         &&& self.tier.valid(core.tiers.len())
         &&& core.tiers[self.tier.index() as int].kind == TierKind::HostDram
         &&& self.sync_points.len() == self.num_frames as usize
@@ -236,7 +254,7 @@ impl<'a> CudaBackend<'a> {
         &&& self.gpu_buffer.space() is GpuAlloc
         &&& self.gpu_buffer.space()->GpuAlloc_device == self.device
         &&& self.gpu_buffer.num_slots() == self.gpu_num_frames as usize
-        &&& self.gpu_buffer.slot_len() == core.frames.frame_size
+        &&& self.gpu_buffer.slot_len() == core.frames.tier_frame_size(self.gpu_tier)
         &&& self.gpu_tier.valid(core.tiers.len())
         &&& core.tiers[self.gpu_tier.index() as int].kind == TierKind::GpuVram
         &&& self.gpu_sync_points.len() == self.gpu_num_frames as usize
@@ -249,7 +267,10 @@ impl<'a> CudaBackend<'a> {
         )
         &&& match self.pinned_host {
             None => true,
-            Some(h) => h.well_formed(core) && h.tier != self.gpu_tier,
+            Some(h) => h.well_formed(core) && h.tier != self.gpu_tier
+                && core.frames.tier_frame_size(h.tier) == core.frames.tier_frame_size(
+                self.gpu_tier,
+            ),
         }
         &&& self.timeline.device == self.device
         &&& self.timeline.well_formed(&core.timelines, core.node(), &core.ledger@)
@@ -276,9 +297,9 @@ impl<'a> CudaBackend<'a> {
         }
     }
 
-    /// Allocate a GPU VRAM slab, create its `CudaTimeline` with `event_ring_len`
-    /// events, and register both the `TierKind::GpuVram` tier and CUDA timeline
-    /// in `core`.
+    /// Allocate a GPU VRAM slab using the node default `frame_size`, create its
+    /// `CudaTimeline` with `event_ring_len` events, and register both the
+    /// `TierKind::GpuVram` tier and CUDA timeline in `core`.
     pub fn new(
         core: &mut CacheCore,
         Tracked(instance): Tracked<&TransferInstance>,
@@ -321,17 +342,232 @@ impl<'a> CudaBackend<'a> {
                     &&& b.gpu_first_frame.0 == old(core).frames.metas.len()
                     &&& b.timeline.timeline_id == old(core).timelines.count
                     &&& b.pinned_host is None
+                    &&& final(core).frames.tier_frame_size(b.gpu_tier) == old(
+                        core,
+                    ).frames.frame_size
+                },
+            },
+    {
+        let frame_size = core.frames.frame_size;
+        Self::new_with_frame_size(
+            core,
+            Tracked(instance),
+            Tracked(alloc),
+            Tracked(stream_source),
+            device,
+            num_frames,
+            event_ring_len,
+            rdma_capable,
+            frame_size,
+        )
+    }
+
+    fn finish_init(
+        core: &mut CacheCore,
+        Tracked(alloc): Tracked<&AllocSource>,
+        device: DeviceId,
+        stream: transfer::cuda::CudaStream,
+        event_slots: Vec<EventSlot>,
+        gpu_buffer: CudaBuffer,
+        Tracked(tokens): Tracked<Map<usize, SlotToken>>,
+        Ghost(before_alloc): Ghost<AllocSource>,
+        frame_size: usize,
+        num_frames: u32,
+        rdma_capable: bool,
+    ) -> (r: Self)
+        requires
+            old(core).well_formed(),
+            before_alloc.well_formed(),
+            before_alloc.id() == old(core).instance_id(),
+            before_alloc.node() == old(core).node(),
+            alloc_fresh_for_core(before_alloc, old(core)),
+            alloc.well_formed(),
+            alloc.id() == old(core).instance_id(),
+            alloc.node() == old(core).node(),
+            alloc.names() == before_alloc.names().tail(),
+            !alloc.names().contains(before_alloc.next_alloc_id()),
+            gpu_buffer.well_formed(),
+            gpu_buffer.instance_id() == old(core).instance_id(),
+            gpu_buffer.node() == old(core).node(),
+            gpu_buffer.space() is GpuAlloc,
+            gpu_buffer.space()->GpuAlloc_device == device,
+            gpu_buffer.space().alloc_id() == before_alloc.next_alloc_id(),
+            gpu_buffer.num_slots() == num_frames as usize,
+            gpu_buffer.slot_len() == frame_size,
+            0 < frame_size,
+            alloc.allocated_slab(before_alloc, gpu_buffer.space(), num_frames as usize, tokens),
+            stream.well_formed(),
+            stream.device() == device,
+            stream.source().source() is CudaStream,
+            stream.source().id() == old(core).instance_id(),
+            stream.source().node() == old(core).node(),
+            source_fresh_for_ledger(stream.source(), old(core).ledger@),
+            stream.tail() == ISet::empty(),
+            stream.infos().map() == IMap::empty(),
+            0 < event_slots.len() <= u32::MAX,
+            forall|j: int|
+                0 <= j < event_slots.len() ==> {
+                    let s = #[trigger] event_slots[j];
+                    &&& s.event.well_formed()
+                    &&& s.event.device() == device
+                    &&& s.event.observer() == old(core).node()
+                    &&& s.event.infos().instance_id() == old(core).instance_id()
+                    &&& s.event.recorded() == ISet::empty()
+                    &&& s.event.infos().map() == IMap::empty()
+                    &&& !s.in_use
+                    &&& s.recorded_seq == 0
+                },
+            num_frames > 0,
+            old(core).tiers.len() < MAX_TIERS,
+            old(core).timelines.count < MAX_TIMELINES,
+            old(core).frames.metas.len() + (num_frames as usize) <= u32::MAX,
+        ensures
+            final(core).well_formed(),
+            alloc_fresh_for_core(*alloc, final(core)),
+            final(core).node_id == old(core).node_id,
+            final(core).ledger == old(core).ledger,
+            final(core).spec == old(core).spec,
+            r.well_formed(final(core)),
+            r.device == device,
+            r.gpu_num_frames == num_frames,
+            r.gpu_tier == TierId(old(core).tiers.len() as u16),
+            r.gpu_first_frame.0 == old(core).frames.metas.len(),
+            r.timeline.timeline_id == old(core).timelines.count,
+            r.pinned_host is None,
+            final(core).frames.tier_frame_size(r.gpu_tier) == frame_size,
+    {
+        hide(CacheCore::well_formed);
+        hide(replica_valid);
+        hide(complete_receipts);
+        let count = num_frames as usize;
+        let ghost slots;
+        proof {
+            slots =
+            lemma_allocated_slab_disjoint_with_size(
+                before_alloc,
+                *alloc,
+                core,
+                gpu_buffer.space(),
+                count,
+                frame_size,
+                tokens,
+            );
+        }
+        let timeline = CudaTimeline::register(core, device, stream, event_slots);
+        let ghost after_tl = *core;
+        let desc = TierDescriptor {
+            id: TierId(0),
+            kind: TierKind::GpuVram,
+            device_id: Some(device),
+            host_accessible: false,
+            rdma_capable,
+        };
+        let (gpu_tier, gpu_first_frame) = core.register_tier_with_frame_size(
+            desc,
+            frame_size,
+            Ghost(slots),
+            num_frames,
+            Tracked(tokens),
+        ).unwrap();
+        let mut gpu_sync_points: Vec<SyncPoint> = Vec::with_capacity(count);
+        let mut i: usize = 0;
+        while i < count
+            invariant
+                i <= count,
+                gpu_sync_points.len() == i,
+            decreases count - i,
+        {
+            gpu_sync_points.push(SyncPoint::HostComplete);
+            i += 1;
+        }
+        let active_gpu_puts: Vec<PendingGpuWrite> = Vec::new();
+        proof {
+            lemma_core_wf_facts(&after_tl);
+            lemma_core_wf_facts(core);
+            lemma_after_register_tier(
+                before_alloc,
+                *alloc,
+                &after_tl,
+                core,
+                gpu_tier,
+                gpu_first_frame,
+                num_frames,
+                gpu_buffer.space(),
+                slots,
+            );
+            lemma_cuda_puts_empty(active_gpu_puts@, core, timeline.timeline_id);
+        }
+        Self {
+            device,
+            gpu_buffer,
+            gpu_tier,
+            gpu_first_frame,
+            gpu_num_frames: num_frames,
+            gpu_sync_points,
+            pinned_host: None,
+            timeline,
+            active_gpu_puts,
+        }
+    }
+
+    /// Allocate a GPU VRAM slab with an explicit per-tier `frame_size`, create its
+    /// `CudaTimeline` with `event_ring_len` events, and register both the
+    /// `TierKind::GpuVram` tier and CUDA timeline in `core`.
+    pub fn new_with_frame_size(
+        core: &mut CacheCore,
+        Tracked(instance): Tracked<&TransferInstance>,
+        Tracked(alloc): Tracked<&mut AllocSource>,
+        Tracked(stream_source): Tracked<EventSourceToken>,
+        device: DeviceId,
+        num_frames: u32,
+        event_ring_len: usize,
+        rdma_capable: bool,
+        frame_size: usize,
+    ) -> (r: BackendResult<Self>)
+        requires
+            old(core).well_formed(),
+            instance.id() == old(core).instance_id(),
+            old(alloc).well_formed(),
+            old(alloc).id() == old(core).instance_id(),
+            old(alloc).node() == old(core).node(),
+            alloc_fresh_for_core(*old(alloc), old(core)),
+            stream_source.well_formed(),
+            stream_source.id() == old(core).instance_id(),
+            stream_source.node() == old(core).node(),
+            stream_source.source() is CudaStream,
+            stream_source.next_seq() == 0,
+            source_fresh_for_ledger(stream_source, old(core).ledger@),
+        ensures
+            final(core).well_formed(),
+            final(alloc).well_formed(),
+            final(alloc).id() == old(alloc).id(),
+            final(alloc).node() == old(alloc).node(),
+            alloc_fresh_for_core(*final(alloc), final(core)),
+            final(core).node_id == old(core).node_id,
+            final(core).ledger == old(core).ledger,
+            final(core).spec == old(core).spec,
+            match r {
+                Err(_) => *final(core) == *old(core) && *final(alloc) == *old(alloc),
+                Ok(b) => {
+                    &&& b.well_formed(final(core))
+                    &&& b.device == device
+                    &&& b.gpu_num_frames == num_frames
+                    &&& b.gpu_tier == TierId(old(core).tiers.len() as u16)
+                    &&& b.gpu_first_frame.0 == old(core).frames.metas.len()
+                    &&& b.timeline.timeline_id == old(core).timelines.count
+                    &&& b.pinned_host is None
+                    &&& final(core).frames.tier_frame_size(b.gpu_tier) == frame_size
                 },
             },
     {
         hide(CacheCore::well_formed);
         hide(replica_valid);
         hide(complete_receipts);
-        let frame_size = core.frames.frame_size;
         proof {
             lemma_core_wf_facts(core);
         }
-        if num_frames == 0 || event_ring_len == 0 || event_ring_len > u32::MAX as usize {
+        if frame_size == 0 || num_frames == 0 || event_ring_len == 0 || event_ring_len
+            > u32::MAX as usize {
             return Err(CoreError::InvalidArgument);
         }
         let count = num_frames as usize;
@@ -375,82 +611,20 @@ impl<'a> CudaBackend<'a> {
                 return Err(cuda_error(e));
             },
         };
-        let ghost slots;
-        proof {
-            slots =
-            lemma_allocated_slab_disjoint(
-                before_alloc,
-                *alloc,
-                core,
-                gpu_buffer.space(),
-                count,
-                tokens,
-            );
-        }
-        let timeline = CudaTimeline::register(core, device, stream, event_slots);
-        let ghost after_tl = *core;
-        let desc = TierDescriptor {
-            id: TierId(0),
-            kind: TierKind::GpuVram,
-            device_id: Some(device),
-            host_accessible: false,
-            rdma_capable,
-        };
-        let (gpu_tier, gpu_first_frame) = match core.register_tier(
-            desc,
-            Ghost(slots),
-            num_frames,
-            Tracked(tokens),
-        ) {
-            Ok(pair) => pair,
-            Err(e) => {
-                assert(false);
-                return Err(e);
-            },
-        };
-        let mut gpu_sync_points: Vec<SyncPoint> = Vec::with_capacity(count);
-        let mut i: usize = 0;
-        while i < count
-            invariant
-                i <= count,
-                gpu_sync_points.len() == i,
-            decreases count - i,
-        {
-            gpu_sync_points.push(SyncPoint::HostComplete);
-            i += 1;
-        }
-        let active_gpu_puts: Vec<PendingGpuWrite> = Vec::new();
-        proof {
-            lemma_core_wf_facts(&after_tl);
-            lemma_core_wf_facts(core);
-            assert(alloc_fresh_for_core(before_alloc, &after_tl)) by {
-                assert(after_tl.frames == old(core).frames);
-            }
-            lemma_after_register_tier(
-                before_alloc,
-                *alloc,
-                &after_tl,
-                core,
-                gpu_tier,
-                gpu_first_frame,
-                num_frames,
-                gpu_buffer.space(),
-                slots,
-            );
-            lemma_cuda_puts_empty(active_gpu_puts@, core, timeline.timeline_id);
-        }
         Ok(
-            Self {
+            Self::finish_init(
+                core,
+                Tracked(alloc),
                 device,
+                stream,
+                event_slots,
                 gpu_buffer,
-                gpu_tier,
-                gpu_first_frame,
-                gpu_num_frames: num_frames,
-                gpu_sync_points,
-                pinned_host: None,
-                timeline,
-                active_gpu_puts,
-            },
+                Tracked(tokens),
+                Ghost(before_alloc),
+                frame_size,
+                num_frames,
+                rdma_capable,
+            ),
         )
     }
 
@@ -474,7 +648,9 @@ impl<'a> CudaBackend<'a> {
                 && h.first_frame == host.first_frame && h.num_frames == host.num_frames),
             r.is_err() ==> *final(self) == *old(self),
     {
-        let _ = core;
+        if core.tier_frame_size(host.tier_id()) != core.tier_frame_size(self.gpu_tier) {
+            return Err(CoreError::InvalidArgument);
+        }
         let reg = match cuda::host_register(host.buffer()) {
             Ok(reg) => reg,
             Err(e) => return Err(cuda_error(e)),
@@ -806,6 +982,309 @@ impl<'a> CudaBackend<'a> {
                         lemma_cuda_ready_put_writable(&entry, core, tl);
                     }
                     core.abort_parked_write(entry.frame, entry.tier);
+                    self.set_frame_sync_point(entry.frame, SyncPoint::HostComplete);
+                    if report.writes_aborted < usize::MAX {
+                        report.writes_aborted += 1;
+                    }
+                },
+            }
+            proof {
+                lemma_versions_monotonic_trans(old(core).spec@, before_step_core.spec@, core.spec@);
+                lemma_cuda_backend_after_retire_put(
+                    before_puts,
+                    self.active_gpu_puts@,
+                    idx as int,
+                    &entry,
+                    &before_step_core,
+                    core,
+                    self.gpu_tier,
+                    self.gpu_first_frame,
+                    self.gpu_num_frames,
+                    self.gpu_buffer.space(),
+                    &self.pinned_host,
+                    tl,
+                );
+                lemma_core_wf_facts(&before_step_core);
+                lemma_core_wf_facts(core);
+                lemma_core_transition_cuda_poll_step(
+                    &before_step_core,
+                    core,
+                    tl,
+                    Some(entry.frame),
+                );
+                lemma_core_transition_trans(
+                    old(core),
+                    &before_step_core,
+                    core,
+                    Some(tl),
+                    None,
+                    FrameTouchMode::PreserveUnparkedInit,
+                );
+            }
+        }
+        match poll_err {
+            Some(e) => Err((e, report)),
+            None => Ok(report),
+        }
+    }
+
+    /// Poll completed CUDA events, retire ready parked GPU puts in FIFO order, and
+    /// register pre-bound `VersionBinding`s into `core.version_registry` so
+    /// `core.all_versions_bound()` is preserved across async GPU publication.
+    pub fn poll_completions_with_bindings(
+        &mut self,
+        core: &mut CacheCore,
+        Tracked(instance): Tracked<&TransferInstance>,
+        Tracked(pending_bindings): Tracked<&mut Map<VersionId, VersionBinding>>,
+    ) -> (r: Result<CudaPollReport, (CoreError, CudaPollReport)>)
+        requires
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            cuda_puts_bindings_covered(old(self).active_gpu_puts@, *old(pending_bindings)),
+            instance.id() == old(core).instance_id(),
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(self).well_formed(final(core)),
+            cuda_puts_bindings_covered(final(self).active_gpu_puts@, *final(pending_bindings)),
+            final(self).device == old(self).device,
+            final(self).gpu_tier == old(self).gpu_tier,
+            final(self).gpu_first_frame == old(self).gpu_first_frame,
+            final(self).gpu_num_frames == old(self).gpu_num_frames,
+            final(self).same_pinned_layout(old(self)),
+            final(self).timeline.timeline_id == old(self).timeline.timeline_id,
+            final(core).node_id == old(core).node_id,
+            final(core).instance_id() == old(core).instance_id(),
+            final(core).tiers == old(core).tiers,
+            old(core).spec@.versions_monotonic(final(core).spec@),
+            core_transition(
+                old(core),
+                final(core),
+                Some(old(self).timeline.timeline_id),
+                None,
+                FrameTouchMode::PreserveUnparkedInit,
+            ),
+    {
+        hide(CacheCore::well_formed);
+        hide(replica_valid);
+        hide(complete_receipts);
+        let ghost before_poll_core = *core;
+        let poll_res = self.timeline.poll_events(core, Tracked(instance));
+        proof {
+            lemma_cuda_backend_after_poll_events(
+                self.active_gpu_puts@,
+                &before_poll_core,
+                core,
+                self.gpu_tier,
+                self.gpu_first_frame,
+                self.gpu_num_frames,
+                self.gpu_buffer.space(),
+                &self.pinned_host,
+                self.timeline.timeline_id,
+            );
+            assert(core.frames.same_layout(&before_poll_core.frames)) by {
+                reveal(FrameTable::same_layout);
+            }
+            assert(core.frames.preserves_initializing(&before_poll_core.frames, None)) by {
+                reveal(FrameTable::preserves_initializing);
+            }
+            lemma_core_transition_cuda_poll_step(
+                &before_poll_core,
+                core,
+                self.timeline.timeline_id,
+                None,
+            );
+            assert(core.all_versions_bound());
+        }
+        let (events_completed, poll_err) = match poll_res {
+            Ok(n) => (n, None),
+            Err((e, n)) => (n, Some(e)),
+        };
+        let mut report = CudaPollReport {
+            events_completed,
+            writes_published: 0,
+            writes_aborted: 0,
+        };
+        if self.active_gpu_puts.is_empty() {
+            return match poll_err {
+                Some(e) => Err((e, report)),
+                None => Ok(report),
+            };
+        }
+        let tl = self.timeline.timeline_id;
+        while !self.active_gpu_puts.is_empty()
+            invariant
+                tl == self.timeline.timeline_id == old(self).timeline.timeline_id,
+                self.device == old(self).device,
+                self.gpu_tier == old(self).gpu_tier,
+                self.gpu_first_frame == old(self).gpu_first_frame,
+                self.gpu_num_frames == old(self).gpu_num_frames,
+                self.same_pinned_layout(old(self)),
+                core.well_formed(),
+                core.all_versions_bound(),
+                self.well_formed(core),
+                cuda_puts_bindings_covered(self.active_gpu_puts@, *pending_bindings),
+                instance.id() == core.instance_id(),
+                core.node_id == old(core).node_id,
+                core.tiers == old(core).tiers,
+                old(core).spec@.versions_monotonic(core.spec@),
+                core_transition(
+                    old(core),
+                    core,
+                    Some(tl),
+                    None,
+                    FrameTouchMode::PreserveUnparkedInit,
+                ),
+            decreases self.active_gpu_puts.len(),
+        {
+            let confirmed = core.timelines.confirmed_seq[tl as usize];
+            let idx = match self.find_min_ready_put(confirmed) {
+                Some(i) => i,
+                None => break,
+            };
+            let ghost before_puts = self.active_gpu_puts@;
+            let ghost before_step_core = *core;
+            let ghost before_bindings = *pending_bindings;
+            let entry = self.active_gpu_puts.swap_remove(idx);
+            proof {
+                lemma_cuda_put_extract_valid(before_puts, core, tl, idx as int);
+                lemma_core_wf_facts(core);
+                lemma_core_catalog_indexed(core);
+            }
+            match entry.action {
+                PendingGpuAction::Publish { key, version, proof: _proof, only_if_current } => {
+                    let should_publish = if only_if_current {
+                        match core.catalog.lookup(key) {
+                            Some(e) => e.version.origin_node == version.origin_node && e.version.seq
+                                == version.seq,
+                            None => false,
+                        }
+                    } else {
+                        true
+                    };
+                    if should_publish {
+                        let ghost cert;
+                        proof {
+                            cert = lemma_cuda_certify_ready_put(&entry, _proof@, core, tl);
+                        }
+                        core.publish_parked_write(entry.frame, entry.ticket, Ghost(cert));
+                        let ghost after_pub_core = *core;
+                        proof {
+                            lemma_core_wf_facts(&after_pub_core);
+                        }
+                        if !only_if_current {
+                            proof {
+                                lemma_cuda_puts_bindings_extract(
+                                    before_puts,
+                                    before_bindings,
+                                    idx as int,
+                                );
+                            }
+                            let tracked b = pending_bindings.tracked_remove(version);
+                            core.register_version_binding(version, Tracked(b));
+                            proof {
+                                lemma_cuda_puts_bindings_swap_remove(
+                                    before_puts,
+                                    self.active_gpu_puts@,
+                                    before_bindings,
+                                    *pending_bindings,
+                                    idx as int,
+                                    Some(version),
+                                    &before_step_core,
+                                    tl,
+                                );
+                                assert(core.all_versions_bound()) by {
+                                    assert forall|v: VersionId| #[trigger]
+                                        core.frames.versions@.contains_key(
+                                            v,
+                                        ) implies core.has_version_binding(v) by {
+                                        if v != version {
+                                            assert(before_step_core.frames.versions@.contains_key(
+                                                v,
+                                            ));
+                                            assert(before_step_core.has_version_binding(v));
+                                            assert(after_pub_core.has_version_binding(v));
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            proof {
+                                lemma_cuda_puts_bindings_swap_remove(
+                                    before_puts,
+                                    self.active_gpu_puts@,
+                                    before_bindings,
+                                    *pending_bindings,
+                                    idx as int,
+                                    None,
+                                    &before_step_core,
+                                    tl,
+                                );
+                                assert(core.all_versions_bound()) by {
+                                    assert(before_step_core.frames.versions@.contains_key(version));
+                                    assert forall|v: VersionId| #[trigger]
+                                        core.frames.versions@.contains_key(
+                                            v,
+                                        ) implies core.has_version_binding(v) by {
+                                        assert(before_step_core.frames.versions@.contains_key(v));
+                                        assert(before_step_core.has_version_binding(v));
+                                    }
+                                }
+                            }
+                        }
+                        self.set_frame_sync_point(entry.frame, SyncPoint::HostComplete);
+                        if report.writes_published < usize::MAX {
+                            report.writes_published += 1;
+                        }
+                    } else {
+                        proof {
+                            lemma_cuda_ready_put_writable(&entry, core, tl);
+                        }
+                        core.abort_parked_write(entry.frame, entry.tier);
+                        proof {
+                            lemma_cuda_puts_bindings_swap_remove(
+                                before_puts,
+                                self.active_gpu_puts@,
+                                before_bindings,
+                                *pending_bindings,
+                                idx as int,
+                                None,
+                                &before_step_core,
+                                tl,
+                            );
+                            assert(core.frames.versions@ == before_step_core.frames.versions@) by {
+                                reveal(FrameTable::same_directory);
+                            }
+                            assert(core.all_versions_bound());
+                        }
+                        self.set_frame_sync_point(entry.frame, SyncPoint::HostComplete);
+                        if report.writes_aborted < usize::MAX {
+                            report.writes_aborted += 1;
+                        }
+                    }
+                },
+                PendingGpuAction::Abort => {
+                    proof {
+                        lemma_cuda_ready_put_writable(&entry, core, tl);
+                    }
+                    core.abort_parked_write(entry.frame, entry.tier);
+                    proof {
+                        lemma_cuda_puts_bindings_swap_remove(
+                            before_puts,
+                            self.active_gpu_puts@,
+                            before_bindings,
+                            *pending_bindings,
+                            idx as int,
+                            None,
+                            &before_step_core,
+                            tl,
+                        );
+                        assert(core.frames.versions@ == before_step_core.frames.versions@) by {
+                            reveal(FrameTable::same_directory);
+                        }
+                        assert(core.all_versions_bound());
+                    }
                     self.set_frame_sync_point(entry.frame, SyncPoint::HostComplete);
                     if report.writes_aborted < usize::MAX {
                         report.writes_aborted += 1;

@@ -198,7 +198,212 @@ fn encode_sges(
     Ok(())
 }
 
+fn disarm_rdma_ptr(slot: &mut *mut u8) -> *mut u8 {
+    let raw = *slot;
+    *slot = std::ptr::null_mut();
+    raw
+}
+
+fn drop_rdma_ptr(slot: &mut *mut u8, destroy: unsafe extern "C" fn(*mut u8) -> i32) {
+    let raw = disarm_rdma_ptr(slot);
+    if !raw.is_null() {
+        let _ = unsafe { destroy(raw) };
+    }
+}
+
 verus! {
+
+#[verifier::external_body]
+pub(super) struct RawDeviceCtxGuard(*mut u8);
+
+impl RawDeviceCtxGuard {
+    #[verifier::external_body]
+    pub(super) fn new(raw: *mut u8) -> Self {
+        Self(raw)
+    }
+
+    #[verifier::external_body]
+    pub(super) fn as_ptr(&self) -> *mut u8 {
+        self.0
+    }
+
+    #[verifier::external_body]
+    pub(super) fn into_raw(mut self) -> *mut u8 {
+        let raw = disarm_rdma_ptr(&mut self.0);
+        std::mem::forget(self);
+        raw
+    }
+}
+
+impl Drop for RawDeviceCtxGuard {
+    #[verifier::external_body]
+    fn drop(&mut self)
+        opens_invariants none
+        no_unwind
+    {
+        drop_rdma_ptr(&mut self.0, ibv_close_device);
+    }
+}
+
+#[verifier::external_body]
+pub(super) struct RawPdGuard(*mut u8);
+
+impl RawPdGuard {
+    #[verifier::external_body]
+    pub(super) fn new(raw: *mut u8) -> Self {
+        Self(raw)
+    }
+
+    #[verifier::external_body]
+    pub(super) fn as_ptr(&self) -> *mut u8 {
+        self.0
+    }
+
+    #[verifier::external_body]
+    pub(super) fn into_raw(mut self) -> *mut u8 {
+        let raw = disarm_rdma_ptr(&mut self.0);
+        std::mem::forget(self);
+        raw
+    }
+}
+
+impl Drop for RawPdGuard {
+    #[verifier::external_body]
+    fn drop(&mut self)
+        opens_invariants none
+        no_unwind
+    {
+        drop_rdma_ptr(&mut self.0, ibv_dealloc_pd);
+    }
+}
+
+#[verifier::external_body]
+pub(super) struct RawCqGuard(*mut u8);
+
+impl RawCqGuard {
+    #[verifier::external_body]
+    pub(super) fn new(raw: *mut u8) -> Self {
+        Self(raw)
+    }
+
+    #[verifier::external_body]
+    pub(super) fn as_ptr(&self) -> *mut u8 {
+        self.0
+    }
+
+    #[verifier::external_body]
+    pub(super) fn into_raw(mut self) -> *mut u8 {
+        let raw = disarm_rdma_ptr(&mut self.0);
+        std::mem::forget(self);
+        raw
+    }
+}
+
+impl Drop for RawCqGuard {
+    #[verifier::external_body]
+    fn drop(&mut self)
+        opens_invariants none
+        no_unwind
+    {
+        drop_rdma_ptr(&mut self.0, vc_destroy_cq);
+    }
+}
+
+#[verifier::external_body]
+pub(super) struct RawQpGuard(*mut u8);
+
+impl RawQpGuard {
+    #[verifier::external_body]
+    pub(super) fn new(raw: *mut u8) -> Self {
+        Self(raw)
+    }
+
+    #[verifier::external_body]
+    pub(super) fn as_ptr(&self) -> *mut u8 {
+        self.0
+    }
+
+    #[verifier::external_body]
+    pub(super) fn into_raw(mut self) -> *mut u8 {
+        let raw = disarm_rdma_ptr(&mut self.0);
+        std::mem::forget(self);
+        raw
+    }
+}
+
+impl Drop for RawQpGuard {
+    #[verifier::external_body]
+    fn drop(&mut self)
+        opens_invariants none
+        no_unwind
+    {
+        drop_rdma_ptr(&mut self.0, ibv_destroy_qp);
+    }
+}
+
+#[verifier::external_body]
+pub(super) struct RawMrGuard(*mut u8);
+
+impl RawMrGuard {
+    #[verifier::external_body]
+    pub(super) fn new(raw: *mut u8) -> Self {
+        Self(raw)
+    }
+
+    #[verifier::external_body]
+    pub(super) fn as_ptr(&self) -> *mut u8 {
+        self.0
+    }
+
+    #[verifier::external_body]
+    pub(super) fn into_raw(mut self) -> *mut u8 {
+        let raw = disarm_rdma_ptr(&mut self.0);
+        std::mem::forget(self);
+        raw
+    }
+}
+
+impl Drop for RawMrGuard {
+    #[verifier::external_body]
+    fn drop(&mut self)
+        opens_invariants none
+        no_unwind
+    {
+        drop_rdma_ptr(&mut self.0, ibv_dereg_mr);
+    }
+}
+
+#[verifier::external_body]
+pub(super) struct RawMwGuard(*mut u8);
+
+impl RawMwGuard {
+    #[verifier::external_body]
+    pub(super) fn new(raw: *mut u8) -> Self {
+        Self(raw)
+    }
+
+    #[verifier::external_body]
+    pub(super) fn as_ptr(&self) -> *mut u8 {
+        self.0
+    }
+
+    #[verifier::external_body]
+    pub(super) fn into_raw(mut self) -> *mut u8 {
+        let raw = disarm_rdma_ptr(&mut self.0);
+        std::mem::forget(self);
+        raw
+    }
+}
+
+impl Drop for RawMwGuard {
+    #[verifier::external_body]
+    fn drop(&mut self)
+        opens_invariants none
+        no_unwind
+    {
+        drop_rdma_ptr(&mut self.0, vc_dealloc_window);
+    }
+}
 
 fn status(code: i32) -> Result<(), RdmaError> {
     if code == 0 {
@@ -228,11 +433,11 @@ pub(super) fn device_count() -> Result<u32, RdmaError> {
 }
 
 #[verifier::external_body]
-pub(super) fn open(index: u32) -> Result<*mut u8, RdmaError> {
+pub(super) fn open(index: u32) -> Result<RawDeviceCtxGuard, RdmaError> {
     let mut n = 0;
     let list = checked(unsafe { ibv_get_device_list(&mut n) })?;
     let result = if index < n as u32 {
-        checked(unsafe { ibv_open_device(vc_device_at(list, index)) })
+        checked(unsafe { ibv_open_device(vc_device_at(list, index)) }).map(RawDeviceCtxGuard::new)
     } else {
         Err(RdmaError(19))
     };
@@ -299,13 +504,14 @@ pub(super) fn port(ctx: *mut u8, p: u8, index: u8) -> Result<(u16, u8, bool, [u8
 
 #[verifier::external_body]
 pub(super) fn register(pd: *mut u8, ptr: *mut u8, len: usize, flags: AccessFlags) -> Result<
-    (*mut u8, u32),
+    (RawMrGuard, u32),
     RdmaError,
 > {
     let mr = checked(
         unsafe { vc_register(pd, ptr, len, flags.local_write as i32, flags.mw_bind as i32) },
     )?;
-    Ok((mr, unsafe { vc_lkey(mr) }))
+    let lkey = unsafe { vc_lkey(mr) };
+    Ok((RawMrGuard::new(mr), lkey))
 }
 
 #[verifier::external_body]
@@ -324,7 +530,7 @@ pub(super) fn raw_deregister_memory(m: &MemoryRegion) -> (r: Result<
             identity_effect_slab()
         }),
 {
-    status(unsafe { ibv_dereg_mr(m.raw) })?;
+    status(unsafe { ibv_dereg_mr(m.raw.as_ptr()) })?;
     Ok(
         Tracked(
             CompletedAccess {
@@ -340,33 +546,36 @@ pub(super) fn raw_deregister_memory(m: &MemoryRegion) -> (r: Result<
 }
 
 #[verifier::external_body]
-pub(super) fn alloc_window(pd: *mut u8) -> Result<(*mut u8, u32), RdmaError> {
+pub(super) fn alloc_window(pd: *mut u8) -> Result<(RawMwGuard, u32), RdmaError> {
     let mw = checked(unsafe { vc_alloc_window(pd) })?;
-    Ok((mw, unsafe { vc_rkey(mw) }))
+    let rkey = unsafe { vc_rkey(mw) };
+    Ok((RawMwGuard::new(mw), rkey))
 }
 
 #[verifier::external_body]
-pub(super) fn create_cq(ctx: *mut u8, depth: i32) -> Result<*mut u8, RdmaError> {
-    checked(unsafe { vc_create_cq(ctx, depth) })
+pub(super) fn create_cq(ctx: *mut u8, depth: i32) -> Result<RawCqGuard, RdmaError> {
+    checked(unsafe { vc_create_cq(ctx, depth) }).map(RawCqGuard::new)
 }
 
 #[verifier::external_body]
 pub(super) fn create_qp(pd: *mut u8, cq: *mut u8, config: QueuePairConfig) -> Result<
-    (*mut u8, u32),
+    (RawQpGuard, u32),
     RdmaError,
 > {
     let qp = checked(unsafe { vc_create_qp(pd, cq, config.send_depth, config.max_send_sge) })?;
-    Ok((qp, unsafe { vc_qpn(qp) }))
+    let qpn = unsafe { vc_qpn(qp) };
+    Ok((RawQpGuard::new(qp), qpn))
 }
 
 #[verifier::external_body]
 pub(super) fn connect(qp: &UnconnectedQueuePair, peer: QueuePairEndpoint) -> Result<(), RdmaError> {
+    let raw = qp.raw.as_ptr();
     let initiator = qp.config.max_rd_atomic.min(peer.responder_resources);
-    status(unsafe { vc_init(qp.raw, qp.port) })?;
+    status(unsafe { vc_init(raw, qp.port) })?;
     status(
         unsafe {
             vc_rtr(
-                qp.raw,
+                raw,
                 qp.port,
                 peer.number,
                 peer.psn,
@@ -379,7 +588,7 @@ pub(super) fn connect(qp: &UnconnectedQueuePair, peer: QueuePairEndpoint) -> Res
             )
         },
     )?;
-    status(unsafe { vc_rts(qp.raw, qp.endpoint.psn, initiator) })
+    status(unsafe { vc_rts(raw, qp.endpoint.psn, initiator) })
 }
 
 #[verifier::external_body]
@@ -387,12 +596,13 @@ pub(super) fn reconnect(qp: &UnconnectedQueuePair, psn: u32, peer: QueuePairEndp
     (),
     RdmaError,
 > {
+    let raw = qp.raw.as_ptr();
     let initiator = qp.config.max_rd_atomic.min(peer.responder_resources);
-    status(unsafe { vc_init(qp.raw, qp.port) })?;
+    status(unsafe { vc_init(raw, qp.port) })?;
     status(
         unsafe {
             vc_rtr(
-                qp.raw,
+                raw,
                 qp.port,
                 peer.number,
                 peer.psn,
@@ -405,7 +615,7 @@ pub(super) fn reconnect(qp: &UnconnectedQueuePair, psn: u32, peer: QueuePairEndp
             )
         },
     )?;
-    status(unsafe { vc_rts(qp.raw, psn, initiator) })
+    status(unsafe { vc_rts(raw, psn, initiator) })
 }
 
 #[verifier::external_body]
@@ -460,7 +670,7 @@ pub(super) fn transfer(
     status(
         unsafe {
             vc_transfer(
-                q.connection.raw,
+                q.connection.raw.as_ptr(),
                 local.addr,
                 local.len as u32,
                 local.mr.lkey,
@@ -519,7 +729,7 @@ pub(super) fn transfer_sg(
     let sges = storage.buffer(locals.len())?;
     encode_sges(sges, locals, remote)?;
     let d = WrDesc::new(remote, id, sges.len() as u32, read, fence);
-    status(unsafe { vc_transfer_sg(q.connection.raw, &d, sges.as_ptr()) })?;
+    status(unsafe { vc_transfer_sg(q.connection.raw.as_ptr(), &d, sges.as_ptr()) })?;
     Ok(
         Tracked(
             PostedTransfer {
@@ -637,7 +847,7 @@ pub(super) fn post_batch<'a>(q: &QueuePair, requests: &[TransferRequest<'a>]) ->
             let mut posted = 0;
             let rc = unsafe {
                 vc_post_batch(
-                    q.connection.raw,
+                    q.connection.raw.as_ptr(),
                     descs.as_ptr(),
                     descs.len(),
                     sges.as_ptr(),
@@ -687,7 +897,7 @@ pub(super) fn poll_batch(cq: &CompletionQueue, max_entries: usize) -> (r: Result
         return Ok(Vec::new());
     }
     let max = i32::try_from(max_entries).map_err(|_| RdmaError(22))?;
-    let n = unsafe { vc_poll_batch(cq.raw, max) };
+    let n = unsafe { vc_poll_batch(cq.raw.as_ptr(), max) };
     if n == 0 {
         return Ok(Vec::new());
     }
@@ -699,7 +909,7 @@ pub(super) fn poll_batch(cq: &CompletionQueue, max_entries: usize) -> (r: Result
     let mut raw = [RawCompletion::default();64];
     while result.len() < n as usize {
         let count = raw.len().min(n as usize - result.len());
-        unsafe { vc_take_batch(cq.raw, raw.as_mut_ptr(), count as i32) };
+        unsafe { vc_take_batch(cq.raw.as_ptr(), raw.as_mut_ptr(), count as i32) };
         for wc in &raw [..count] {
             result.push((wc.id, wc.status, wc.kind));
         }
@@ -717,7 +927,7 @@ pub(super) fn poll(cq: &CompletionQueue) -> (r: Result<Option<(u64, i32, WorkKin
         ),
 {
     let mut wc = RawCompletion::default();
-    match unsafe { vc_poll(cq.raw, &mut wc.id, &mut wc.status, &mut wc.kind) } {
+    match unsafe { vc_poll(cq.raw.as_ptr(), &mut wc.id, &mut wc.status, &mut wc.kind) } {
         0 => Ok(None),
         1 => Ok(Some((wc.id, wc.status, wc.kind))),
         e => Err(RdmaError(e)),
@@ -730,8 +940,8 @@ pub(super) fn close(p: *mut u8) -> Result<(), RdmaError> {
 }
 
 #[verifier::external_body]
-pub(super) fn alloc_pd(p: *mut u8) -> Result<*mut u8, RdmaError> {
-    checked(unsafe { ibv_alloc_pd(p) })
+pub(super) fn alloc_pd(p: *mut u8) -> Result<RawPdGuard, RdmaError> {
+    checked(unsafe { ibv_alloc_pd(p) }).map(RawPdGuard::new)
 }
 
 #[verifier::external_body]

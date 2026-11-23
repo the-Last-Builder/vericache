@@ -35,7 +35,7 @@ impl<'a> CudaBackend<'a> {
             dst.well_formed(),
             dst.instance_id() == old(core).instance_id(),
             dst.slot_ref().loc.node == old(core).node(),
-            dst.slot_ref().sub_len == old(core).frames.frame_size,
+            dst.slot_ref().sub_len == old(core).frames.tier_frame_size(self.gpu_tier),
             dst.slot_ref().loc.space is GpuAlloc ==> dst.slot_ref().loc.space->GpuAlloc_device
                 == self.device,
             slot_is_owned(*old(dst_tok), old(core).instance_id(), dst.slot_ref().loc),

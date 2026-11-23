@@ -28,8 +28,10 @@ pub(super) proof fn lemma_scatter_piece_pre_enqueue(
         0 <= i < srcs.len(),
         pieces.len() == i,
         piece_seqs.len() == i,
-        scatter_offsets_valid(srcs, offsets, core.frames.frame_size),
-        bytes.len() == core.frames.frame_size,
+        scatter_offsets_valid(srcs, offsets, dst_slot.slot_len as usize),
+        bytes.len() == dst_slot.slot_len,
+        dst_slot.is_full(),
+        dst_slot.slot_len <= usize::MAX,
         src_certs.len() == srcs.len(),
         core.well_formed(),
         before_core.well_formed(),
@@ -74,7 +76,7 @@ pub(super) proof fn lemma_scatter_piece_pre_enqueue(
             readers: ISet::empty(),
         }) && stream.tail() == ISet::empty().insert(pieces[i - 1].writer),
     ensures
-        offsets[i] <= offsets[i + 1] <= core.frames.frame_size,
+        offsets[i] <= offsets[i + 1] <= dst_slot.slot_len,
         srcs[i].well_formed(),
         srcs[i].instance_id() == core.instance_id(),
         srcs[i].slot_ref().loc.node == core.node(),
@@ -99,7 +101,7 @@ pub(super) proof fn lemma_scatter_piece_pre_enqueue(
     hide(replica_valid);
     hide(complete_receipts);
     lemma_core_wf_facts(core);
-    lemma_scatter_offsets_bounded(srcs, offsets, core.frames.frame_size, i + 1);
+    lemma_scatter_offsets_bounded(srcs, offsets, dst_slot.slot_len as usize, i + 1);
     lemma_cuda_scatter_src_at(
         before_core.ledger@,
         core.instance_id(),

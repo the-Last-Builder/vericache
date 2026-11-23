@@ -1,8 +1,10 @@
 use crate::policy::LruPolicy;
-use crate::schema::{bytes_per_sec_to_gbps, JobSpec, LatencyHist, MetricRecord, ProcSampler};
-use crate::shard::{key_from_hash_id, stamp_checksummed_frame, verify_checksummed_frame};
+use crate::schema::{JobSpec, LatencyHist, MetricRecord, ProcSampler, bytes_per_sec_to_gbps};
+use crate::shard::{
+    ShardCapabilityBundle, key_from_hash_id, stamp_checksummed_frame, verify_checksummed_frame,
+};
 use crate::suites::rdma_ablation::{
-    build_distributed_engine, connect_peer, open_rdma_device, TcpTransport,
+    TcpTransport, build_distributed_engine, connect_peer, open_rdma_device,
 };
 use crate::suites::trace_replay::load_trace;
 use std::collections::HashSet;
@@ -10,17 +12,16 @@ use std::io::Read;
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-use transfer::context::NodeContext;
 use transfer::rdma::ProtectionDomain;
 use transfer::transport::ByteTransport;
 use vericache_core::backends::host::HostBackend;
 use vericache_core::backends::rdma::peer::{FetchOutcome, ServeOutcome};
 use vericache_core::backends::rdma::protocol::ControlPayload;
 use vericache_core::backends::rdma::pull::PullTarget;
-use vericache_core::engine::DistributedEvent;
-use vericache_core::kernel::CacheCore;
-use vericache_core::spec::{CoreError, FrameId, ObjectKey, BACKEND_RDMA};
-use vstd::prelude::Tracked;
+use vericache_core::engine::{DistributedEngine, DistributedEvent};
+use vericache_core::spec::{BACKEND_RDMA, CoreError, FrameId, ObjectKey, TierId};
+#[cfg_attr(not(verus_only), allow(unused_imports))]
+use vstd::prelude::{Tracked, verus};
 
 const IBV_WC_REM_ACCESS_ERR: i32 = 10;
 
@@ -133,47 +134,69 @@ fn build_hotspot_workload(job: &JobSpec) -> (Vec<u64>, usize) {
     (ops, cap_frames)
 }
 
-fn should_revoke(op_idx: usize, revoke_rate: f64) -> bool {
+fn build_revoke_schedule(total_ops: usize, revoke_rate: f64) -> Vec<bool> {
     if revoke_rate <= 0.0 {
-        return false;
+        return vec![false; total_ops];
     }
     let period = (1.0 / revoke_rate).round().max(1.0) as usize;
-    (op_idx + 1) % period == 0
+    (0..total_ops).map(|idx| (idx + 1) % period == 0).collect()
 }
 
-fn make_core(node_id: u64, frame_size: usize) -> CacheCore {
-    let (_inst, _alloc, _ev, _sh, _vi, _vs) =
-        NodeContext::bootstrap(node_id).into_sources_with_versions();
-    let mut core = CacheCore::new(
-        node_id as u16,
-        frame_size,
-        Vec::new(),
-        64,
-        Tracked::assume_new(),
-    );
-    core.enable_version_registry(Tracked::assume_new(), Tracked::assume_new());
-    core
+verus! {
+
+fn ensure_donor_resident(
+    caps: &ShardCapabilityBundle,
+    engine: &mut DistributedEngine<'_, TcpTransport>,
+    host_tier: TierId,
+    lru: &mut LruPolicy<ObjectKey, FrameId>,
+    buf: &mut [u8],
+    version_counter: &mut u64,
+    hid: u64,
+) {
+    let key = key_from_hash_id(hid);
+    if lru.contains(&key) {
+        lru.touch(&key);
+        return;
+    }
+    if lru.is_full() {
+        if let Some((_vk, vf)) = lru.pop_lru() {
+            engine.evict_frame(vf).expect("donor evict lru");
+            let r = engine.reclaim_draining(host_tier, 8);
+            assert!(r >= 1, "donor reclaim failed");
+        }
+    }
+    let ver = *version_counter;
+    *version_counter += 1;
+    stamp_checksummed_frame(buf, hid, ver);
+    let (_v, frame) = engine
+        .put_host(Tracked(caps.instance.borrow()), key, buf)
+        .expect("donor put_host");
+    let _ = lru.insert(key, frame);
 }
 
-fn run_donor(job: &JobSpec, transport: TcpTransport) {
+fn run_donor_inner(
+    job: &JobSpec,
+    transport: TcpTransport,
+    ops: &[u64],
+    revoke_flags: &[bool],
+    donor_cap: usize,
+) {
     let frame_size = job.chunk_bytes;
-    let revoke_rate = job.revoke_rate.unwrap_or(0.01);
-    let (ops, donor_cap) = build_hotspot_workload(job);
-
+    let mut caps = ShardCapabilityBundle::take(0);
     let device = open_rdma_device(0, &job.rdma_dev);
-    let pd = ProtectionDomain::new(&device, Tracked::assume_new()).expect("PD");
-    let mut core = make_core(0, frame_size);
+    let pd = ProtectionDomain::new(&device, caps.mint_rdma()).expect("PD");
+    let mut core = caps.make_versioned_core(frame_size, 64);
     let host = HostBackend::new(
         &mut core,
-        Tracked::assume_new(),
-        Tracked::assume_new(),
-        Tracked::assume_new(),
+        Tracked(caps.instance.borrow()),
+        Tracked(caps.alloc.borrow_mut()),
+        caps.mint_host(),
         donor_cap as u32,
         4096,
     )
     .expect("donor HostBackend");
     let mut engine = build_distributed_engine(
-        0,
+        &mut caps,
         frame_size,
         donor_cap as u32,
         8,
@@ -191,45 +214,28 @@ fn run_donor(job: &JobSpec, transport: TcpTransport) {
     let mut version_counter: u64 = 1;
     let mut psn_counter: u32 = 0x1000;
 
-    // Helper closure: ensure `key` is resident in donor's tight 15%-capacity LRU slab with checksummed payload.
-    let ensure_resident = |engine: &mut vericache_core::engine::DistributedEngine<'_, TcpTransport>,
-                           lru: &mut LruPolicy<ObjectKey, FrameId>,
-                           buf: &mut [u8],
-                           version_counter: &mut u64,
-                           hid: u64| {
-        let key = key_from_hash_id(hid);
-        if lru.contains(&key) {
-            lru.touch(&key);
-            return;
-        }
-        if lru.is_full() {
-            if let Some((_vk, vf)) = lru.pop_lru() {
-                engine.evict_frame(vf).expect("donor evict lru");
-                let r = engine.reclaim_draining(host_tier, 8);
-                assert!(r >= 1, "donor reclaim failed");
-            }
-        }
-        let ver = *version_counter;
-        *version_counter += 1;
-        stamp_checksummed_frame(buf, hid, ver);
-        let (_v, frame) = engine
-            .put_host(Tracked::assume_new(), key, buf)
-            .expect("donor put_host");
-        let _ = lru.insert(key, frame);
-    };
-
-    for (op_idx, &hid) in ops.iter().enumerate() {
-        ensure_resident(&mut engine, &mut lru, &mut buf, &mut version_counter, hid);
+    let mut op_idx = 0usize;
+    while op_idx < ops.len() {
+        let hid = ops[op_idx];
+        ensure_donor_resident(
+            &caps,
+            &mut engine,
+            host_tier,
+            &mut lru,
+            &mut buf,
+            &mut version_counter,
+            hid,
+        );
         let key = key_from_hash_id(hid);
         let req_id = match engine
-            .poll_peer_event(Tracked::assume_new())
+            .poll_peer_event(Tracked(caps.instance.borrow()))
             .expect("donor poll FetchRequest")
         {
             DistributedEvent::Control(ControlPayload::FetchRequest { request_id, key: k }) => {
-                assert_eq!(k, key);
+                assert!(k == key);
                 request_id
-            }
-            _ => panic!("donor expected FetchRequest at op {op_idx}"),
+            },
+            _ => panic!("donor expected FetchRequest"),
         };
 
         let grant_tag = match engine
@@ -237,8 +243,8 @@ fn run_donor(job: &JobSpec, transport: TcpTransport) {
                 host_tier,
                 req_id,
                 key,
-                Tracked::assume_new(),
-                Tracked::assume_new(),
+                Tracked(caps.shares.borrow_mut()),
+                Tracked(caps.instance.borrow()),
             )
             .expect("donor serve_fetch_request")
         {
@@ -246,10 +252,10 @@ fn run_donor(job: &JobSpec, transport: TcpTransport) {
             ServeOutcome::Miss => panic!("donor unexpectedly missed resident key"),
         };
 
-        if should_revoke(op_idx, revoke_rate) {
+        if revoke_flags[op_idx] {
             // Option-A unilateral donor revocation: LOCAL_INV + ibv_dealloc_mw -> Quarantined + RevokeNotice.
             let mw_slot = engine
-                .revoke_lease_unilateral(grant_tag, Tracked::assume_new())
+                .revoke_lease_unilateral(grant_tag, Tracked(caps.instance.borrow()))
                 .expect("donor revoke_lease_unilateral");
 
             // Immediately evict, reclaim, and overwrite that frame with a conflicting hot key to
@@ -257,27 +263,27 @@ fn run_donor(job: &JobSpec, transport: TcpTransport) {
             if let Some(evicted_f) = lru.remove(&key) {
                 engine.evict_frame(evicted_f).expect("evict revoked frame");
                 let r = engine.reclaim_draining(host_tier, 8);
-                assert_eq!(r, 1, "revoked frame must reclaim immediately after LOCAL_INV");
+                assert!(r == 1, "revoked frame must reclaim immediately after LOCAL_INV");
                 let conflict_hid = hid.wrapping_add(0xDEAD_BEEF);
                 let ver = version_counter;
                 version_counter += 1;
                 stamp_checksummed_frame(&mut buf, conflict_hid, ver);
                 let conflict_key = key_from_hash_id(conflict_hid);
                 let (_cv, cf) = engine
-                    .put_host(Tracked::assume_new(), conflict_key, &buf)
+                    .put_host(Tracked(caps.instance.borrow()), conflict_key, &buf)
                     .expect("overwrite reclaimed donor frame");
                 let _ = lru.insert(conflict_key, cf);
             }
 
             // Drain initiator's post-abort ReadRelease.
             match engine
-                .poll_peer_event(Tracked::assume_new())
+                .poll_peer_event(Tracked(caps.instance.borrow()))
                 .expect("donor poll post-abort ReadRelease")
             {
                 DistributedEvent::ReadReleased { tag, was_active, .. } => {
-                    assert_eq!(tag, grant_tag);
+                    assert!(tag == grant_tag);
                     assert!(!was_active);
-                }
+                },
                 _ => panic!("donor expected post-abort ReadRelease"),
             }
 
@@ -285,22 +291,30 @@ fn run_donor(job: &JobSpec, transport: TcpTransport) {
             let _err_w = engine.enter_qp_error().expect("donor enter_qp_error");
             psn_counter = (psn_counter + 7) & 0x00ff_ffff;
             engine
-                .reset_and_reconnect(psn_counter, Tracked::assume_new())
+                .reset_and_reconnect(psn_counter, Tracked(caps.instance.borrow()))
                 .expect("donor reset_and_reconnect");
             engine
-                .replenish_window(mw_slot, &pd, Tracked::assume_new())
+                .replenish_window(mw_slot, &pd, caps.mint_rdma())
                 .expect("donor replenish_window");
 
             // Re-populate `hid` and serve the clean retry fetch!
-            ensure_resident(&mut engine, &mut lru, &mut buf, &mut version_counter, hid);
+            ensure_donor_resident(
+                &caps,
+                &mut engine,
+                host_tier,
+                &mut lru,
+                &mut buf,
+                &mut version_counter,
+                hid,
+            );
             let retry_req_id = match engine
-                .poll_peer_event(Tracked::assume_new())
+                .poll_peer_event(Tracked(caps.instance.borrow()))
                 .expect("donor poll retry FetchRequest")
             {
                 DistributedEvent::Control(ControlPayload::FetchRequest { request_id, key: k }) => {
-                    assert_eq!(k, key);
+                    assert!(k == key);
                     request_id
-                }
+                },
                 _ => panic!("donor expected retry FetchRequest"),
             };
             let retry_tag = match engine
@@ -308,8 +322,8 @@ fn run_donor(job: &JobSpec, transport: TcpTransport) {
                     host_tier,
                     retry_req_id,
                     key,
-                    Tracked::assume_new(),
-                    Tracked::assume_new(),
+                    Tracked(caps.shares.borrow_mut()),
+                    Tracked(caps.instance.borrow()),
                 )
                 .expect("donor serve retry")
             {
@@ -317,50 +331,66 @@ fn run_donor(job: &JobSpec, transport: TcpTransport) {
                 ServeOutcome::Miss => panic!("donor missed retry key"),
             };
             match engine
-                .poll_peer_event(Tracked::assume_new())
+                .poll_peer_event(Tracked(caps.instance.borrow()))
                 .expect("donor poll retry ReadRelease")
             {
                 DistributedEvent::ReadReleased { tag, was_active, .. } => {
-                    assert_eq!(tag, retry_tag);
+                    assert!(tag == retry_tag);
                     assert!(was_active);
-                }
+                },
                 _ => panic!("donor expected retry ReadRelease"),
             }
         } else {
             // Normal cooperative release.
             match engine
-                .poll_peer_event(Tracked::assume_new())
+                .poll_peer_event(Tracked(caps.instance.borrow()))
                 .expect("donor poll ReadRelease")
             {
                 DistributedEvent::ReadReleased { tag, was_active, .. } => {
-                    assert_eq!(tag, grant_tag);
+                    assert!(tag == grant_tag);
                     assert!(was_active);
-                }
+                },
                 _ => panic!("donor expected cooperative ReadRelease"),
             }
         }
+        op_idx += 1;
     }
 }
 
-fn run_initiator(job: &JobSpec, transport: TcpTransport) -> MetricRecord {
-    let frame_size = job.chunk_bytes;
-    let revoke_rate = job.revoke_rate.unwrap_or(0.01);
-    let (ops, donor_cap) = build_hotspot_workload(job);
+struct InitiatorRunStats {
+    elapsed_s: f64,
+    sampler: ProcSampler,
+    op_hist: LatencyHist,
+    recov_hist: LatencyHist,
+    corrupted_frames: u64,
+    revoke_count: u64,
+    rem_access_errs: u64,
+    valid_fetches: u64,
+    total_wire_attempts: u64,
+}
 
+fn run_initiator_inner(
+    job: &JobSpec,
+    transport: TcpTransport,
+    ops: &[u64],
+    revoke_flags: &[bool],
+) -> InitiatorRunStats {
+    let frame_size = job.chunk_bytes;
+    let mut caps = ShardCapabilityBundle::take(1);
     let device = open_rdma_device(1, &job.rdma_dev);
-    let pd = ProtectionDomain::new(&device, Tracked::assume_new()).expect("PD");
-    let mut core = make_core(1, frame_size);
+    let pd = ProtectionDomain::new(&device, caps.mint_rdma()).expect("PD");
+    let mut core = caps.make_versioned_core(frame_size, 64);
     let host = HostBackend::new(
         &mut core,
-        Tracked::assume_new(),
-        Tracked::assume_new(),
-        Tracked::assume_new(),
+        Tracked(caps.instance.borrow()),
+        Tracked(caps.alloc.borrow_mut()),
+        caps.mint_host(),
         8,
         4096,
     )
     .expect("initiator HostBackend");
     let mut engine = build_distributed_engine(
-        1,
+        &mut caps,
         frame_size,
         8,
         8,
@@ -387,30 +417,32 @@ fn run_initiator(job: &JobSpec, transport: TcpTransport) -> MetricRecord {
     let sampler = ProcSampler::start();
     let run_start = Instant::now();
 
-    for (op_idx, &hid) in ops.iter().enumerate() {
+    let mut op_idx = 0usize;
+    while op_idx < ops.len() {
+        let hid = ops[op_idx];
         let key = key_from_hash_id(hid);
         let t_op = Instant::now();
 
-        if should_revoke(op_idx, revoke_rate) {
+        if revoke_flags[op_idx] {
             revoke_count += 1;
             total_wire_attempts += 1;
             let _req_id = engine
-                .send_fetch_request(key, Tracked::assume_new())
+                .send_fetch_request(key, Tracked(caps.instance.borrow()))
                 .expect("send_fetch_request");
             let grant = match engine
-                .poll_peer_event(Tracked::assume_new())
+                .poll_peer_event(Tracked(caps.instance.borrow()))
                 .expect("poll ReadGrant")
             {
                 DistributedEvent::ReadGrant(g) => g,
                 _ => panic!("expected ReadGrant"),
             };
             match engine
-                .poll_peer_event(Tracked::assume_new())
+                .poll_peer_event(Tracked(caps.instance.borrow()))
                 .expect("poll RevokeNotice")
             {
                 DistributedEvent::Control(ControlPayload::RevokeNotice { grant_tag }) => {
-                    assert_eq!(grant_tag, grant.tag);
-                }
+                    assert!(grant_tag == grant.tag);
+                },
                 _ => panic!("expected RevokeNotice"),
             }
 
@@ -421,20 +453,20 @@ fn run_initiator(job: &JobSpec, transport: TcpTransport) -> MetricRecord {
                 host_tier,
                 PullTarget::Host,
                 grant,
-                Tracked::assume_new(),
+                Tracked(caps.instance.borrow()),
             );
             match pull_res {
                 Err(CoreError::Backend {
                     kind: BACKEND_RDMA,
                     code,
                 }) => {
-                    assert_eq!(
-                        code, IBV_WC_REM_ACCESS_ERR,
-                        "expected IBV_WC_REM_ACCESS_ERR (10), got {code}"
+                    assert!(
+                        code == IBV_WC_REM_ACCESS_ERR,
+                        "expected IBV_WC_REM_ACCESS_ERR (10)"
                     );
                     rem_access_errs += 1;
-                }
-                other => panic!("expected IBV_WC_REM_ACCESS_ERR on revoked MW, got {other:?}"),
+                },
+                _ => panic!("expected IBV_WC_REM_ACCESS_ERR on revoked MW"),
             }
             // Frame MUST NOT be published after abort_write.
             assert!(
@@ -446,7 +478,7 @@ fn run_initiator(job: &JobSpec, transport: TcpTransport) -> MetricRecord {
             let _err_w = engine.enter_qp_error().expect("init enter_qp_error");
             psn_counter = (psn_counter + 7) & 0x00ff_ffff;
             engine
-                .reset_and_reconnect(psn_counter, Tracked::assume_new())
+                .reset_and_reconnect(psn_counter, Tracked(caps.instance.borrow()))
                 .expect("init reset_and_reconnect");
             let recov_ns = t_recov.elapsed().as_nanos() as u64;
             recov_hist.record_ns(recov_ns);
@@ -454,15 +486,20 @@ fn run_initiator(job: &JobSpec, transport: TcpTransport) -> MetricRecord {
             // Clean retry fetch over reconnected QP + full checksum verification.
             total_wire_attempts += 1;
             let FetchOutcome::Hit { frame, .. } = engine
-                .fetch_remote_frame(key, host_tier, PullTarget::Host, Tracked::assume_new())
+                .fetch_remote_frame(
+                    key,
+                    host_tier,
+                    PullTarget::Host,
+                    Tracked(caps.instance.borrow()),
+                )
                 .expect("retry fetch_remote_frame")
             else {
                 panic!("expected retry Hit");
             };
             let got = engine
                 .get_into_host(
-                    Tracked::assume_new(),
-                    Tracked::assume_new(),
+                    Tracked(caps.instance.borrow()),
+                    Tracked(caps.shares.borrow_mut()),
                     key,
                     &mut read_buf,
                 )
@@ -474,19 +511,24 @@ fn run_initiator(job: &JobSpec, transport: TcpTransport) -> MetricRecord {
                 valid_fetches += 1;
             }
             engine.evict_frame(frame).expect("evict retry frame");
-            assert_eq!(engine.reclaim_draining(host_tier, 8), 1);
+            assert!(engine.reclaim_draining(host_tier, 8) == 1);
         } else {
             total_wire_attempts += 1;
             let FetchOutcome::Hit { frame, .. } = engine
-                .fetch_remote_frame(key, host_tier, PullTarget::Host, Tracked::assume_new())
+                .fetch_remote_frame(
+                    key,
+                    host_tier,
+                    PullTarget::Host,
+                    Tracked(caps.instance.borrow()),
+                )
                 .expect("fetch_remote_frame")
             else {
                 panic!("expected Hit");
             };
             let got = engine
                 .get_into_host(
-                    Tracked::assume_new(),
-                    Tracked::assume_new(),
+                    Tracked(caps.instance.borrow()),
+                    Tracked(caps.shares.borrow_mut()),
                     key,
                     &mut read_buf,
                 )
@@ -498,42 +540,71 @@ fn run_initiator(job: &JobSpec, transport: TcpTransport) -> MetricRecord {
                 valid_fetches += 1;
             }
             engine.evict_frame(frame).expect("evict frame");
-            assert_eq!(engine.reclaim_draining(host_tier, 8), 1);
+            assert!(engine.reclaim_draining(host_tier, 8) == 1);
         }
 
         let op_ns = t_op.elapsed().as_nanos() as u64;
         op_hist.record_ns(op_ns);
+        op_idx += 1;
     }
 
-    let elapsed_s = run_start.elapsed().as_secs_f64();
-    let (cpu_pct, rss_mb) = sampler.finish();
-    let good_bytes = valid_fetches * (frame_size as u64);
-    let wire_bytes = total_wire_attempts * (frame_size as u64);
+    InitiatorRunStats {
+        elapsed_s: run_start.elapsed().as_secs_f64(),
+        sampler,
+        op_hist,
+        recov_hist,
+        corrupted_frames,
+        revoke_count,
+        rem_access_errs,
+        valid_fetches,
+        total_wire_attempts,
+    }
+}
+
+} // verus!
+
+fn run_donor(job: &JobSpec, transport: TcpTransport) {
+    let revoke_rate = job.revoke_rate.unwrap_or(0.01);
+    let (ops, donor_cap) = build_hotspot_workload(job);
+    let revoke_flags = build_revoke_schedule(ops.len(), revoke_rate);
+    run_donor_inner(job, transport, &ops, &revoke_flags, donor_cap);
+}
+
+fn run_initiator(job: &JobSpec, transport: TcpTransport) -> MetricRecord {
+    let frame_size = job.chunk_bytes;
+    let revoke_rate = job.revoke_rate.unwrap_or(0.01);
+    let (ops, donor_cap) = build_hotspot_workload(job);
+    let revoke_flags = build_revoke_schedule(ops.len(), revoke_rate);
+    let st = run_initiator_inner(job, transport, &ops, &revoke_flags);
+
+    let (cpu_pct, rss_mb) = st.sampler.finish();
+    let good_bytes = st.valid_fetches * (frame_size as u64);
+    let wire_bytes = st.total_wire_attempts * (frame_size as u64);
 
     assert_eq!(
-        corrupted_frames, 0,
+        st.corrupted_frames, 0,
         "VeriCache Option-A revocation MUST guarantee corrupted_frames == 0"
     );
 
     let mut rec = MetricRecord::from_job("vericache", job);
     rec.num_blocks = donor_cap;
-    rec.throughput_gbps = bytes_per_sec_to_gbps(wire_bytes, elapsed_s);
-    rec.goodput_gbps = bytes_per_sec_to_gbps(good_bytes, elapsed_s);
-    rec.p50_us = op_hist.p50_us();
-    rec.p95_us = op_hist.p95_us();
-    rec.p99_us = op_hist.p99_us();
-    rec.hit_rate = (valid_fetches as f64) / (ops.len() as f64);
+    rec.throughput_gbps = bytes_per_sec_to_gbps(wire_bytes, st.elapsed_s);
+    rec.goodput_gbps = bytes_per_sec_to_gbps(good_bytes, st.elapsed_s);
+    rec.p50_us = st.op_hist.p50_us();
+    rec.p95_us = st.op_hist.p95_us();
+    rec.p99_us = st.op_hist.p99_us();
+    rec.hit_rate = (st.valid_fetches as f64) / (ops.len() as f64);
     rec.cpu_pct = cpu_pct;
     rec.rss_mb = rss_mb;
-    rec.corrupted_frames = corrupted_frames;
-    rec.recovery_us = recov_hist.mean_us();
+    rec.corrupted_frames = st.corrupted_frames;
+    rec.recovery_us = st.recov_hist.mean_us();
     rec.notes = format!(
         "Option-A unilateral revoke (rate={:.3}, revokes={}, IBV_WC_REM_ACCESS_ERR={}, recov_p50_us={:.1}, recov_p99_us={:.1}, donor_cap_15pct={})",
         revoke_rate,
-        revoke_count,
-        rem_access_errs,
-        recov_hist.p50_us(),
-        recov_hist.p99_us(),
+        st.revoke_count,
+        st.rem_access_errs,
+        st.recov_hist.p50_us(),
+        st.recov_hist.p99_us(),
         donor_cap
     );
     rec

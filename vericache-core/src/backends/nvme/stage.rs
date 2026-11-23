@@ -61,6 +61,7 @@ impl NvmeBackend {
             hop.dst_frame.0 < old(core).frames.metas.len(),
             hop.src_slot@ == old(core).frames.frame(hop.src_frame).slot,
             hop.dst_slot@ == old(core).frames.frame(hop.dst_frame).slot,
+            hop.src_slot@.slot_len == hop.dst_slot@.slot_len,
             hop.src_slot@.loc != hop.dst_slot@.loc,
             old(core).frames.meta(hop.src_frame).state == STATE_PUBLISHED,
             old(core).frames.frame(hop.src_frame).cert == Some(hop.src_cert@),

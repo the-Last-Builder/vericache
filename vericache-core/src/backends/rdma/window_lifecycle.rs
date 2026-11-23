@@ -345,10 +345,27 @@ impl<'a> WindowPool<'a> {
                     &&& final(self).slots@ == old(self).slots@
                     &&& final(self).free@ == old(self).free@
                 },
-                Ok(_) => {
+                Ok(grant_opt) => {
                     &&& final(self).slots[i as int].state == MwSlotState::Vacant
                     &&& final(self).slots[i as int].generation == generation
                     &&& final(self).slots[i as int].window is None
+                    &&& match old(self).slots[i as int].window->Some_0.state() {
+                        rdma::WindowState::Binding {
+                            instance_id,
+                            share,
+                            target_slot,
+                            access,
+                            ..
+                        } => {
+                            &&& grant_opt@ matches Some(g)
+                            &&& g.access() == access
+                            &&& g.share() == share
+                            &&& (g matches rdma::WindowBindGrant::ReadOnly(right)
+                                ==> right.instance_id() == instance_id && right.loc()
+                                == target_slot.loc)
+                        },
+                        _ => grant_opt@ is None,
+                    }
                 },
             },
     {
@@ -448,6 +465,11 @@ impl<'a> WindowPool<'a> {
             r.is_ok() ==> final(self).free@.len() == 0 && forall|j: int|
                 0 <= j < final(self).slots.len() ==> (#[trigger] final(self).slots[j]).state
                     == MwSlotState::Vacant,
+            forall|j: int|
+                0 <= j < final(self).slots.len() ==> !((
+                #[trigger] final(self).slots[j]).state is Binding
+                    || final(self).slots[j].state is Bound
+                    || final(self).slots[j].state is Invalidating),
     {
         proof {
             reveal(window_pool_slots_wf);
@@ -479,6 +501,8 @@ impl<'a> WindowPool<'a> {
                         &&& s.window matches Some(w) ==> (w.pd_id() == self.pd_id@ && w.node()
                             == self.node@) && (w.state() is Binding || w.state() is Bound
                             || w.state() is Invalidating ==> w.consistent())
+                        &&& (s.state == MwSlotState::Free || s.state is Quarantined || s.state
+                            == MwSlotState::Vacant)
                         &&& first_err.is_none() ==> s.state == MwSlotState::Vacant
                     },
                 forall|j: int|

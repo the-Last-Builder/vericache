@@ -171,7 +171,9 @@ impl FrameTable {
             g.preserve_readers(
                 prior,
                 self.meta(f),
+                self.ovf(f),
                 old(self).meta(f),
+                old(self).ovf(f),
                 &v.timelines,
                 &v.timelines,
                 v.node,
@@ -212,12 +214,14 @@ impl FrameTable {
             before.frame(f).has_pin(share, remote),
             f.0 < before.metas.len(),
             old(self).metas == before.metas,
+            old(self).overflow_seqs == before.overflow_seqs,
             old(self).bindings == before.bindings,
             old(self).num_tiers == before.num_tiers,
             old(self).ready_queue == before.ready_queue,
             old(self).draining_queue == before.draining_queue,
             old(self).draining_cursor == before.draining_cursor,
             old(self).frame_size == before.frame_size,
+            old(self).tier_frame_sizes == before.tier_frame_sizes,
             old(self).ghosts@.dom() == before.ghosts@.dom(),
             forall|i: nat|
                 i < before.metas.len() && i != f.0 ==> #[trigger] old(self).ghosts@[i]
@@ -241,11 +245,18 @@ impl FrameTable {
                     shares: before.frame(f).live_shares().remove(share),
                 }
             }),
-            old(self).frame(f).covered(before.meta(f), &v.timelines, v.node, &v.ledger),
+            old(self).frame(f).covered(
+                before.meta(f),
+                before.ovf(f),
+                &v.timelines,
+                v.node,
+                &v.ledger,
+            ),
         ensures
             forall|g: FrameId|
                 g != f && g.0 < before.metas.len() ==> (#[trigger] final(self).meta(g))
-                    == before.meta(g),
+                    == before.meta(g) && final(self).ovf(g) == before.ovf(g),
+            final(self).overflow_seqs == before.overflow_seqs,
             final(self).meta(f).inline_read_tickets == before.meta(f).inline_read_tickets,
             final(self).meta(f).flags == before.meta(f).flags,
             final(self).same_directory(&before),
@@ -308,7 +319,7 @@ impl FrameTable {
 
     pub(super) fn unpin(
         &mut self,
-        table: &mut TimelineTable,
+        table: &TimelineTable,
         f: FrameId,
         remote: bool,
         Tracked(cap): Tracked<ShareCap>,
@@ -319,18 +330,18 @@ impl FrameTable {
         requires
             old(self).consistent(v),
             instance.id() == v.id(),
-            v.timelines == *old(table),
+            v.timelines == *table,
             f.0 < old(self).metas.len(),
             old(self).frame(f).has_pin(cap.share(), remote),
             old(self).returned_reads(f, cap, k, v),
-            old(table).valid_ticket(k),
+            table.valid_ticket(k),
         ensures
             forall|g: FrameId|
                 g != f && g.0 < old(self).metas.len() ==> (#[trigger] final(self).meta(g)) == old(
                     self,
-                ).meta(g),
+                ).meta(g) && final(self).ovf(g) == old(self).ovf(g),
             k != Ticket::NONE ==> final(self).meta(f).bounds_reader(
-                final(table),
+                final(self).ovf(f),
                 k.timeline_id(),
                 k.sequence(),
             ),
@@ -339,7 +350,7 @@ impl FrameTable {
             final(self).same_other_pins(old(self), Some(f)),
             final(self).metas.len() == old(self).metas.len(),
             f.0 < old(self).metas.len() ==> final(self).frame(f).slot == old(self).frame(f).slot,
-            final(self).consistent(KernelView::of(final(table), &v.ledger, v.node)),
+            final(self).consistent(v),
             final(self).frame(f).local_shares == (if remote {
                 old(self).frame(f).local_shares
             } else {
@@ -350,7 +361,6 @@ impl FrameTable {
             } else {
                 old(self).frame(f).remote_shares
             }),
-            final(table).only_watermarks(old(table)),
             r@.instance_id() == v.id(),
             r@.share() == cap.share(),
             r@.loc() == old(self).frame(f).slot.loc,
@@ -364,11 +374,11 @@ impl FrameTable {
         } else {
             assert(Ticket::NONE.sequence() == 0) by (compute);
         }
-        let ghost view = KernelView::of(table, &v.ledger, v.node);
         let ghost before = *self;
         let ghost m = self.meta(f);
+        let ghost ovf = self.ovf(f);
         proof {
-            assert(self.valid_frame(f, view));
+            assert(self.valid_frame(f, v));
         }
         let tracked mut g = self.ghosts.borrow_mut().tracked_remove(f.0 as nat);
         let tracked lent_tok;
@@ -393,8 +403,9 @@ impl FrameTable {
             } else {
                 Slot::Lent { base: g.frontier(), shares: ids.remove(share) }
             });
-            assert(before.valid_frame(f, view));
+            assert(before.valid_frame(f, v));
             assert forall|e| #[trigger] g.frontier().readers.contains(e) implies m.accounts(
+                ovf,
                 table,
                 v.node,
                 &v.ledger,
@@ -419,15 +430,15 @@ impl FrameTable {
                             };
                         assert(s <= m.inline_read_tickets[i].sequence());
                     }
-                    assert(m.bounds_reader(table, t, s));
+                    assert(m.bounds_reader(ovf, t, s));
                     assert(table.events@[(t, s)] == e);
                 }
             }
-            assert(g.covered(m, table, v.node, &v.ledger));
+            assert(g.covered(m, ovf, table, v.node, &v.ledger));
             self.ghosts.borrow_mut().tracked_insert(f.0 as nat, g);
             assert(self.ghosts@.dom() =~= before.ghosts@.dom());
         }
-        self.finish_return(f, remote, Ghost(share), Ghost(before), Ghost(view));
+        self.finish_return(f, remote, Ghost(share), Ghost(before), Ghost(v));
         Tracked(receipt)
     }
 

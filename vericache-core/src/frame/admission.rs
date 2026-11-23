@@ -9,13 +9,41 @@ broadcast use {
 };
 
 impl FrameTable {
+    pub(super) fn frame_overflow_retired(&self, table: &TimelineTable, f: FrameId) -> (r: bool)
+        requires
+            f.0 < self.metas.len(),
+            self.overflow_seqs.len() == self.metas.len(),
+            table.bounds(),
+        ensures
+            r == FrameSyncMeta::overflow_retired(self.ovf(f), table),
+    {
+        let mut i = 0;
+        while i < table.count
+            invariant
+                f.0 < self.metas.len(),
+                self.overflow_seqs.len() == self.metas.len(),
+                i <= table.count <= MAX_TIMELINES,
+                forall|j: int|
+                    0 <= j < i ==> self.overflow_seqs[f.0 as int][j]
+                        <= #[trigger] table.confirmed_seq[j],
+            decreases table.count - i,
+        {
+            if table.confirmed_seq[i] < self.overflow_seqs[f.0 as usize][i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
     pub fn is_reusable_observed(&self, table: &TimelineTable, f: FrameId) -> (r: bool)
         requires
             f.0 < self.metas.len(),
+            self.overflow_seqs.len() == self.metas.len(),
             table.bounds(),
             self.meta(f).valid_tickets(table),
         ensures
-            r == self.meta(f).reusable(table),
+            r == self.meta(f).reusable(self.ovf(f), table),
     {
         let m = &self.metas[f.0 as usize];
         if !(m.state == STATE_EMPTY || m.state == STATE_DRAINING) || m.active_local_reads != 0
@@ -27,7 +55,7 @@ impl FrameTable {
             return false;
         }
         if m.flags & FLAG_READ_OVERFLOW != 0 {
-            return table.overflow_all_retired();
+            return self.frame_overflow_retired(table, f);
         }
         for i in 0..4
             invariant
@@ -79,22 +107,24 @@ impl FrameTable {
         requires
             self.well_formed(ledger.submitted.instance_id(), node, table, ledger),
             f.0 < self.metas.len(),
-            self.meta(f).reusable(table),
+            self.meta(f).reusable(self.ovf(f), table),
         ensures
             self.frame(f).writable(ledger.submitted.instance_id(), node, ledger, ISet::empty()),
             self.frame(f).write_admitted_in(node, ledger, ISet::empty()),
     {
         let m = self.meta(f);
+        let ovf = self.ovf(f);
         assert(self.frame(f).valid(
             m,
+            ovf,
             self.num_tiers,
-            self.frame_size,
+            self.tier_frame_size(self.frame(f).tier),
             ledger.submitted.instance_id(),
             node,
             table,
             ledger,
         ));
-        self.frame(f).prove_frontier_ordered(m, table, node, ledger, ISet::empty());
+        self.frame(f).prove_frontier_ordered(m, ovf, table, node, ledger, ISet::empty());
         self.frame(f).writable_admission(node, ledger, ISet::empty(), ISet::empty());
     }
 
@@ -127,16 +157,18 @@ impl FrameTable {
             self.frame(f).write_admitted_in(node, ledger, after),
     {
         let m = self.meta(f);
+        let ovf = self.ovf(f);
         assert(self.frame(f).valid(
             m,
+            ovf,
             self.num_tiers,
-            self.frame_size,
+            self.tier_frame_size(self.frame(f).tier),
             ledger.submitted.instance_id(),
             node,
             table,
             ledger,
         ));
-        self.frame(f).prove_frontier_ordered(m, table, node, ledger, covered);
+        self.frame(f).prove_frontier_ordered(m, ovf, table, node, ledger, covered);
         self.frame(f).writable_admission(node, ledger, after, covered);
     }
 }

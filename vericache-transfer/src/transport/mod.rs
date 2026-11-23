@@ -30,6 +30,13 @@ pub trait ByteTransport {
     fn send_frame(&mut self, frame: &[u8]) -> Result<(), Self::Error>;
 
     fn recv_frame(&mut self) -> Result<Vec<u8>, Self::Error>;
+
+    fn try_recv_frame(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        match self.recv_frame() {
+            Ok(frame) => Ok(Some(frame)),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 broadcast use {
@@ -116,8 +123,9 @@ pub enum ChannelError<E> {
 /// Constructive protocol-layer attachment carried alongside wire frames.
 ///
 /// Protocols with non-zero `protocol_magic()` prefix every wire frame with
-/// `[0xff, le_u32(magic)]`, isolating protocol sessions from legacy (`()`) frames
-/// and from other protocol magic values.
+/// `[0xff, le_u32(magic)]` and append a 4-byte little-endian CRC32 trailer over
+/// the prefixed header + payload bytes, isolating and integrity-checking
+/// protocol sessions against legacy (`()`) frames and bit corruption.
 pub trait ChannelAttachment: Sized {
     spec fn protocol_magic() -> u32;
 
@@ -189,6 +197,11 @@ pub enum ReceivedFrame<M = ()> {
     WriteGrant(Received<M>),
     WriteRelease(Received<M>),
     Notice(Received<M>),
+}
+
+pub enum EndpointOrFrame<M = ()> {
+    Endpoint(QueuePairEndpoint),
+    Frame(ReceivedFrame<M>),
 }
 
 } // verus!

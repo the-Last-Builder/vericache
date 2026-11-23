@@ -6,10 +6,11 @@ VeriCache enforces verification integrity through three independent layers execu
 
 ## 1. Layer 1: Dual-SMT AND Gate & `--no-cheating`
 
-- **Dual-SMT (`just verify-dual`)**: Every proof item across all three crates must verify with **both** `Z3 4.16.0` (default rlimit) and `CVC5 1.3.4` (`target/cvc5` with `--fwd-verus-args-to roots`; `vericache-core` runs CVC5 with `--rlimit 60`).
+- **Dual-SMT (`just verify-dual`)**: Every proof item across all three verified crates (`vericache-foundation`, `vericache-transfer`, `vericache-core`) must verify with **both** `Z3 4.16.0` (with `-V spinoff-all`) and `CVC5 1.3.4` (`target/cvc5` with `-V cvc5 -V spinoff-all`; `vericache-core` runs CVC5 with `--rlimit 80`).
 - **Compiler `--no-cheating`**: Enabled on `vericache-core` (`just verify`, `just verify-cvc5`), where Verus itself rejects `assume`, `admit`, `external_body`, `assume_specification`, and check-weakening flags.
   - `vericache-foundation` uses `tokenized_state_machine!`, whose macro expansion triggers Verus's `--no-cheating` syntactic check on macro-generated internals; it is audited by Layer 2 instead.
   - `vericache-transfer` isolates its hardware/network axioms inside the 6 whitelisted `src/*/ffi.rs` files and is audited by Layers 2 and 3.
+  - `vericache-bench` constructs all linear capabilities via `ShardAllocator` / `ShardCapabilityBundle` with zero `Tracked::assume_new()` / `Ghost::assume_new()` calls.
 
 ---
 
@@ -40,14 +41,14 @@ All 10 rules are regression-tested (`rule-tests/*-test.yml`, run via `ast-grep t
 
 | File | Assumed Hardware / Platform Premise |
 |---|---|
-| `vericache-transfer/src/context/ffi.rs` | Cluster-unique `NodeId` process bootstrap (`AtomicBool` single-init guard) and initial linear token partition |
+| `vericache-transfer/src/context/ffi.rs` | Cluster-unique `NodeId` process bootstrap (`AtomicBool` single-init guard) and initial linear token partition (further subdivided in verified code via `ShardAllocator`) |
 | `vericache-transfer/src/host/ffi.rs` | Aligned host heap allocation/deallocation and synchronous CPU read/write/copy semantics |
-| `vericache-transfer/src/cuda/ffi.rs` | `libcudart` device/host allocation, `cudaHostRegister`, stream FIFO execution, `CudaEvent` completion, GPUDirect RDMA visibility |
-| `vericache-transfer/src/nvme/ffi.rs` | `O_DIRECT` temp file lifecycle and Linux `io_uring` SQ/CQ completion semantics |
-| `vericache-transfer/src/rdma/ffi.rs` | `libibverbs` PD/CQ/QP/MR/Type-2 MW resource coverage, RC ordering, RDMA read/send completion |
-| `vericache-transfer/src/transport/ffi.rs` | Unmodified byte-frame delivery and linear token attachment conservation over `ByteTransport` |
+| `vericache-transfer/src/cuda/ffi.rs` | `libcudart` device/host allocation, `cudaHostRegister`, RAII stream/event lifecycle guards, stream FIFO execution, `CudaEvent` completion, GPUDirect RDMA visibility |
+| `vericache-transfer/src/nvme/ffi.rs` | `O_DIRECT` temporary file, persistent named file, and raw block device (`BLKGETSIZE64`) RAII lifecycle plus Linux `io_uring` SQ/CQ completion semantics |
+| `vericache-transfer/src/rdma/ffi.rs` | `libibverbs` RAII-guarded PD/CQ/QP/MR/Type-2B MW resource coverage, RC ordering, inline 62-bit control WR IDs (`< CONTROL_WR_ID_LIMIT`), RDMA read/send completion |
+| `vericache-transfer/src/transport/ffi.rs` | Protocol-magic and CRC32-verified byte-frame delivery, non-blocking `try_recv_frame`, and linear token attachment conservation over `ByteTransport` |
 | `vericache-transfer/src/nvme/uring.c` | Raw `io_uring_setup` / `io_uring_enter` syscall & shared ring barrier C shim |
-| `vericache-transfer/src/rdma/verbs.c` | `libibverbs` struct layout adapters, QP state transitions (`INIT→RTR→RTS`), WR posting & CQ polling |
+| `vericache-transfer/src/rdma/verbs.c` | `libibverbs` struct layout adapters, QP state transitions (`INIT→RTR→RTS`, `ERR→RESET`), `wide_cookie` zero-alloc inline control WR posting & CQ polling |
 | `vericache-transfer/build.rs` | Static compilation (`-std=c11 -O2 -fPIC -Wall -Werror`) of `uring.c` and `verbs.c` and linking `cudart` / `ibverbs` |
 
 `scripts/audit-tcb.sh` also verifies that no other `*ffi*.rs`, `.c`/`.h`/`.cu`/`.cpp`/`.s`/`.S`, or `build.rs` exists in the workspace, and that `--globs` exclusions in `Justfile`s never widen beyond `!src/{context,host,cuda,rdma,nvme,transport}/ffi.rs` inside `vericache-transfer/Justfile`.

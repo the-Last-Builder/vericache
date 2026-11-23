@@ -8,9 +8,11 @@ broadcast use {
     vstd::imap::group_imap_lemmas,
 };
 
-pub const BITMAP_WORDS: usize = 8;
+pub const BITMAP_WORDS: usize = 64;
 
-pub const BITMAP_CAPACITY: u64 = 512;
+pub const BITMAP_CAPACITY: u64 = 4096;
+
+pub const BITMAP_SLOTS: usize = 4096;
 
 pub struct SlidingBitmap {
     words: [u64; BITMAP_WORDS],
@@ -87,7 +89,7 @@ impl SlidingBitmap {
         self.words[index] = word | (1u64 << bit);
         assert forall|i: int| #[trigger]
             self.bit_set(i) == (old(self).bit_set(i) || i == offset) by {
-            if 0 <= i < 512 && i / 64 == index {
+            if 0 <= i < BITMAP_CAPACITY && i / 64 == index {
                 let b = (i % 64) as u64;
                 assert((((word | (1u64 << bit)) >> b) & 1u64 == 1u64) == (((word >> b) & 1u64
                     == 1u64) || b == bit)) by (bit_vector)
@@ -412,7 +414,6 @@ pub fn apply_bitmap_completion(
         final(table).next_seq == old(table).next_seq,
         final(table).kinds == old(table).kinds,
         final(table).count == old(table).count,
-        final(table).overflow_watermark == old(table).overflow_watermark,
         final(ledger).submitted == old(ledger).submitted,
         final(ledger).succeeded == old(ledger).succeeded,
         final(ledger).revoked == old(ledger).revoked,

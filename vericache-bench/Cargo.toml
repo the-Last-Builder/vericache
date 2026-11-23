@@ -9,6 +9,9 @@ description = "Unverified release benchmark driver for VeriCache Suites 1-4."
 [package.metadata.verus]
 verify = false
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)', 'cfg(verus_keep_ghost)', 'cfg(verus_keep_ghost_body)'] }
+
 [dependencies]
 foundation = { package = "vericache-foundation", path = "../vericache-foundation" }
 transfer = { package = "vericache-transfer", path = "../vericache-transfer" }

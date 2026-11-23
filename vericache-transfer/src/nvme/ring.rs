@@ -25,7 +25,7 @@ impl PendingIo {
 }
 
 pub struct IoUring {
-    pub(super) raw: *mut u8,
+    pub(super) raw: ffi::IoUringGuard,
     sq_capacity: usize,
     max_in_flight: usize,
     source: Tracked<EventSourceToken>,
@@ -236,7 +236,7 @@ impl IoUring {
             s@.well_formed(),
             s@.source() is IoUring,
     {
-        ffi::destroy(&self);
+        ffi::destroy(self.raw);
         self.source
     }
 

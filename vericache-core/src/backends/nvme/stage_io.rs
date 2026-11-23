@@ -23,7 +23,7 @@ impl NvmeBackend {
             old(self).file.instance_id() == core.instance_id(),
             old(self).file.node() == core.node(),
             old(self).file.num_slots() == old(self).num_frames as usize,
-            old(self).file.slot_len() == core.frames.frame_size as u64,
+            old(self).file.slot_len() == core.frames.tier_frame_size(old(self).tier) as u64,
             0 < old(self).file.slot_len() <= MAX_IO_LEN,
             old(self).file.slot_len() % DIRECT_IO_ALIGNMENT == 0,
             old(self).ring.well_formed(),
@@ -54,6 +54,7 @@ impl NvmeBackend {
             hop.dst_frame.0 < core.frames.metas.len(),
             hop.src_slot@ == core.frames.frame(hop.src_frame).slot,
             hop.dst_slot@ == core.frames.frame(hop.dst_frame).slot,
+            hop.src_slot@.slot_len == hop.dst_slot@.slot_len,
             hop.src_slot@.loc != hop.dst_slot@.loc,
             old(src_perm).valid_local(core.instance_id(), hop.src_slot@.loc),
             slot_is_owned(*old(dst_tok), core.instance_id(), hop.dst_slot@.loc),
@@ -135,6 +136,7 @@ impl NvmeBackend {
             NvmeOpKind::DramToNvme => {
                 let src_slice = host_backend.frame_slice(hop.src_frame);
                 proof {
+                    assert(host_backend.buffer.slot_len() as u64 == self.file.slot_len());
                     lemma_aligned_host_slot(
                         host_backend.buffer.address(),
                         host_backend.buffer.align(),
@@ -163,6 +165,7 @@ impl NvmeBackend {
                 );
                 let dst_slice = host_backend.frame_slice(hop.dst_frame);
                 proof {
+                    assert(host_backend.buffer.slot_len() as u64 == self.file.slot_len());
                     lemma_aligned_host_slot(
                         host_backend.buffer.address(),
                         host_backend.buffer.align(),
@@ -204,7 +207,7 @@ impl NvmeBackend {
             old(self).file.instance_id() == old(core).instance_id(),
             old(self).file.node() == old(core).node(),
             old(self).file.num_slots() == old(self).num_frames as usize,
-            old(self).file.slot_len() == old(core).frames.frame_size as u64,
+            old(self).file.slot_len() == old(core).frames.tier_frame_size(old(self).tier) as u64,
             0 < old(self).file.slot_len() <= MAX_IO_LEN,
             old(self).file.slot_len() % DIRECT_IO_ALIGNMENT == 0,
             before_ring.well_formed(),
@@ -273,6 +276,7 @@ impl NvmeBackend {
             hop.dst_frame.0 < old(core).frames.metas.len(),
             hop.src_slot@ == old(core).frames.frame(hop.src_frame).slot,
             hop.dst_slot@ == old(core).frames.frame(hop.dst_frame).slot,
+            hop.src_slot@.slot_len == hop.dst_slot@.slot_len,
             hop.src_slot@.loc != hop.dst_slot@.loc,
             old(core).frames.meta(hop.src_frame).state == STATE_PUBLISHED,
             old(core).frames.frame(hop.src_frame).cert == Some(hop.src_cert@),

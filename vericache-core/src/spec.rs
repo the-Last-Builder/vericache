@@ -241,10 +241,10 @@ impl ServiceSpec {
         &&& Self::directory_valid(self.catalog, self.versions)
     }
 
-    pub open spec fn valid_versions(size: nat, versions: Map<VersionId, Seq<u8>>) -> bool {
+    pub open spec fn valid_versions(_size: nat, versions: Map<VersionId, Seq<u8>>) -> bool {
         forall|v| #[trigger]
-            versions.contains_key(v) ==> v != VersionId::NONE && v.valid_sequence()
-                && versions[v].len() == size
+            versions.contains_key(v) ==> v != VersionId::NONE && v.valid_sequence() && 0
+                < versions[v].len() <= u64::MAX
     }
 
     pub proof fn insert_version(
@@ -257,17 +257,17 @@ impl ServiceSpec {
             Self::valid_versions(size, versions),
             version != VersionId::NONE,
             version.well_formed(),
-            bytes.len() == size,
+            0 < bytes.len() <= u64::MAX,
         ensures
             Self::valid_versions(size, versions.insert(version, bytes)),
     {
         let next = versions.insert(version, bytes);
         assert forall|v: VersionId| #[trigger] next.contains_key(v) implies {
-            v != VersionId::NONE && v.valid_sequence() && next[v].len() == size
+            v != VersionId::NONE && v.valid_sequence() && 0 < next[v].len() <= u64::MAX
         } by {
             if v != version {
                 assert(versions.contains_key(v));
-                assert(versions[v].len() == size);
+                assert(0 < versions[v].len() <= u64::MAX);
             }
         }
     }

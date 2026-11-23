@@ -1,10 +1,12 @@
 use crate::policy::LruPolicy;
 use crate::schema::{
-    bytes_per_sec_to_gbps, read_proc_hwm_mb, JobSpec, LatencyHist, MetricRecord, ProcSampler,
+    JobSpec, LatencyHist, MetricRecord, ProcSampler, bytes_per_sec_to_gbps, read_proc_hwm_mb,
 };
-use crate::shard::{key_from_hash_id, splitmix64};
+use crate::shard::{
+    ShardCapabilityBundle, ensure_bench_node_allocator, key_from_hash_id, splitmix64,
+};
 use crate::suites::rdma_ablation::open_rdma_device;
-use crate::suites::trace_replay::{load_trace, TraceRequest};
+use crate::suites::trace_replay::{TraceRequest, load_trace};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Read, Write};
@@ -13,28 +15,32 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
-use transfer::context::NodeContext;
+#[cfg_attr(not(verus_only), allow(unused_imports))]
+use transfer::context::*;
 use transfer::cuda::{self, CudaStream};
 use transfer::domain::DeviceId;
 use transfer::host::{self, HostContext};
 use transfer::rdma::{
-    alloc_window, connect_rc, AccessFlags, CompletionQueue, DeviceContext, ProtectionDomain,
-    UnconnectedQueuePair,
+    AccessFlags, CompletionQueue, DeviceContext, ProtectionDomain, UnconnectedQueuePair,
+    alloc_window, connect_rc,
 };
 use transfer::transport::{ByteTransport, Channel};
 use vericache_core::backends::cuda::CudaBackend;
 use vericache_core::backends::host::HostBackend;
 use vericache_core::backends::nvme::NvmeBackend;
+use vericache_core::backends::rdma::RdmaBackend;
 use vericache_core::backends::rdma::peer::{PeerSession, ServeOutcome};
 use vericache_core::backends::rdma::protocol::{ControlPayload, VeriCacheAttachment};
 use vericache_core::backends::rdma::pull::PullTarget;
-use vericache_core::backends::rdma::RdmaBackend;
 use vericache_core::engine::{DistributedEngine, DistributedEvent};
 use vericache_core::frame::STATE_EMPTY;
 use vericache_core::kernel::CacheCore;
-use vericache_core::spec::{CoreError, FrameId, ObjectKey, TierId};
+#[cfg(verus_only)]
+use vericache_core::provenance::{ValueCertificate, ValueProof};
+use vericache_core::spec::{CoreError, FrameId, ObjectKey, Ticket, TierId};
 use vericache_core::timeline::TimelineKind;
-use vstd::prelude::{Ghost, Tracked};
+#[cfg_attr(not(verus_only), allow(unused_imports))]
+use vstd::prelude::{Ghost, Tracked, verus};
 
 const PEER_DONE_TAG: u64 = 0xDEAD_BEEF_CAFE_0005;
 const COORD_CHANNEL_ID: u8 = 255;
@@ -191,20 +197,11 @@ impl ScaleupConfig {
     }
 }
 
-fn make_versioned_core(node_id: u64, frame_size: usize, max_leases: usize) -> CacheCore {
-    let mut core = CacheCore::new(
-        node_id as u16,
-        frame_size,
-        Vec::new(),
-        max_leases,
-        Tracked::assume_new(),
-    );
-    core.enable_version_registry(Tracked::assume_new(), Tracked::assume_new());
-    core
-}
+verus! {
 
+#[allow(clippy::too_many_arguments)]
 fn connect_shard_peer_rdma<'a>(
-    node_id: u64,
+    caps: &mut ShardCapabilityBundle,
     shard_id: usize,
     gid_index: u8,
     core: &mut CacheCore,
@@ -214,8 +211,9 @@ fn connect_shard_peer_rdma<'a>(
     host: &'a HostBackend,
     cuda: &'a CudaBackend<'a>,
 ) -> PeerSession<'a, ScaleupTcpTransport> {
+    let node_id = caps.node;
     let peer_id = 1 - node_id;
-    let cq = CompletionQueue::new(device, 512, Tracked::assume_new()).expect("shard CQ");
+    let cq = CompletionQueue::new(device, 512, caps.mint_rdma()).expect("shard CQ");
     let psn = 0x1000 + ((node_id as u32) << 8) + (shard_id as u32);
     let reset = UnconnectedQueuePair::new(
         pd,
@@ -224,19 +222,24 @@ fn connect_shard_peer_rdma<'a>(
         1,
         gid_index,
         psn,
-        Tracked::assume_new(),
+        caps.mint_rdma(),
     )
     .expect("shard UnconnectedQueuePair");
     let mut channel: Channel<ScaleupTcpTransport, VeriCacheAttachment> =
-        Channel::new_with_protocol(transport, node_id, peer_id, Tracked::assume_new());
+        Channel::new_with_protocol(
+            transport,
+            node_id,
+            peer_id,
+            Tracked(caps.instance.borrow()),
+        );
     let peer_ep = channel
-        .exchange_queue_pair_endpoint(&reset.endpoint(), Tracked::assume_new())
+        .exchange_queue_pair_endpoint(&reset.endpoint(), Tracked(caps.instance.borrow()))
         .expect("exchange shard QP endpoint");
     let qp = connect_rc(reset, peer_ep, peer_id).expect("connect_rc shard QP");
 
     let mut windows = Vec::with_capacity(64);
     for _ in 0..64 {
-        windows.push(alloc_window(pd, Tracked::assume_new()).expect("alloc shard Type-2B MW"));
+        windows.push(alloc_window(pd, caps.mint_rdma()).expect("alloc shard Type-2B MW"));
     }
     let mut rdma = RdmaBackend::new(core, peer_id, qp, cq, windows)
         .map_err(|e| e.0)
@@ -271,13 +274,14 @@ fn connect_shard_peer_rdma<'a>(
 /// Helper: handle one incoming peer event (serving FetchRequest from HBM or DRAM,
 /// handling cooperative ReadRelease, or noting PeerDone).
 fn handle_peer_event(
+    caps: &mut ShardCapabilityBundle,
     engine: &mut DistributedEngine<'_, ScaleupTcpTransport>,
     gpu_tier: TierId,
     host_tier: TierId,
     peer_done: &mut bool,
 ) -> Option<DistributedEvent> {
     let ev = engine
-        .poll_peer_event(Tracked::assume_new())
+        .poll_peer_event(Tracked(caps.instance.borrow()))
         .expect("poll_peer_event");
     match ev {
         DistributedEvent::Control(ControlPayload::FetchRequest { request_id, key }) => {
@@ -296,8 +300,8 @@ fn handle_peer_event(
                             t,
                             request_id,
                             key,
-                            Tracked::assume_new(),
-                            Tracked::assume_new(),
+                            Tracked(caps.shares.borrow_mut()),
+                            Tracked(caps.instance.borrow()),
                         )
                         .expect("serve_fetch_request");
                     if let ServeOutcome::Miss = outcome {
@@ -308,7 +312,7 @@ fn handle_peer_event(
                     engine
                         .send_control(
                             ControlPayload::FetchMiss { request_id },
-                            Tracked::assume_new(),
+                            Tracked(caps.instance.borrow()),
                         )
                         .expect("send FetchMiss");
                 }
@@ -328,6 +332,7 @@ fn handle_peer_event(
 
 /// Drain any queued peer messages without blocking.
 fn drain_peer_nonblocking(
+    caps: &mut ShardCapabilityBundle,
     engine: &mut DistributedEngine<'_, ScaleupTcpTransport>,
     peek_sock: &TcpStream,
     gpu_tier: TierId,
@@ -335,7 +340,7 @@ fn drain_peer_nonblocking(
     peer_done: &mut bool,
 ) {
     while tcp_has_pending_data(peek_sock) {
-        let _ = handle_peer_event(engine, gpu_tier, host_tier, peer_done);
+        let _ = handle_peer_event(caps, engine, gpu_tier, host_tier, peer_done);
     }
 }
 
@@ -343,6 +348,7 @@ fn drain_peer_nonblocking(
 /// into `STATE_DRAINING` (`Err(CoreError::StaleReplica)`), and only draining peer
 /// events if this specific victim still holds an active remote lease.
 fn evict_and_reclaim(
+    caps: &mut ShardCapabilityBundle,
     engine: &mut DistributedEngine<'_, ScaleupTcpTransport>,
     tier: TierId,
     frame: FrameId,
@@ -357,14 +363,14 @@ fn evict_and_reclaim(
     while engine.core.frames.metas[frame.0 as usize].state != STATE_EMPTY {
         let reclaimed = engine.reclaim_draining(tier, 8);
         if reclaimed == 0 && engine.core.frames.metas[frame.0 as usize].state != STATE_EMPTY {
-            // Wait for any lingering remote lease release on this specific victim frame.
-            let _ = handle_peer_event(engine, gpu_tier, host_tier, peer_done);
+            let _ = handle_peer_event(caps, engine, gpu_tier, host_tier, peer_done);
         }
     }
 }
 
 /// Ensure NVMe has at least 1 free frame in `ready_queue` (LRU evict if empty).
 fn ensure_nvme_space(
+    caps: &mut ShardCapabilityBundle,
     engine: &mut DistributedEngine<'_, ScaleupTcpTransport>,
     nvme_lru: &mut LruPolicy<ObjectKey, FrameId>,
     gpu_tier: TierId,
@@ -375,9 +381,9 @@ fn ensure_nvme_space(
     let _ = engine.reclaim_draining(nvme_tier, 8);
     while engine.core.frames.ready_queue[nvme_tier.as_index()].is_empty() {
         if let Some((_nk, nf)) = nvme_lru.pop_lru() {
-            evict_and_reclaim(engine, nvme_tier, nf, gpu_tier, host_tier, peer_done);
+            evict_and_reclaim(caps, engine, nvme_tier, nf, gpu_tier, host_tier, peer_done);
         } else {
-            let _ = handle_peer_event(engine, gpu_tier, host_tier, peer_done);
+            let _ = handle_peer_event(caps, engine, gpu_tier, host_tier, peer_done);
             let _ = engine.reclaim_draining(nvme_tier, 8);
         }
     }
@@ -385,7 +391,9 @@ fn ensure_nvme_space(
 
 /// Ensure Host DRAM has at least 1 free frame in `ready_queue`
 /// (cascading LRU victim -> NVMe via io_uring O_DIRECT).
+#[allow(clippy::too_many_arguments)]
 fn ensure_dram_space(
+    caps: &mut ShardCapabilityBundle,
     engine: &mut DistributedEngine<'_, ScaleupTcpTransport>,
     dram_lru: &mut LruPolicy<ObjectKey, FrameId>,
     nvme_lru: &mut LruPolicy<ObjectKey, FrameId>,
@@ -398,19 +406,23 @@ fn ensure_dram_space(
     while engine.core.frames.ready_queue[host_tier.as_index()].is_empty() {
         if let Some((dk, df)) = dram_lru.pop_lru() {
             if let Some(old_nf) = nvme_lru.remove(&dk) {
-                evict_and_reclaim(engine, nvme_tier, old_nf, gpu_tier, host_tier, peer_done);
+                evict_and_reclaim(caps, engine, nvme_tier, old_nf, gpu_tier, host_tier, peer_done);
             }
-            ensure_nvme_space(engine, nvme_lru, gpu_tier, host_tier, nvme_tier, peer_done);
+            ensure_nvme_space(caps, engine, nvme_lru, gpu_tier, host_tier, nvme_tier, peer_done);
             // Only spill if dk is still published in host_tier (not already superseded).
             if engine.lookup_tier(dk, host_tier).is_some() {
                 let nf = engine
-                    .spill_host_to_nvme_sync(Tracked::assume_new(), Tracked::assume_new(), dk)
+                    .spill_host_to_nvme_sync(
+                        Tracked(caps.instance.borrow()),
+                        Tracked(caps.shares.borrow_mut()),
+                        dk,
+                    )
                     .expect("spill_host_to_nvme_sync");
                 let _ = nvme_lru.insert(dk, nf);
             }
-            evict_and_reclaim(engine, host_tier, df, gpu_tier, host_tier, peer_done);
+            evict_and_reclaim(caps, engine, host_tier, df, gpu_tier, host_tier, peer_done);
         } else {
-            let _ = handle_peer_event(engine, gpu_tier, host_tier, peer_done);
+            let _ = handle_peer_event(caps, engine, gpu_tier, host_tier, peer_done);
             let _ = engine.reclaim_draining(host_tier, 8);
         }
     }
@@ -420,6 +432,7 @@ fn ensure_dram_space(
 /// (cascading LRU victim -> DRAM via D2H + put_host -> NVMe).
 #[allow(clippy::too_many_arguments)]
 fn ensure_hbm_space(
+    caps: &mut ShardCapabilityBundle,
     engine: &mut DistributedEngine<'_, ScaleupTcpTransport>,
     hbm_lru: &mut LruPolicy<ObjectKey, FrameId>,
     dram_lru: &mut LruPolicy<ObjectKey, FrameId>,
@@ -430,6 +443,7 @@ fn ensure_hbm_space(
     caller_stream: &mut CudaStream,
     caller_tl: u8,
     d2h_stage_buf: &cuda::CudaHostBuffer,
+    Tracked(d2h_tok): Tracked<&mut SlotToken>,
     d2h_host_ctx: &mut HostContext,
     d2h_scratch: &mut [u8],
     peer_done: &mut bool,
@@ -440,7 +454,7 @@ fn ensure_hbm_space(
     }
     let Some((vk, vf)) = hbm_lru.pop_lru() else {
         while engine.core.frames.ready_queue[gpu_tier.as_index()].is_empty() {
-            let _ = handle_peer_event(engine, gpu_tier, host_tier, peer_done);
+            let _ = handle_peer_event(caps, engine, gpu_tier, host_tier, peer_done);
             let _ = engine.reclaim_draining(gpu_tier, 8);
         }
         return;
@@ -449,44 +463,61 @@ fn ensure_hbm_space(
     let d2h_cuda = d2h_stage_buf.as_cuda_slice();
     if let Some((_ver, t_d2h, _ev)) = engine
         .get_into_gpu(
-            Tracked::assume_new(),
-            Tracked::assume_new(),
+            Tracked(caps.instance.borrow()),
+            Tracked(caps.shares.borrow_mut()),
             vk,
             caller_stream,
             caller_tl,
             &d2h_cuda,
-            Tracked::assume_new(),
+            Tracked(d2h_tok),
         )
         .expect("get_into_gpu D2H demote")
     {
-        let k_d2h = cuda::stream_synchronize(caller_stream, Tracked::assume_new())
+        let k_d2h = cuda::stream_synchronize(caller_stream, Tracked(caps.instance.borrow()))
             .expect("sync D2H demote");
         engine
             .core
             .mark_timeline_complete(caller_tl, t_d2h.seq(), k_d2h);
         let d2h_host = d2h_stage_buf.as_host_slice();
-        let _ = host::read_slice(
+        let tracked mut tmp_tok = SlotToken::empty(caps.instance.borrow().id());
+        proof {
+            vstd::modes::tracked_swap(d2h_tok, &mut tmp_tok);
+        }
+        let tracked mut d2h_perm = ReadPerm::Owned(tmp_tok);
+        let Tracked(r_comp) = host::read_slice(
             d2h_host_ctx,
-            Tracked::assume_new(),
+            Tracked(caps.instance.borrow()),
             &d2h_host,
             d2h_scratch,
-            Tracked::assume_new(),
-            Tracked::assume_new(),
-            Tracked::assume_new(),
-            Ghost::assume_new(),
+            Tracked(&mut d2h_perm),
+            Tracked(&engine.core.ledger.borrow().submitted),
+            Tracked(&engine.core.ledger.borrow().knows),
+            Ghost(engine.core.citations()),
         );
+        let t_r = engine
+            .core
+            .issue_ticket(engine.host.timeline_id(), Tracked(r_comp.submitted))
+            .expect("issue D2H host read ticket");
+        engine.core.mark_timeline_complete(
+            engine.host.timeline_id(),
+            t_r.seq(),
+            Tracked(r_comp.knows),
+        );
+        proof {
+            *d2h_tok = d2h_perm.into_owned();
+        }
     }
-    evict_and_reclaim(engine, gpu_tier, vf, gpu_tier, host_tier, peer_done);
+    evict_and_reclaim(caps, engine, gpu_tier, vf, gpu_tier, host_tier, peer_done);
 
     // Demote victim into L2 DRAM (evicting any stale copy and cascading to NVMe if DRAM is full).
     if let Some(old_df) = dram_lru.remove(&vk) {
-        evict_and_reclaim(engine, host_tier, old_df, gpu_tier, host_tier, peer_done);
+        evict_and_reclaim(caps, engine, host_tier, old_df, gpu_tier, host_tier, peer_done);
     }
     ensure_dram_space(
-        engine, dram_lru, nvme_lru, gpu_tier, host_tier, nvme_tier, peer_done,
+        caps, engine, dram_lru, nvme_lru, gpu_tier, host_tier, nvme_tier, peer_done,
     );
     let (_v_host, new_df) = engine
-        .put_host(Tracked::assume_new(), vk, d2h_scratch)
+        .put_host(Tracked(caps.instance.borrow()), vk, d2h_scratch)
         .expect("put_host demote HBM->DRAM");
     let _ = dram_lru.insert(vk, new_df);
 }
@@ -506,16 +537,17 @@ fn run_shard_worker(
     let frame_size = cfg.frame_size;
     let init_t0 = Instant::now();
 
-    // 1. Parallel per-shard 4-tier verified pool allocation & registration.
+    // 1. Share-nothing per-shard capability bundle carved from node's ShardAllocator.
+    let mut caps = ShardCapabilityBundle::take(node_id);
     let device = open_rdma_device(node_id, &job.rdma_dev);
-    let pd = ProtectionDomain::new(&device, Tracked::assume_new()).expect("shard PD");
-    let mut core = make_versioned_core(node_id, frame_size, 128);
+    let pd = ProtectionDomain::new(&device, caps.mint_rdma()).expect("shard PD");
+    let mut core = caps.make_versioned_core(frame_size, 128);
 
     let host = HostBackend::new(
         &mut core,
-        Tracked::assume_new(),
-        Tracked::assume_new(),
-        Tracked::assume_new(),
+        Tracked(caps.instance.borrow()),
+        Tracked(caps.alloc.borrow_mut()),
+        caps.mint_host(),
         cfg.dram_frames_per_shard as u32,
         4096,
     )
@@ -523,9 +555,9 @@ fn run_shard_worker(
 
     let mut cuda_b = CudaBackend::new(
         &mut core,
-        Tracked::assume_new(),
-        Tracked::assume_new(),
-        Tracked::assume_new(),
+        Tracked(caps.instance.borrow()),
+        Tracked(caps.alloc.borrow_mut()),
+        caps.mint_cuda(),
         gpu_id,
         cfg.hbm_frames_per_shard as u32,
         32,
@@ -538,13 +570,14 @@ fn run_shard_worker(
         .attach_pinned_host(&core, &host)
         .expect("attach_pinned_host");
 
+    let shard_nvme_path = format!("{}/node{}_shard{}", job.nvme_dir, node_id, shard_id);
     let nvme = NvmeBackend::new(
         &mut core,
         &host.ctx,
-        Tracked::assume_new(),
-        Tracked::assume_new(),
-        Tracked::assume_new(),
-        &job.nvme_dir,
+        Tracked(caps.instance.borrow()),
+        Tracked(caps.alloc.borrow_mut()),
+        caps.mint_nvme(),
+        &shard_nvme_path,
         cfg.nvme_frames_per_shard as u32,
         32,
     )
@@ -554,11 +587,11 @@ fn run_shard_worker(
         .register_timeline(TimelineKind::CudaStream { device: gpu_id })
         .expect("register caller_tl");
     let mut caller_stream =
-        CudaStream::new(gpu_id, Tracked::assume_new()).expect("caller CudaStream::new");
+        CudaStream::new(gpu_id, caps.mint_cuda()).expect("caller CudaStream::new");
 
     let peek_sock = transport.clone_for_peek();
     let peer = connect_shard_peer_rdma(
-        node_id,
+        &mut caps,
         shard_id,
         job.gid_index,
         &mut core,
@@ -568,7 +601,7 @@ fn run_shard_worker(
         &host,
         &cuda_b,
     );
-    let eng_ctx = HostContext::new(Tracked::assume_new());
+    let eng_ctx = HostContext::new(caps.mint_host());
     let mut engine =
         DistributedEngine::new_with_nvme(core, &host, eng_ctx, Some(&cuda_b), peer, Some(nvme));
 
@@ -576,34 +609,52 @@ fn run_shard_worker(
     let host_tier = engine.host_tier();
     let nvme_tier = engine.nvme_tier().unwrap();
 
-    // Reusable per-shard 2 MiB staging buffers (compute HBM slot, D2H demote pinned buf, cold writeback pinned buf).
-    let (compute_slot_buf, _) =
-        cuda::alloc_device(Tracked::assume_new(), gpu_id, frame_size).expect("alloc compute slot");
+    // Reusable per-shard staging buffers (compute HBM slot, D2H demote pinned buf, cold writeback pinned buf).
+    let (compute_slot_buf, Tracked(mut compute_tok)) =
+        cuda::alloc_device(Tracked(caps.alloc.borrow_mut()), gpu_id, frame_size)
+            .expect("alloc compute slot");
     let compute_slot_slice = compute_slot_buf.slot_slice(0);
 
-    let (d2h_stage_buf, _) =
-        cuda::alloc_host(Tracked::assume_new(), frame_size).expect("alloc d2h stage");
-    let mut d2h_host_ctx = HostContext::new(Tracked::assume_new());
+    let (d2h_stage_buf, Tracked(mut d2h_tok)) =
+        cuda::alloc_host(Tracked(caps.alloc.borrow_mut()), frame_size).expect("alloc d2h stage");
+    let mut d2h_host_ctx = HostContext::new(caps.mint_host());
     let mut d2h_scratch = vec![0u8; frame_size];
 
-    let (cold_stage_buf, _) =
-        cuda::alloc_host(Tracked::assume_new(), frame_size).expect("alloc cold stage");
-    let mut cold_ctx = HostContext::new(Tracked::assume_new());
+    let (cold_stage_buf, Tracked(mut cold_tok)) =
+        cuda::alloc_host(Tracked(caps.alloc.borrow_mut()), frame_size).expect("alloc cold stage");
+    let mut cold_ctx = HostContext::new(caps.mint_host());
     let cold_payload: Vec<u8> = (0..frame_size)
         .map(|i| ((i.wrapping_mul(29) + shard_id + 7) & 0xff) as u8)
         .collect();
     let cold_host_slice = cold_stage_buf.as_host_slice();
-    let _ = host::write_slice(
+    let Tracked(cold_w_comp) = host::write_slice(
         &mut cold_ctx,
-        Tracked::assume_new(),
+        Tracked(caps.instance.borrow()),
         &cold_host_slice,
         &cold_payload,
-        Tracked::assume_new(),
-        Tracked::assume_new(),
-        Tracked::assume_new(),
-        Ghost::assume_new(),
+        Tracked(&mut cold_tok),
+        Tracked(&engine.core.ledger.borrow().submitted),
+        Tracked(&engine.core.ledger.borrow().knows),
+        Ghost(engine.core.citations()),
+    );
+    let ghost cold_w_ev = cold_w_comp.submitted.key();
+    let t_cold_w = engine
+        .core
+        .issue_ticket(engine.host.timeline_id(), Tracked(cold_w_comp.submitted))
+        .expect("issue cold stage ticket");
+    engine.core.mark_timeline_complete(
+        engine.host.timeline_id(),
+        t_cold_w.seq(),
+        Tracked(cold_w_comp.knows),
     );
     let cold_cuda_slice = cold_stage_buf.as_cuda_slice();
+    let tracked mut cold_perm = ReadPerm::Owned(cold_tok);
+    let ghost cold_cert = ValueCertificate {
+        slot: cold_cuda_slice.slot_ref(),
+        writer: cold_w_ev,
+        bytes: cold_payload@,
+        proof: ValueProof::HostWrite,
+    };
 
     let init_time_s = init_t0.elapsed().as_secs_f64();
 
@@ -624,7 +675,14 @@ fn run_shard_worker(
 
     for hash_ids in &reqs {
         // Service any incoming peer RDMA FetchRequest / ReadRelease promptly before starting request.
-        drain_peer_nonblocking(&mut engine, &peek_sock, gpu_tier, host_tier, &mut peer_done);
+        drain_peer_nonblocking(
+            &mut caps,
+            &mut engine,
+            &peek_sock,
+            gpu_tier,
+            host_tier,
+            &mut peer_done,
+        );
 
         let req_t0 = Instant::now();
         let mut prefix_open = true;
@@ -637,18 +695,19 @@ fn run_shard_worker(
                 if hbm_lru.contains(&key) {
                     if let Some((_ver, t_hit, _ev)) = engine
                         .get_into_gpu(
-                            Tracked::assume_new(),
-                            Tracked::assume_new(),
+                            Tracked(caps.instance.borrow()),
+                            Tracked(caps.shares.borrow_mut()),
                             key,
                             &mut caller_stream,
                             caller_tl,
                             &compute_slot_slice,
-                            Tracked::assume_new(),
+                            Tracked(&mut compute_tok),
                         )
                         .expect("get_into_gpu L1 HBM hit")
                     {
-                        let k_hit = cuda::stream_synchronize(&caller_stream, Tracked::assume_new())
-                            .expect("sync L1 HBM hit");
+                        let k_hit =
+                            cuda::stream_synchronize(&caller_stream, Tracked(caps.instance.borrow()))
+                                .expect("sync L1 HBM hit");
                         engine
                             .core
                             .mark_timeline_complete(caller_tl, t_hit.seq(), k_hit);
@@ -661,6 +720,7 @@ fn run_shard_worker(
                 // Tier 2: L2 Local Pinned DRAM hit -> 1-hop DMA H2D promote into L1 HBM
                 if let Some(host_frame) = dram_lru.touch(&key) {
                     ensure_hbm_space(
+                        &mut caps,
                         &mut engine,
                         &mut hbm_lru,
                         &mut dram_lru,
@@ -671,27 +731,47 @@ fn run_shard_worker(
                         &mut caller_stream,
                         caller_tl,
                         &d2h_stage_buf,
+                        Tracked(&mut d2h_tok),
                         &mut d2h_host_ctx,
                         &mut d2h_scratch,
                         &mut peer_done,
                     );
-                    // Promote directly from pinned HostBackend frame slice -> GPU HBM!
+                    let (lease_h, _l_ver, Ghost(src_cert), Tracked(share_cap)) = engine
+                        .core
+                        .acquire_local_lease(
+                            host_frame,
+                            false,
+                            Tracked(caps.shares.borrow_mut()),
+                            Tracked(caps.instance.borrow()),
+                        )
+                        .expect("acquire_local_lease DRAM->HBM");
+                    let tracked mut src_perm = ReadPerm::Shared(share_cap);
                     let pinned_src = cuda_b.pinned_host_frame_slice(host_frame);
                     let (_ver, new_hbm_f) = engine
                         .put_gpu_sync(
-                            Tracked::assume_new(),
+                            Tracked(caps.instance.borrow()),
                             &mut caller_stream,
                             caller_tl,
                             key,
                             &pinned_src,
-                            Tracked::assume_new(),
-                            Ghost::assume_new(),
+                            Tracked(&mut src_perm),
+                            Ghost(src_cert),
                         )
                         .expect("put_gpu_sync promote DRAM->HBM");
+                    let tracked returned_cap = src_perm.into_shared();
+                    engine
+                        .core
+                        .release_local_lease(
+                            lease_h,
+                            Tracked(returned_cap),
+                            Ticket::NONE,
+                            Tracked(caps.instance.borrow()),
+                        )
+                        .expect("release_local_lease DRAM->HBM");
                     let _ = hbm_lru.insert(key, new_hbm_f);
-                    // Exclusive tiering: free promoted DRAM slot so full 200 GiB holds unique frames.
                     if let Some(df) = dram_lru.remove(&key) {
                         evict_and_reclaim(
+                            &mut caps,
                             &mut engine,
                             host_tier,
                             df,
@@ -707,6 +787,7 @@ fn run_shard_worker(
                 // Tier 3: L3 Local NVMe hit -> io_uring O_DIRECT warm to DRAM -> DMA H2D promote to HBM
                 if nvme_lru.contains(&key) {
                     ensure_dram_space(
+                        &mut caps,
                         &mut engine,
                         &mut dram_lru,
                         &mut nvme_lru,
@@ -717,13 +798,14 @@ fn run_shard_worker(
                     );
                     let warmed_df = engine
                         .warm_host_from_nvme_sync(
-                            Tracked::assume_new(),
-                            Tracked::assume_new(),
+                            Tracked(caps.instance.borrow()),
+                            Tracked(caps.shares.borrow_mut()),
                             key,
                         )
                         .expect("warm_host_from_nvme_sync");
                     if let Some(nf) = nvme_lru.remove(&key) {
                         evict_and_reclaim(
+                            &mut caps,
                             &mut engine,
                             nvme_tier,
                             nf,
@@ -733,6 +815,7 @@ fn run_shard_worker(
                         );
                     }
                     ensure_hbm_space(
+                        &mut caps,
                         &mut engine,
                         &mut hbm_lru,
                         &mut dram_lru,
@@ -743,24 +826,46 @@ fn run_shard_worker(
                         &mut caller_stream,
                         caller_tl,
                         &d2h_stage_buf,
+                        Tracked(&mut d2h_tok),
                         &mut d2h_host_ctx,
                         &mut d2h_scratch,
                         &mut peer_done,
                     );
+                    let (lease_h, _l_ver, Ghost(src_cert), Tracked(share_cap)) = engine
+                        .core
+                        .acquire_local_lease(
+                            warmed_df,
+                            false,
+                            Tracked(caps.shares.borrow_mut()),
+                            Tracked(caps.instance.borrow()),
+                        )
+                        .expect("acquire_local_lease NVMe->DRAM->HBM");
+                    let tracked mut src_perm = ReadPerm::Shared(share_cap);
                     let pinned_src = cuda_b.pinned_host_frame_slice(warmed_df);
                     let (_ver, new_hbm_f) = engine
                         .put_gpu_sync(
-                            Tracked::assume_new(),
+                            Tracked(caps.instance.borrow()),
                             &mut caller_stream,
                             caller_tl,
                             key,
                             &pinned_src,
-                            Tracked::assume_new(),
-                            Ghost::assume_new(),
+                            Tracked(&mut src_perm),
+                            Ghost(src_cert),
                         )
                         .expect("put_gpu_sync promote NVMe->DRAM->HBM");
+                    let tracked returned_cap = src_perm.into_shared();
+                    engine
+                        .core
+                        .release_local_lease(
+                            lease_h,
+                            Tracked(returned_cap),
+                            Ticket::NONE,
+                            Tracked(caps.instance.borrow()),
+                        )
+                        .expect("release_local_lease NVMe->DRAM->HBM");
                     let _ = hbm_lru.insert(key, new_hbm_f);
                     evict_and_reclaim(
+                        &mut caps,
                         &mut engine,
                         host_tier,
                         warmed_df,
@@ -772,8 +877,9 @@ fn run_shard_worker(
                     continue;
                 }
 
-                // Tier 4: Remote Peer hit -> cross-node GPUDirect RDMA into GPU HBM over mlx5_3
+                // Tier 4: Remote Peer hit -> cross-node GPUDirect RDMA into GPU HBM
                 ensure_hbm_space(
+                    &mut caps,
                     &mut engine,
                     &mut hbm_lru,
                     &mut dram_lru,
@@ -784,18 +890,23 @@ fn run_shard_worker(
                     &mut caller_stream,
                     caller_tl,
                     &d2h_stage_buf,
+                    Tracked(&mut d2h_tok),
                     &mut d2h_host_ctx,
                     &mut d2h_scratch,
                     &mut peer_done,
                 );
                 let my_req_id = engine
-                    .send_fetch_request(key, Tracked::assume_new())
+                    .send_fetch_request(key, Tracked(caps.instance.borrow()))
                     .expect("send_fetch_request");
                 let mut got_remote = false;
                 loop {
-                    if let Some(ev) =
-                        handle_peer_event(&mut engine, gpu_tier, host_tier, &mut peer_done)
-                    {
+                    if let Some(ev) = handle_peer_event(
+                        &mut caps,
+                        &mut engine,
+                        gpu_tier,
+                        host_tier,
+                        &mut peer_done,
+                    ) {
                         match ev {
                             DistributedEvent::ReadGrant(grant)
                                 if grant.meta.request_id == my_req_id =>
@@ -806,7 +917,7 @@ fn run_shard_worker(
                                         gpu_tier,
                                         PullTarget::GpuGdr,
                                         grant,
-                                        Tracked::assume_new(),
+                                        Tracked(caps.instance.borrow()),
                                     )
                                     .expect("pull_with_grant GpuGdr");
                                 if let vericache_core::backends::rdma::peer::FetchOutcome::Hit {
@@ -849,6 +960,7 @@ fn run_shard_worker(
             }
             if let Some(df) = dram_lru.remove(&key) {
                 evict_and_reclaim(
+                    &mut caps,
                     &mut engine,
                     host_tier,
                     df,
@@ -859,6 +971,7 @@ fn run_shard_worker(
             }
             if let Some(nf) = nvme_lru.remove(&key) {
                 evict_and_reclaim(
+                    &mut caps,
                     &mut engine,
                     nvme_tier,
                     nf,
@@ -868,6 +981,7 @@ fn run_shard_worker(
                 );
             }
             ensure_hbm_space(
+                &mut caps,
                 &mut engine,
                 &mut hbm_lru,
                 &mut dram_lru,
@@ -878,19 +992,20 @@ fn run_shard_worker(
                 &mut caller_stream,
                 caller_tl,
                 &d2h_stage_buf,
+                Tracked(&mut d2h_tok),
                 &mut d2h_host_ctx,
                 &mut d2h_scratch,
                 &mut peer_done,
             );
             let (_ver, new_hbm_f) = engine
                 .put_gpu_sync(
-                    Tracked::assume_new(),
+                    Tracked(caps.instance.borrow()),
                     &mut caller_stream,
                     caller_tl,
                     key,
                     &cold_cuda_slice,
-                    Tracked::assume_new(),
-                    Ghost::assume_new(),
+                    Tracked(&mut cold_perm),
+                    Ghost(cold_cert),
                 )
                 .expect("put_gpu_sync cold writeback");
             let _ = hbm_lru.insert(key, new_hbm_f);
@@ -908,17 +1023,19 @@ fn run_shard_worker(
             ControlPayload::RevokeAck {
                 grant_tag: PEER_DONE_TAG,
             },
-            Tracked::assume_new(),
+            Tracked(caps.instance.borrow()),
         )
         .expect("send PEER_DONE_TAG");
-    while !peer_done || engine.peer.rdma.active_lease_count() > 0 {
-        let _ = handle_peer_event(&mut engine, gpu_tier, host_tier, &mut peer_done);
+    while !peer_done || engine.peers[0].rdma.active_lease_count() > 0 {
+        let _ = handle_peer_event(&mut caps, &mut engine, gpu_tier, host_tier, &mut peer_done);
     }
 
     let _ = caller_stream.destroy();
     stats.hist_buckets = hist.export_buckets();
     stats
 }
+
+} // verus!
 
 fn partition_requests_for_node(
     reqs: &[TraceRequest],
@@ -951,8 +1068,8 @@ fn run_node(
         eprintln!("[scaleup_cluster] FATAL PANIC: {info}");
         std::process::abort();
     }));
-    // Bootstrap NodeContext exactly ONCE per OS process (panics if called twice in the same process).
-    let _boot = NodeContext::bootstrap(node_id).into_sources_with_versions();
+    // Bootstrap NodeContext -> ShardAllocator once per OS process; each worker thread carves its own disjoint ShardSources.
+    ensure_bench_node_allocator(node_id);
     fs::create_dir_all(&job.nvme_dir).expect("create nvme_dir");
     let per_shard_reqs =
         partition_requests_for_node(reqs, node_id, cfg.shards_per_node, cfg.sticky_pct);
@@ -972,29 +1089,19 @@ fn run_node(
         let b_go = Arc::clone(&start_go_barrier);
         handles.push(thread::spawn(move || {
             run_shard_worker(
-                node_id,
-                shard_id,
-                gpu_id,
-                &cfg_copy,
-                &job_clone,
-                transport,
-                s_reqs,
-                b_done,
-                b_go,
+                node_id, shard_id, gpu_id, &cfg_copy, &job_clone, transport, s_reqs, b_done, b_go,
             )
         }));
     }
 
-    // Wait for all 8 shards on this node to complete parallel pool allocation & QP setup.
+    // Wait for all shards on this node to complete parallel pool allocation & QP setup.
     init_done_barrier.wait();
     let init_time_s = node_init_t0.elapsed().as_secs_f64();
 
     // Cross-node ready barrier so Node 0 and Node 1 begin timed trace replay simultaneously.
     if node_id == 0 {
         let _ = coord_transport.recv_frame().expect("recv node1 ready");
-        coord_transport
-            .send_frame(b"GO")
-            .expect("send GO to node1");
+        coord_transport.send_frame(b"GO").expect("send GO to node1");
     } else {
         coord_transport
             .send_frame(b"READY")

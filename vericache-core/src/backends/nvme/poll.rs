@@ -18,7 +18,7 @@ impl NvmeBackend {
             old(self).file.instance_id() == old(core).instance_id(),
             old(self).file.node() == old(core).node(),
             old(self).file.num_slots() == old(self).num_frames as usize,
-            old(self).file.slot_len() == old(core).frames.frame_size as u64,
+            old(self).file.slot_len() == old(core).frames.tier_frame_size(old(self).tier) as u64,
             0 < old(self).file.slot_len() <= MAX_IO_LEN,
             old(self).file.slot_len() % DIRECT_IO_ALIGNMENT == 0,
             before_ring.well_formed(),

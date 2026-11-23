@@ -114,7 +114,6 @@ pub(super) proof fn lemma_nvme_preserve_core_after_submission(
         after.timelines.count == before.timelines.count,
         after.timelines.kinds == before.timelines.kinds,
         after.timelines.confirmed_seq == before.timelines.confirmed_seq,
-        after.timelines.overflow_watermark == before.timelines.overflow_watermark,
         after.timelines.next_seq@ == before.timelines.next_seq@.update(
             timeline as int,
             (seq + 1) as u64,
@@ -136,8 +135,7 @@ pub(super) proof fn lemma_nvme_preserve_core_after_submission(
     assert forall|i: int|
         0 <= i < before.timelines.count implies #[trigger] after.timelines.confirmed_seq[i]
         >= before.timelines.confirmed_seq[i] && after.timelines.next_seq[i]
-        >= before.timelines.next_seq[i] && after.timelines.overflow_watermark[i]
-        >= before.timelines.overflow_watermark[i] && after.timelines.kinds[i]
+        >= before.timelines.next_seq[i] && after.timelines.kinds[i]
         == before.timelines.kinds[i] by {}
     assert forall|u: u8, s: u64|
         before.timelines.issued(u, s) implies #[trigger] after.timelines.events@[(u, s)]
@@ -700,8 +698,8 @@ proof fn lemma_nvme_op_valid_after_reap(
 pub(super) proof fn lemma_nvme_pending_preserved_after_stage(
     old_transfers: Seq<Option<InFlightNvmeOp>>,
     new_transfers: Seq<Option<InFlightNvmeOp>>,
-    old_ops: [Option<PendingOperation>; 512],
-    new_ops: [Option<PendingOperation>; 512],
+    old_ops: [Option<PendingOperation>; BITMAP_SLOTS],
+    new_ops: [Option<PendingOperation>; BITMAP_SLOTS],
     old_ring: IoUring,
     new_ring: IoUring,
     before_core: &CacheCore,
@@ -835,8 +833,8 @@ pub(super) proof fn lemma_nvme_pending_preserved_after_stage(
 pub(super) proof fn lemma_nvme_pending_preserved_after_reap(
     old_transfers: Seq<Option<InFlightNvmeOp>>,
     new_transfers: Seq<Option<InFlightNvmeOp>>,
-    old_ops: [Option<PendingOperation>; 512],
-    new_ops: [Option<PendingOperation>; 512],
+    old_ops: [Option<PendingOperation>; BITMAP_SLOTS],
+    new_ops: [Option<PendingOperation>; BITMAP_SLOTS],
     old_ring: IoUring,
     new_ring: IoUring,
     before_core: &CacheCore,

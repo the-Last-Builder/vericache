@@ -31,7 +31,6 @@ pub enum TimelineKind {
 pub struct TimelineTable {
     pub confirmed_seq: [u64; MAX_TIMELINES],
     pub next_seq: [u64; MAX_TIMELINES],
-    pub overflow_watermark: [u64; MAX_TIMELINES],
     pub kinds: [TimelineKind; MAX_TIMELINES],
     pub count: usize,
     pub events: Ghost<Map<(u8, u64), TransferEvent>>,
@@ -40,21 +39,14 @@ pub struct TimelineTable {
 impl TimelineTable {
     pub open spec fn polled(&self, prior: &Self, timeline: u8) -> bool {
         &&& self.events == prior.events && self.next_seq == prior.next_seq
-        &&& self.count == prior.count && self.kinds == prior.kinds && self.overflow_watermark
-            == prior.overflow_watermark
+        &&& self.count == prior.count && self.kinds == prior.kinds
         &&& forall|i: int|
             0 <= i < MAX_TIMELINES ==> (#[trigger] self.confirmed_seq[i]) >= prior.confirmed_seq[i]
                 && (i != timeline ==> self.confirmed_seq[i] == prior.confirmed_seq[i])
     }
 
     pub open spec fn only_watermarks(&self, before: &Self) -> bool {
-        &&& self.confirmed_seq == before.confirmed_seq && self.next_seq == before.next_seq
-            && self.count == before.count && self.kinds == before.kinds && self.events
-            == before.events
-        &&& self.bounds()
-        &&& forall|i: int|
-            0 <= i < MAX_TIMELINES ==> #[trigger] self.overflow_watermark[i]
-                >= before.overflow_watermark[i]
+        *self == *before
     }
 
     pub open spec fn issued(&self, t: u8, s: u64) -> bool {
@@ -84,8 +76,7 @@ impl TimelineTable {
         &&& self.count <= MAX_TIMELINES
         &&& forall|i: int|
             0 <= i < self.count ==> 1 <= #[trigger] self.next_seq[i] <= MAX_TICKET_SEQ + 1
-                && self.confirmed_seq[i] < self.next_seq[i] && self.overflow_watermark[i]
-                < self.next_seq[i]
+                && self.confirmed_seq[i] < self.next_seq[i]
     }
 
     pub open spec fn well_formed(
@@ -105,11 +96,6 @@ impl TimelineTable {
                 node,
                 ledger.knows,
             )
-    }
-
-    pub open spec fn overflow_retired(&self) -> bool {
-        forall|i: int|
-            0 <= i < self.count ==> self.overflow_watermark[i] <= #[trigger] self.confirmed_seq[i]
     }
 
     pub proof fn lemma_well_formed_ledger_growth(
@@ -227,7 +213,6 @@ impl TimelineTable {
         Self {
             confirmed_seq: [0;MAX_TIMELINES],
             next_seq: [1;MAX_TIMELINES],
-            overflow_watermark: [0;MAX_TIMELINES],
             kinds: [TimelineKind::Host;MAX_TIMELINES],
             count: 0,
             events: Ghost(Map::empty()),
@@ -242,14 +227,12 @@ impl TimelineTable {
                 Err(_) => *final(self) == *old(self) && old(self).count == MAX_TIMELINES,
                 Ok(t) => t == old(self).count && final(self).count == t + 1
                     && final(self).kinds[t as int] == kind && final(self).next_seq[t as int] == 1
-                    && final(self).confirmed_seq[t as int] == 0
-                    && final(self).overflow_watermark[t as int] == 0 && final(self).events == old(
+                    && final(self).confirmed_seq[t as int] == 0 && final(self).events == old(
                     self,
                 ).events && final(self).bounds() && forall|i: int|
                     0 <= i < t ==> #[trigger] final(self).kinds[i] == old(self).kinds[i]
                         && final(self).confirmed_seq[i] == old(self).confirmed_seq[i]
-                        && final(self).next_seq[i] == old(self).next_seq[i]
-                        && final(self).overflow_watermark[i] == old(self).overflow_watermark[i],
+                        && final(self).next_seq[i] == old(self).next_seq[i],
             },
     {
         let i = self.count;
@@ -259,7 +242,6 @@ impl TimelineTable {
         self.kinds[i] = kind;
         self.confirmed_seq[i] = 0;
         self.next_seq[i] = 1;
-        self.overflow_watermark[i] = 0;
         self.count += 1;
         Ok(i as u8)
     }
@@ -291,7 +273,6 @@ impl TimelineTable {
                     &&& final(self).events@ == old(self).events@.insert((t, s), event)
                     &&& final(self).count == old(self).count && final(self).kinds == old(self).kinds
                         && final(self).confirmed_seq == old(self).confirmed_seq
-                        && final(self).overflow_watermark == old(self).overflow_watermark
                     &&& old(ledger).submitted.map().submap_of(final(ledger).submitted.map())
                     &&& final(ledger).submitted.map() == old(ledger).submitted.map().insert(
                         event,
@@ -356,7 +337,6 @@ impl TimelineTable {
             final(self).next_seq == old(self).next_seq,
             final(self).kinds == old(self).kinds,
             final(self).count == old(self).count,
-            final(self).overflow_watermark == old(self).overflow_watermark,
             final(self).events == old(self).events,
             final(ledger).knows.set() == old(ledger).knows.set().union(knows.set()),
             final(ledger).submitted == old(ledger).submitted,
@@ -398,59 +378,6 @@ impl TimelineTable {
         ticket.is_none() || ticket.seq() <= self.confirmed_seq[ticket.timeline() as usize]
     }
 
-    pub fn record_overflow(&mut self, ticket: Ticket)
-        requires
-            old(self).bounds(),
-            old(self).valid_ticket(ticket),
-        ensures
-            final(self).bounds(),
-            final(self).events == old(self).events,
-            final(self).kinds == old(self).kinds,
-            final(self).next_seq == old(self).next_seq,
-            final(self).confirmed_seq == old(self).confirmed_seq,
-            final(self).count == old(self).count,
-            forall|i: int|
-                0 <= i < MAX_TIMELINES ==> #[trigger] final(self).overflow_watermark[i] == if ticket
-                    != Ticket::NONE && i == ticket.timeline_id() {
-                    vstd::math::max(
-                        old(self).overflow_watermark[i] as int,
-                        ticket.sequence() as int,
-                    )
-                } else {
-                    old(self).overflow_watermark[i] as int
-                },
-    {
-        if !ticket.is_none() {
-            let i = ticket.timeline() as usize;
-            let s = ticket.seq();
-            if self.overflow_watermark[i] < s {
-                self.overflow_watermark[i] = s;
-            }
-        }
-    }
-
-    pub fn overflow_all_retired(&self) -> (r: bool)
-        requires
-            self.bounds(),
-        ensures
-            r == self.overflow_retired(),
-    {
-        let mut i = 0;
-        while i < self.count
-            invariant
-                i <= self.count <= MAX_TIMELINES,
-                forall|j: int|
-                    0 <= j < i ==> self.overflow_watermark[j] <= #[trigger] self.confirmed_seq[j],
-            decreases self.count - i,
-        {
-            if self.confirmed_seq[i] < self.overflow_watermark[i] {
-                return false;
-            }
-            i += 1;
-        }
-        true
-    }
-
     pub proof fn lemma_retired_ticket_in_frontier(
         &self,
         id: InstanceId,
@@ -465,24 +392,6 @@ impl TimelineTable {
             ticket != Ticket::NONE,
         ensures
             self.observed(ticket.timeline_id(), ticket.sequence(), node, ledger.knows),
-    {
-    }
-
-    pub proof fn lemma_overflow_all_retired(
-        &self,
-        id: InstanceId,
-        node: NodeId,
-        ledger: &KnowledgeLedger,
-        t: u8,
-        s: u64,
-    )
-        requires
-            self.well_formed(id, node, ledger),
-            self.overflow_retired(),
-            self.issued(t, s),
-            s <= self.overflow_watermark[t as int],
-        ensures
-            self.observed(t, s, node, ledger.knows),
     {
     }
 }
@@ -508,7 +417,7 @@ pub open spec fn remove_range(m: Map<u64, TransferEvent>, start: u64, count: int
 }
 
 pub open spec fn window_matches(
-    ops: [Option<PendingOperation>; 512],
+    ops: [Option<PendingOperation>; BITMAP_SLOTS],
     bitmap: SlidingBitmap,
     table: &TimelineTable,
     t: u8,
@@ -529,8 +438,8 @@ pub open spec fn window_matches(
 }
 
 pub proof fn window_after_completion(
-    prior_ops: [Option<PendingOperation>; 512],
-    ops: [Option<PendingOperation>; 512],
+    prior_ops: [Option<PendingOperation>; BITMAP_SLOTS],
+    ops: [Option<PendingOperation>; BITMAP_SLOTS],
     prior_bitmap: SlidingBitmap,
     bitmap: SlidingBitmap,
     before: &TimelineTable,
@@ -585,7 +494,7 @@ pub proof fn window_after_completion(
 }
 
 pub fn record_submission(
-    ops: &mut [Option<PendingOperation>; 512],
+    ops: &mut [Option<PendingOperation>; BITMAP_SLOTS],
     Ghost(bitmap): Ghost<SlidingBitmap>,
     table: &mut TimelineTable,
     t: u8,
@@ -635,7 +544,6 @@ pub fn record_submission(
         final(table).kinds == old(table).kinds,
         final(table).count == old(table).count,
         final(table).confirmed_seq == old(table).confirmed_seq,
-        final(table).overflow_watermark == old(table).overflow_watermark,
 {
     let s = table.next_seq[t as usize];
     let ticket = table.issue_ticket(
@@ -652,9 +560,9 @@ pub fn record_submission(
         % BITMAP_CAPACITY) as int] matches Some(p) && p.sequence == q) by {
         if q != s {
             assert(pending.remove(s).contains_key(q));
-            assert(q % 512 != s % 512) by {
-                assert(q == 512 * (q / 512) + q % 512);
-                assert(s == 512 * (s / 512) + s % 512);
+            assert(q % BITMAP_CAPACITY != s % BITMAP_CAPACITY) by {
+                assert(q == BITMAP_CAPACITY * (q / BITMAP_CAPACITY) + q % BITMAP_CAPACITY);
+                assert(s == BITMAP_CAPACITY * (s / BITMAP_CAPACITY) + s % BITMAP_CAPACITY);
             }
         }
     }
@@ -690,7 +598,7 @@ pub fn record_submission(
 
 /// Dispatch a reaped data completion and retain its success witness only on success.
 pub fn complete_data(
-    ops: &mut [Option<PendingOperation>; 512],
+    ops: &mut [Option<PendingOperation>; BITMAP_SLOTS],
     bitmap: &mut SlidingBitmap,
     table: &mut TimelineTable,
     t: u8,
@@ -724,7 +632,6 @@ pub fn complete_data(
         final(table).count == old(table).count,
         final(table).next_seq == old(table).next_seq,
         final(table).events == old(table).events,
-        final(table).overflow_watermark == old(table).overflow_watermark,
         final(ledger).submitted == old(ledger).submitted,
         final(ledger).revoked == old(ledger).revoked,
         final(ledger).knows.set() == old(ledger).knows.set().union(observation.set()),

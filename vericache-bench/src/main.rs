@@ -9,7 +9,10 @@ use std::fs;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "vericache-bench", about = "VeriCache release benchmark driver (Suites 1-4)")]
+#[command(
+    name = "vericache-bench",
+    about = "VeriCache release benchmark driver (Suites 1-4)"
+)]
 struct Cli {
     /// Path to JSON JobSpec file (mutually exclusive with --job-json).
     #[arg(long)]

@@ -149,7 +149,7 @@ impl<'a> RegistrationBuffer<'a> {
 }
 
 pub struct MemoryRegion<'a> {
-    pub(super) raw: *mut u8,
+    pub(super) raw: ffi::RawMrGuard,
     pub(super) addr: u64,
     #[cfg_attr(not(verus_only), allow(dead_code))]
     pub(super) len: u64,
@@ -555,7 +555,7 @@ pub fn register_memory<'a>(
             (p, l, b.num_slots_val(), b.slot_len_val(), Some(ord))
         },
     };
-    let (raw, lkey) = ffi::register(pd.raw, ptr, len, flags)?;
+    let (raw, lkey) = ffi::register(pd.raw.as_ptr(), ptr, len, flags)?;
     Ok(
         MemoryRegion {
             raw,
@@ -622,6 +622,7 @@ pub fn deregister_memory<'a>(
         Err(e) => return Err((e, buf, Tracked(tok))),
         Ok(w) => w,
     };
+    let _ = buf.raw.into_raw();
     proof {
         assert(slab_locs(loc.node, loc.space, 1nat) =~= ISet::empty().insert(loc));
         assert(completed.access == dereg_access(loc));
@@ -703,6 +704,7 @@ pub fn deregister_memory_slab<'a>(
         Err(e) => return Err((e, buf, Tracked(tokens))),
         Ok(w) => w,
     };
+    let _ = buf.raw.into_raw();
     let tracked (completion, out_tokens) = host::finish_slab_owned(
         _ctx.source.borrow_mut(),
         instance,

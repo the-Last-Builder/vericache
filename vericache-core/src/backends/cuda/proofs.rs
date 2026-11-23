@@ -187,6 +187,24 @@ pub(super) proof fn lemma_cuda_certify_ready_put(
     cert
 }
 
+proof fn lemma_confirmed_seq_in_citations(core: &CacheCore, timeline: u8, s: u64)
+    requires
+        core.timelines.well_formed(core.instance_id(), core.node(), &core.ledger@),
+        timeline < core.timelines.count,
+        1 <= s <= core.timelines.confirmed_seq[timeline as int],
+    ensures
+        core.timelines.issued(timeline, s),
+        core.timelines.events@.contains_key((timeline, s)),
+        core.citations().contains(core.timelines.events@[(timeline, s)]),
+{
+    let w = core.timelines.events@[(timeline, s)];
+    assert(core.timelines.issued(timeline, s));
+    assert(core.timelines.events@.contains_key((timeline, s)));
+    assert(core.ledger@.submitted.dom().contains(w));
+    assert(core.timelines.observed(timeline, s, core.node(), core.ledger@.knows));
+    assert(core.citations().contains(w));
+}
+
 pub(super) proof fn lemma_cuda_ready_put_writable(
     entry: &PendingGpuWrite,
     core: &CacheCore,
@@ -204,6 +222,12 @@ pub(super) proof fn lemma_cuda_ready_put_writable(
             ISet::empty(),
         ),
 {
+    hide(CacheCore::well_formed);
+    hide(TimelineTable::well_formed);
+    hide(replica_valid);
+    hide(complete_receipts);
+    lemma_core_wf_facts(core);
+    lemma_core_timelines_wf(core);
     let tok = core.frames.frame(entry.frame).token.unwrap();
     let s = entry.ticket.sequence();
     if let Some(w) = slot_frontier(tok).last_writer {
@@ -211,24 +235,26 @@ pub(super) proof fn lemma_cuda_ready_put_writable(
             match entry.action {
                 PendingGpuAction::Publish { .. } => {
                     assert(w == core.timelines.events@[(timeline, s)]);
-                    assert(core.timelines.issued(timeline, s));
-                    assert(core.timelines.events@.contains_key((timeline, s)));
-                    assert(core.ledger@.submitted.dom().contains(w));
-                    assert(core.timelines.observed(timeline, s, core.node(), core.ledger@.knows));
+                    lemma_confirmed_seq_in_citations(core, timeline, s);
+                    assert(core.citations().contains(w));
+                    assert(false);
                 },
                 PendingGpuAction::Abort => {
                     assert(core.timelines.ticket_covers(entry.ticket, w));
+                    assert(exists|q: u64|
+                        1 <= q <= s && #[trigger] core.timelines.events@[(timeline, q)] == w);
                     let q = choose|q: u64|
-                        1 <= q <= s && core.timelines.events@[(timeline, q)] == w;
-                    assert(core.timelines.issued(timeline, q));
-                    assert(core.timelines.events@.contains_key((timeline, q)));
-                    assert(core.ledger@.submitted.dom().contains(w));
-                    assert(core.timelines.observed(timeline, q, core.node(), core.ledger@.knows));
+                        1 <= q <= s && #[trigger] core.timelines.events@[(timeline, q)] == w;
+                    lemma_confirmed_seq_in_citations(core, timeline, q);
+                    assert(core.citations().contains(w));
+                    assert(false);
                 },
             }
         }
     }
+    assert(core.citations().union(ISet::empty()) =~= core.citations());
     assert(write_admitted(slot_frontier(tok), core.citations()));
+    assert(write_admitted(slot_frontier(tok), core.citations().union(ISet::empty())));
 }
 
 proof fn lemma_cuda_puts_disjoint_swap_remove(
@@ -342,12 +368,16 @@ proof fn lemma_cuda_put_valid_after_retire_other(
     match entry.action {
         PendingGpuAction::Abort => {},
         PendingGpuAction::Publish { version, only_if_current, .. } => {
+            broadcast use vstd::map::group_map_lemmas;
+
+            assert(retired.action matches PendingGpuAction::Publish {
+                version: rv,
+                only_if_current: true,
+                ..
+            } ==> before_core.frames.versions@.contains_key(rv));
             if only_if_current {
                 assert(before_core.frames.versions@.dom().contains(version));
                 assert(after_core.frames.versions@.dom().contains(version));
-            } else {
-                broadcast use vstd::map::group_map_lemmas;
-
             }
         },
     }
@@ -495,17 +525,19 @@ pub(super) proof fn lemma_copy_hop_slots_ready<'a>(
             backend.gpu_num_frames,
             backend.gpu_buffer.space(),
         ),
-        backend.pinned_host matches Some(h) ==> h.well_formed(core) && h.tier != backend.gpu_tier,
+        backend.pinned_host matches Some(h) ==> h.well_formed(core) && h.tier != backend.gpu_tier
+            && core.frames.tier_frame_size(h.tier) == core.frames.tier_frame_size(backend.gpu_tier),
         backend.timeline.well_formed(&core.timelines, core.node(), &core.ledger@),
         core.frames.frame_size == before_core.frames.frame_size,
+        core.frames.tier_frame_sizes == before_core.frames.tier_frame_sizes,
         core.frames.metas.len() == before_core.frames.metas.len(),
         core.frames.frame(src_frame).slot.is_full(),
         core.frames.frame(src_frame).slot.well_formed(),
-        core.frames.frame(src_frame).slot.slot_len == core.frames.frame_size,
+        core.frames.frame(src_frame).slot.slot_len == core.frames.tier_frame_size(backend.gpu_tier),
         core.frames.frame(src_frame).slot.loc.node == core.node(),
         core.frames.frame(dst_frame).slot.is_full(),
         core.frames.frame(dst_frame).slot.well_formed(),
-        core.frames.frame(dst_frame).slot.slot_len == core.frames.frame_size,
+        core.frames.frame(dst_frame).slot.slot_len == core.frames.tier_frame_size(backend.gpu_tier),
         core.frames.frame(dst_frame).slot.loc.node == core.node(),
         core.frames.frame(src_frame).bound_version is Some,
         core.frames.frame(src_frame).bound_version.unwrap().well_formed(),
@@ -685,12 +717,11 @@ pub(super) proof fn lemma_finish_put_gpu_core_step(
         source_slice_valid(src_cert, src_slot),
         src_cert.slot == src_slot,
         src_cert.bytes.len() == src_slot.sub_len,
-        src_slot.sub_len == core.frames.frame_size,
+        src_slot.sub_len == h_slot.slot_len,
         src_slot.loc != h_slot.loc,
         h_slot.is_full(),
         h_slot.well_formed(),
-        h_slot.slot_len == core.frames.frame_size,
-        h_slot.sub_len == core.frames.frame_size,
+        h_slot.sub_len == h_slot.slot_len,
         h_slot.loc.node == core.node(),
         core_transition(
             before_core,
@@ -718,7 +749,8 @@ pub(super) proof fn lemma_finish_put_gpu_core_step(
         ),
         core.timelines.ticket_covers(ticket, put_proof.certificate.writer),
         put_proof.certificate.slot == h_slot,
-        put_proof.certificate.bytes.len() == core.frames.frame_size,
+        put_proof.certificate.bytes == src_cert.bytes,
+        put_proof.certificate.bytes.len() == h_slot.slot_len,
         put_proof.certificate.writer == core.timelines.events@[(timeline_id, ticket.sequence())],
         put_proof.pending(core.ledger@, core.node()),
         cuda_put_events_covered(
@@ -795,6 +827,191 @@ pub(super) proof fn lemma_finish_put_gpu_core_step(
     );
     lemma_cuda_ticket_covers_exact(&core.timelines, ticket, ev);
     put_proof
+}
+
+pub proof fn lemma_cuda_puts_bindings_empty(
+    puts: Seq<PendingGpuWrite>,
+    bindings: Map<VersionId, VersionBinding>,
+)
+    requires
+        puts.len() == 0,
+    ensures
+        cuda_puts_bindings_covered(puts, bindings),
+{
+    reveal(cuda_puts_bindings_covered);
+}
+
+pub proof fn lemma_cuda_puts_bindings_push_abort(
+    old_puts: Seq<PendingGpuWrite>,
+    new_puts: Seq<PendingGpuWrite>,
+    entry: PendingGpuWrite,
+    bindings: Map<VersionId, VersionBinding>,
+)
+    requires
+        cuda_puts_bindings_covered(old_puts, bindings),
+        new_puts == old_puts.push(entry),
+        !(entry.action matches PendingGpuAction::Publish { only_if_current: false, .. }),
+    ensures
+        cuda_puts_bindings_covered(new_puts, bindings),
+{
+    reveal(cuda_puts_bindings_covered);
+    assert forall|i: int| 0 <= i < new_puts.len() implies match (#[trigger] new_puts[i]).action {
+        PendingGpuAction::Publish { version, proof, only_if_current: false, .. } => {
+            &&& bindings.contains_key(version)
+            &&& bindings[version].instance_id() == cluster_version_instance_id()
+            &&& bindings[version].key() == (version.origin_node as NodeId, version.seq)
+            &&& bindings[version].value() == proof@.certificate.bytes
+        },
+        _ => true,
+    } by {
+        if i < old_puts.len() {
+            assert(new_puts[i] == old_puts[i]);
+        } else {
+            assert(new_puts[i] == entry);
+        }
+    }
+}
+
+pub proof fn lemma_cuda_puts_bindings_push_publish(
+    old_puts: Seq<PendingGpuWrite>,
+    new_puts: Seq<PendingGpuWrite>,
+    entry: PendingGpuWrite,
+    old_bindings: Map<VersionId, VersionBinding>,
+    new_bindings: Map<VersionId, VersionBinding>,
+    version: VersionId,
+    binding: VersionBinding,
+    after_core: &CacheCore,
+    timeline: u8,
+)
+    requires
+        cuda_puts_bindings_covered(old_puts, old_bindings),
+        cuda_puts_valid(new_puts, after_core, timeline),
+        new_puts == old_puts.push(entry),
+        entry.action matches PendingGpuAction::Publish {
+            version: ev,
+            proof: ep,
+            only_if_current: false,
+            ..
+        } && ev == version && binding.value() == ep@.certificate.bytes,
+        binding.instance_id() == cluster_version_instance_id(),
+        binding.key() == (version.origin_node as NodeId, version.seq),
+        new_bindings == old_bindings.insert(version, binding),
+    ensures
+        cuda_puts_bindings_covered(new_puts, new_bindings),
+{
+    broadcast use vstd::map::group_map_lemmas;
+
+    reveal(cuda_puts_valid);
+    reveal(cuda_puts_disjoint);
+    reveal(cuda_puts_bindings_covered);
+    let last = old_puts.len() as int;
+    assert(new_puts[last] == entry);
+    assert forall|i: int| 0 <= i < new_puts.len() implies match (#[trigger] new_puts[i]).action {
+        PendingGpuAction::Publish { version: v, proof, only_if_current: false, .. } => {
+            &&& new_bindings.contains_key(v)
+            &&& new_bindings[v].instance_id() == cluster_version_instance_id()
+            &&& new_bindings[v].key() == (v.origin_node as NodeId, v.seq)
+            &&& new_bindings[v].value() == proof@.certificate.bytes
+        },
+        _ => true,
+    } by {
+        if i < last {
+            assert(new_puts[i] == old_puts[i]);
+            assert(i != last);
+            if let PendingGpuAction::Publish { version: v, only_if_current: false, .. } =
+                new_puts[i].action {
+                assert(v != version);
+                assert(old_bindings.contains_key(v));
+                assert(new_bindings[v] == old_bindings[v]);
+            }
+        }
+    }
+}
+
+pub proof fn lemma_cuda_puts_bindings_extract(
+    puts: Seq<PendingGpuWrite>,
+    bindings: Map<VersionId, VersionBinding>,
+    idx: int,
+)
+    requires
+        cuda_puts_bindings_covered(puts, bindings),
+        0 <= idx < puts.len(),
+    ensures
+        match puts[idx].action {
+            PendingGpuAction::Publish { version, proof, only_if_current: false, .. } => {
+                &&& bindings.contains_key(version)
+                &&& bindings[version].instance_id() == cluster_version_instance_id()
+                &&& bindings[version].key() == (version.origin_node as NodeId, version.seq)
+                &&& bindings[version].value() == proof@.certificate.bytes
+            },
+            _ => true,
+        },
+{
+    reveal(cuda_puts_bindings_covered);
+}
+
+pub(super) proof fn lemma_cuda_puts_bindings_swap_remove(
+    old_puts: Seq<PendingGpuWrite>,
+    new_puts: Seq<PendingGpuWrite>,
+    old_bindings: Map<VersionId, VersionBinding>,
+    new_bindings: Map<VersionId, VersionBinding>,
+    idx: int,
+    removed_ver: Option<VersionId>,
+    before_core: &CacheCore,
+    timeline: u8,
+)
+    requires
+        cuda_puts_valid(old_puts, before_core, timeline),
+        cuda_puts_bindings_covered(old_puts, old_bindings),
+        0 <= idx < old_puts.len(),
+        new_puts.len() == old_puts.len() - 1,
+        forall|i: int|
+            0 <= i < new_puts.len() ==> new_puts[i] == if i == idx {
+                old_puts[old_puts.len() - 1]
+            } else {
+                old_puts[i]
+            },
+        match removed_ver {
+            None => new_bindings == old_bindings,
+            Some(rv) => (old_puts[idx].action matches PendingGpuAction::Publish {
+                version,
+                only_if_current: false,
+                ..
+            } && version == rv) && new_bindings == old_bindings.remove(rv),
+        },
+    ensures
+        cuda_puts_bindings_covered(new_puts, new_bindings),
+{
+    broadcast use vstd::map::group_map_lemmas;
+
+    reveal(cuda_puts_valid);
+    reveal(cuda_puts_bindings_covered);
+    assert forall|i: int| 0 <= i < new_puts.len() implies match (#[trigger] new_puts[i]).action {
+        PendingGpuAction::Publish { version, proof, only_if_current: false, .. } => {
+            &&& new_bindings.contains_key(version)
+            &&& new_bindings[version].instance_id() == cluster_version_instance_id()
+            &&& new_bindings[version].key() == (version.origin_node as NodeId, version.seq)
+            &&& new_bindings[version].value() == proof@.certificate.bytes
+        },
+        _ => true,
+    } by {
+        let oi = if i == idx {
+            old_puts.len() - 1
+        } else {
+            i
+        };
+        assert(oi != idx);
+        assert(new_puts[i] == old_puts[oi]);
+        lemma_cuda_disjoint_pair(old_puts, oi, idx);
+        if let PendingGpuAction::Publish { version, only_if_current: false, .. } =
+            old_puts[oi].action {
+            assert(old_bindings.contains_key(version));
+            if let Some(rv) = removed_ver {
+                assert(version != rv);
+                assert(new_bindings[version] == old_bindings[version]);
+            }
+        }
+    }
 }
 
 } // verus!

@@ -38,9 +38,14 @@ pub use window_pool::{MwPoolSlot, MwSlotState, WindowPool};
 
 verus! {
 
-/// Control WR IDs (`BindWindow`, `LocalInvalidate`) live in the high half of
-/// `u64`, strictly disjoint from FIFO data sequence numbers `1..=MAX_TICKET_SEQ`.
-pub const CONTROL_WR_ID_BASE: u64 = 0x8000_0000_0000_0000u64;
+/// Control WR IDs (`BindWindow`, `LocalInvalidate`) live in `[1 << 60, 1 << 62)`,
+/// strictly disjoint from FIFO data sequence numbers `1..=MAX_TICKET_SEQ` and
+/// always fitting within the 62-bit inline `wr_id <= UINT64_MAX >> 2` range
+/// (zero C heap `malloc` in `verbs.c`).
+pub const CONTROL_WR_ID_BASE: u64 = 0x1000_0000_0000_0000u64;
+
+/// Exclusive upper bound (`1 << 62`) for inline 62-bit control WR IDs.
+pub const CONTROL_WR_ID_LIMIT: u64 = 0x4000_0000_0000_0000u64;
 
 /// Stable `(mw_slot, generation)` handle identifying an active remote RDMA read
 /// lease across `swap_remove`s in `active_leases` (M5).
@@ -77,12 +82,20 @@ pub enum PeerCompletion {
 pub enum RemoteLeaseState {
     /// MW bind WR is posted; `share_cap` is retained locally until bind completes or fails.
     Binding,
+    /// `WindowBound` CQE has been reaped by `pump_cq`; `bind_witness` is staged for `complete_bind`.
+    BindReady,
+    /// `BindFailed` CQE has been reaped by `pump_cq`; `bind_failed_witness` + `staged_error` are staged.
+    BindFailedReady,
     /// MW is bound; `RemoteCapability` + `ShareCap` were handed off to the protocol layer.
     Bound,
     /// Cooperatively unpinned in `CacheCore`; `ReturnedShare` awaits `WindowInvalidated`.
     Unbinding,
     /// Unilateral fenced revocation in progress; still pinned in `CacheCore`, awaiting `WindowInvalidated`.
     Revoking,
+    /// `WindowInvalidated` CQE for a `Revoking` lease was reaped by `pump_cq`; `inv_witness` is staged.
+    RevokeInvReady,
+    /// `ControlFailed` CQE was reaped by `pump_cq`; `staged_error` records the failure status.
+    ControlFailedState,
 }
 
 /// One active remote read lease tracked by [`RdmaBackend`].
@@ -95,6 +108,35 @@ pub struct ActiveRemoteLease {
     pub share: Ghost<TransferShare>,
     pub share_cap: Option<Tracked<ShareCap>>,
     pub returned_share: Option<Tracked<ReturnedShare>>,
+    pub bind_witness: Option<Tracked<rdma::BindWitness>>,
+    pub bind_failed_witness: Option<Tracked<rdma::BindFailedWitness>>,
+    pub inv_witness: Option<Tracked<rdma::InvalidateWitness>>,
+    pub staged_error: Option<i32>,
+}
+
+/// Transparent layout predicate matching [`slab_bound_to_core`] (used for shared slabs
+/// so sibling `compose` preservation proofs work without revealing `slab_bound_to_core`).
+pub open spec fn slab_bound_open(
+    core: &CacheCore,
+    tier: TierId,
+    first_frame: FrameId,
+    num_frames: u32,
+    space: MemorySpace,
+) -> bool {
+    &&& tier.valid(core.tiers.len())
+    &&& num_frames > 0
+    &&& (first_frame.0 as nat) + (num_frames as nat) <= core.frames.metas.len()
+    &&& forall|j: nat|
+        j < num_frames ==> {
+            &&& (#[trigger] core.frames.frame(FrameId((first_frame.0 + j) as u32))).tier == tier
+            &&& core.frames.frame(FrameId((first_frame.0 + j) as u32)).slot == SlotRef::full(
+                SlotLoc { node: core.node(), space, slot_index: j },
+                core.frames.tier_frame_size(tier) as u64,
+            )
+        }
+    &&& forall|f: FrameId|
+        f.0 < core.frames.metas.len() && (#[trigger] core.frames.frame(f)).tier == tier
+            ==> first_frame.0 <= f.0 && f.0 < first_frame.0 + num_frames
 }
 
 /// Registered RDMA `MemoryRegion` bound to a contiguous slab of `CacheCore` frames.
@@ -113,9 +155,116 @@ impl<'a> RegisteredSlab<'a> {
         &&& self.mr.pd_id() == pd_id
         &&& self.mr.access().mw_bind
         &&& self.mr.num_slots() == self.num_frames as usize
-        &&& self.mr.slot_len() == core.frames.frame_size
+        &&& self.mr.slot_len() == core.frames.tier_frame_size(self.tier)
         &&& self.tier.valid(core.tiers.len())
         &&& slab_bound_to_core(core, self.tier, self.first_frame, self.num_frames, self.mr.space())
+    }
+
+    pub open spec fn well_formed_shared(&self, core: &CacheCore, pd_id: nat) -> bool {
+        &&& self.mr.well_formed()
+        &&& self.mr.instance_id() == core.instance_id()
+        &&& self.mr.node() == core.node()
+        &&& self.mr.pd_id() == pd_id
+        &&& self.mr.access().mw_bind
+        &&& self.mr.num_slots() == self.num_frames as usize
+        &&& self.mr.slot_len() == core.frames.tier_frame_size(self.tier)
+        &&& self.tier.valid(core.tiers.len())
+        &&& slab_bound_open(core, self.tier, self.first_frame, self.num_frames, self.mr.space())
+    }
+
+    pub proof fn lemma_shared_wf_iff(&self, core: &CacheCore, pd_id: nat)
+        ensures
+            self.well_formed_shared(core, pd_id) <==> self.well_formed(core, pd_id),
+    {
+        reveal(slab_bound_to_core);
+    }
+
+    /// Standalone constructor registering a host DRAM slab MR for sharing across multiple QPs on `pd`.
+    pub fn register_host(
+        core: &CacheCore,
+        pd: &'a rdma::ProtectionDomain<'a>,
+        buffer: &'a transfer::host::HostBuffer,
+        tier: TierId,
+        first_frame: FrameId,
+        num_frames: u32,
+        flags: rdma::AccessFlags,
+    ) -> (r: BackendResult<Self>)
+        requires
+            core.well_formed(),
+            pd.node() == core.node(),
+            flags.mw_bind,
+            buffer.well_formed(),
+            buffer.instance_id() == core.instance_id(),
+            buffer.node() == core.node(),
+            buffer.num_slots() == num_frames as usize,
+            buffer.slot_len() == core.frames.tier_frame_size(tier),
+            tier.valid(core.tiers.len()),
+            slab_bound_to_core(core, tier, first_frame, num_frames, buffer.space()),
+        ensures
+            r matches Ok(s) ==> {
+                &&& s.well_formed(core, pd.id())
+                &&& s.well_formed_shared(core, pd.id())
+                &&& s.tier == tier
+                &&& s.first_frame == first_frame
+                &&& s.num_frames == num_frames
+                &&& s.mr.access() == flags
+                &&& s.mr.gpu_device_spec().is_none()
+            },
+    {
+        let _ = core;
+        let mr = match rdma::register_memory(pd, rdma::RegistrationBuffer::Host(buffer), flags) {
+            Ok(mr) => mr,
+            Err(e) => return Err(rdma_error(e)),
+        };
+        let slab = RegisteredSlab { mr, tier, first_frame, num_frames };
+        proof {
+            slab.lemma_shared_wf_iff(core, pd.id());
+        }
+        Ok(slab)
+    }
+
+    /// Standalone constructor registering a GPU VRAM slab MR for sharing across multiple QPs on `pd`.
+    pub fn register_gpu(
+        core: &CacheCore,
+        pd: &'a rdma::ProtectionDomain<'a>,
+        buffer: &'a transfer::cuda::CudaBuffer,
+        tier: TierId,
+        first_frame: FrameId,
+        num_frames: u32,
+        flags: rdma::AccessFlags,
+    ) -> (r: BackendResult<Self>)
+        requires
+            core.well_formed(),
+            pd.node() == core.node(),
+            flags.mw_bind,
+            buffer.well_formed(),
+            buffer.instance_id() == core.instance_id(),
+            buffer.node() == core.node(),
+            buffer.num_slots() == num_frames as usize,
+            buffer.slot_len() == core.frames.tier_frame_size(tier),
+            tier.valid(core.tiers.len()),
+            slab_bound_to_core(core, tier, first_frame, num_frames, buffer.space()),
+        ensures
+            r matches Ok(s) ==> {
+                &&& s.well_formed(core, pd.id())
+                &&& s.well_formed_shared(core, pd.id())
+                &&& s.tier == tier
+                &&& s.first_frame == first_frame
+                &&& s.num_frames == num_frames
+                &&& s.mr.access() == flags
+                &&& s.mr.gpu_device_spec() is Some
+            },
+    {
+        let _ = core;
+        let mr = match rdma::register_memory(pd, rdma::RegistrationBuffer::Cuda(buffer), flags) {
+            Ok(mr) => mr,
+            Err(e) => return Err(rdma_error(e)),
+        };
+        let slab = RegisteredSlab { mr, tier, first_frame, num_frames };
+        proof {
+            slab.lemma_shared_wf_iff(core, pd.id());
+        }
+        Ok(slab)
     }
 
     pub open spec fn owns(&self, frame: FrameId) -> bool {
@@ -188,7 +337,7 @@ pub open spec fn rdma_remove_range(m: Map<u64, TransferEvent>, start: u64, count
 /// Opaque data-window and control-WR-ID invariant for `RdmaBackend`.
 #[verifier::opaque]
 pub open spec fn rdma_window_wf(
-    ops: [Option<PendingOperation>; 512],
+    ops: [Option<PendingOperation>; BITMAP_SLOTS],
     bitmap: SlidingBitmap,
     table: &TimelineTable,
     t: u8,
@@ -202,13 +351,94 @@ pub open spec fn rdma_window_wf(
     &&& bitmap.well_formed()
     &&& bitmap.observations(table, t, cq.observer, ledger)
     &&& window_matches(ops, bitmap, table, t, rdma_data_events(cq))
-    &&& CONTROL_WR_ID_BASE <= next_control_wr_id
+    &&& CONTROL_WR_ID_BASE <= next_control_wr_id <= CONTROL_WR_ID_LIMIT
     &&& forall|s: u64|
         cq.pending.contains_key(s) && !((#[trigger] cq.pending[s]).kind is DataTransfer)
             ==> CONTROL_WR_ID_BASE <= s < next_control_wr_id
 }
 
+/// Staging invariant for reaped data CQ completions stored in `RdmaBackend::completed_pulls`.
+pub open spec fn completed_pulls_wf(
+    completed_pulls: [Option<(u64, Result<(), i32>)>; BITMAP_SLOTS],
+    table: &TimelineTable,
+    t: u8,
+    observer: NodeId,
+    ledger: &KnowledgeLedger,
+) -> bool {
+    forall|i: int|
+        0 <= i < BITMAP_SLOTS ==> match #[trigger] completed_pulls[i] {
+            None => true,
+            Some((seq, st)) => {
+                &&& ((seq as int) % (BITMAP_CAPACITY as int)) == i
+                &&& table.issued(t, seq)
+                &&& ledger.knows.set().contains((observer, table.events@[(t, seq)]))
+                &&& (st.is_ok() ==> ledger.succeeded.dom().contains(table.events@[(t, seq)]))
+            },
+        }
+}
+
+/// Invariant tying active control-WR leases (`Binding`, `Unbinding`, `Revoking`) to
+/// pending entries in `cq` and guaranteeing distinct `wr_id`s across active control WRs.
+#[verifier::opaque]
+pub open spec fn rdma_control_leases_match_cq<'a>(
+    leases: Seq<ActiveRemoteLease>,
+    pool: &WindowPool<'a>,
+    cq: rdma::CqSnapshot,
+    next_control_wr_id: u64,
+) -> bool {
+    &&& forall|i: int|
+        0 <= i < leases.len() && (#[trigger] leases[i]).has_active_wr() ==> {
+            let l = leases[i];
+            &&& (l.mw_slot as int) < pool.slots.len()
+            &&& {
+                let w = pool.slots[l.mw_slot as int].window;
+                &&& CONTROL_WR_ID_BASE <= l.wr_id < next_control_wr_id
+                &&& (l.state == RemoteLeaseState::Binding && cq.pending.contains_key(l.wr_id)) ==> {
+                    &&& cq.pending[l.wr_id].kind is BindWindow
+                    &&& (w matches Some(win) ==> cq.pending[l.wr_id].kind->BindWindow_window_id
+                        == win.id())
+                }
+                &&& ((l.state == RemoteLeaseState::Unbinding || l.state
+                    == RemoteLeaseState::Revoking) && cq.pending.contains_key(l.wr_id)) ==> {
+                    &&& cq.pending[l.wr_id].kind is LocalInvalidate
+                    &&& (w matches Some(win) ==> cq.pending[l.wr_id].kind->LocalInvalidate_window_id
+                        == win.id())
+                }
+            }
+        }
+    &&& forall|i: int, j: int|
+        0 <= i < j < leases.len() && (#[trigger] leases[i]).has_active_wr() && (
+        #[trigger] leases[j]).has_active_wr() ==> leases[i].wr_id != leases[j].wr_id
+}
+
+/// Every checked-out MW slot (`Binding`, `Bound`, `Invalidating`) in `pool` is owned
+/// by an entry in `leases` (so draining `leases` guarantees `pool` can `dealloc_all`).
+#[verifier::opaque]
+pub open spec fn rdma_pool_slots_owned_by_leases<'a>(
+    leases: Seq<ActiveRemoteLease>,
+    pool: &WindowPool<'a>,
+) -> bool {
+    forall|s: int|
+        0 <= s < pool.slots.len() && ((#[trigger] pool.slots[s]).state is Binding
+            || pool.slots[s].state is Bound || pool.slots[s].state is Invalidating) ==> exists|
+            i: int,
+        |
+            0 <= i < leases.len() && (#[trigger] leases[i]).mw_slot as int == s
+}
+
 impl ActiveRemoteLease {
+    /// True when the lease has already unpinned its frame in `CacheCore`.
+    pub open spec fn is_unpinned(&self) -> bool {
+        self.state == RemoteLeaseState::Unbinding || (self.state
+            == RemoteLeaseState::ControlFailedState && self.returned_share is Some)
+    }
+
+    /// True when the lease currently owns an active control WR ID (`Binding`, `Unbinding`, `Revoking`).
+    pub open spec fn has_active_wr(&self) -> bool {
+        self.state == RemoteLeaseState::Binding || self.state == RemoteLeaseState::Unbinding
+            || self.state == RemoteLeaseState::Revoking
+    }
+
     pub open spec fn valid<'a>(
         &self,
         pool: &WindowPool<'a>,
@@ -242,6 +472,66 @@ impl ActiveRemoteLease {
                 &&& cap@.share() == self.share@
                 &&& cap@.frontier().readers.is_empty()
                 &&& self.returned_share is None
+                &&& self.bind_witness is None
+                &&& self.bind_failed_witness is None
+                &&& self.inv_witness is None
+                &&& self.staged_error is None
+            },
+            RemoteLeaseState::BindReady => {
+                &&& core.frames.meta(self.frame).active_remote_leases > 0
+                &&& core.frames.frame(self.frame).matches_lease(
+                    self.share@,
+                    self.mw_slot,
+                    self.generation,
+                )
+                &&& pool.slots[self.mw_slot as int].state is Binding
+                &&& pool.slots[self.mw_slot as int].window matches Some(w)
+                &&& w.state() is Binding
+                &&& w.state()->Binding_qp_id == qp.id()
+                &&& w.state()->Binding_instance_id == core.instance_id()
+                &&& w.state()->Binding_share == Some(self.share@)
+                &&& w.state()->Binding_wr_id == self.wr_id
+                &&& w.state()->Binding_target_slot == core.frames.frame(self.frame).slot
+                &&& w.state()->Binding_access == rdma::RemoteAccess::ReadOnly
+                &&& self.share_cap matches Some(cap)
+                &&& cap@.is_rdma_bound()
+                &&& cap@.instance_id() == core.instance_id()
+                &&& cap@.loc() == core.frames.frame(self.frame).slot.loc
+                &&& cap@.share() == self.share@
+                &&& cap@.frontier().readers.is_empty()
+                &&& self.returned_share is None
+                &&& self.bind_witness matches Some(bw) && bw@.matches(w)
+                &&& self.bind_failed_witness is None
+                &&& self.inv_witness is None
+                &&& self.staged_error is None
+            },
+            RemoteLeaseState::BindFailedReady => {
+                &&& core.frames.meta(self.frame).active_remote_leases > 0
+                &&& core.frames.frame(self.frame).matches_lease(
+                    self.share@,
+                    self.mw_slot,
+                    self.generation,
+                )
+                &&& pool.slots[self.mw_slot as int].state is Binding
+                &&& pool.slots[self.mw_slot as int].window matches Some(w)
+                &&& w.state() is Binding
+                &&& w.state()->Binding_qp_id == qp.id()
+                &&& w.state()->Binding_instance_id == core.instance_id()
+                &&& w.state()->Binding_share == Some(self.share@)
+                &&& w.state()->Binding_wr_id == self.wr_id
+                &&& w.state()->Binding_target_slot == core.frames.frame(self.frame).slot
+                &&& w.state()->Binding_access == rdma::RemoteAccess::ReadOnly
+                &&& self.share_cap matches Some(cap)
+                &&& cap@.is_rdma_bound()
+                &&& cap@.instance_id() == core.instance_id()
+                &&& cap@.loc() == core.frames.frame(self.frame).slot.loc
+                &&& cap@.share() == self.share@
+                &&& cap@.frontier().readers.is_empty()
+                &&& self.returned_share is None
+                &&& self.bind_witness is None
+                &&& self.bind_failed_witness matches Some(bfw) && bfw@.matches(w)
+                &&& self.inv_witness is None
+                &&& self.staged_error is Some
             },
             RemoteLeaseState::Bound => {
                 &&& core.frames.meta(self.frame).active_remote_leases > 0
@@ -259,6 +549,10 @@ impl ActiveRemoteLease {
                 &&& w.state()->Bound_slot == core.frames.frame(self.frame).slot
                 &&& self.share_cap is None
                 &&& self.returned_share is None
+                &&& self.bind_witness is None
+                &&& self.bind_failed_witness is None
+                &&& self.inv_witness is None
+                &&& self.staged_error is None
             },
             RemoteLeaseState::Unbinding => {
                 &&& pool.slots[self.mw_slot as int].state is Invalidating
@@ -274,6 +568,10 @@ impl ActiveRemoteLease {
                 &&& r@.share() == self.share@
                 &&& r@.instance_id() == core.instance_id()
                 &&& r@.loc() == core.frames.frame(self.frame).slot.loc
+                &&& self.bind_witness is None
+                &&& self.bind_failed_witness is None
+                &&& self.inv_witness is None
+                &&& self.staged_error is None
             },
             RemoteLeaseState::Revoking => {
                 &&& core.frames.meta(self.frame).active_remote_leases > 0
@@ -292,6 +590,92 @@ impl ActiveRemoteLease {
                 &&& w.state()->Invalidating_slot == core.frames.frame(self.frame).slot
                 &&& self.share_cap is None
                 &&& self.returned_share is None
+                &&& self.bind_witness is None
+                &&& self.bind_failed_witness is None
+                &&& self.inv_witness is None
+                &&& self.staged_error is None
+            },
+            RemoteLeaseState::RevokeInvReady => {
+                &&& core.frames.meta(self.frame).active_remote_leases > 0
+                &&& core.frames.frame(self.frame).matches_lease(
+                    self.share@,
+                    self.mw_slot,
+                    self.generation,
+                )
+                &&& pool.slots[self.mw_slot as int].state is Invalidating
+                &&& pool.slots[self.mw_slot as int].window matches Some(w)
+                &&& w.state() is Invalidating
+                &&& w.state()->Invalidating_qp_id == qp.id()
+                &&& w.state()->Invalidating_instance_id == core.instance_id()
+                &&& w.state()->Invalidating_share == Some(self.share@)
+                &&& w.state()->Invalidating_wr_id == self.wr_id
+                &&& w.state()->Invalidating_slot == core.frames.frame(self.frame).slot
+                &&& self.share_cap is None
+                &&& self.returned_share is None
+                &&& self.bind_witness is None
+                &&& self.bind_failed_witness is None
+                &&& self.inv_witness matches Some(iw) && iw@.matches(w)
+                &&& self.staged_error is None
+            },
+            RemoteLeaseState::ControlFailedState => {
+                &&& self.bind_witness is None
+                &&& self.bind_failed_witness is None
+                &&& self.inv_witness is None
+                &&& self.staged_error is Some
+                &&& match (self.share_cap, self.returned_share) {
+                    (Some(cap), None) => {
+                        &&& core.frames.meta(self.frame).active_remote_leases > 0
+                        &&& core.frames.frame(self.frame).matches_lease(
+                            self.share@,
+                            self.mw_slot,
+                            self.generation,
+                        )
+                        &&& pool.slots[self.mw_slot as int].state is Binding
+                        &&& pool.slots[self.mw_slot as int].window matches Some(w)
+                        &&& w.state() is Binding
+                        &&& w.state()->Binding_qp_id == qp.id()
+                        &&& w.state()->Binding_instance_id == core.instance_id()
+                        &&& w.state()->Binding_share == Some(self.share@)
+                        &&& w.state()->Binding_wr_id == self.wr_id
+                        &&& w.state()->Binding_target_slot == core.frames.frame(self.frame).slot
+                        &&& w.state()->Binding_access == rdma::RemoteAccess::ReadOnly
+                        &&& cap@.is_rdma_bound()
+                        &&& cap@.instance_id() == core.instance_id()
+                        &&& cap@.loc() == core.frames.frame(self.frame).slot.loc
+                        &&& cap@.share() == self.share@
+                        &&& cap@.frontier().readers.is_empty()
+                    },
+                    (None, Some(r)) => {
+                        &&& pool.slots[self.mw_slot as int].state is Invalidating
+                        &&& pool.slots[self.mw_slot as int].window matches Some(w)
+                        &&& w.state() is Invalidating
+                        &&& w.state()->Invalidating_qp_id == qp.id()
+                        &&& w.state()->Invalidating_instance_id == core.instance_id()
+                        &&& w.state()->Invalidating_share == Some(self.share@)
+                        &&& w.state()->Invalidating_wr_id == self.wr_id
+                        &&& w.state()->Invalidating_slot == core.frames.frame(self.frame).slot
+                        &&& r@.share() == self.share@
+                        &&& r@.instance_id() == core.instance_id()
+                        &&& r@.loc() == core.frames.frame(self.frame).slot.loc
+                    },
+                    (None, None) => {
+                        &&& core.frames.meta(self.frame).active_remote_leases > 0
+                        &&& core.frames.frame(self.frame).matches_lease(
+                            self.share@,
+                            self.mw_slot,
+                            self.generation,
+                        )
+                        &&& pool.slots[self.mw_slot as int].state is Invalidating
+                        &&& pool.slots[self.mw_slot as int].window matches Some(w)
+                        &&& w.state() is Invalidating
+                        &&& w.state()->Invalidating_qp_id == qp.id()
+                        &&& w.state()->Invalidating_instance_id == core.instance_id()
+                        &&& w.state()->Invalidating_share == Some(self.share@)
+                        &&& w.state()->Invalidating_wr_id == self.wr_id
+                        &&& w.state()->Invalidating_slot == core.frames.frame(self.frame).slot
+                    },
+                    (Some(_), Some(_)) => false,
+                }
             },
         }
     }
@@ -367,17 +751,76 @@ pub struct RdmaBackend<'a> {
     pub qp: rdma::QueuePair<'a>,
     pub cq: rdma::CompletionQueue<'a>,
     pub bitmap: SlidingBitmap,
-    pub in_flight_ops: [Option<PendingOperation>; 512],
+    pub in_flight_ops: [Option<PendingOperation>; BITMAP_SLOTS],
     pub window_pool: WindowPool<'a>,
     pub host_mr: Option<RegisteredSlab<'a>>,
     pub gpu_mr: Option<RegisteredSlab<'a>>,
+    pub shared_host_mr: Option<&'a RegisteredSlab<'a>>,
+    pub shared_gpu_mr: Option<&'a RegisteredSlab<'a>>,
     pub active_leases: Vec<ActiveRemoteLease>,
     pub next_control_wr_id: u64,
+    pub completed_pulls: [Option<(u64, Result<(), i32>)>; BITMAP_SLOTS],
 }
 
 impl<'a> RdmaBackend<'a> {
     pub open spec fn pending(&self) -> Map<u64, TransferEvent> {
         rdma_data_events(rdma::CqSnapshot::of(self.cq))
+    }
+
+    pub open spec fn effective_host_mr_spec(&self) -> Option<RegisteredSlab<'a>> {
+        match self.host_mr {
+            Some(s) => Some(s),
+            None => match self.shared_host_mr {
+                Some(s) => Some(*s),
+                None => None,
+            },
+        }
+    }
+
+    pub open spec fn effective_gpu_mr_spec(&self) -> Option<RegisteredSlab<'a>> {
+        match self.gpu_mr {
+            Some(s) => Some(s),
+            None => match self.shared_gpu_mr {
+                Some(s) => Some(*s),
+                None => None,
+            },
+        }
+    }
+
+    pub fn effective_host_mr(&self) -> (r: Option<&RegisteredSlab<'a>>)
+        requires
+            !(self.host_mr is Some && self.shared_host_mr is Some),
+        ensures
+            match r {
+                None => self.effective_host_mr_spec() is None,
+                Some(s) => self.effective_host_mr_spec() == Some(*s),
+            },
+    {
+        match &self.host_mr {
+            Some(s) => Some(s),
+            None => match self.shared_host_mr {
+                Some(s) => Some(s),
+                None => None,
+            },
+        }
+    }
+
+    pub fn effective_gpu_mr(&self) -> (r: Option<&RegisteredSlab<'a>>)
+        requires
+            !(self.gpu_mr is Some && self.shared_gpu_mr is Some),
+        ensures
+            match r {
+                None => self.effective_gpu_mr_spec() is None,
+                Some(s) => self.effective_gpu_mr_spec() == Some(*s),
+            },
+    {
+        match &self.gpu_mr {
+            Some(s) => Some(s),
+            None => match self.shared_gpu_mr {
+                Some(s) => Some(s),
+                None => None,
+            },
+        }
     }
 
     pub open spec fn well_formed(&self, core: &CacheCore) -> bool {
@@ -396,6 +839,8 @@ impl<'a> RdmaBackend<'a> {
         &&& self.cq.infos().instance_id() == core.instance_id()
         &&& self.window_pool.well_formed()
         &&& self.window_pool.node() == core.node()
+        &&& !(self.host_mr is Some && self.shared_host_mr is Some)
+        &&& !(self.gpu_mr is Some && self.shared_gpu_mr is Some)
         &&& match self.host_mr {
             None => true,
             Some(ref s) => s.well_formed(core, self.window_pool.pd()),
@@ -403,6 +848,14 @@ impl<'a> RdmaBackend<'a> {
         &&& match self.gpu_mr {
             None => true,
             Some(ref s) => s.well_formed(core, self.window_pool.pd()),
+        }
+        &&& match self.shared_host_mr {
+            None => true,
+            Some(s) => s.well_formed_shared(core, self.window_pool.pd()),
+        }
+        &&& match self.shared_gpu_mr {
+            None => true,
+            Some(s) => s.well_formed_shared(core, self.window_pool.pd()),
         }
         &&& rdma_window_wf(
             self.in_flight_ops,
@@ -414,7 +867,115 @@ impl<'a> RdmaBackend<'a> {
             core.instance_id(),
             self.next_control_wr_id,
         )
+        &&& completed_pulls_wf(
+            self.completed_pulls,
+            &core.timelines,
+            t,
+            self.cq.observer(),
+            &core.ledger@,
+        )
+        &&& rdma_leases_disjoint(self.active_leases@)
         &&& rdma_leases_valid(self.active_leases@, &self.window_pool, &self.qp, core)
+        &&& rdma_control_leases_match_cq(
+            self.active_leases@,
+            &self.window_pool,
+            rdma::CqSnapshot::of(self.cq),
+            self.next_control_wr_id,
+        )
+        &&& rdma_pool_slots_owned_by_leases(self.active_leases@, &self.window_pool)
+    }
+
+    pub proof fn lemma_effective_slabs_wf(&self, core: &CacheCore)
+        requires
+            self.well_formed(core),
+        ensures
+            self.effective_host_mr_spec() matches Some(s) ==> s.well_formed(
+                core,
+                self.window_pool.pd(),
+            ),
+            self.effective_gpu_mr_spec() matches Some(s) ==> s.well_formed(
+                core,
+                self.window_pool.pd(),
+            ),
+    {
+        if let Some(s) = self.shared_host_mr {
+            s.lemma_shared_wf_iff(core, self.window_pool.pd());
+        }
+        if let Some(s) = self.shared_gpu_mr {
+            s.lemma_shared_wf_iff(core, self.window_pool.pd());
+        }
+    }
+
+    pub open spec fn completed_pull_spec(&self, seq: u64) -> Option<Result<(), i32>> {
+        let slot = ((seq as int) % (BITMAP_CAPACITY as int));
+        match self.completed_pulls[slot] {
+            Some((s, st)) => if s == seq {
+                Some(st)
+            } else {
+                None
+            },
+            None => None,
+        }
+    }
+
+    pub fn has_completed_pull(&self, seq: u64) -> (r: bool)
+        ensures
+            r == self.completed_pull_spec(seq) is Some,
+    {
+        let slot = (seq % BITMAP_CAPACITY) as usize;
+        match self.completed_pulls[slot] {
+            Some((s, _)) => s == seq,
+            None => false,
+        }
+    }
+
+    pub fn take_completed_pull(&mut self, core: &CacheCore, seq: u64) -> (r: Option<
+        Result<(), i32>,
+    >)
+        requires
+            core.well_formed(),
+            old(self).well_formed(core),
+        ensures
+            final(self).well_formed(core),
+            final(self).timeline_id == old(self).timeline_id,
+            final(self).peer_node == old(self).peer_node,
+            final(self).qp == old(self).qp,
+            final(self).cq == old(self).cq,
+            final(self).bitmap == old(self).bitmap,
+            final(self).in_flight_ops == old(self).in_flight_ops,
+            final(self).window_pool == old(self).window_pool,
+            final(self).host_mr == old(self).host_mr,
+            final(self).gpu_mr == old(self).gpu_mr,
+            final(self).shared_host_mr == old(self).shared_host_mr,
+            final(self).shared_gpu_mr == old(self).shared_gpu_mr,
+            final(self).active_leases == old(self).active_leases,
+            final(self).next_control_wr_id == old(self).next_control_wr_id,
+            r == old(self).completed_pull_spec(seq),
+            final(self).completed_pull_spec(seq) is None,
+            r matches Some(st) ==> {
+                &&& core.timelines.issued(old(self).timeline_id, seq)
+                &&& core.ledger@.knows.set().contains(
+                    (core.node(), core.timelines.events@[(old(self).timeline_id, seq)]),
+                )
+                &&& (st.is_ok() ==> core.ledger@.succeeded.dom().contains(
+                    core.timelines.events@[(old(self).timeline_id, seq)],
+                ))
+            },
+    {
+        let _ = core;
+        let slot = (seq % BITMAP_CAPACITY) as usize;
+        let entry = self.completed_pulls[slot];
+        match entry {
+            Some((s, st)) => {
+                if s == seq {
+                    self.completed_pulls[slot] = None;
+                    Some(st)
+                } else {
+                    None
+                }
+            },
+            None => None,
+        }
     }
 
     pub fn timeline_id(&self) -> (t: u8)
@@ -561,6 +1122,9 @@ impl<'a> RdmaBackend<'a> {
                     &&& b.cq == cq
                     &&& b.host_mr is None
                     &&& b.gpu_mr is None
+                    &&& b.shared_host_mr is None
+                    &&& b.shared_gpu_mr is None
+                    &&& forall|seq: u64| #[trigger] b.completed_pull_spec(seq) is None
                 },
             },
     {
@@ -580,12 +1144,15 @@ impl<'a> RdmaBackend<'a> {
             qp,
             cq,
             bitmap: SlidingBitmap::new(),
-            in_flight_ops: [None;512],
+            in_flight_ops: [None;BITMAP_SLOTS],
             window_pool,
             host_mr: None,
             gpu_mr: None,
+            shared_host_mr: None,
+            shared_gpu_mr: None,
             active_leases: Vec::new(),
             next_control_wr_id: CONTROL_WR_ID_BASE,
+            completed_pulls: [None;BITMAP_SLOTS],
         };
         proof {
             lemma_core_wf_facts(core);
@@ -604,6 +1171,33 @@ impl<'a> RdmaBackend<'a> {
                 &backend.qp,
                 core,
             );
+            assert(rdma_leases_disjoint(backend.active_leases@)) by {
+                reveal(rdma_leases_disjoint);
+            }
+            assert(completed_pulls_wf(
+                backend.completed_pulls,
+                &core.timelines,
+                timeline_id,
+                backend.cq.observer(),
+                &core.ledger@,
+            ));
+            assert forall|seq: u64| #[trigger] backend.completed_pull_spec(seq) is None by {
+                let slot = ((seq as int) % (BITMAP_CAPACITY as int));
+                assert(0 <= slot < BITMAP_SLOTS);
+                assert(backend.completed_pulls[slot] is None);
+            }
+            assert(rdma_control_leases_match_cq(
+                backend.active_leases@,
+                &backend.window_pool,
+                rdma::CqSnapshot::of(backend.cq),
+                backend.next_control_wr_id,
+            )) by {
+                reveal(rdma_control_leases_match_cq);
+            }
+            assert(rdma_pool_slots_owned_by_leases(backend.active_leases@, &backend.window_pool))
+                by {
+                reveal(rdma_pool_slots_owned_by_leases);
+            }
         }
         Ok(backend)
     }
@@ -630,22 +1224,50 @@ impl<'a> RdmaBackend<'a> {
             buffer.instance_id() == core.instance_id(),
             buffer.node() == core.node(),
             buffer.num_slots() == num_frames as usize,
-            buffer.slot_len() == core.frames.frame_size,
+            buffer.slot_len() == core.frames.tier_frame_size(tier),
             tier.valid(core.tiers.len()),
             slab_bound_to_core(core, tier, first_frame, num_frames, buffer.space()),
         ensures
             final(self).well_formed(core),
-            r.is_ok() ==> final(self).host_mr is Some,
+            r.is_ok() ==> final(self).host_mr is Some && final(self).shared_host_mr is None,
     {
-        if self.host_mr.is_some() {
+        if self.host_mr.is_some() || self.shared_host_mr.is_some() {
             return Err(CoreError::InvalidArgument);
         }
-        let _ = core;
-        let mr = match rdma::register_memory(pd, rdma::RegistrationBuffer::Host(buffer), flags) {
-            Ok(mr) => mr,
-            Err(e) => return Err(rdma_error(e)),
-        };
-        self.host_mr = Some(RegisteredSlab { mr, tier, first_frame, num_frames });
+        let slab = RegisteredSlab::register_host(
+            core,
+            pd,
+            buffer,
+            tier,
+            first_frame,
+            num_frames,
+            flags,
+        )?;
+        self.host_mr = Some(slab);
+        Ok(())
+    }
+
+    /// Attach a shared read-only-reference host DRAM slab MR registered on the shard's PD.
+    pub fn attach_shared_host_slab(&mut self, core: &CacheCore, slab: &'a RegisteredSlab<'a>) -> (r:
+        BackendResult<()>)
+        requires
+            core.well_formed(),
+            old(self).well_formed(core),
+            old(self).host_mr is None,
+            old(self).shared_host_mr is None,
+            slab.well_formed(core, old(self).window_pool.pd()),
+        ensures
+            final(self).well_formed(core),
+            r.is_ok() ==> final(self).shared_host_mr == Some(slab)
+                && final(self).effective_host_mr_spec() == Some(*slab),
+    {
+        if self.host_mr.is_some() || self.shared_host_mr.is_some() {
+            return Err(CoreError::InvalidArgument);
+        }
+        proof {
+            slab.lemma_shared_wf_iff(core, self.window_pool.pd());
+        }
+        self.shared_host_mr = Some(slab);
         Ok(())
     }
 
@@ -671,28 +1293,98 @@ impl<'a> RdmaBackend<'a> {
             buffer.instance_id() == core.instance_id(),
             buffer.node() == core.node(),
             buffer.num_slots() == num_frames as usize,
-            buffer.slot_len() == core.frames.frame_size,
+            buffer.slot_len() == core.frames.tier_frame_size(tier),
             tier.valid(core.tiers.len()),
             slab_bound_to_core(core, tier, first_frame, num_frames, buffer.space()),
         ensures
             final(self).well_formed(core),
-            r.is_ok() ==> final(self).gpu_mr is Some,
+            r.is_ok() ==> final(self).gpu_mr is Some && final(self).shared_gpu_mr is None,
     {
-        if self.gpu_mr.is_some() {
+        if self.gpu_mr.is_some() || self.shared_gpu_mr.is_some() {
             return Err(CoreError::InvalidArgument);
         }
-        let _ = core;
-        let mr = match rdma::register_memory(pd, rdma::RegistrationBuffer::Cuda(buffer), flags) {
-            Ok(mr) => mr,
-            Err(e) => return Err(rdma_error(e)),
-        };
-        self.gpu_mr = Some(RegisteredSlab { mr, tier, first_frame, num_frames });
+        let slab = RegisteredSlab::register_gpu(
+            core,
+            pd,
+            buffer,
+            tier,
+            first_frame,
+            num_frames,
+            flags,
+        )?;
+        self.gpu_mr = Some(slab);
         Ok(())
     }
 
+    /// Attach a shared GPU VRAM slab MR registered on the shard's PD.
+    pub fn attach_shared_gpu_slab(&mut self, core: &CacheCore, slab: &'a RegisteredSlab<'a>) -> (r:
+        BackendResult<()>)
+        requires
+            core.well_formed(),
+            old(self).well_formed(core),
+            old(self).gpu_mr is None,
+            old(self).shared_gpu_mr is None,
+            slab.well_formed(core, old(self).window_pool.pd()),
+        ensures
+            final(self).well_formed(core),
+            r.is_ok() ==> final(self).shared_gpu_mr == Some(slab)
+                && final(self).effective_gpu_mr_spec() == Some(*slab),
+    {
+        if self.gpu_mr.is_some() || self.shared_gpu_mr.is_some() {
+            return Err(CoreError::InvalidArgument);
+        }
+        proof {
+            slab.lemma_shared_wf_iff(core, self.window_pool.pd());
+        }
+        self.shared_gpu_mr = Some(slab);
+        Ok(())
+    }
+
+    pub fn has_lease(&self, handle: RemoteLeaseHandle) -> (r: bool)
+        requires
+            rdma_leases_disjoint(self.active_leases@),
+        ensures
+            r == self.lease_index_spec(handle) is Some,
+    {
+        self.find_lease_index(handle).is_some()
+    }
+
+    pub fn lease_state(&self, handle: RemoteLeaseHandle) -> (r: Option<RemoteLeaseState>)
+        requires
+            rdma_leases_disjoint(self.active_leases@),
+        ensures
+            match self.lease_index_spec(handle) {
+                None => r is None,
+                Some(idx) => r == Some(self.active_leases@[idx].state),
+            },
+    {
+        match self.find_lease_index(handle) {
+            Some(idx) => Some(self.active_leases[idx].state),
+            None => None,
+        }
+    }
+
+    pub fn lease_staged_error(&self, handle: RemoteLeaseHandle) -> (r: Option<i32>)
+        requires
+            rdma_leases_disjoint(self.active_leases@),
+        ensures
+            match self.lease_index_spec(handle) {
+                None => r is None,
+                Some(idx) => r == self.active_leases@[idx].staged_error,
+            },
+    {
+        match self.find_lease_index(handle) {
+            Some(idx) => self.active_leases[idx].staged_error,
+            None => None,
+        }
+    }
+
     /// Query GPUDirect RDMA write ordering on the attached GPU MR, if present.
-    pub fn gpu_gdr_ordering(&self) -> Option<rdma::RdmaGdrWritesOrdering> {
-        match &self.gpu_mr {
+    pub fn gpu_gdr_ordering(&self) -> Option<rdma::RdmaGdrWritesOrdering>
+        requires
+            !(self.gpu_mr is Some && self.shared_gpu_mr is Some),
+    {
+        match self.effective_gpu_mr() {
             Some(slab) => slab.gdr_ordering(),
             None => None,
         }
@@ -702,14 +1394,15 @@ impl<'a> RdmaBackend<'a> {
     /// to `consumer_device` without a host-side flush.
     pub fn gdr_visible_to_device(&self, consumer_device: DeviceId) -> (r: bool)
         requires
-            self.gpu_mr matches Some(ref s) ==> s.mr.well_formed(),
+            !(self.gpu_mr is Some && self.shared_gpu_mr is Some),
+            self.effective_gpu_mr_spec() matches Some(s) ==> s.mr.well_formed(),
         ensures
-            self.gpu_mr matches Some(ref s) ==> r == s.mr.gdr_visible_to_device_spec(
+            self.effective_gpu_mr_spec() matches Some(s) ==> r == s.mr.gdr_visible_to_device_spec(
                 consumer_device,
             ),
-            self.gpu_mr is None ==> r,
+            self.effective_gpu_mr_spec() is None ==> r,
     {
-        match &self.gpu_mr {
+        match self.effective_gpu_mr() {
             Some(slab) => slab.gdr_visible_to_device(consumer_device),
             None => true,
         }
@@ -719,14 +1412,14 @@ impl<'a> RdmaBackend<'a> {
     /// `consumer_device` after `self.flush_gdr_writes()`.
     pub fn gdr_visible_after_flush_to_device(&self, consumer_device: DeviceId) -> (r: bool)
         requires
-            self.gpu_mr matches Some(ref s) ==> s.mr.well_formed(),
+            !(self.gpu_mr is Some && self.shared_gpu_mr is Some),
+            self.effective_gpu_mr_spec() matches Some(s) ==> s.mr.well_formed(),
         ensures
-            self.gpu_mr matches Some(ref s) ==> r == s.mr.gdr_visible_after_flush_to_device_spec(
-                consumer_device,
-            ),
-            self.gpu_mr is None ==> r,
+            self.effective_gpu_mr_spec() matches Some(s) ==> r
+                == s.mr.gdr_visible_after_flush_to_device_spec(consumer_device),
+            self.effective_gpu_mr_spec() is None ==> r,
     {
-        match &self.gpu_mr {
+        match self.effective_gpu_mr() {
             Some(slab) => slab.gdr_visible_after_flush_to_device(consumer_device),
             None => true,
         }
@@ -735,9 +1428,10 @@ impl<'a> RdmaBackend<'a> {
     /// Flush GPUDirect RDMA writes to the owning GPU derived from `gpu_mr` when required.
     pub fn flush_gdr_writes(&self) -> BackendResult<()>
         requires
-            self.gpu_mr matches Some(ref s) ==> s.mr.well_formed(),
+            !(self.gpu_mr is Some && self.shared_gpu_mr is Some),
+            self.effective_gpu_mr_spec() matches Some(s) ==> s.mr.well_formed(),
     {
-        match &self.gpu_mr {
+        match self.effective_gpu_mr() {
             Some(slab) => slab.flush_gdr_writes(),
             None => Ok(()),
         }

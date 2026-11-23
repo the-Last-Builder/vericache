@@ -157,7 +157,7 @@ pub enum WindowState {
 }
 
 pub struct MemoryWindow<'a> {
-    raw: *mut u8,
+    raw: ffi::RawMwGuard,
     pd: &'a ProtectionDomain<'a>,
     #[cfg_attr(not(verus_only), allow(dead_code))]
     window_id: Ghost<nat>,
@@ -185,7 +185,7 @@ pub fn alloc_window<'a>(
     if !pd.context.supports_type_2()? {
         return Err(RdmaError(95));
     }
-    let (raw, rkey) = ffi::alloc_window(pd.raw)?;
+    let (raw, rkey) = ffi::alloc_window(pd.raw.as_ptr())?;
     Ok(
         MemoryWindow {
             raw,
@@ -206,8 +206,11 @@ pub fn dealloc_window<'a>(w: MemoryWindow<'a>) -> (r: Result<(), (RdmaError, Mem
     ensures
         r matches Err((_, returned)) ==> returned == w,
 {
-    match ffi::dealloc_window(w.raw) {
-        Ok(()) => Ok(()),
+    match ffi::dealloc_window(w.raw.as_ptr()) {
+        Ok(()) => {
+            let _ = w.raw.into_raw();
+            Ok(())
+        },
         Err(e) => Err((e, w)),
     }
 }
@@ -492,9 +495,10 @@ pub fn revoke_read_share_with_window<'a>(
             old(host).source@.next_event(),
         ),
 {
-    if let Err(e) = ffi::dealloc_window(mw.raw) {
+    if let Err(e) = ffi::dealloc_window(mw.raw.as_ptr()) {
         return Err((e, mw, Tracked(witness), Tracked(lent)));
     }
+    let _ = mw.raw.into_raw();
     let ghost share = mw.state().binding().share->Some_0;
     Ok(perform_revocation(host, Tracked(instance), Ghost(share), Tracked(lent)))
 }
@@ -522,9 +526,10 @@ pub fn revoke_read_share_on_reset_qp<'a>(
             old(host).source@.next_event(),
         ),
 {
-    if let Err(e) = ffi::dealloc_window(mw.raw) {
+    if let Err(e) = ffi::dealloc_window(mw.raw.as_ptr()) {
         return Err((e, mw, Tracked(lent)));
     }
+    let _ = mw.raw.into_raw();
     let ghost share = mw.state().binding().share->Some_0;
     Ok(perform_revocation(host, Tracked(instance), Ghost(share), Tracked(lent)))
 }
@@ -561,7 +566,7 @@ pub fn dealloc_window_on_reset_qp<'a>(
             _ => grant_opt@ is None,
         },
 {
-    if let Err(e) = ffi::dealloc_window(mw.raw) {
+    if let Err(e) = ffi::dealloc_window(mw.raw.as_ptr()) {
         return Err((e, mw, Tracked(returned)));
     }
     let tracked out = if mw.state@ is Binding {
@@ -569,6 +574,7 @@ pub fn dealloc_window_on_reset_qp<'a>(
     } else {
         None
     };
+    let _ = mw.raw.into_raw();
     Ok(Tracked(out))
 }
 
@@ -627,14 +633,14 @@ pub fn post_bind_window(
     let addr = slice.addr;
     let len = slice.len;
     if len == 0 || next_rkey != mw.next_rkey() || !mr.flags.mw_bind || (access
-        == RemoteAccess::ReadWrite && !mr.flags.local_write) || mr.pd.raw != qp.connection.pd.raw
-        || mw.pd.raw != mr.pd.raw {
+        == RemoteAccess::ReadWrite && !mr.flags.local_write) || mr.pd.raw.as_ptr()
+        != qp.connection.pd.raw.as_ptr() || mw.pd.raw.as_ptr() != mr.pd.raw.as_ptr() {
         return Err((RdmaError(22), Tracked(grant)));
     }
     if let Err(e) = ffi::bind(
-        qp.connection.raw,
-        mw.raw,
-        mr.raw,
+        qp.connection.raw.as_ptr(),
+        mw.raw.as_ptr(),
+        mr.raw.as_ptr(),
         addr,
         len,
         next_rkey,
@@ -717,7 +723,7 @@ pub fn post_local_invalidate(
             },
         ),
 {
-    ffi::invalidate(qp.connection.raw, mw.rkey, wr_id)?;
+    ffi::invalidate(qp.connection.raw.as_ptr(), mw.rkey, wr_id)?;
     cq.in_flight_count += 1;
     proof {
         mw.state = Ghost(

@@ -396,7 +396,7 @@ fn run_scenario1_host_pull(node: &mut NodeEnv, device: &DeviceContext, transport
             },
             _ => panic!("donor expected cooperative ReadReleased"),
         }
-        assert!(engine.peer.rdma.active_lease_count() == 0);
+        assert!(engine.peers[0].rdma.active_lease_count() == 0);
         // Donor evicts and reclaims the frame now that the remote lease was cooperatively released.
         engine.evict_frame(f_donor).unwrap();
         assert!(engine.reclaim_draining(host_tier, 4) == 1);
@@ -543,7 +543,7 @@ fn run_scenario2_gdr_gpu_pull(
             },
             _ => panic!("GDR donor expected cooperative ReadReleased"),
         }
-        assert!(engine.peer.rdma.active_lease_count() == 0);
+        assert!(engine.peers[0].rdma.active_lease_count() == 0);
         engine.evict_frame(f_gpu).unwrap();
         assert!(engine.reclaim_draining(gpu_tier, 4) == 1);
         assert!(engine.core.frames.metas[f_gpu.0 as usize].state == STATE_EMPTY);
@@ -772,7 +772,7 @@ fn run_scenario4_unilateral_revoke_and_reconnect(
             grant_tag1,
             Tracked(node.instance.borrow()),
         ).unwrap();
-        assert!(engine.peer.rdma.active_lease_count() == 0);
+        assert!(engine.peers[0].rdma.active_lease_count() == 0);
 
         // 2. Drain initiator's post-abort ReadRelease before QP Error -> Reset -> Reconnect.
         match engine.poll_peer_event(Tracked(node.instance.borrow())).unwrap() {
@@ -1161,7 +1161,7 @@ fn run_scenario5_four_tier_roundtrip(
             },
             _ => panic!("4-tier donor expected cooperative ReadReleased"),
         }
-        assert!(engine.peer.rdma.active_lease_count() == 0);
+        assert!(engine.peers[0].rdma.active_lease_count() == 0);
         engine.evict_frame(f_gpu2).unwrap();
         assert!(engine.reclaim_draining(gpu_tier, 4) == 1);
         assert!(engine.core.frames.metas[f_gpu2.0 as usize].state == STATE_EMPTY);

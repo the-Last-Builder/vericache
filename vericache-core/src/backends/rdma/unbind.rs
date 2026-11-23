@@ -42,10 +42,24 @@ impl<'a> RdmaBackend<'a> {
             final(core).tiers == old(core).tiers,
             final(core).spec == old(core).spec,
             final(core).version_registry == old(core).version_registry,
+            final(core).timelines == old(core).timelines,
             peer_core_step(old(core), final(core), old(self).timeline_id),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).active_leases@,
+                final(self).active_leases@,
+            ),
             final(self).timeline_id == old(self).timeline_id,
             final(self).peer_node == old(self).peer_node,
             final(self).qp == old(self).qp,
+            final(self).host_mr == old(self).host_mr,
+            final(self).gpu_mr == old(self).gpu_mr,
+            final(self).shared_host_mr == old(self).shared_host_mr,
+            final(self).shared_gpu_mr == old(self).shared_gpu_mr,
+            final(self).window_pool.pd() == old(self).window_pool.pd(),
+            final(self).pending() == old(self).pending(),
+            final(self).completed_pulls == old(self).completed_pulls,
             r.is_ok() ==> final(core).frames.same_directory(&old(core).frames),
             match r {
                 Err((_, cap_back)) => cap_back@ == returned_cap && *final(core) == *old(core)
@@ -90,6 +104,7 @@ impl<'a> RdmaBackend<'a> {
             None => {
                 proof {
                     lemma_peer_core_step_refl(core, self.timeline_id);
+                    lemma_foreign_shares_refl(core, self.active_leases@);
                 }
                 return Err((CoreError::InvalidArgument, Tracked(returned_cap)));
             },
@@ -97,18 +112,21 @@ impl<'a> RdmaBackend<'a> {
         if !matches!(self.active_leases[lease_idx].state, RemoteLeaseState::Bound) {
             proof {
                 lemma_peer_core_step_refl(core, self.timeline_id);
+                lemma_foreign_shares_refl(core, self.active_leases@);
             }
             return Err((CoreError::WouldConflict, Tracked(returned_cap)));
         }
         if self.cq.in_flight_count() >= self.cq.capacity_exec() {
             proof {
                 lemma_peer_core_step_refl(core, self.timeline_id);
+                lemma_foreign_shares_refl(core, self.active_leases@);
             }
             return Err((CoreError::CapacityExhausted, Tracked(returned_cap)));
         }
-        if self.next_control_wr_id == u64::MAX {
+        if self.next_control_wr_id >= CONTROL_WR_ID_LIMIT {
             proof {
                 lemma_peer_core_step_refl(core, self.timeline_id);
+                lemma_foreign_shares_refl(core, self.active_leases@);
             }
             return Err((CoreError::SequenceExhausted, Tracked(returned_cap)));
         }
@@ -154,7 +172,15 @@ impl<'a> RdmaBackend<'a> {
                     &self.qp,
                     core,
                 );
+                lemma_rdma_opaque_same_pool_slots(
+                    before_leases,
+                    &before_pool,
+                    &self.window_pool,
+                    before_cq,
+                    self.next_control_wr_id,
+                );
                 lemma_peer_core_step_refl(core, self.timeline_id);
+                lemma_foreign_shares_refl(core, self.active_leases@);
             }
             return Err((e, Tracked(returned_cap)));
         }
@@ -203,9 +229,20 @@ impl<'a> RdmaBackend<'a> {
                 core.instance_id(),
                 self.next_control_wr_id,
             );
-            lemma_rdma_slabs_same_directory(
+            lemma_completed_pulls_after_step(
+                self.completed_pulls,
+                &before_core.timelines,
+                &core.timelines,
+                self.timeline_id,
+                self.cq.observer(),
+                &before_core.ledger@,
+                &core.ledger@,
+            );
+            lemma_rdma_all_slabs_same_directory(
                 &self.host_mr,
                 &self.gpu_mr,
+                self.shared_host_mr,
+                self.shared_gpu_mr,
                 &before_core,
                 core,
                 self.window_pool.pd(),
@@ -226,6 +263,28 @@ impl<'a> RdmaBackend<'a> {
                 core,
                 Some(before_leases[lease_idx as int].share@),
             );
+            assert((before_leases[lease_idx as int].mw_slot as int) < before_pool.slots.len()) by {
+                reveal(rdma_leases_valid);
+                reveal(ActiveRemoteLease::valid);
+            }
+            lemma_control_leases_match_cq_after_update_invalidate(
+                before_leases,
+                self.active_leases@,
+                lease_idx as int,
+                &before_pool,
+                &self.window_pool,
+                before_cq,
+                rdma::CqSnapshot::of(self.cq),
+                wr_id,
+                req,
+            );
+            lemma_pool_slots_owned_after_update_in_place(
+                before_leases,
+                self.active_leases@,
+                lease_idx as int,
+                &before_pool,
+                &self.window_pool,
+            );
             reveal(rdma_leases_valid);
             reveal(rdma_leases_disjoint);
             reveal(peer_core_step_except);
@@ -234,6 +293,24 @@ impl<'a> RdmaBackend<'a> {
             reveal(FrameTable::preserves_initializing);
             broadcast use {vstd::imap::group_imap_lemmas, vstd::iset::group_iset_lemmas};
 
+            assert(rdma_data_events(rdma::CqSnapshot::of(self.cq)) =~= rdma_data_events(before_cq));
+            assert forall|j: int|
+                0 <= j < self.active_leases@.len() && !(
+                #[trigger] self.active_leases@[j]).is_unpinned() implies exists|i: int|
+                0 <= i < before_leases.len() && !(#[trigger] before_leases[i]).is_unpinned()
+                    && before_leases[i].frame == self.active_leases@[j].frame
+                    && before_leases[i].share@ == self.active_leases@[j].share@ by {
+                assert(j != lease_idx as int);
+                assert(self.active_leases@[j] == before_leases[j]);
+                assert(!before_leases[j].is_unpinned());
+            }
+            lemma_foreign_shares_after_unpin(
+                &before_core,
+                core,
+                before_leases,
+                self.active_leases@,
+                lease_idx as int,
+            );
         }
         Ok(wr_id)
     }
@@ -254,9 +331,19 @@ impl<'a> RdmaBackend<'a> {
             ) ==> witness.matches(w),
         ensures
             final(self).well_formed(core),
+            peer_foreign_shares_preserved(
+                core,
+                core,
+                old(self).active_leases@,
+                final(self).active_leases@,
+            ),
             final(self).timeline_id == old(self).timeline_id,
             final(self).peer_node == old(self).peer_node,
             final(self).qp == old(self).qp,
+            final(self).host_mr == old(self).host_mr,
+            final(self).gpu_mr == old(self).gpu_mr,
+            final(self).shared_host_mr == old(self).shared_host_mr,
+            final(self).shared_gpu_mr == old(self).shared_gpu_mr,
             final(self).cq == old(self).cq,
             final(self).window_pool.pd() == old(self).window_pool.pd(),
             match r {
@@ -282,9 +369,17 @@ impl<'a> RdmaBackend<'a> {
         }
         let lease_idx = match self.find_lease_index(handle) {
             Some(i) => i,
-            None => return Err(CoreError::InvalidArgument),
+            None => {
+                proof {
+                    lemma_foreign_shares_refl(core, self.active_leases@);
+                }
+                return Err(CoreError::InvalidArgument);
+            },
         };
         if !matches!(self.active_leases[lease_idx].state, RemoteLeaseState::Unbinding) {
+            proof {
+                lemma_foreign_shares_refl(core, self.active_leases@);
+            }
             return Err(CoreError::WouldConflict);
         }
         let ghost before_leases = self.active_leases@;
@@ -319,12 +414,38 @@ impl<'a> RdmaBackend<'a> {
                 core,
                 None,
             );
+            lemma_control_leases_match_cq_after_swap_remove(
+                before_leases,
+                self.active_leases@,
+                lease_idx as int,
+                &before_pool,
+                &self.window_pool,
+                rdma::CqSnapshot::of(self.cq),
+                rdma::CqSnapshot::of(self.cq),
+                self.next_control_wr_id,
+                None,
+            );
+            lemma_pool_slots_owned_after_swap_remove(
+                before_leases,
+                self.active_leases@,
+                lease_idx as int,
+                &before_pool,
+                &self.window_pool,
+                lease.mw_slot,
+            );
             reveal(rdma_leases_valid);
             lemma_rdma_leases_swap_remove_preserves(
                 before_leases,
                 self.active_leases@,
                 lease_idx as int,
                 handle,
+            );
+            lemma_swap_remove_foreign_shares_same_pins(
+                core,
+                core,
+                before_leases,
+                self.active_leases@,
+                lease_idx as int,
             );
         }
         Ok(())
@@ -346,11 +467,25 @@ impl<'a> RdmaBackend<'a> {
             qp_reset.matches_qp(old(self).qp.id(), core.node()),
         ensures
             final(self).well_formed(core),
+            peer_foreign_shares_preserved(
+                core,
+                core,
+                old(self).active_leases@,
+                final(self).active_leases@,
+            ),
             final(self).timeline_id == old(self).timeline_id,
             final(self).peer_node == old(self).peer_node,
             final(self).qp == old(self).qp,
+            final(self).host_mr == old(self).host_mr,
+            final(self).gpu_mr == old(self).gpu_mr,
+            final(self).shared_host_mr == old(self).shared_host_mr,
+            final(self).shared_gpu_mr == old(self).shared_gpu_mr,
             final(self).cq == old(self).cq,
             final(self).window_pool.pd() == old(self).window_pool.pd(),
+            final(self).host_mr == old(self).host_mr,
+            final(self).gpu_mr == old(self).gpu_mr,
+            final(self).shared_host_mr == old(self).shared_host_mr,
+            final(self).shared_gpu_mr == old(self).shared_gpu_mr,
             match r {
                 Err(_) => final(self).window_pool.slots@ == old(self).window_pool.slots@
                     && final(self).window_pool.free@ == old(self).window_pool.free@
@@ -378,9 +513,21 @@ impl<'a> RdmaBackend<'a> {
         }
         let lease_idx = match self.find_lease_index(handle) {
             Some(i) => i,
-            None => return Err(CoreError::InvalidArgument),
+            None => {
+                proof {
+                    lemma_foreign_shares_refl(core, self.active_leases@);
+                }
+                return Err(CoreError::InvalidArgument);
+            },
         };
-        if !matches!(self.active_leases[lease_idx].state, RemoteLeaseState::Unbinding) {
+        let is_unbinding_like =
+            matches!(self.active_leases[lease_idx].state, RemoteLeaseState::Unbinding) || (
+        matches!(self.active_leases[lease_idx].state, RemoteLeaseState::ControlFailedState)
+            && self.active_leases[lease_idx].returned_share.is_some());
+        if !is_unbinding_like {
+            proof {
+                lemma_foreign_shares_refl(core, self.active_leases@);
+            }
             return Err(CoreError::WouldConflict);
         }
         let ghost before_leases = self.active_leases@;
@@ -414,6 +561,14 @@ impl<'a> RdmaBackend<'a> {
                     &self.qp,
                     core,
                 );
+                lemma_rdma_opaque_same_pool_slots(
+                    before_leases,
+                    &before_pool,
+                    &self.window_pool,
+                    rdma::CqSnapshot::of(self.cq),
+                    self.next_control_wr_id,
+                );
+                lemma_foreign_shares_refl(core, self.active_leases@);
             }
             return Err(e);
         }
@@ -437,6 +592,25 @@ impl<'a> RdmaBackend<'a> {
                 core,
                 None,
             );
+            lemma_control_leases_match_cq_after_swap_remove(
+                before_leases,
+                self.active_leases@,
+                lease_idx as int,
+                &before_pool,
+                &self.window_pool,
+                rdma::CqSnapshot::of(self.cq),
+                rdma::CqSnapshot::of(self.cq),
+                self.next_control_wr_id,
+                None,
+            );
+            lemma_pool_slots_owned_after_swap_remove(
+                before_leases,
+                self.active_leases@,
+                lease_idx as int,
+                &before_pool,
+                &self.window_pool,
+                mw_slot,
+            );
             reveal(rdma_leases_valid);
             lemma_rdma_leases_swap_remove_preserves(
                 before_leases,
@@ -444,6 +618,21 @@ impl<'a> RdmaBackend<'a> {
                 lease_idx as int,
                 handle,
             );
+            assert forall|j: int|
+                0 <= j < self.active_leases@.len() && !(
+                #[trigger] self.active_leases@[j]).is_unpinned() implies exists|i: int|
+                0 <= i < before_leases.len() && !(#[trigger] before_leases[i]).is_unpinned()
+                    && before_leases[i].frame == self.active_leases@[j].frame
+                    && before_leases[i].share@ == self.active_leases@[j].share@ by {
+                let oi = if j == lease_idx as int {
+                    before_leases.len() - 1
+                } else {
+                    j
+                };
+                assert(self.active_leases@[j] == before_leases[oi]);
+                assert(!before_leases[oi].is_unpinned());
+            }
+            lemma_foreign_shares_same_pins(core, core, before_leases, self.active_leases@);
         }
         Ok(mw_slot)
     }
@@ -502,11 +691,21 @@ impl<'a> RdmaBackend<'a> {
             forall|i: int|
                 0 <= i < before_leases.len() ==> (#[trigger] before_leases[i]).mw_slot != mw_slot,
             rdma_leases_valid(before_leases, &before_pool, &old(self).qp, &before_core),
-            old(self).host_mr matches Some(ref s) ==> s.well_formed(
+            !(old(self).host_mr is Some && old(self).shared_host_mr is Some),
+            !(old(self).gpu_mr is Some && old(self).shared_gpu_mr is Some),
+            old(self).shared_host_mr matches Some(s) ==> s.well_formed_shared(
                 old(core),
                 old(self).window_pool.pd(),
             ),
-            old(self).gpu_mr matches Some(ref s) ==> s.well_formed(
+            old(self).shared_gpu_mr matches Some(s) ==> s.well_formed_shared(
+                old(core),
+                old(self).window_pool.pd(),
+            ),
+            old(self).effective_host_mr_spec() matches Some(s) ==> s.well_formed(
+                old(core),
+                old(self).window_pool.pd(),
+            ),
+            old(self).effective_gpu_mr_spec() matches Some(s) ==> s.well_formed(
                 old(core),
                 old(self).window_pool.pd(),
             ),
@@ -520,6 +719,20 @@ impl<'a> RdmaBackend<'a> {
                 old(core).instance_id(),
                 old(self).next_control_wr_id,
             ),
+            completed_pulls_wf(
+                old(self).completed_pulls,
+                &old(core).timelines,
+                old(self).timeline_id,
+                old(self).cq.observer(),
+                &old(core).ledger@,
+            ),
+            rdma_control_leases_match_cq(
+                before_leases,
+                &before_pool,
+                rdma::CqSnapshot::of(old(self).cq),
+                old(self).next_control_wr_id,
+            ),
+            rdma_pool_slots_owned_by_leases(before_leases, &before_pool),
             old(core).node_id == before_core.node_id,
             old(core).instance_id() == before_core.instance_id(),
             old(core).tiers == before_core.tiers,
@@ -572,12 +785,27 @@ impl<'a> RdmaBackend<'a> {
             final(core).active_leases == before_core.active_leases,
             final(core).frames.same_directory(&before_core.frames),
             final(core).frames.preserves_initializing(&before_core.frames, None),
+            final(core).frames.preserves_remote_leases(&before_core.frames),
+            peer_foreign_shares_preserved(
+                &before_core,
+                final(core),
+                before_leases,
+                final(self).active_leases@,
+            ),
             final(core).timelines.only_watermarks(&before_core.timelines),
             final(core).ledger == before_core.ledger,
             final(self).timeline_id == old(self).timeline_id,
             final(self).peer_node == old(self).peer_node,
             final(self).qp == old(self).qp,
+            final(self).cq == old(self).cq,
+            final(self).completed_pulls == old(self).completed_pulls,
             final(self).active_leases == old(self).active_leases,
+            final(self).host_mr == old(self).host_mr,
+            final(self).gpu_mr == old(self).gpu_mr,
+            final(self).shared_host_mr == old(self).shared_host_mr,
+            final(self).shared_gpu_mr == old(self).shared_gpu_mr,
+            final(self).window_pool.pd() == old(self).window_pool.pd(),
+            final(self).pending() == old(self).pending(),
     {
         hide(CacheCore::well_formed);
         hide(replica_valid);
@@ -606,8 +834,9 @@ impl<'a> RdmaBackend<'a> {
             Ticket::NONE,
             Tracked(instance),
         );
-        let _ = self.window_pool.return_unbound(mw_slot, generation);
+        let ret = self.window_pool.return_unbound(mw_slot, generation);
         proof {
+            assert(ret.is_ok());
             lemma_core_wf_facts(core);
             lemma_core_timelines_wf(core);
             lemma_rdma_window_after_watermarks(
@@ -621,13 +850,72 @@ impl<'a> RdmaBackend<'a> {
                 core.instance_id(),
                 self.next_control_wr_id,
             );
-            lemma_rdma_slabs_same_directory(
+            lemma_completed_pulls_after_step(
+                self.completed_pulls,
+                &after_pin_core.timelines,
+                &core.timelines,
+                self.timeline_id,
+                self.cq.observer(),
+                &after_pin_core.ledger@,
+                &core.ledger@,
+            );
+            lemma_rdma_all_slabs_same_directory(
                 &self.host_mr,
                 &self.gpu_mr,
+                self.shared_host_mr,
+                self.shared_gpu_mr,
                 &after_pin_core,
                 core,
                 self.window_pool.pd(),
             );
+            assert(rdma_pool_slots_owned_by_leases(before_leases, &self.window_pool)) by {
+                reveal(rdma_pool_slots_owned_by_leases);
+                assert forall|s: int|
+                    0 <= s < self.window_pool.slots.len() && ((
+                    #[trigger] self.window_pool.slots[s]).state is Binding
+                        || self.window_pool.slots[s].state is Bound
+                        || self.window_pool.slots[s].state is Invalidating) implies exists|i: int|
+                    0 <= i < before_leases.len() && (#[trigger] before_leases[i]).mw_slot as int
+                        == s by {
+                    assert(s != mw_slot as int);
+                    assert(before_pool.slots[s] == self.window_pool.slots[s]);
+                }
+            }
+            assert(rdma_control_leases_match_cq(
+                before_leases,
+                &self.window_pool,
+                rdma::CqSnapshot::of(self.cq),
+                self.next_control_wr_id,
+            )) by {
+                reveal(rdma_control_leases_match_cq);
+                assert forall|i: int|
+                    0 <= i < before_leases.len() && (
+                    #[trigger] before_leases[i]).has_active_wr() implies {
+                    let l = before_leases[i];
+                    let w = self.window_pool.slots[l.mw_slot as int].window;
+                    let cq_snap = rdma::CqSnapshot::of(self.cq);
+                    &&& CONTROL_WR_ID_BASE <= l.wr_id < self.next_control_wr_id
+                    &&& (l.state == RemoteLeaseState::Binding && cq_snap.pending.contains_key(
+                        l.wr_id,
+                    )) ==> {
+                        &&& cq_snap.pending[l.wr_id].kind is BindWindow
+                        &&& (w matches Some(win)
+                            ==> cq_snap.pending[l.wr_id].kind->BindWindow_window_id == win.id())
+                    }
+                    &&& ((l.state == RemoteLeaseState::Unbinding || l.state
+                        == RemoteLeaseState::Revoking) && cq_snap.pending.contains_key(l.wr_id))
+                        ==> {
+                        &&& cq_snap.pending[l.wr_id].kind is LocalInvalidate
+                        &&& (w matches Some(win)
+                            ==> cq_snap.pending[l.wr_id].kind->LocalInvalidate_window_id
+                            == win.id())
+                    }
+                } by {
+                    assert(before_leases[i].mw_slot != mw_slot);
+                    assert(self.window_pool.slots[before_leases[i].mw_slot as int]
+                        == before_pool.slots[before_leases[i].mw_slot as int]);
+                }
+            }
             lemma_rdma_leases_after_bind_rollback(
                 before_leases,
                 &before_pool,
@@ -640,8 +928,47 @@ impl<'a> RdmaBackend<'a> {
                 mw_slot,
                 share,
             );
+            reveal(rdma_leases_valid);
             reveal(FrameTable::same_directory);
             reveal(FrameTable::preserves_initializing);
+            reveal(FrameTable::same_other_pins);
+            broadcast use vstd::map::group_map_lemmas;
+
+            assert(core.frames.frame(frame).remote_shares =~= before_core.frames.frame(
+                frame,
+            ).remote_shares);
+            assert forall|f: FrameId| f.0 < before_core.frames.metas.len() implies {
+                &&& (#[trigger] core.frames.frame(f)).remote_shares == before_core.frames.frame(
+                    f,
+                ).remote_shares
+                &&& core.frames.meta(f).active_remote_leases == before_core.frames.meta(
+                    f,
+                ).active_remote_leases
+            } by {
+                if f != frame {
+                    assert(after_pin_core.frames.frame(f).remote_shares == before_core.frames.frame(
+                        f,
+                    ).remote_shares);
+                    assert(after_pin_core.frames.meta(f).active_remote_leases
+                        == before_core.frames.meta(f).active_remote_leases);
+                } else {
+                    assert(before_core.frames.valid_frame(frame, before_core.kernel_view())) by {
+                        reveal(CacheCore::well_formed);
+                    }
+                    assert(core.frames.valid_frame(frame, core.kernel_view())) by {
+                        reveal(CacheCore::well_formed);
+                    }
+                    assert(before_core.frames.frame(frame).authority(
+                        before_core.frames.meta(frame),
+                        before_core.instance_id(),
+                    ));
+                    assert(core.frames.frame(frame).authority(
+                        core.frames.meta(frame),
+                        core.instance_id(),
+                    ));
+                }
+            }
+            lemma_foreign_shares_identical_pins(&before_core, core, before_leases);
             assert forall|f: FrameId|
                 f.0 < before_core.frames.metas.len() && (#[trigger] before_core.frames.meta(
                     f,
@@ -716,7 +1043,7 @@ proof fn lemma_rdma_leases_after_bind_rollback<'a>(
         assert(after_core.frames.frame(leases[i].frame).slot == before_core.frames.frame(
             leases[i].frame,
         ).slot);
-        if leases[i].state != RemoteLeaseState::Unbinding {
+        if !leases[i].is_unpinned() {
             if leases[i].frame == frame {
                 let s = leases[i].share@;
                 assert(s != share);

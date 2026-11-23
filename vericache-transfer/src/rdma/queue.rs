@@ -36,7 +36,7 @@ pub struct PendingWorkRequest {
 }
 
 pub struct CompletionQueue<'a> {
-    pub(super) raw: *mut u8,
+    pub(super) raw: ffi::RawCqGuard,
     pub(super) device: &'a DeviceContext,
     pub(super) capacity: usize,
     pub(super) in_flight_count: usize,
@@ -123,7 +123,7 @@ impl<'a> CompletionQueue<'a> {
         }
         Ok(
             Self {
-                raw: ffi::create_cq(device.raw, depth)?,
+                raw: ffi::create_cq(device.raw.as_ptr(), depth)?,
                 device,
                 capacity: depth as usize,
                 in_flight_count: 0,
@@ -138,7 +138,7 @@ impl<'a> CompletionQueue<'a> {
         requires
             self.pending().is_empty(),
     {
-        ffi::destroy_cq(self.raw)
+        ffi::destroy_cq(self.raw.into_raw())
     }
 }
 
@@ -194,7 +194,7 @@ impl QueuePairEndpoint {
 }
 
 pub struct UnconnectedQueuePair<'a> {
-    pub(super) raw: *mut u8,
+    pub(super) raw: ffi::RawQpGuard,
     pub(super) pd: &'a ProtectionDomain<'a>,
     #[cfg_attr(not(verus_only), allow(dead_code))]
     pub(super) cq_id: Ghost<nat>,
@@ -311,11 +311,11 @@ impl<'a> UnconnectedQueuePair<'a> {
             > attr.max_qp_init_rd_atomic || config.max_dest_rd_atomic > attr.max_qp_rd_atomic {
             return Err(RdmaError(22));
         }
-        if pd.context.raw != cq.device.raw || psn > 0xffffff {
+        if pd.context.raw.as_ptr() != cq.device.raw.as_ptr() || psn > 0xffffff {
             return Err(RdmaError(22));
         }
-        let (lid, mtu, global, gid) = ffi::port(pd.context.raw, port, gid_index)?;
-        let (raw, number) = ffi::create_qp(pd.raw, cq.raw, config)?;
+        let (lid, mtu, global, gid) = ffi::port(pd.context.raw.as_ptr(), port, gid_index)?;
+        let (raw, number) = ffi::create_qp(pd.raw.as_ptr(), cq.raw.as_ptr(), config)?;
         Ok(
             Self {
                 raw,
@@ -377,7 +377,7 @@ pub fn connect_rc<'a>(
         use_type_invariant(&qp);
     }
     if let Err(e) = ffi::connect(&qp, peer) {
-        let _ = ffi::destroy_qp(qp.raw);
+        let _ = ffi::destroy_qp(qp.raw.into_raw());
         return Err(e);
     }
     let eff = if qp.config.max_rd_atomic <= peer.responder_resources {
@@ -516,7 +516,7 @@ impl<'a> QueuePair<'a> {
                 _cq.pending().contains_key(wr_id) ==> (#[trigger] _cq.pending()[wr_id]).kind.qp_id()
                     != self.id(),
     {
-        ffi::destroy_qp(self.connection.raw)
+        ffi::destroy_qp(self.connection.raw.into_raw())
     }
 }
 
@@ -554,7 +554,7 @@ pub fn modify_queue_pair_error(qp: &mut QueuePair) -> (r: Result<
             old(qp).source().node(),
         ),
 {
-    ffi::error(qp.connection.raw)?;
+    ffi::error(qp.connection.raw.as_ptr())?;
     proof {
         qp.state = Ghost(QueuePairState::Error);
     }
@@ -598,7 +598,7 @@ pub fn reset_queue_pair(qp: &mut QueuePair, _cq: &CompletionQueue) -> (r: Result
             == old(qp).pd_id() && final(qp).peer() == old(qp).peer() && final(qp).configuration()
             == old(qp).configuration() && w@.matches_qp(old(qp).id(), old(qp).source().node()),
 {
-    ffi::reset(qp.connection.raw)?;
+    ffi::reset(qp.connection.raw.as_ptr())?;
     proof {
         qp.pending_reads = Ghost(ISet::empty());
         qp.pending_read_infos = Tracked(SubmittedMap::empty(qp.source().id()));

@@ -492,7 +492,7 @@ impl<'a> CudaBackend<'a> {
             src.well_formed(),
             src.instance_id() == old(core).instance_id(),
             src.slot_ref().loc.node == old(core).node(),
-            src.slot_ref().sub_len == old(core).frames.frame_size,
+            src.slot_ref().sub_len == old(core).frames.tier_frame_size(self.gpu_tier),
             old(src_perm).valid_local(old(core).instance_id(), src.slot_ref().loc),
             read_admitted(old(src_perm).frontier(), old(core).citations()),
             replica_valid(old(core).ledger@, old(core).node(), src_cert),
@@ -562,7 +562,7 @@ impl<'a> CudaBackend<'a> {
                 &&& self.gpu_buffer.space() is GpuAlloc
                 &&& self.gpu_buffer.space()->GpuAlloc_device == self.device
                 &&& self.gpu_buffer.num_slots() == self.gpu_num_frames
-                &&& self.gpu_buffer.slot_len() == before.frames.frame_size
+                &&& self.gpu_buffer.slot_len() == before.frames.tier_frame_size(self.gpu_tier)
                 &&& slab_bound_to_core(
                     &before,
                     self.gpu_tier,

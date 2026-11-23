@@ -347,4 +347,28 @@ impl<M: ChannelAttachment> Attachment<M> {
     }
 }
 
+#[cfg_attr(not(verus_only), allow(dead_code))]
+pub(super) enum RecvPoll<M: ChannelAttachment> {
+    Empty,
+    Invalid,
+    Frame(Header, Vec<u8>, Tracked<Attachment<M>>),
+}
+
+pub(super) open spec fn grant_kind_op(k: GrantKind) -> u8 {
+    match k {
+        GrantKind::ReadShare { .. } => READ_GRANT,
+        GrantKind::OwnedSlot { .. } => WRITE_GRANT,
+    }
+}
+
+pub(super) open spec fn tag_map_matches(
+    exec_map: Map<GrantTag, u8>,
+    ghost_map: Map<GrantTag, GrantKind>,
+) -> bool {
+    &&& forall|tag: GrantTag| #[trigger]
+        ghost_map.contains_key(tag) ==> exec_map.contains_key(tag) && exec_map[tag]
+            == grant_kind_op(ghost_map[tag])
+    &&& forall|tag: GrantTag| #[trigger] exec_map.contains_key(tag) ==> ghost_map.contains_key(tag)
+}
+
 } // verus!

@@ -18,7 +18,7 @@ pub(super) open spec fn cuda_backend_pre_park_wf<'a>(
     &&& b.gpu_buffer.space() is GpuAlloc
     &&& b.gpu_buffer.space()->GpuAlloc_device == b.device
     &&& b.gpu_buffer.num_slots() == b.gpu_num_frames as usize
-    &&& b.gpu_buffer.slot_len() == core.frames.frame_size
+    &&& b.gpu_buffer.slot_len() == core.frames.tier_frame_size(b.gpu_tier)
     &&& b.gpu_tier.valid(core.tiers.len())
     &&& core.tiers[b.gpu_tier.index() as int].kind == TierKind::GpuVram
     &&& b.gpu_sync_points.len() == b.gpu_num_frames as usize
@@ -31,7 +31,9 @@ pub(super) open spec fn cuda_backend_pre_park_wf<'a>(
     )
     &&& match b.pinned_host {
         None => true,
-        Some(h) => h.well_formed(core) && h.tier != b.gpu_tier,
+        Some(h) => h.well_formed(core) && h.tier != b.gpu_tier && core.frames.tier_frame_size(
+            h.tier,
+        ) == core.frames.tier_frame_size(b.gpu_tier),
     }
     &&& b.timeline.device == b.device
     &&& b.timeline.well_formed(&core.timelines, core.node(), &core.ledger@)
@@ -70,6 +72,8 @@ pub(super) open spec fn put_gpu_committed_ready<'a>(
         && after_begin_core.next_version_seq == before_core.next_version_seq + 1
     &&& core.version_seq_limit == after_begin_core.version_seq_limit
         && after_begin_core.version_seq_limit == before_core.version_seq_limit
+    &&& core.version_registry == after_begin_core.version_registry
+        && after_begin_core.version_registry == before_core.version_registry
     &&& core.frames == after_begin_core.frames
     &&& after_begin_core.frames.same_directory(&before_core.frames)
     &&& core.frames.same_directory(&before_core.frames)
@@ -99,7 +103,7 @@ pub(super) open spec fn put_gpu_committed_ready<'a>(
     &&& handle.version.seq == before_core.next_version_seq
     &&& !core.frames.versions@.contains_key(handle.version)
     &&& handle.slot@.is_full()
-    &&& handle.slot@.slot_len == core.frames.frame_size
+    &&& handle.slot@.slot_len == core.frames.tier_frame_size(b.gpu_tier)
     &&& slot_is_owned(dst_tok, core.instance_id(), handle.slot@.loc)
     &&& slot_frontier(dst_tok).readers.is_empty()
     &&& slot_frontier(dst_tok).readers.subset_of(core.citations())
@@ -111,7 +115,7 @@ pub(super) open spec fn put_gpu_committed_ready<'a>(
     &&& core.timelines.events@.contains_key((b.timeline.timeline_id, ticket.sequence()))
     &&& core.timelines.valid_ticket(ticket)
     &&& put_proof.certificate.slot == handle.slot@
-    &&& put_proof.certificate.bytes.len() == core.frames.frame_size
+    &&& put_proof.certificate.bytes.len() == core.frames.tier_frame_size(b.gpu_tier)
     &&& put_proof.certificate.writer == core.timelines.events@[(
         b.timeline.timeline_id,
         ticket.sequence(),
@@ -179,7 +183,7 @@ impl<'a> CudaBackend<'a> {
                 core,
             ).next_version_seq || handle.version.seq >= old(core).version_seq_limit,
             handle.slot@.is_full(),
-            handle.slot@.slot_len == old(core).frames.frame_size,
+            handle.slot@.slot_len == old(core).frames.tier_frame_size(old(self).gpu_tier),
             slot_is_owned(dst_tok, old(core).instance_id(), handle.slot@.loc),
             slot_frontier(dst_tok).readers.is_empty(),
             slot_frontier(dst_tok).readers.subset_of(old(core).citations()),
@@ -197,7 +201,9 @@ impl<'a> CudaBackend<'a> {
                 core,
             ).frames.versions@[handle.version] == put_proof.certificate.bytes,
             put_proof.certificate.slot == handle.slot@,
-            put_proof.certificate.bytes.len() == old(core).frames.frame_size,
+            put_proof.certificate.bytes.len() == old(core).frames.tier_frame_size(
+                old(self).gpu_tier,
+            ),
             put_proof.certificate.writer == old(core).timelines.events@[(
                 old(self).timeline.timeline_id,
                 ticket.sequence(),
@@ -231,6 +237,8 @@ impl<'a> CudaBackend<'a> {
             final(core).instance_id() == old(core).instance_id(),
             final(core).tiers == old(core).tiers,
             final(core).spec == old(core).spec,
+            final(core).next_version_seq == old(core).next_version_seq,
+            final(core).version_registry == old(core).version_registry,
             core_transition(
                 &before_core,
                 final(core),
@@ -238,6 +246,19 @@ impl<'a> CudaBackend<'a> {
                 Some(old(self).timeline.stream.source().source()),
                 FrameTouchMode::PreserveAllInit,
             ),
+            match r {
+                Ok(sync_point) => final(self).active_gpu_puts@ == old(self).active_gpu_puts@.push(
+                    final(self).active_gpu_puts@.last(),
+                ) && final(self).active_gpu_puts@.last().action == (PendingGpuAction::Publish {
+                    key: handle.key,
+                    version: handle.version,
+                    proof: Ghost(put_proof),
+                    only_if_current,
+                }),
+                Err(_) => final(self).active_gpu_puts@ == old(self).active_gpu_puts@.push(
+                    final(self).active_gpu_puts@.last(),
+                ) && (final(self).active_gpu_puts@.last().action is Abort),
+            },
     {
         hide(CacheCore::well_formed);
         hide(replica_valid);
@@ -397,6 +418,8 @@ impl<'a> CudaBackend<'a> {
             final(core).instance_id() == old(core).instance_id(),
             final(core).tiers == old(core).tiers,
             final(core).spec == old(core).spec,
+            final(core).next_version_seq == old(core).next_version_seq,
+            final(core).version_registry == old(core).version_registry,
             core_transition(
                 &before_core,
                 final(core),
@@ -404,6 +427,9 @@ impl<'a> CudaBackend<'a> {
                 Some(old(self).timeline.stream.source().source()),
                 FrameTouchMode::PreserveAllInit,
             ),
+            final(self).active_gpu_puts@ == old(self).active_gpu_puts@.push(
+                final(self).active_gpu_puts@.last(),
+            ) && (final(self).active_gpu_puts@.last().action is Abort),
     {
         hide(CacheCore::well_formed);
         hide(replica_valid);
@@ -505,11 +531,14 @@ impl<'a> CudaBackend<'a> {
             final(self).gpu_first_frame == old(self).gpu_first_frame,
             final(self).gpu_num_frames == old(self).gpu_num_frames,
             final(self).pinned_host == old(self).pinned_host,
+            final(self).active_gpu_puts == old(self).active_gpu_puts,
             final(self).timeline.timeline_id == old(self).timeline.timeline_id,
             final(core).node_id == old(core).node_id,
             final(core).instance_id() == old(core).instance_id(),
             final(core).tiers == old(core).tiers,
             final(core).spec == old(core).spec,
+            final(core).next_version_seq == old(core).next_version_seq,
+            final(core).version_registry == old(core).version_registry,
             core_transition(
                 &before_core,
                 final(core),
@@ -648,6 +677,7 @@ impl<'a> CudaBackend<'a> {
             final(core).instance_id() == after_begin_core.instance_id(),
             final(core).tiers == after_begin_core.tiers,
             final(core).spec == after_begin_core.spec,
+            final(core).version_registry == before_core.version_registry,
             core_transition(
                 &before_core,
                 final(core),
@@ -655,13 +685,28 @@ impl<'a> CudaBackend<'a> {
                 Some(after_begin_self.timeline.stream.source().source()),
                 FrameTouchMode::PreserveAllInit,
             ),
-            r matches Ok((version, frame, t, _)) ==> {
-                &&& t != Ticket::NONE
-                &&& t.timeline_id() == after_begin_self.timeline.timeline_id
-                &&& version.origin_node == before_core.node_id
-                &&& version.seq == before_core.next_version_seq
-                &&& ((handle.tier == after_begin_self.gpu_tier && final(self).owns_gpu(frame))
-                    || final(self).owns_pinned_host(frame))
+            match r {
+                Ok((version, frame, t, _)) => {
+                    &&& t != Ticket::NONE
+                    &&& t.timeline_id() == after_begin_self.timeline.timeline_id
+                    &&& version.origin_node == before_core.node_id
+                    &&& version.seq == before_core.next_version_seq
+                    &&& final(core).next_version_seq == before_core.next_version_seq + 1
+                    &&& ((handle.tier == after_begin_self.gpu_tier && final(self).owns_gpu(frame))
+                        || final(self).owns_pinned_host(frame))
+                    &&& final(self).active_gpu_puts@ == after_begin_self.active_gpu_puts@.push(
+                        final(self).active_gpu_puts@.last(),
+                    )
+                    &&& final(self).active_gpu_puts@.last().action == (PendingGpuAction::Publish {
+                        key: handle.key,
+                        version,
+                        proof: Ghost(put_proof),
+                        only_if_current: false,
+                    })
+                },
+                Err(_) => final(self).active_gpu_puts@ == after_begin_self.active_gpu_puts@.push(
+                    final(self).active_gpu_puts@.last(),
+                ) && (final(self).active_gpu_puts@.last().action is Abort),
             },
     {
         hide(CacheCore::well_formed);

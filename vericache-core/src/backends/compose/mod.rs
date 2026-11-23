@@ -1111,4 +1111,292 @@ pub proof fn lemma_peer_core_step_except_then(
     }
 }
 
+/// True when no pinned (`!is_unpinned()`) entry in `leases` owns `(f, s)`.
+pub open spec fn leases_free_of_share(
+    leases: Seq<super::rdma::ActiveRemoteLease>,
+    f: FrameId,
+    s: TransferShare,
+) -> bool {
+    forall|k: int|
+        0 <= k < leases.len() && !(#[trigger] leases[k]).is_unpinned() ==> !(leases[k].frame == f
+            && leases[k].share@ == s)
+}
+
+/// Pairwise disjointness of pinned `(frame, share)` ownership between two peer sessions' RDMA lease tables.
+pub open spec fn peer_leases_disjoint(
+    a: Seq<super::rdma::ActiveRemoteLease>,
+    b: Seq<super::rdma::ActiveRemoteLease>,
+) -> bool {
+    forall|i: int|
+        0 <= i < a.len() && !(#[trigger] a[i]).is_unpinned() ==> leases_free_of_share(
+            b,
+            a[i].frame,
+            a[i].share@,
+        )
+}
+
+pub proof fn lemma_peer_leases_disjoint_sym(
+    a: Seq<super::rdma::ActiveRemoteLease>,
+    b: Seq<super::rdma::ActiveRemoteLease>,
+)
+    requires
+        peer_leases_disjoint(a, b),
+    ensures
+        peer_leases_disjoint(b, a),
+{
+    assert forall|j: int|
+        0 <= j < b.len() && !(#[trigger] b[j]).is_unpinned() implies leases_free_of_share(
+        a,
+        b[j].frame,
+        b[j].share@,
+    ) by {
+        assert forall|i: int| 0 <= i < a.len() && !(#[trigger] a[i]).is_unpinned() implies !(
+        a[i].frame == b[j].frame && a[i].share@ == b[j].share@) by {
+            assert(leases_free_of_share(b, a[i].frame, a[i].share@));
+        }
+    }
+}
+
+pub proof fn lemma_foreign_shares_lookup(
+    before_core: &CacheCore,
+    after_core: &CacheCore,
+    before_leases: Seq<super::rdma::ActiveRemoteLease>,
+    after_leases: Seq<super::rdma::ActiveRemoteLease>,
+    f: FrameId,
+    s: TransferShare,
+)
+    requires
+        peer_foreign_shares_preserved(before_core, after_core, before_leases, after_leases),
+        f.0 < before_core.frames.metas.len(),
+        before_core.frames.frame(f).remote_shares.contains_key(s),
+        leases_free_of_share(before_leases, f, s),
+    ensures
+        f.0 < after_core.frames.metas.len(),
+        after_core.frames.frame(f).remote_shares.contains_key(s),
+        after_core.frames.frame(f).remote_shares[s] == before_core.frames.frame(f).remote_shares[s],
+        leases_free_of_share(after_leases, f, s),
+{
+    reveal(peer_foreign_shares_preserved);
+}
+
+/// Opaque step summary stating that every remote share `(f, s)` present in
+/// `before_core` and NOT owned by any pinned lease in `before_leases` remains
+/// intact in `after_core` and unowned by any pinned lease in `after_leases`.
+#[verifier::opaque]
+pub open spec fn peer_foreign_shares_preserved(
+    before_core: &CacheCore,
+    after_core: &CacheCore,
+    before_leases: Seq<super::rdma::ActiveRemoteLease>,
+    after_leases: Seq<super::rdma::ActiveRemoteLease>,
+) -> bool {
+    forall|f: FrameId, s: TransferShare|
+        f.0 < before_core.frames.metas.len() && (#[trigger] before_core.frames.frame(
+            f,
+        ).remote_shares.contains_key(s)) && leases_free_of_share(before_leases, f, s) ==> {
+            &&& f.0 < after_core.frames.metas.len()
+            &&& after_core.frames.frame(f).remote_shares.contains_key(s)
+            &&& after_core.frames.frame(f).remote_shares[s] == before_core.frames.frame(
+                f,
+            ).remote_shares[s]
+            &&& leases_free_of_share(after_leases, f, s)
+        }
+}
+
+pub proof fn lemma_foreign_shares_refl(
+    core: &CacheCore,
+    leases: Seq<super::rdma::ActiveRemoteLease>,
+)
+    ensures
+        peer_foreign_shares_preserved(core, core, leases, leases),
+{
+    reveal(peer_foreign_shares_preserved);
+}
+
+pub proof fn lemma_foreign_shares_trans(
+    a: &CacheCore,
+    b: &CacheCore,
+    c: &CacheCore,
+    la: Seq<super::rdma::ActiveRemoteLease>,
+    lb: Seq<super::rdma::ActiveRemoteLease>,
+    lc: Seq<super::rdma::ActiveRemoteLease>,
+)
+    requires
+        peer_foreign_shares_preserved(a, b, la, lb),
+        peer_foreign_shares_preserved(b, c, lb, lc),
+    ensures
+        peer_foreign_shares_preserved(a, c, la, lc),
+{
+    reveal(peer_foreign_shares_preserved);
+    assert forall|f: FrameId, s: TransferShare|
+        f.0 < a.frames.metas.len() && (#[trigger] a.frames.frame(f).remote_shares.contains_key(s))
+            && leases_free_of_share(la, f, s) implies {
+        &&& f.0 < c.frames.metas.len()
+        &&& c.frames.frame(f).remote_shares.contains_key(s)
+        &&& c.frames.frame(f).remote_shares[s] == a.frames.frame(f).remote_shares[s]
+        &&& leases_free_of_share(lc, f, s)
+    } by {
+        assert(b.frames.frame(f).remote_shares.contains_key(s));
+        assert(leases_free_of_share(lb, f, s));
+    }
+}
+
+pub proof fn lemma_foreign_shares_same_pins(
+    before: &CacheCore,
+    after: &CacheCore,
+    before_leases: Seq<super::rdma::ActiveRemoteLease>,
+    after_leases: Seq<super::rdma::ActiveRemoteLease>,
+)
+    requires
+        after.frames.metas.len() == before.frames.metas.len(),
+        after.frames.preserves_remote_leases(&before.frames),
+        forall|j: int|
+            0 <= j < after_leases.len() && !(#[trigger] after_leases[j]).is_unpinned() ==> exists|
+                i: int,
+            |
+                0 <= i < before_leases.len() && !(#[trigger] before_leases[i]).is_unpinned()
+                    && before_leases[i].frame == after_leases[j].frame && before_leases[i].share@
+                    == after_leases[j].share@,
+    ensures
+        peer_foreign_shares_preserved(before, after, before_leases, after_leases),
+{
+    reveal(peer_foreign_shares_preserved);
+    assert forall|f: FrameId, s: TransferShare|
+        f.0 < before.frames.metas.len() && (#[trigger] before.frames.frame(
+            f,
+        ).remote_shares.contains_key(s)) && leases_free_of_share(before_leases, f, s) implies {
+        &&& f.0 < after.frames.metas.len()
+        &&& after.frames.frame(f).remote_shares.contains_key(s)
+        &&& after.frames.frame(f).remote_shares[s] == before.frames.frame(f).remote_shares[s]
+        &&& leases_free_of_share(after_leases, f, s)
+    } by {
+        assert(after.frames.frame(f).remote_shares == before.frames.frame(f).remote_shares);
+        assert forall|k: int|
+            0 <= k < after_leases.len() && !(#[trigger] after_leases[k]).is_unpinned() implies !(
+        after_leases[k].frame == f && after_leases[k].share@ == s) by {
+            let i = choose|i: int|
+                0 <= i < before_leases.len() && !(#[trigger] before_leases[i]).is_unpinned()
+                    && before_leases[i].frame == after_leases[k].frame && before_leases[i].share@
+                    == after_leases[k].share@;
+            assert(!before_leases[i].is_unpinned());
+        }
+    }
+}
+
+pub proof fn lemma_foreign_shares_after_pin(
+    before: &CacheCore,
+    after: &CacheCore,
+    before_leases: Seq<super::rdma::ActiveRemoteLease>,
+    after_leases: Seq<super::rdma::ActiveRemoteLease>,
+    frame: FrameId,
+    new_share: TransferShare,
+)
+    requires
+        frame.0 < before.frames.metas.len(),
+        after.frames.metas.len() == before.frames.metas.len(),
+        !before.frames.frame(frame).remote_shares.contains_key(new_share),
+        after.frames.same_other_pins(&before.frames, Some(frame)),
+        forall|s: TransferShare| #[trigger]
+            before.frames.frame(frame).remote_shares.contains_key(s) ==> after.frames.frame(
+                frame,
+            ).remote_shares.contains_key(s) && after.frames.frame(frame).remote_shares[s]
+                == before.frames.frame(frame).remote_shares[s],
+        forall|j: int|
+            0 <= j < after_leases.len() && !(#[trigger] after_leases[j]).is_unpinned() ==> (
+            after_leases[j].frame == frame && after_leases[j].share@ == new_share) || (exists|
+                i: int,
+            |
+                0 <= i < before_leases.len() && !(#[trigger] before_leases[i]).is_unpinned()
+                    && before_leases[i].frame == after_leases[j].frame && before_leases[i].share@
+                    == after_leases[j].share@),
+    ensures
+        peer_foreign_shares_preserved(before, after, before_leases, after_leases),
+{
+    reveal(peer_foreign_shares_preserved);
+    assert forall|f: FrameId, s: TransferShare|
+        f.0 < before.frames.metas.len() && (#[trigger] before.frames.frame(
+            f,
+        ).remote_shares.contains_key(s)) && leases_free_of_share(before_leases, f, s) implies {
+        &&& f.0 < after.frames.metas.len()
+        &&& after.frames.frame(f).remote_shares.contains_key(s)
+        &&& after.frames.frame(f).remote_shares[s] == before.frames.frame(f).remote_shares[s]
+        &&& leases_free_of_share(after_leases, f, s)
+    } by {
+        if f != frame {
+            assert(after.frames.frame(f).remote_shares == before.frames.frame(f).remote_shares);
+        } else {
+            assert(s != new_share);
+        }
+        assert forall|k: int|
+            0 <= k < after_leases.len() && !(#[trigger] after_leases[k]).is_unpinned() implies !(
+        after_leases[k].frame == f && after_leases[k].share@ == s) by {
+            if !(after_leases[k].frame == frame && after_leases[k].share@ == new_share) {
+                let i = choose|i: int|
+                    0 <= i < before_leases.len() && !(#[trigger] before_leases[i]).is_unpinned()
+                        && before_leases[i].frame == after_leases[k].frame
+                        && before_leases[i].share@ == after_leases[k].share@;
+                assert(!before_leases[i].is_unpinned());
+            }
+        }
+    }
+}
+
+pub proof fn lemma_foreign_shares_after_unpin(
+    before: &CacheCore,
+    after: &CacheCore,
+    before_leases: Seq<super::rdma::ActiveRemoteLease>,
+    after_leases: Seq<super::rdma::ActiveRemoteLease>,
+    idx: int,
+)
+    requires
+        0 <= idx < before_leases.len(),
+        !before_leases[idx].is_unpinned(),
+        before_leases[idx].frame.0 < before.frames.metas.len(),
+        after.frames.metas.len() == before.frames.metas.len(),
+        after.frames.same_other_pins(&before.frames, Some(before_leases[idx].frame)),
+        after.frames.frame(before_leases[idx].frame).remote_shares == before.frames.frame(
+            before_leases[idx].frame,
+        ).remote_shares.remove(before_leases[idx].share@),
+        forall|j: int|
+            0 <= j < after_leases.len() && !(#[trigger] after_leases[j]).is_unpinned() ==> exists|
+                i: int,
+            |
+                0 <= i < before_leases.len() && !(#[trigger] before_leases[i]).is_unpinned()
+                    && before_leases[i].frame == after_leases[j].frame && before_leases[i].share@
+                    == after_leases[j].share@,
+    ensures
+        peer_foreign_shares_preserved(before, after, before_leases, after_leases),
+{
+    broadcast use vstd::map::group_map_lemmas;
+
+    reveal(peer_foreign_shares_preserved);
+    let uf = before_leases[idx].frame;
+    let us = before_leases[idx].share@;
+    assert forall|f: FrameId, s: TransferShare|
+        f.0 < before.frames.metas.len() && (#[trigger] before.frames.frame(
+            f,
+        ).remote_shares.contains_key(s)) && leases_free_of_share(before_leases, f, s) implies {
+        &&& f.0 < after.frames.metas.len()
+        &&& after.frames.frame(f).remote_shares.contains_key(s)
+        &&& after.frames.frame(f).remote_shares[s] == before.frames.frame(f).remote_shares[s]
+        &&& leases_free_of_share(after_leases, f, s)
+    } by {
+        assert(!before_leases[idx].is_unpinned());
+        assert(!(uf == f && us == s));
+        if f != uf {
+            assert(after.frames.frame(f).remote_shares == before.frames.frame(f).remote_shares);
+        } else {
+            assert(s != us);
+        }
+        assert forall|k: int|
+            0 <= k < after_leases.len() && !(#[trigger] after_leases[k]).is_unpinned() implies !(
+        after_leases[k].frame == f && after_leases[k].share@ == s) by {
+            let i = choose|i: int|
+                0 <= i < before_leases.len() && !(#[trigger] before_leases[i]).is_unpinned()
+                    && before_leases[i].frame == after_leases[k].frame && before_leases[i].share@
+                    == after_leases[k].share@;
+            assert(!before_leases[i].is_unpinned());
+        }
+    }
+}
+
 } // verus!

@@ -24,6 +24,7 @@ pub(super) open spec fn put_gpu_enqueue_ready<'a>(
     &&& core.spec == before_core.spec
     &&& core.next_version_seq == before_core.next_version_seq + 1
     &&& core.version_seq_limit == before_core.version_seq_limit
+    &&& core.version_registry == before_core.version_registry
     &&& core.timelines == before_core.timelines
     &&& core.ledger == before_core.ledger
     &&& core.frames.same_directory(&before_core.frames)
@@ -44,12 +45,12 @@ pub(super) open spec fn put_gpu_enqueue_ready<'a>(
     &&& !before_core.frames.versions@.contains_key(handle.version)
     &&& handle.slot@.is_full()
     &&& handle.slot@.well_formed()
-    &&& handle.slot@.slot_len == core.frames.frame_size
+    &&& handle.slot@.slot_len == core.frames.tier_frame_size(b.gpu_tier)
     &&& handle.slot@.loc.node == core.node()
     &&& src.well_formed()
     &&& src.instance_id() == core.instance_id()
     &&& src.slot_ref().loc.node == core.node()
-    &&& src.slot_ref().sub_len == core.frames.frame_size
+    &&& src.slot_ref().sub_len == core.frames.tier_frame_size(b.gpu_tier)
     &&& src.slot_ref().loc != handle.slot@.loc
     &&& src_perm.valid_local(core.instance_id(), src.slot_ref().loc)
     &&& (src.slot_ref().loc.space is GpuAlloc && src.slot_ref().loc.space->GpuAlloc_device
@@ -133,11 +134,13 @@ impl<'a> CudaBackend<'a> {
                     &&& final(self).gpu_first_frame == old(self).gpu_first_frame
                     &&& final(self).gpu_num_frames == old(self).gpu_num_frames
                     &&& final(self).same_pinned_layout(old(self))
+                    &&& final(self).active_gpu_puts == old(self).active_gpu_puts
                     &&& final(self).timeline.timeline_id == old(self).timeline.timeline_id
                     &&& final(core).node_id == old(core).node_id
                     &&& final(core).instance_id() == old(core).instance_id()
                     &&& final(core).tiers == old(core).tiers
                     &&& final(core).spec == old(core).spec
+                    &&& final(core).version_registry == before_core.version_registry
                     &&& core_transition(
                         &before_core,
                         final(core),
@@ -148,6 +151,7 @@ impl<'a> CudaBackend<'a> {
                 },
                 Ok((ticket, h_out, tok, put_proof)) => {
                     &&& h_out == handle
+                    &&& put_proof@.certificate.bytes == src_cert.bytes
                     &&& final(core).well_formed()
                     &&& final(self).timeline.well_formed(
                         &final(core).timelines,
@@ -195,8 +199,10 @@ impl<'a> CudaBackend<'a> {
             assert(self.gpu_buffer.well_formed() && self.gpu_buffer.instance_id()
                 == core.instance_id() && self.gpu_buffer.node() == core.node()
                 && self.gpu_buffer.num_slots() == self.gpu_num_frames as usize
-                && self.gpu_buffer.slot_len() == core.frames.frame_size && (
-            self.pinned_host matches Some(h) ==> h.well_formed(core)) && self.timeline.well_formed(
+                && self.gpu_buffer.slot_len() == core.frames.tier_frame_size(self.gpu_tier) && (
+            self.pinned_host matches Some(h) ==> h.well_formed(core) && core.frames.tier_frame_size(
+                h.tier,
+            ) == core.frames.tier_frame_size(self.gpu_tier)) && self.timeline.well_formed(
                 &core.timelines,
                 core.node(),
                 &core.ledger@,

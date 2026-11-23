@@ -112,7 +112,9 @@ impl<'a> LocalEngine<'a> {
             src.well_formed(),
             src.instance_id() == old(self).core.instance_id(),
             src.slot_ref().loc.node == old(self).core.node(),
-            src.slot_ref().sub_len == old(self).core.frames.frame_size,
+            old(self).cuda matches Some(c) ==> src.slot_ref().sub_len == old(
+                self,
+            ).core.frames.tier_frame_size(c.gpu_tier),
             old(src_perm).valid_local(old(self).core.instance_id(), src.slot_ref().loc),
             read_admitted(old(src_perm).frontier(), old(self).core.citations()),
             old(self).cuda matches Some(c) ==> (src.slot_ref().loc.space is GpuAlloc
@@ -185,8 +187,14 @@ impl<'a> LocalEngine<'a> {
         requires
             old(self).well_formed(),
             instance.id() == old(self).core.instance_id(),
-            scatter_offsets_valid(srcs@, offsets, old(self).core.frames.frame_size),
-            bytes.len() == old(self).core.frames.frame_size,
+            old(self).cuda matches Some(c) ==> {
+                &&& scatter_offsets_valid(
+                    srcs@,
+                    offsets,
+                    old(self).core.frames.tier_frame_size(c.gpu_tier),
+                )
+                &&& bytes.len() == old(self).core.frames.tier_frame_size(c.gpu_tier)
+            },
             src_certs.len() == srcs@.len(),
             forall|i: int|
                 0 <= i < srcs@.len() ==> {
@@ -666,7 +674,7 @@ impl<'a> LocalEngine<'a> {
     {
         hide(CacheCore::well_formed);
         hide(replica_valid);
-        if dst.len() != self.core.frames.frame_size {
+        if dst.len() != self.core.tier_frame_size(self.host.tier) {
             return Err(CoreError::InvalidArgument);
         }
         // 1-hop: direct Host DRAM hit.

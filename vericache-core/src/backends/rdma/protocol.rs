@@ -48,6 +48,7 @@ pub enum ControlPayload {
     FetchMiss { request_id: u64 },
     RevokeNotice { grant_tag: u64 },
     RevokeAck { grant_tag: u64 },
+    ReconnectBarrier { epoch: u64 },
 }
 
 /// Wire metadata carried inside `READ_GRANT` (`op == 1`) `user_bytes`.
@@ -73,7 +74,11 @@ pub const CONTROL_TAG_REVOKE_NOTICE: u8 = 3;
 
 pub const CONTROL_TAG_REVOKE_ACK: u8 = 4;
 
+pub const CONTROL_TAG_RECONNECT_BARRIER: u8 = 5;
+
 pub const FETCH_REQUEST_LEN: usize = 41;
+
+pub const RECONNECT_BARRIER_LEN: usize = 9;
 
 pub const READ_GRANT_META_LEN: usize = 58;
 
@@ -94,6 +99,8 @@ pub open spec fn encode_control_payload_spec(p: ControlPayload) -> Seq<u8> {
             + spec_u64_to_le_bytes(grant_tag),
         ControlPayload::RevokeAck { grant_tag } => seq![CONTROL_TAG_REVOKE_ACK]
             + spec_u64_to_le_bytes(grant_tag),
+        ControlPayload::ReconnectBarrier { epoch } => seq![CONTROL_TAG_RECONNECT_BARRIER]
+            + spec_u64_to_le_bytes(epoch),
     }
 }
 
@@ -255,6 +262,10 @@ pub fn encode_control_payload(payload: ControlPayload) -> (out: Vec<u8>)
             out.push(CONTROL_TAG_REVOKE_ACK);
             push_u64_le(&mut out, grant_tag);
         },
+        ControlPayload::ReconnectBarrier { epoch } => {
+            out.push(CONTROL_TAG_RECONNECT_BARRIER);
+            push_u64_le(&mut out, epoch);
+        },
     }
     proof {
         assert(out@ =~= encode_control_payload_spec(payload));
@@ -302,18 +313,27 @@ pub proof fn lemma_encode_control_payload_injective(a: ControlPayload, b: Contro
             assert(encode_control_payload_spec(a).subrange(1, 9) =~= spec_u64_to_le_bytes(t1));
             assert(encode_control_payload_spec(b).subrange(1, 9) =~= spec_u64_to_le_bytes(t2));
         },
+        (
+            ControlPayload::ReconnectBarrier { epoch: e1 },
+            ControlPayload::ReconnectBarrier { epoch: e2 },
+        ) => {
+            assert(encode_control_payload_spec(a).subrange(1, 9) =~= spec_u64_to_le_bytes(e1));
+            assert(encode_control_payload_spec(b).subrange(1, 9) =~= spec_u64_to_le_bytes(e2));
+        },
         _ => {
             assert(encode_control_payload_spec(a)[0] == match a {
                 ControlPayload::FetchRequest { .. } => CONTROL_TAG_FETCH_REQUEST,
                 ControlPayload::FetchMiss { .. } => CONTROL_TAG_FETCH_MISS,
                 ControlPayload::RevokeNotice { .. } => CONTROL_TAG_REVOKE_NOTICE,
                 ControlPayload::RevokeAck { .. } => CONTROL_TAG_REVOKE_ACK,
+                ControlPayload::ReconnectBarrier { .. } => CONTROL_TAG_RECONNECT_BARRIER,
             });
             assert(encode_control_payload_spec(b)[0] == match b {
                 ControlPayload::FetchRequest { .. } => CONTROL_TAG_FETCH_REQUEST,
                 ControlPayload::FetchMiss { .. } => CONTROL_TAG_FETCH_MISS,
                 ControlPayload::RevokeNotice { .. } => CONTROL_TAG_REVOKE_NOTICE,
                 ControlPayload::RevokeAck { .. } => CONTROL_TAG_REVOKE_ACK,
+                ControlPayload::ReconnectBarrier { .. } => CONTROL_TAG_RECONNECT_BARRIER,
             });
         },
     }
@@ -351,6 +371,9 @@ pub fn decode_control_payload(bytes: &[u8]) -> (r: Option<ControlPayload>)
     } else if tag == CONTROL_TAG_REVOKE_ACK && bytes.len() == 9 {
         let grant_tag = read_u64_le(bytes, 1);
         Some(ControlPayload::RevokeAck { grant_tag })
+    } else if tag == CONTROL_TAG_RECONNECT_BARRIER && bytes.len() == RECONNECT_BARRIER_LEN {
+        let epoch = read_u64_le(bytes, 1);
+        Some(ControlPayload::ReconnectBarrier { epoch })
     } else {
         None
     };
@@ -641,6 +664,35 @@ pub proof fn lemma_statement_replica_valid_ext(
             run,
         ) implies #[trigger] certificate_valid_in(cert, h, run) by {
         assert(statement_consistent_with_history(sub1, succeeded, revoked, facts, h, run));
+    }
+}
+
+/// Extensionality: `statement_replica_valid` depends only on `revoked.map()`.
+pub proof fn lemma_statement_replica_valid_revoked_ext(
+    submitted: SubmittedMap,
+    succeeded: SucceededMap,
+    rev1: RevokedMap,
+    rev2: RevokedMap,
+    facts: ISet<TransferEvent>,
+    cert: ValueCertificate,
+)
+    requires
+        statement_replica_valid(submitted, succeeded, rev1, facts, cert),
+        rev2.map() == rev1.map(),
+    ensures
+        statement_replica_valid(submitted, succeeded, rev2, facts, cert),
+{
+    assert forall|h, run|
+        foundation::history::reachable(h) && foundation::value::valid_run(h, run)
+            && statement_consistent_with_history(
+            submitted,
+            succeeded,
+            rev2,
+            facts,
+            h,
+            run,
+        ) implies #[trigger] certificate_valid_in(cert, h, run) by {
+        assert(statement_consistent_with_history(submitted, succeeded, rev1, facts, h, run));
     }
 }
 

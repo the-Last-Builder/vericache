@@ -14,3 +14,10 @@ target/
 experiments/results/
 **/__pycache__/
 *.pyc
+
+# LaTeX intermediates
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz

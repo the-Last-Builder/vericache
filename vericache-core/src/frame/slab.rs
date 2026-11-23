@@ -71,7 +71,7 @@ impl FrameTable {
             old(self).metas.len() < u32::MAX,
             tier.valid(old(self).num_tiers),
             slot.is_full(),
-            slot.slot_len == old(self).frame_size,
+            slot.slot_len == old(self).tier_frame_size(tier),
             slot_owned(tok, tok.instance_id(), slot.loc, untouched()),
             forall|i: nat|
                 i < old(self).metas.len() ==> (#[trigger] old(self).ghosts@[i].slot).loc
@@ -80,6 +80,7 @@ impl FrameTable {
             final(self).well_formed(tok.instance_id(), slot.loc.node, _table, ledger),
             final(self).num_tiers == old(self).num_tiers,
             final(self).frame_size == old(self).frame_size,
+            final(self).tier_frame_sizes == old(self).tier_frame_sizes,
             final(self).versions == old(self).versions,
             final(self).metas.len() == old(self).metas.len() + 1,
             final(self).ghosts@[old(self).metas.len() as nat].slot == slot,
@@ -89,7 +90,8 @@ impl FrameTable {
             forall|i: nat|
                 i < old(self).metas.len() ==> #[trigger] final(self).ghosts@[i] == old(
                     self,
-                ).ghosts@[i] && final(self).metas[i as int] == old(self).metas[i as int],
+                ).ghosts@[i] && final(self).metas[i as int] == old(self).metas[i as int]
+                    && final(self).overflow_seqs[i as int] == old(self).overflow_seqs[i as int],
             final(self).ready_queue[tier.index() as int]@ == old(
                 self,
             ).ready_queue[tier.index() as int]@.push(FrameId(old(self).metas.len() as u32)),
@@ -97,6 +99,7 @@ impl FrameTable {
         let idx = self.metas.len();
         let t = tier.as_index();
         let m = FrameSyncMeta::empty();
+        let ovf = [0u64;MAX_TIMELINES];
         let tracked g = FrameGhost {
             slot,
             tier,
@@ -110,14 +113,15 @@ impl FrameTable {
         assert(m.valid_tickets(_table));
         assert(g.authority(m, tok.instance_id()));
         assert(g.frontier() == untouched());
-        assert(g.covered(m, _table, slot.loc.node, ledger));
+        assert(g.covered(m, ovf, _table, slot.loc.node, ledger));
         assert(g.binding(m, _table));
         assert(2u8 & 2u8 != 0u8 && 2u8 & 1u8 == 0u8) by (bit_vector);
-        assert(m.reusable(_table));
+        assert(m.reusable(ovf, _table));
         assert(g.valid(
             m,
+            ovf,
             self.num_tiers,
-            self.frame_size,
+            self.tier_frame_size(tier),
             tok.instance_id(),
             slot.loc.node,
             _table,
@@ -125,6 +129,7 @@ impl FrameTable {
         ));
         self.bindings.push((ObjectKey([0;4]), tier));
         self.metas.push(m);
+        self.overflow_seqs.push(ovf);
         proof {
             self.ghosts.borrow_mut().tracked_insert(idx as nat, g);
         }
@@ -140,7 +145,7 @@ impl FrameTable {
                 let f = #[trigger] ready[i];
                 f.0 < self.metas.len() && self.frame(f).tier.index() == u && self.meta(f).state
                     == STATE_EMPTY && self.meta(f).queued() && !self.meta(f).overflow()
-                    && self.meta(f).reusable(_table)
+                    && self.meta(f).reusable(self.ovf(f), _table)
             } by {
                 if u != t || i < ready.len() - 1 {
                     assert(old(self).ready_queue[u][i].0 < idx);
@@ -156,8 +161,9 @@ impl FrameTable {
         }
         assert forall|i: nat| i < self.metas.len() implies #[trigger] self.ghosts@[i].valid(
             self.metas[i as int],
+            self.overflow_seqs[i as int],
             self.num_tiers,
-            self.frame_size,
+            self.tier_frame_size(self.ghosts@[i].tier),
             tok.instance_id(),
             slot.loc.node,
             _table,
@@ -166,8 +172,9 @@ impl FrameTable {
             if i < idx {
                 assert(old(self).ghosts@[i].valid(
                     old(self).metas[i as int],
-                    self.num_tiers,
-                    self.frame_size,
+                    old(self).overflow_seqs[i as int],
+                    old(self).num_tiers,
+                    old(self).tier_frame_size(old(self).ghosts@[i].tier),
                     tok.instance_id(),
                     slot.loc.node,
                     _table,
@@ -194,8 +201,8 @@ impl FrameTable {
             tier.valid(old(self).num_tiers),
             forall|i: usize|
                 i < num_frames ==> tokens.contains_key(i) && (#[trigger] slots[i as int]).is_full()
-                    && slots[i as int].slot_len == old(self).frame_size && slots[i as int].loc.node
-                    == node && slot_owned(
+                    && slots[i as int].slot_len == old(self).tier_frame_size(tier)
+                    && slots[i as int].loc.node == node && slot_owned(
                     tokens[i],
                     ledger.submitted.instance_id(),
                     slots[i as int].loc,
@@ -211,12 +218,14 @@ impl FrameTable {
             final(self).well_formed(ledger.submitted.instance_id(), node, table, ledger),
             final(self).num_tiers == old(self).num_tiers,
             final(self).frame_size == old(self).frame_size,
+            final(self).tier_frame_sizes == old(self).tier_frame_sizes,
             final(self).versions == old(self).versions,
             final(self).metas.len() == old(self).metas.len() + num_frames,
             forall|j: nat|
                 j < old(self).metas.len() ==> #[trigger] final(self).ghosts@[j] == old(
                     self,
-                ).ghosts@[j] && final(self).metas[j as int] == old(self).metas[j as int],
+                ).ghosts@[j] && final(self).metas[j as int] == old(self).metas[j as int]
+                    && final(self).overflow_seqs[j as int] == old(self).overflow_seqs[j as int],
             forall|j: nat|
                 old(self).metas.len() <= j < final(self).metas.len() ==> (
                 #[trigger] final(self).ghosts@[j]).tier == tier && final(self).metas[j as int].state
@@ -235,14 +244,17 @@ impl FrameTable {
         self.ready_queue[t].reserve(extra);
         let extra = total.saturating_sub(self.draining_queue[t].len());
         self.draining_queue[t].reserve(extra);
+        let ghost id = ledger.submitted.instance_id();
+        proof {
+            self.prove_valid_frames_unchanged(*old(self), None, id, node, table, ledger);
+        }
         assert forall|u: int| 0 <= u < self.num_tiers implies #[trigger] self.tier_queues(
             u,
             table,
         ) by {
             assert(old(self).tier_queues(u, table));
         }
-        let ghost size = self.frame_size;
-        let ghost id = ledger.submitted.instance_id();
+        let ghost size = self.tier_frame_size(tier);
         let ghost first = self.metas.len();
         let ghost ready = old(self).ready_queue[t as int].len();
         let mut i = 0usize;
@@ -250,14 +262,17 @@ impl FrameTable {
             invariant
                 i <= num_frames,
                 self.num_tiers == old(self).num_tiers,
-                self.frame_size == size,
+                self.frame_size == old(self).frame_size,
+                self.tier_frame_sizes == old(self).tier_frame_sizes,
+                self.tier_frame_size(tier) == size,
                 self.versions == old(self).versions,
                 self.metas.len() == first + i,
                 self.well_formed(id, node, table, ledger),
                 self.ready_queue[t as int].len() == ready + i,
                 forall|j: nat|
                     j < first ==> #[trigger] self.ghosts@[j] == old(self).ghosts@[j]
-                        && self.metas[j as int] == old(self).metas[j as int],
+                        && self.metas[j as int] == old(self).metas[j as int]
+                        && self.overflow_seqs[j as int] == old(self).overflow_seqs[j as int],
                 forall|j: nat|
                     first <= j < first + i ==> (#[trigger] self.ghosts@[j]).tier == tier
                         && self.metas[j as int].state == STATE_EMPTY

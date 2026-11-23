@@ -15,6 +15,7 @@ pub struct CudaHostBuffer {
 
 pub struct CudaHostRegistration<'a> {
     pub(super) buffer: &'a HostBuffer,
+    pub(super) guard: ffi::RawHostRegGuard,
 }
 
 impl CudaHostBuffer {
@@ -321,8 +322,8 @@ pub fn host_register(buffer: &HostBuffer) -> (r: Result<CudaHostRegistration<'_>
             == buffer.space() && reg.num_slots() == buffer.num_slots() && reg.slot_len()
             == buffer.slot_len() && reg.instance_id() == buffer.instance_id(),
 {
-    ffi::raw_host_register(buffer)?;
-    Ok(CudaHostRegistration { buffer })
+    let guard = ffi::raw_host_register(buffer)?;
+    Ok(CudaHostRegistration { buffer, guard })
 }
 
 pub fn free_host(
@@ -491,6 +492,7 @@ pub fn host_unregister<'a>(
         Err(e) => return Err((e, buf, Tracked(tok))),
         Ok(w) => w,
     };
+    let _ = buf.guard.into_raw();
     proof {
         assert(slab_locs(loc.node, loc.space, 1nat) =~= ISet::empty().insert(loc));
         assert(completed.access == dereg_access(loc));
@@ -572,6 +574,7 @@ pub fn host_unregister_slab<'a>(
         Err(e) => return Err((e, buf, Tracked(tokens))),
         Ok(w) => w,
     };
+    let _ = buf.guard.into_raw();
     let tracked (completion, out_tokens) = cpu_host::finish_slab_owned(
         _ctx.source.borrow_mut(),
         instance,

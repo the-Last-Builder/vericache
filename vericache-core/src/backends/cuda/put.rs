@@ -45,7 +45,7 @@ impl<'a> CudaBackend<'a> {
             src.well_formed(),
             src.instance_id() == old(core).instance_id(),
             src.slot_ref().loc.node == old(core).node(),
-            src.slot_ref().sub_len == old(core).frames.frame_size,
+            src.slot_ref().sub_len == old(core).frames.tier_frame_size(old(self).gpu_tier),
             old(src_perm).valid_local(old(core).instance_id(), src.slot_ref().loc),
             read_admitted(old(src_perm).frontier(), old(core).citations()),
             src.slot_ref().loc.space is GpuAlloc && src.slot_ref().loc.space->GpuAlloc_device
@@ -71,6 +71,7 @@ impl<'a> CudaBackend<'a> {
             final(core).instance_id() == old(core).instance_id(),
             final(core).tiers == old(core).tiers,
             final(core).spec == old(core).spec,
+            final(core).version_registry == old(core).version_registry,
             core_transition(
                 old(core),
                 final(core),
@@ -78,13 +79,29 @@ impl<'a> CudaBackend<'a> {
                 Some(old(self).timeline.stream.source().source()),
                 FrameTouchMode::PreserveAllInit,
             ),
-            r matches Ok((version, frame, ticket, _)) ==> {
-                &&& ticket != Ticket::NONE
-                &&& ticket.timeline_id() == old(self).timeline.timeline_id
-                &&& version.origin_node == old(core).node_id
-                &&& version.seq == old(core).next_version_seq
-                &&& ((dst_tier == old(self).gpu_tier && final(self).owns_gpu(frame))
-                    || final(self).owns_pinned_host(frame))
+            match r {
+                Ok((version, frame, ticket, _)) => {
+                    &&& ticket != Ticket::NONE
+                    &&& ticket.timeline_id() == old(self).timeline.timeline_id
+                    &&& version.origin_node == old(core).node_id
+                    &&& version.seq == old(core).next_version_seq
+                    &&& final(core).next_version_seq == old(core).next_version_seq + 1
+                    &&& ((dst_tier == old(self).gpu_tier && final(self).owns_gpu(frame))
+                        || final(self).owns_pinned_host(frame))
+                    &&& final(self).active_gpu_puts@ == old(self).active_gpu_puts@.push(
+                        final(self).active_gpu_puts@.last(),
+                    )
+                    &&& final(self).active_gpu_puts@.last().action matches PendingGpuAction::Publish {
+                        version: pv,
+                        proof,
+                        only_if_current: false,
+                        ..
+                    } && pv == version && proof@.certificate.bytes == src_cert.bytes
+                },
+                Err(_) => final(self).active_gpu_puts@ == old(self).active_gpu_puts@ || (
+                final(self).active_gpu_puts@ == old(self).active_gpu_puts@.push(
+                    final(self).active_gpu_puts@.last(),
+                ) && (final(self).active_gpu_puts@.last().action is Abort)),
             },
     {
         hide(CacheCore::well_formed);
@@ -231,8 +248,12 @@ impl<'a> CudaBackend<'a> {
                 self,
             ).gpu_buffer.space()->GpuAlloc_device == old(self).device,
             old(self).gpu_buffer.num_slots() == old(self).gpu_num_frames as usize,
-            old(self).gpu_buffer.slot_len() == old(core).frames.frame_size,
-            old(self).pinned_host matches Some(h) ==> h.well_formed(old(core)),
+            old(self).gpu_buffer.slot_len() == old(core).frames.tier_frame_size(old(self).gpu_tier),
+            old(self).pinned_host matches Some(h) ==> h.well_formed(old(core)) && old(
+                core,
+            ).frames.tier_frame_size(h.tier) == old(core).frames.tier_frame_size(
+                old(self).gpu_tier,
+            ),
             instance.id() == old(core).instance_id(),
             src.well_formed(),
             src.instance_id() == old(core).instance_id(),
@@ -292,6 +313,7 @@ impl<'a> CudaBackend<'a> {
             final(core).spec == old(core).spec,
             final(core).next_version_seq == old(core).next_version_seq,
             final(core).version_seq_limit == old(core).version_seq_limit,
+            final(core).version_registry == old(core).version_registry,
             final(core).active_leases == old(core).active_leases,
             final(core).timelines.count == old(core).timelines.count,
             final(core).timelines.kinds == old(core).timelines.kinds,
@@ -425,6 +447,7 @@ impl<'a> CudaBackend<'a> {
             final(core).instance_id() == old(core).instance_id(),
             final(core).tiers == old(core).tiers,
             final(core).spec == old(core).spec,
+            final(core).version_registry == before_core.version_registry,
             core_transition(
                 &before_core,
                 final(core),
@@ -432,13 +455,29 @@ impl<'a> CudaBackend<'a> {
                 Some(old(self).timeline.stream.source().source()),
                 FrameTouchMode::PreserveAllInit,
             ),
-            r matches Ok((version, frame, ticket, _)) ==> {
-                &&& ticket != Ticket::NONE
-                &&& ticket.timeline_id() == old(self).timeline.timeline_id
-                &&& version.origin_node == before_core.node_id
-                &&& version.seq == before_core.next_version_seq
-                &&& ((handle.tier == old(self).gpu_tier && final(self).owns_gpu(frame))
-                    || final(self).owns_pinned_host(frame))
+            match r {
+                Ok((version, frame, ticket, _)) => {
+                    &&& ticket != Ticket::NONE
+                    &&& ticket.timeline_id() == old(self).timeline.timeline_id
+                    &&& version.origin_node == before_core.node_id
+                    &&& version.seq == before_core.next_version_seq
+                    &&& final(core).next_version_seq == before_core.next_version_seq + 1
+                    &&& ((handle.tier == old(self).gpu_tier && final(self).owns_gpu(frame))
+                        || final(self).owns_pinned_host(frame))
+                    &&& final(self).active_gpu_puts@ == old(self).active_gpu_puts@.push(
+                        final(self).active_gpu_puts@.last(),
+                    )
+                    &&& final(self).active_gpu_puts@.last().action matches PendingGpuAction::Publish {
+                        version: pv,
+                        proof,
+                        only_if_current: false,
+                        ..
+                    } && pv == version && proof@.certificate.bytes == src_cert.bytes
+                },
+                Err(_) => final(self).active_gpu_puts@ == old(self).active_gpu_puts@ || (
+                final(self).active_gpu_puts@ == old(self).active_gpu_puts@.push(
+                    final(self).active_gpu_puts@.last(),
+                ) && (final(self).active_gpu_puts@.last().action is Abort)),
             },
     {
         hide(CacheCore::well_formed);
@@ -504,8 +543,12 @@ impl<'a> CudaBackend<'a> {
                 self,
             ).gpu_buffer.space()->GpuAlloc_device == old(self).device,
             old(self).gpu_buffer.num_slots() == old(self).gpu_num_frames as usize,
-            old(self).gpu_buffer.slot_len() == old(core).frames.frame_size,
-            old(self).pinned_host matches Some(h) ==> h.well_formed(old(core)),
+            old(self).gpu_buffer.slot_len() == old(core).frames.tier_frame_size(old(self).gpu_tier),
+            old(self).pinned_host matches Some(h) ==> h.well_formed(old(core)) && old(
+                core,
+            ).frames.tier_frame_size(h.tier) == old(core).frames.tier_frame_size(
+                old(self).gpu_tier,
+            ),
             instance.id() == old(core).instance_id(),
             old(core).node_id == before_core.node_id,
             old(core).instance_id() == before_core.instance_id(),
@@ -523,12 +566,12 @@ impl<'a> CudaBackend<'a> {
             old(core).frames.frame(dst_frame).slot == dst_slot,
             dst_slot.is_full(),
             dst_slot.well_formed(),
-            dst_slot.slot_len == old(core).frames.frame_size,
+            dst_slot.slot_len == old(core).frames.tier_frame_size(old(self).gpu_tier),
             dst_slot.loc.node == old(core).node(),
             src.well_formed(),
             src.instance_id() == old(core).instance_id(),
             src.slot_ref().loc.node == old(core).node(),
-            src.slot_ref().sub_len == old(core).frames.frame_size,
+            src.slot_ref().sub_len == old(core).frames.tier_frame_size(old(self).gpu_tier),
             src.slot_ref().loc != dst_slot.loc,
             old(src_perm).valid_local(old(core).instance_id(), src.slot_ref().loc),
             slot_is_owned(*old(dst_tok), old(core).instance_id(), dst_slot.loc),
@@ -594,6 +637,7 @@ impl<'a> CudaBackend<'a> {
             final(core).spec == old(core).spec,
             final(core).next_version_seq == old(core).next_version_seq,
             final(core).version_seq_limit == old(core).version_seq_limit,
+            final(core).version_registry == old(core).version_registry,
             final(core).active_leases == old(core).active_leases,
             final(core).timelines.count == old(core).timelines.count,
             final(core).timelines.kinds == old(core).timelines.kinds,
@@ -653,7 +697,10 @@ impl<'a> CudaBackend<'a> {
                         },
                     )
                     &&& put_proof@.certificate.slot == dst_slot
-                    &&& put_proof@.certificate.bytes.len() == final(core).frames.frame_size
+                    &&& put_proof@.certificate.bytes == src_cert.bytes
+                    &&& put_proof@.certificate.bytes.len() == final(core).frames.tier_frame_size(
+                        old(self).gpu_tier,
+                    )
                     &&& put_proof@.certificate.writer == final(core).timelines.events@[(
                         old(self).timeline.timeline_id,
                         ticket.sequence(),

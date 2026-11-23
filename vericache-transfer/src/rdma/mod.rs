@@ -94,13 +94,13 @@ pub struct QueuePairConfig {
 }
 
 pub struct DeviceContext {
-    raw: *mut u8,
+    raw: ffi::RawDeviceCtxGuard,
     #[cfg_attr(not(verus_only), allow(dead_code))]
     node: NodeId,
 }
 
 pub struct ProtectionDomain<'a> {
-    raw: *mut u8,
+    raw: ffi::RawPdGuard,
     context: &'a DeviceContext,
     #[cfg_attr(not(verus_only), allow(dead_code))]
     pd_id: Ghost<nat>,
@@ -123,7 +123,7 @@ impl DeviceContext {
     }
 
     pub fn name(&self) -> String {
-        ffi::device_name(self.raw)
+        ffi::device_name(self.raw.as_ptr())
     }
 
     pub fn supports_type_2(&self) -> Result<bool, RdmaError> {
@@ -131,11 +131,11 @@ impl DeviceContext {
     }
 
     pub fn attributes(&self) -> Result<DeviceAttributes, RdmaError> {
-        ffi::attributes(self.raw)
+        ffi::attributes(self.raw.as_ptr())
     }
 
     pub fn close(self) -> Result<(), RdmaError> {
-        ffi::close(self.raw)
+        ffi::close(self.raw.into_raw())
     }
 }
 
@@ -158,7 +158,7 @@ impl<'a> ProtectionDomain<'a> {
     {
         Ok(
             Self {
-                raw: ffi::alloc_pd(context.raw)?,
+                raw: ffi::alloc_pd(context.raw.as_ptr())?,
                 context,
                 pd_id: Ghost(name.source()->RdmaQueuePair_id),
             },
@@ -170,7 +170,7 @@ impl<'a> ProtectionDomain<'a> {
     }
 
     pub fn destroy(self) -> Result<(), RdmaError> {
-        ffi::dealloc_pd(self.raw)
+        ffi::dealloc_pd(self.raw.into_raw())
     }
 }
 

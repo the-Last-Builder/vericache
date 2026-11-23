@@ -114,7 +114,7 @@ pub open spec fn slab_bound_to_core(
             &&& (#[trigger] core.frames.frame(FrameId((first_frame.0 + j) as u32))).tier == tier
             &&& core.frames.frame(FrameId((first_frame.0 + j) as u32)).slot == SlotRef::full(
                 SlotLoc { node: core.node(), space, slot_index: j },
-                core.frames.frame_size as u64,
+                core.frames.tier_frame_size(tier) as u64,
             )
         }
     &&& forall|f: FrameId|
@@ -156,12 +156,70 @@ pub proof fn lemma_slab_frame_slot(
         core.frames.frame(f).tier == tier,
         core.frames.frame(f).slot == SlotRef::full(
             SlotLoc { node: core.node(), space, slot_index: (f.0 - first_frame.0) as nat },
-            core.frames.frame_size as u64,
+            core.frames.tier_frame_size(tier) as u64,
         ),
 {
     reveal(slab_bound_to_core);
     let j = (f.0 - first_frame.0) as nat;
     assert(FrameId((first_frame.0 + j) as u32) == f);
+}
+
+/// Show that a freshly allocated slab from `AllocSource` is disjoint from every
+/// existing frame in `core` and satisfies `CacheCore::register_tier_with_frame_size` preconditions.
+pub proof fn lemma_allocated_slab_disjoint_with_size(
+    before_alloc: AllocSource,
+    after_alloc: AllocSource,
+    core: &CacheCore,
+    space: MemorySpace,
+    num_frames: usize,
+    frame_size: usize,
+    tokens: Map<usize, SlotToken>,
+) -> (slots: Seq<SlotRef>)
+    requires
+        core.well_formed(),
+        0 < frame_size,
+        before_alloc.well_formed(),
+        before_alloc.id() == core.instance_id(),
+        before_alloc.node() == core.node(),
+        alloc_fresh_for_core(before_alloc, core),
+        space.alloc_id() == before_alloc.next_alloc_id(),
+        after_alloc.allocated_slab(before_alloc, space, num_frames, tokens),
+    ensures
+        slots.len() == num_frames,
+        forall|i: int|
+            0 <= i < num_frames ==> (#[trigger] slots[i]) == SlotRef::full(
+                SlotLoc { node: core.node(), space, slot_index: i as nat },
+                frame_size as u64,
+            ),
+        forall|i: usize|
+            i < num_frames ==> tokens.contains_key(i) && (#[trigger] slots[i as int]).is_full()
+                && slots[i as int].slot_len == frame_size && slots[i as int].loc.node == core.node()
+                && slot_owned(tokens[i], core.instance_id(), slots[i as int].loc, untouched()),
+        forall|i: int, j: int|
+            0 <= i < j < num_frames ==> (#[trigger] slots[i]).loc != (#[trigger] slots[j]).loc,
+        forall|i: nat, j: int|
+            i < core.frames.metas.len() && 0 <= j < num_frames ==> (
+            #[trigger] core.frames.ghosts@[i].slot).loc != (#[trigger] slots[j]).loc,
+{
+    let slots = lemma_slab_slots_valid(
+        core.instance_id(),
+        core.node(),
+        space,
+        num_frames,
+        frame_size,
+        tokens,
+    );
+    assert(before_alloc.names().contains(space.alloc_id())) by {
+        assert((before_alloc.names().name)(0) == before_alloc.next_alloc_id());
+    }
+    assert forall|i: nat, j: int| i < core.frames.metas.len() && 0 <= j < num_frames implies (
+    #[trigger] core.frames.ghosts@[i].slot).loc != (#[trigger] slots[j]).loc by {
+        let existing = core.frames.ghosts@[i].slot.loc;
+        assert(!before_alloc.names().contains(existing.space.alloc_id()));
+        assert(slots[j].loc.space == space);
+        assert(existing.space.alloc_id() != space.alloc_id());
+    }
+    slots
 }
 
 /// Show that a freshly allocated slab from `AllocSource` is disjoint from every
@@ -204,29 +262,19 @@ pub proof fn lemma_allocated_slab_disjoint(
             i < core.frames.metas.len() && 0 <= j < num_frames ==> (
             #[trigger] core.frames.ghosts@[i].slot).loc != (#[trigger] slots[j]).loc,
 {
-    let slots = lemma_slab_slots_valid(
-        core.instance_id(),
-        core.node(),
+    lemma_allocated_slab_disjoint_with_size(
+        before_alloc,
+        after_alloc,
+        core,
         space,
         num_frames,
         core.frames.frame_size,
         tokens,
-    );
-    assert(before_alloc.names().contains(space.alloc_id())) by {
-        assert((before_alloc.names().name)(0) == before_alloc.next_alloc_id());
-    }
-    assert forall|i: nat, j: int| i < core.frames.metas.len() && 0 <= j < num_frames implies (
-    #[trigger] core.frames.ghosts@[i].slot).loc != (#[trigger] slots[j]).loc by {
-        let existing = core.frames.ghosts@[i].slot.loc;
-        assert(!before_alloc.names().contains(existing.space.alloc_id()));
-        assert(slots[j].loc.space == space);
-        assert(existing.space.alloc_id() != space.alloc_id());
-    }
-    slots
+    )
 }
 
 /// Preserve `alloc_fresh_for_core` and establish `slab_bound_to_core` after
-/// `CacheCore::register_tier`.
+/// `CacheCore::register_tier` / `CacheCore::register_tier_with_frame_size`.
 pub proof fn lemma_after_register_tier(
     before_alloc: AllocSource,
     after_alloc: AllocSource,
@@ -257,7 +305,7 @@ pub proof fn lemma_after_register_tier(
         forall|j: int|
             0 <= j < num_frames ==> (#[trigger] slots[j]) == SlotRef::full(
                 SlotLoc { node: after_core.node(), space, slot_index: j as nat },
-                after_core.frames.frame_size as u64,
+                after_core.frames.tier_frame_size(tier) as u64,
             ),
         forall|j: nat|
             j < before_core.frames.metas.len() ==> #[trigger] after_core.frames.ghosts@[j]
@@ -315,6 +363,7 @@ pub proof fn lemma_slab_bound_preserved(
         after.node_id == before.node_id,
         after.tiers.len() == before.tiers.len(),
         after.frames.frame_size == before.frames.frame_size,
+        after.frames.tier_frame_size(tier) == before.frames.tier_frame_size(tier),
         after.frames.metas.len() == before.frames.metas.len(),
         forall|f: FrameId|
             f.0 < before.frames.metas.len() ==> (#[trigger] after.frames.frame(f)).tier
@@ -329,7 +378,7 @@ pub proof fn lemma_slab_bound_preserved(
         &&& (#[trigger] after.frames.frame(FrameId((first_frame.0 + j) as u32))).tier == tier
         &&& after.frames.frame(FrameId((first_frame.0 + j) as u32)).slot == SlotRef::full(
             SlotLoc { node: after.node(), space, slot_index: j },
-            after.frames.frame_size as u64,
+            after.frames.tier_frame_size(tier) as u64,
         )
     } by {
         let f = FrameId((first_frame.0 + j) as u32);
@@ -379,6 +428,7 @@ pub proof fn lemma_slab_bound_same_layout(
     ensures
         slab_bound_to_core(after, tier, first_frame, num_frames, space),
         after.frames.frame_size == before.frames.frame_size,
+        after.frames.tier_frame_sizes == before.frames.tier_frame_sizes,
         after.frames.metas.len() == before.frames.metas.len(),
 {
     lemma_slab_bound_preserved(before, after, tier, first_frame, num_frames, space);
@@ -401,6 +451,7 @@ pub proof fn lemma_slab_bound_same_directory(
     ensures
         slab_bound_to_core(after, tier, first_frame, num_frames, space),
         after.frames.frame_size == before.frames.frame_size,
+        after.frames.tier_frame_sizes == before.frames.tier_frame_sizes,
         after.frames.metas.len() == before.frames.metas.len(),
 {
     lemma_slab_bound_preserved(before, after, tier, first_frame, num_frames, space);
@@ -542,6 +593,8 @@ pub proof fn lemma_core_wf_facts(core: &CacheCore)
         core.ledger@.valid(core.instance_id(), core.node()),
         core.ledger@.knows.instance_id() == core.instance_id(),
         core.timelines.bounds(),
+        core.frames.shape(),
+        core.tiers.len() == core.frames.num_tiers,
         core.frames.frame_size > 0,
         core.frames.frame_size == core.spec@.frame_size,
         core.frames.versions@ == core.spec@.versions,
@@ -578,9 +631,12 @@ pub proof fn lemma_published_frame_slot_valid(core: &CacheCore, f: FrameId)
         f.0 < core.frames.metas.len(),
         core.frames.meta(f).state == STATE_PUBLISHED,
     ensures
+        core.frames.frame(f).tier.valid(core.tiers.len()),
         core.frames.frame(f).slot.is_full(),
         core.frames.frame(f).slot.well_formed(),
-        core.frames.frame(f).slot.slot_len == core.frames.frame_size,
+        core.frames.frame(f).slot.slot_len == core.frames.tier_frame_size(
+            core.frames.frame(f).tier,
+        ),
         core.frames.frame(f).bound_version is Some,
         core.frames.frame(f).bound_version.unwrap().well_formed(),
         core.frames.frame(f).bound_version.unwrap() != VersionId::NONE,
@@ -643,9 +699,12 @@ pub proof fn lemma_initializing_frame_slot_valid(core: &CacheCore, f: FrameId)
         core.well_formed(),
         f.0 < core.frames.metas.len(),
     ensures
+        core.frames.frame(f).tier.valid(core.tiers.len()),
         core.frames.frame(f).slot.is_full(),
         core.frames.frame(f).slot.well_formed(),
-        core.frames.frame(f).slot.slot_len == core.frames.frame_size,
+        core.frames.frame(f).slot.slot_len == core.frames.tier_frame_size(
+            core.frames.frame(f).tier,
+        ),
         core.frames.frame(f).slot.loc.node == core.node(),
 {
     assert(core.frames.valid_frame(f, core.kernel_view()));

@@ -40,7 +40,7 @@ impl NameSupply {
         }
     }
 
-    proof fn partition(self)
+    pub proof fn partition(self)
         requires
             self.distinct(),
         ensures
@@ -51,7 +51,10 @@ impl NameSupply {
                 self.half(true).contains(id) ==> self.contains(id) && !self.half(false).contains(
                     id,
                 ),
-            forall|id: nat| #[trigger] self.half(false).contains(id) ==> self.contains(id),
+            forall|id: nat| #[trigger]
+                self.half(false).contains(id) ==> self.contains(id) && !self.half(true).contains(
+                    id,
+                ),
             forall|id: nat| #[trigger]
                 self.tail().contains(id) ==> self.contains(id) && id != (self.name)(0),
     {
@@ -315,6 +318,14 @@ impl AllocSource {
         slots
     }
 
+    pub proof fn lemma_names_distinct(tracked &self)
+        requires
+            self.well_formed(),
+        ensures
+            self.names().distinct(),
+    {
+    }
+
     pub proof fn split(tracked &mut self) -> (tracked other: Self)
         requires
             old(self).well_formed(),
@@ -328,7 +339,11 @@ impl AllocSource {
             final(self).names() == old(self).names().half(false),
             other.names() == old(self).names().half(true),
             forall|id: nat| #[trigger]
-                other.names().contains(id) ==> !final(self).names().contains(id),
+                other.names().contains(id) ==> old(self).names().contains(id)
+                    && !final(self).names().contains(id),
+            forall|id: nat| #[trigger]
+                final(self).names().contains(id) ==> old(self).names().contains(id)
+                    && !other.names().contains(id),
     {
         let names = self.names;
         names.partition();
@@ -540,6 +555,14 @@ impl EventSourceAllocator {
         self.names.distinct() && Self::events(self.node, self.names).subset_of(self.unused.set())
     }
 
+    pub proof fn lemma_names_distinct(tracked &self)
+        requires
+            self.well_formed(),
+        ensures
+            self.names().distinct(),
+    {
+    }
+
     pub proof fn mint(tracked &mut self, kind: EventSourceKind) -> (tracked token: EventSourceToken)
         requires
             old(self).well_formed(),
@@ -547,6 +570,7 @@ impl EventSourceAllocator {
             token.well_formed(),
             token.node() == old(self).node(),
             token.source() == kind.source((old(self).names().name)(0)),
+            old(self).names().contains(token.source().id()),
             !final(self).names().contains(token.source().id()),
             token.next_seq() == 0,
             token.id() == old(self).id(),
@@ -554,6 +578,8 @@ impl EventSourceAllocator {
             final(self).id() == old(self).id(),
             final(self).node() == old(self).node(),
             final(self).names() == old(self).names().tail(),
+            forall|id: nat| #[trigger]
+                final(self).names().contains(id) ==> old(self).names().contains(id),
     {
         let names = self.names;
         names.partition();
@@ -583,7 +609,11 @@ impl EventSourceAllocator {
             final(self).names() == old(self).names().half(false),
             other.names() == old(self).names().half(true),
             forall|id: nat| #[trigger]
-                other.names().contains(id) ==> !final(self).names().contains(id),
+                other.names().contains(id) ==> old(self).names().contains(id)
+                    && !final(self).names().contains(id),
+            forall|id: nat| #[trigger]
+                final(self).names().contains(id) ==> old(self).names().contains(id)
+                    && !other.names().contains(id),
     {
         let names = self.names;
         names.partition();
@@ -628,6 +658,14 @@ impl ShareSource {
         TransferShare { owner: self.node(), seq: (self.names().name)(0) }
     }
 
+    pub proof fn lemma_names_distinct(tracked &self)
+        requires
+            self.well_formed(),
+        ensures
+            self.names().distinct(),
+    {
+    }
+
     pub proof fn allocate(tracked &mut self) -> (tracked token: UnusedShare)
         requires
             old(self).well_formed(),
@@ -664,7 +702,11 @@ impl ShareSource {
             final(self).names() == old(self).names().half(false),
             other.names() == old(self).names().half(true),
             forall|id: nat| #[trigger]
-                other.names().contains(id) ==> !final(self).names().contains(id),
+                other.names().contains(id) ==> old(self).names().contains(id)
+                    && !final(self).names().contains(id),
+            forall|id: nat| #[trigger]
+                final(self).names().contains(id) ==> old(self).names().contains(id)
+                    && !other.names().contains(id),
     {
         let names = self.names;
         names.partition();
@@ -705,6 +747,13 @@ impl VersionInstance {
         self.inner.id()
     }
 
+    pub proof fn duplicate(tracked &self) -> (tracked out: Self)
+        ensures
+            out == *self,
+    {
+        Self { inner: self.inner }
+    }
+
     pub proof fn bind(
         tracked &self,
         key: VersionKey,
@@ -722,6 +771,15 @@ impl VersionInstance {
         use foundation::write_once::WriteOnceTransitions;
         self.inner.bind(key, bytes, unused)
     }
+}
+
+pub fn clone_version_instance(Tracked(i): Tracked<&VersionInstance>) -> (out: Tracked<
+    VersionInstance,
+>)
+    ensures
+        out@ == *i,
+{
+    Tracked(i.duplicate())
 }
 
 pub proof fn version_binding_agree(tracked a: &VersionBinding, tracked b: &VersionBinding)
@@ -745,6 +803,7 @@ pub proof fn version_binding_duplicate(tracked a: &VersionBinding) -> (tracked b
 pub tracked struct VersionSource {
     ghost node: NodeId,
     ghost min_seq: nat,
+    ghost max_seq: Option<nat>,
     tracked unused: VersionUnusedSet,
 }
 
@@ -757,20 +816,33 @@ impl VersionSource {
         self.min_seq
     }
 
+    pub closed spec fn max_seq(self) -> Option<nat> {
+        self.max_seq
+    }
+
     pub closed spec fn id(self) -> InstanceId {
         self.unused.instance_id()
     }
 
-    pub closed spec fn well_formed(self) -> bool {
-        ISet::new(|k: VersionKey| k.0 == self.node && k.1 as nat >= self.min_seq).subset_of(
-            self.unused.set(),
+    spec fn range_keys(node: NodeId, min_seq: nat, max_seq: Option<nat>) -> ISet<VersionKey> {
+        ISet::new(
+            |k: VersionKey|
+                k.0 == node && k.1 as nat >= min_seq && (match max_seq {
+                    Some(lim) => (k.1 as nat) < lim,
+                    None => true,
+                }),
         )
+    }
+
+    pub closed spec fn well_formed(self) -> bool {
+        Self::range_keys(self.node, self.min_seq, self.max_seq).subset_of(self.unused.set())
     }
 
     pub proof fn take_seq(tracked &mut self, seq: u64) -> (tracked tok: VersionUnused)
         requires
             old(self).well_formed(),
             seq as nat >= old(self).min_seq(),
+            old(self).max_seq() matches Some(lim) ==> (seq as nat) < lim,
         ensures
             tok.instance_id() == old(self).id(),
             tok.element() == (old(self).node(), seq),
@@ -778,24 +850,55 @@ impl VersionSource {
             final(self).id() == old(self).id(),
             final(self).node() == old(self).node(),
             final(self).min_seq() == (seq as nat) + 1,
+            final(self).max_seq() == old(self).max_seq(),
     {
         let key: VersionKey = (self.node, seq);
-        assert(ISet::new(|k: VersionKey| k.0 == self.node && k.1 as nat >= self.min_seq).contains(
-            key,
-        ));
+        assert(Self::range_keys(self.node, self.min_seq, self.max_seq).contains(key));
         let tracked tok = self.unused.remove(key);
         let old_min = self.min_seq;
         self.min_seq = (seq as nat) + 1;
-        assert forall|k: VersionKey|
-            ISet::new(|k: VersionKey| k.0 == self.node && k.1 as nat >= self.min_seq).contains(
+        assert forall|k: VersionKey| #[trigger]
+            Self::range_keys(self.node, self.min_seq, self.max_seq).contains(
                 k,
             ) implies self.unused.set().contains(k) by {
-            assert(ISet::new(|k: VersionKey| k.0 == self.node && k.1 as nat >= old_min).contains(
-                k,
-            ));
+            assert(Self::range_keys(self.node, old_min, self.max_seq).contains(k));
             assert(k != key);
         }
         tok
+    }
+
+    pub proof fn split_range(tracked &mut self, quota: u64) -> (tracked sub: Self)
+        requires
+            old(self).well_formed(),
+            quota > 0,
+            old(self).max_seq() matches Some(lim) ==> old(self).min_seq() + quota <= lim,
+        ensures
+            sub.well_formed(),
+            sub.id() == old(self).id(),
+            sub.node() == old(self).node(),
+            sub.min_seq() == old(self).min_seq(),
+            sub.max_seq() == Some(old(self).min_seq() + quota as nat),
+            final(self).well_formed(),
+            final(self).id() == old(self).id(),
+            final(self).node() == old(self).node(),
+            final(self).min_seq() == old(self).min_seq() + quota as nat,
+            final(self).max_seq() == old(self).max_seq(),
+    {
+        let old_min = self.min_seq;
+        let new_min = old_min + quota as nat;
+        let sub_max = Some(new_min);
+        let keys = Self::range_keys(self.node, old_min, sub_max);
+        assert(keys.subset_of(Self::range_keys(self.node, old_min, self.max_seq)));
+        let tracked sub_unused = take_names(&mut self.unused, keys);
+        self.min_seq = new_min;
+        assert forall|k: VersionKey| #[trigger]
+            Self::range_keys(self.node, self.min_seq, self.max_seq).contains(
+                k,
+            ) implies self.unused.set().contains(k) by {
+            assert(Self::range_keys(self.node, old_min, self.max_seq).contains(k));
+            assert(!keys.contains(k));
+        }
+        Self { node: self.node, min_seq: old_min, max_seq: sub_max, unused: sub_unused }
     }
 }
 
@@ -889,6 +992,7 @@ impl NodeContext {
             result.5@.node() == self.node,
             result.5@.id() == self.version_instance@.id(),
             result.5@.min_seq() == 0,
+            result.5@.max_seq() is None,
     {
         let ghost names = NameSupply { name: |i: nat| i };
         let tracked alloc = AllocSource {
@@ -909,6 +1013,7 @@ impl NodeContext {
         let tracked versions = VersionSource {
             node: self.node,
             min_seq: 0,
+            max_seq: None,
             unused: self.unused_versions.get(),
         };
         (
@@ -920,6 +1025,439 @@ impl NodeContext {
             Tracked(versions),
         )
     }
+}
+
+/// Exclusive upper bound (`MAX_VERSION_SEQ + 1`) for shard version sequence ranges.
+pub const VERSION_SEQ_LIMIT: u64 = 0x0001_0000_0000_0000;
+
+/// Disjoint per-shard capability bundle carved from a node's cluster partition.
+///
+/// Guarantees pairwise-disjoint allocation/event-source/share `NameSupply`s and
+/// strictly positive, non-overlapping version ranges `[version_start, version_limit)`
+/// starting at `>= 1` so `VersionId::NONE` (`seq == 0`) is never minted.
+pub struct ShardSources {
+    pub node: NodeId,
+    pub instance: Tracked<TransferInstance>,
+    pub alloc: Tracked<AllocSource>,
+    pub events: Tracked<EventSourceAllocator>,
+    pub shares: Tracked<ShareSource>,
+    pub version_instance: Tracked<VersionInstance>,
+    pub versions: Tracked<VersionSource>,
+    pub version_start: u64,
+    pub version_limit: u64,
+}
+
+impl ShardSources {
+    pub open spec fn well_formed(&self) -> bool {
+        &&& self.instance@.id() == cluster_instance_id()
+        &&& self.alloc@.well_formed()
+        &&& self.events@.well_formed()
+        &&& self.shares@.well_formed()
+        &&& self.alloc@.id() == self.instance@.id()
+        &&& self.events@.id() == self.instance@.id()
+        &&& self.shares@.id() == self.instance@.id()
+        &&& self.alloc@.node() == self.node
+        &&& self.events@.node() == self.node
+        &&& self.shares@.node() == self.node
+        &&& self.alloc@.names().distinct()
+        &&& self.events@.names().distinct()
+        &&& self.shares@.names().distinct()
+        &&& self.version_instance@.id() == cluster_version_instance_id()
+        &&& self.versions@.well_formed()
+        &&& self.versions@.id() == self.version_instance@.id()
+        &&& self.versions@.node() == self.node
+        &&& 1 <= self.version_start < self.version_limit <= VERSION_SEQ_LIMIT
+        &&& self.versions@.min_seq() == self.version_start as nat
+        &&& self.versions@.max_seq() == Some(self.version_limit as nat)
+    }
+
+    pub open spec fn disjoint_from(&self, other: &Self) -> bool {
+        &&& self.node == other.node
+        &&& self.instance@.id() == other.instance@.id()
+        &&& self.version_instance@.id() == other.version_instance@.id()
+        &&& (forall|id: nat| #[trigger]
+            self.alloc@.names().contains(id) ==> !other.alloc@.names().contains(id))
+        &&& (forall|id: nat| #[trigger]
+            self.events@.names().contains(id) ==> !other.events@.names().contains(id))
+        &&& (forall|id: nat| #[trigger]
+            self.shares@.names().contains(id) ==> !other.shares@.names().contains(id))
+        &&& (self.version_limit <= other.version_start || other.version_limit <= self.version_start)
+    }
+
+    pub open spec fn disjoint_from_allocator(&self, alloc: &ShardAllocator) -> bool {
+        &&& self.node == alloc.node()
+        &&& self.instance@.id() == alloc.instance_id()
+        &&& self.version_instance@.id() == alloc.version_instance_id()
+        &&& (forall|id: nat| #[trigger]
+            self.alloc@.names().contains(id) ==> !alloc.alloc_names().contains(id))
+        &&& (forall|id: nat| #[trigger]
+            self.events@.names().contains(id) ==> !alloc.event_names().contains(id))
+        &&& (forall|id: nat| #[trigger]
+            self.shares@.names().contains(id) ==> !alloc.share_names().contains(id))
+        &&& self.version_limit <= alloc.next_version_seq()
+    }
+
+    pub open spec fn contained_in_allocator(&self, alloc: &ShardAllocator) -> bool {
+        &&& self.node == alloc.node()
+        &&& self.instance@.id() == alloc.instance_id()
+        &&& self.version_instance@.id() == alloc.version_instance_id()
+        &&& (forall|id: nat| #[trigger]
+            self.alloc@.names().contains(id) ==> alloc.alloc_names().contains(id))
+        &&& (forall|id: nat| #[trigger]
+            self.events@.names().contains(id) ==> alloc.event_names().contains(id))
+        &&& (forall|id: nat| #[trigger]
+            self.shares@.names().contains(id) ==> alloc.share_names().contains(id))
+        &&& alloc.next_version_seq() <= self.version_start
+        &&& self.version_limit <= alloc.version_limit()
+    }
+}
+
+/// Progressive multi-shard partitioner over a node's `TransferInstance`,
+/// `AllocSource`, `EventSourceAllocator`, `ShareSource`, and bounded `VersionSource`.
+pub struct ShardAllocator {
+    node: NodeId,
+    instance: Tracked<TransferInstance>,
+    alloc: Tracked<AllocSource>,
+    events: Tracked<EventSourceAllocator>,
+    shares: Tracked<ShareSource>,
+    version_instance: Tracked<VersionInstance>,
+    versions: Tracked<VersionSource>,
+    next_version_seq: u64,
+    version_limit: u64,
+}
+
+impl ShardAllocator {
+    pub closed spec fn node(&self) -> NodeId {
+        self.node
+    }
+
+    pub closed spec fn instance_id(&self) -> InstanceId {
+        self.instance@.id()
+    }
+
+    pub closed spec fn version_instance_id(&self) -> InstanceId {
+        self.version_instance@.id()
+    }
+
+    pub closed spec fn next_version_seq(&self) -> u64 {
+        self.next_version_seq
+    }
+
+    pub closed spec fn version_limit(&self) -> u64 {
+        self.version_limit
+    }
+
+    pub open spec fn remaining_versions(&self) -> nat {
+        (self.version_limit() - self.next_version_seq()) as nat
+    }
+
+    pub closed spec fn alloc_names(&self) -> NameSupply {
+        self.alloc@.names()
+    }
+
+    pub closed spec fn event_names(&self) -> NameSupply {
+        self.events@.names()
+    }
+
+    pub closed spec fn share_names(&self) -> NameSupply {
+        self.shares@.names()
+    }
+
+    pub closed spec fn well_formed(&self) -> bool {
+        &&& self.instance@.id() == cluster_instance_id()
+        &&& self.alloc@.well_formed()
+        &&& self.events@.well_formed()
+        &&& self.shares@.well_formed()
+        &&& self.alloc@.id() == self.instance@.id()
+        &&& self.events@.id() == self.instance@.id()
+        &&& self.shares@.id() == self.instance@.id()
+        &&& self.alloc@.node() == self.node
+        &&& self.events@.node() == self.node
+        &&& self.shares@.node() == self.node
+        &&& self.version_instance@.id() == cluster_version_instance_id()
+        &&& self.versions@.well_formed()
+        &&& self.versions@.id() == self.version_instance@.id()
+        &&& self.versions@.node() == self.node
+        &&& 1 <= self.next_version_seq <= self.version_limit <= VERSION_SEQ_LIMIT
+        &&& self.versions@.min_seq() == self.next_version_seq as nat
+        &&& self.versions@.max_seq() == Some(self.version_limit as nat)
+    }
+
+    pub open spec fn contained_in_allocator(&self, older: &Self) -> bool {
+        &&& self.node() == older.node()
+        &&& self.instance_id() == older.instance_id()
+        &&& self.version_instance_id() == older.version_instance_id()
+        &&& (forall|id: nat| #[trigger]
+            self.alloc_names().contains(id) ==> older.alloc_names().contains(id))
+        &&& (forall|id: nat| #[trigger]
+            self.event_names().contains(id) ==> older.event_names().contains(id))
+        &&& (forall|id: nat| #[trigger]
+            self.share_names().contains(id) ==> older.share_names().contains(id))
+        &&& older.next_version_seq() <= self.next_version_seq()
+        &&& self.version_limit() <= older.version_limit()
+    }
+
+    pub fn node_id(&self) -> (n: NodeId)
+        ensures
+            n == self.node(),
+    {
+        self.node
+    }
+
+    pub fn next_version_seq_val(&self) -> (n: u64)
+        ensures
+            n == self.next_version_seq(),
+    {
+        self.next_version_seq
+    }
+
+    pub fn version_limit_val(&self) -> (n: u64)
+        ensures
+            n == self.version_limit(),
+    {
+        self.version_limit
+    }
+
+    pub fn remaining_version_budget(&self) -> (n: u64)
+        requires
+            self.well_formed(),
+        ensures
+            n as nat == self.remaining_versions(),
+    {
+        self.version_limit - self.next_version_seq
+    }
+
+    /// Construct a node-wide `ShardAllocator` reserving `[1, VERSION_SEQ_LIMIT)` so
+    /// `VersionId::NONE` (`seq == 0`) can never be minted by any shard.
+    pub fn from_node_context(ctx: NodeContext) -> (a: Self)
+        requires
+            ctx.initial_partition(),
+        ensures
+            a.well_formed(),
+            a.node() == ctx.node,
+            a.instance_id() == ctx.instance@.id(),
+            a.version_instance_id() == ctx.version_instance@.id(),
+            a.next_version_seq() == 1,
+            a.version_limit() == VERSION_SEQ_LIMIT,
+    {
+        let node = ctx.node;
+        let (instance, alloc, events, shares, version_instance, Tracked(mut full_versions)) =
+            ctx.into_sources_with_versions();
+        let tracked versions;
+        proof {
+            let tracked _reserved_zero = full_versions.take_seq(0);
+            versions = full_versions.split_range((VERSION_SEQ_LIMIT - 1) as u64);
+        }
+        Self {
+            node,
+            instance,
+            alloc,
+            events,
+            shares,
+            version_instance,
+            versions: Tracked(versions),
+            next_version_seq: 1,
+            version_limit: VERSION_SEQ_LIMIT,
+        }
+    }
+
+    /// Sub-partition an existing `ShardSources` into smaller sub-shards.
+    pub fn from_shard(shard: ShardSources) -> (a: Self)
+        requires
+            shard.well_formed(),
+        ensures
+            a.well_formed(),
+            a.node() == shard.node,
+            a.instance_id() == shard.instance@.id(),
+            a.version_instance_id() == shard.version_instance@.id(),
+            a.next_version_seq() == shard.version_start,
+            a.version_limit() == shard.version_limit,
+            a.alloc_names() == shard.alloc@.names(),
+            a.event_names() == shard.events@.names(),
+            a.share_names() == shard.shares@.names(),
+    {
+        Self {
+            node: shard.node,
+            instance: shard.instance,
+            alloc: shard.alloc,
+            events: shard.events,
+            shares: shard.shares,
+            version_instance: shard.version_instance,
+            versions: shard.versions,
+            next_version_seq: shard.version_start,
+            version_limit: shard.version_limit,
+        }
+    }
+
+    /// Carve one disjoint `ShardSources` with `version_quota` sequences `[start, start + quota)`.
+    pub fn split_shard(&mut self, version_quota: u64) -> (r: Option<ShardSources>)
+        requires
+            old(self).well_formed(),
+        ensures
+            final(self).well_formed(),
+            final(self).node() == old(self).node(),
+            final(self).instance_id() == old(self).instance_id(),
+            final(self).version_instance_id() == old(self).version_instance_id(),
+            final(self).version_limit() == old(self).version_limit(),
+            match r {
+                None => {
+                    &&& version_quota == 0 || version_quota > old(self).remaining_versions()
+                    &&& *final(self) == *old(self)
+                },
+                Some(shard) => {
+                    &&& 0 < version_quota <= old(self).remaining_versions()
+                    &&& shard.well_formed()
+                    &&& shard.node == old(self).node()
+                    &&& shard.instance@.id() == old(self).instance_id()
+                    &&& shard.version_instance@.id() == old(self).version_instance_id()
+                    &&& shard.version_start == old(self).next_version_seq()
+                    &&& shard.version_limit == old(self).next_version_seq() + version_quota
+                    &&& final(self).next_version_seq() == old(self).next_version_seq()
+                        + version_quota
+                    &&& shard.disjoint_from_allocator(&*final(self))
+                    &&& shard.contained_in_allocator(&*old(self))
+                    &&& final(self).contained_in_allocator(&*old(self))
+                },
+            },
+    {
+        if version_quota == 0 || version_quota > self.version_limit - self.next_version_seq {
+            return None;
+        }
+        let version_start = self.next_version_seq;
+        let version_limit = self.next_version_seq + version_quota;
+        let tracked shard_alloc;
+        let tracked shard_events;
+        let tracked shard_shares;
+        let tracked shard_versions;
+        let tracked shard_instance;
+        let tracked shard_ver_instance;
+        proof {
+            shard_alloc = self.alloc.borrow_mut().split();
+            shard_events = self.events.borrow_mut().split();
+            shard_shares = self.shares.borrow_mut().split();
+            shard_versions = self.versions.borrow_mut().split_range(version_quota);
+            shard_instance = self.instance.borrow().duplicate();
+            shard_ver_instance = self.version_instance.borrow().duplicate();
+        }
+        self.next_version_seq = version_limit;
+        Some(
+            ShardSources {
+                node: self.node,
+                instance: Tracked(shard_instance),
+                alloc: Tracked(shard_alloc),
+                events: Tracked(shard_events),
+                shares: Tracked(shard_shares),
+                version_instance: Tracked(shard_ver_instance),
+                versions: Tracked(shard_versions),
+                version_start,
+                version_limit,
+            },
+        )
+    }
+
+    /// Consume the remaining allocator budget as a final `ShardSources` if non-empty.
+    pub fn into_shard(self) -> (r: Option<ShardSources>)
+        requires
+            self.well_formed(),
+        ensures
+            self.next_version_seq() < self.version_limit() <==> r is Some,
+            r matches Some(shard) ==> {
+                &&& shard.well_formed()
+                &&& shard.node == self.node()
+                &&& shard.instance@.id() == self.instance_id()
+                &&& shard.version_instance@.id() == self.version_instance_id()
+                &&& shard.version_start == self.next_version_seq()
+                &&& shard.version_limit == self.version_limit()
+                &&& shard.contained_in_allocator(&self)
+            },
+    {
+        if self.next_version_seq >= self.version_limit {
+            return None;
+        }
+        proof {
+            self.alloc.borrow().lemma_names_distinct();
+            self.events.borrow().lemma_names_distinct();
+            self.shares.borrow().lemma_names_distinct();
+        }
+        Some(
+            ShardSources {
+                node: self.node,
+                instance: self.instance,
+                alloc: self.alloc,
+                events: self.events,
+                shares: self.shares,
+                version_instance: self.version_instance,
+                versions: self.versions,
+                version_start: self.next_version_seq,
+                version_limit: self.version_limit,
+            },
+        )
+    }
+}
+
+pub proof fn lemma_split_disjoint(
+    prev_shard: &ShardSources,
+    old_alloc: &ShardAllocator,
+    next_shard: &ShardSources,
+)
+    requires
+        prev_shard.disjoint_from_allocator(old_alloc),
+        next_shard.contained_in_allocator(old_alloc),
+    ensures
+        prev_shard.disjoint_from(next_shard),
+{
+}
+
+pub proof fn lemma_remainder_disjoint(
+    prev_shard: &ShardSources,
+    old_alloc: &ShardAllocator,
+    new_alloc: &ShardAllocator,
+)
+    requires
+        prev_shard.disjoint_from_allocator(old_alloc),
+        new_alloc.contained_in_allocator(old_alloc),
+    ensures
+        prev_shard.disjoint_from_allocator(new_alloc),
+{
+}
+
+#[cfg(verus_only)]
+fn verify_four_way_shard_split(ctx: NodeContext) -> (r: (
+    ShardSources,
+    ShardSources,
+    ShardSources,
+    ShardSources,
+))
+    requires
+        ctx.initial_partition(),
+    ensures
+        r.0.well_formed() && r.1.well_formed() && r.2.well_formed() && r.3.well_formed(),
+        r.0.disjoint_from(&r.1) && r.0.disjoint_from(&r.2) && r.0.disjoint_from(&r.3),
+        r.1.disjoint_from(&r.2) && r.1.disjoint_from(&r.3) && r.2.disjoint_from(&r.3),
+{
+    let mut alloc = ShardAllocator::from_node_context(ctx);
+    let ghost a0 = alloc;
+    let s0 = alloc.split_shard(100).unwrap();
+    let ghost a1 = alloc;
+    let s1 = alloc.split_shard(200).unwrap();
+    let ghost a2 = alloc;
+    let s2 = alloc.split_shard(300).unwrap();
+    let ghost a3 = alloc;
+    let s3 = alloc.into_shard().unwrap();
+    proof {
+        lemma_split_disjoint(&s0, &a1, &s1);
+        lemma_remainder_disjoint(&s0, &a1, &a2);
+        lemma_split_disjoint(&s0, &a2, &s2);
+        lemma_remainder_disjoint(&s0, &a2, &a3);
+        lemma_split_disjoint(&s0, &a3, &s3);
+
+        lemma_split_disjoint(&s1, &a2, &s2);
+        lemma_remainder_disjoint(&s1, &a2, &a3);
+        lemma_split_disjoint(&s1, &a3, &s3);
+
+        lemma_split_disjoint(&s2, &a3, &s3);
+    }
+    (s0, s1, s2, s3)
 }
 
 } // verus!

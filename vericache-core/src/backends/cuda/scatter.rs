@@ -29,8 +29,12 @@ impl<'a> CudaBackend<'a> {
             old(core).well_formed(),
             old(self).well_formed(old(core)),
             instance.id() == old(core).instance_id(),
-            scatter_offsets_valid(srcs@, offsets, old(core).frames.frame_size),
-            bytes.len() == old(core).frames.frame_size,
+            scatter_offsets_valid(
+                srcs@,
+                offsets,
+                old(core).frames.tier_frame_size(old(self).gpu_tier),
+            ),
+            bytes.len() == old(core).frames.tier_frame_size(old(self).gpu_tier),
             src_certs.len() == srcs@.len(),
             forall|i: int|
                 0 <= i < srcs@.len() ==> {
@@ -201,8 +205,12 @@ impl<'a> CudaBackend<'a> {
             before_core.well_formed(),
             cuda_backend_pre_park_wf(old(self), old(core), &before_core),
             instance.id() == old(core).instance_id(),
-            scatter_offsets_valid(srcs@, offsets, old(core).frames.frame_size),
-            bytes.len() == old(core).frames.frame_size,
+            scatter_offsets_valid(
+                srcs@,
+                offsets,
+                old(core).frames.tier_frame_size(old(self).gpu_tier),
+            ),
+            bytes.len() == old(core).frames.tier_frame_size(old(self).gpu_tier),
             src_certs.len() == srcs@.len(),
             old(self).owns_gpu(handle.frame),
             old(self).gpu_buffer.slot_ref((handle.frame.0 - old(self).gpu_first_frame.0) as nat)
@@ -234,7 +242,7 @@ impl<'a> CudaBackend<'a> {
             handle.version.well_formed() && handle.version != VersionId::NONE,
             !before_core.frames.versions@.contains_key(handle.version),
             handle.slot@.is_full(),
-            handle.slot@.slot_len == old(core).frames.frame_size,
+            handle.slot@.slot_len == old(core).frames.tier_frame_size(old(self).gpu_tier),
             handle.slot@.loc.node == old(core).node(),
             slot_is_owned(dst_tok, old(core).instance_id(), handle.slot@.loc),
             write_admitted(slot_frontier(dst_tok), old(core).citations()),
@@ -376,8 +384,12 @@ impl<'a> CudaBackend<'a> {
             before_core.well_formed(),
             cuda_backend_pre_park_wf(old(self), old(core), &before_core),
             instance.id() == old(core).instance_id(),
-            scatter_offsets_valid(srcs@, offsets, old(core).frames.frame_size),
-            bytes.len() == old(core).frames.frame_size,
+            scatter_offsets_valid(
+                srcs@,
+                offsets,
+                old(core).frames.tier_frame_size(old(self).gpu_tier),
+            ),
+            bytes.len() == old(core).frames.tier_frame_size(old(self).gpu_tier),
             src_certs.len() == srcs@.len(),
             old(self).owns_gpu(dst_frame),
             old(self).gpu_buffer.slot_ref((dst_frame.0 - old(self).gpu_first_frame.0) as nat)
@@ -386,7 +398,7 @@ impl<'a> CudaBackend<'a> {
             old(core).frames.meta(dst_frame).state == STATE_INITIALIZING,
             old(core).frames.frame(dst_frame).slot == dst_slot,
             dst_slot.is_full(),
-            dst_slot.slot_len == old(core).frames.frame_size,
+            dst_slot.slot_len == old(core).frames.tier_frame_size(old(self).gpu_tier),
             dst_slot.loc.node == old(core).node(),
             old(core).node_id == before_core.node_id,
             old(core).instance_id() == before_core.instance_id(),
@@ -574,8 +586,8 @@ impl<'a> CudaBackend<'a> {
                 offset == offsets[i as int],
                 pieces.len() == i,
                 piece_seqs.len() == i,
-                scatter_offsets_valid(srcs@, offsets, core.frames.frame_size),
-                bytes.len() == core.frames.frame_size,
+                scatter_offsets_valid(srcs@, offsets, core.frames.tier_frame_size(self.gpu_tier)),
+                bytes.len() == core.frames.tier_frame_size(self.gpu_tier),
                 src_certs.len() == srcs@.len(),
                 tl == self.timeline.timeline_id == old(self).timeline.timeline_id,
                 self.device == old(self).device,
@@ -620,7 +632,7 @@ impl<'a> CudaBackend<'a> {
                 core.frames.meta(dst_frame).state == STATE_INITIALIZING,
                 core.frames.frame(dst_frame).slot == dst_slot,
                 dst_slot.is_full(),
-                dst_slot.slot_len == core.frames.frame_size,
+                dst_slot.slot_len == core.frames.tier_frame_size(self.gpu_tier),
                 dst_slot.loc.node == core.node(),
                 core.timelines.count == before_core.timelines.count,
                 core.timelines.next_seq[tl as int] >= before_core.timelines.next_seq[tl as int],
@@ -684,8 +696,16 @@ impl<'a> CudaBackend<'a> {
                 lemma_scatter_offsets_bounded(
                     srcs@,
                     offsets,
-                    core.frames.frame_size,
+                    core.frames.tier_frame_size(self.gpu_tier),
                     (i + 1) as int,
+                );
+                lemma_slab_frame_slot(
+                    core,
+                    self.gpu_tier,
+                    self.gpu_first_frame,
+                    self.gpu_num_frames,
+                    self.gpu_buffer.space(),
+                    dst_frame,
                 );
             }
             let slice_len = srcs[i].len();

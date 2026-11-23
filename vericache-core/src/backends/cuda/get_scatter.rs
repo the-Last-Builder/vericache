@@ -284,7 +284,7 @@ impl<'a> CudaBackend<'a> {
             old(shares).well_formed(),
             old(shares).id() == old(core).instance_id(),
             old(shares).node() == old(core).node(),
-            scatter_offsets_valid(dsts@, offsets, old(core).frames.frame_size),
+            scatter_offsets_valid(dsts@, offsets, old(core).frames.tier_frame_size(self.gpu_tier)),
             forall|i: int|
                 0 <= i < dsts@.len() ==> {
                     &&& (#[trigger] dsts@[i]).instance_id() == old(core).instance_id()
@@ -505,11 +505,11 @@ impl<'a> CudaBackend<'a> {
             invariant
                 i <= dsts.len(),
                 offset == offsets[i as int],
-                scatter_offsets_valid(dsts@, offsets, core.frames.frame_size),
+                scatter_offsets_valid(dsts@, offsets, core.frames.tier_frame_size(self.gpu_tier)),
                 src_slice.well_formed(),
                 src_slice.instance_id() == core.instance_id(),
                 src_slice.slot_ref() == core.frames.frame(frame).slot,
-                src_slice.slot_ref().sub_len == core.frames.frame_size,
+                src_slice.slot_ref().sub_len == core.frames.tier_frame_size(self.gpu_tier),
                 src_slice.slot_ref().loc.node == core.node(),
                 before_core == *old(core),
                 before_core.well_formed(),
@@ -539,7 +539,9 @@ impl<'a> CudaBackend<'a> {
                 before_core.tiers == old(core).tiers,
                 before_core.spec == old(core).spec,
                 core.frames == after_acq_core.frames,
-                core.frames.frame_size == before_core.frames.frame_size,
+                core.frames.tier_frame_size(self.gpu_tier) == before_core.frames.tier_frame_size(
+                    self.gpu_tier,
+                ),
                 core.frames.same_directory(&before_core.frames),
                 frame.0 < core.frames.metas.len(),
                 lease.frame == frame,
@@ -581,7 +583,7 @@ impl<'a> CudaBackend<'a> {
                 lemma_scatter_offsets_bounded(
                     dsts@,
                     offsets,
-                    core.frames.frame_size,
+                    core.frames.tier_frame_size(self.gpu_tier),
                     (i + 1) as int,
                 );
                 assert(dsts@[i as int].well_formed());

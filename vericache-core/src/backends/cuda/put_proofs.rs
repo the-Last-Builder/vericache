@@ -326,7 +326,10 @@ pub(super) proof fn lemma_cuda_slabs_same_directory<'a>(
             backend.gpu_num_frames,
             backend.gpu_buffer.space(),
         ),
-        backend.pinned_host matches Some(h) ==> h.well_formed(before) && h.tier != backend.gpu_tier,
+        backend.pinned_host matches Some(h) ==> h.well_formed(before) && h.tier != backend.gpu_tier
+            && before.frames.tier_frame_size(h.tier) == before.frames.tier_frame_size(
+            backend.gpu_tier,
+        ),
         after.node_id == before.node_id,
         after.instance_id() == before.instance_id(),
         after.tiers == before.tiers,
@@ -339,8 +342,12 @@ pub(super) proof fn lemma_cuda_slabs_same_directory<'a>(
             backend.gpu_num_frames,
             backend.gpu_buffer.space(),
         ),
-        backend.pinned_host matches Some(h) ==> h.well_formed(after) && h.tier != backend.gpu_tier,
+        backend.pinned_host matches Some(h) ==> h.well_formed(after) && h.tier != backend.gpu_tier
+            && after.frames.tier_frame_size(h.tier) == after.frames.tier_frame_size(
+            backend.gpu_tier,
+        ),
         after.frames.frame_size == before.frames.frame_size,
+        after.frames.tier_frame_sizes == before.frames.tier_frame_sizes,
         after.frames.metas.len() == before.frames.metas.len(),
 {
     lemma_slab_bound_same_directory(

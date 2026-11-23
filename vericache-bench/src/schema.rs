@@ -140,8 +140,8 @@ pub struct LatencyHist {
 
 impl LatencyHist {
     pub fn new() -> Self {
-        let hist = Histogram::<u64>::new_with_bounds(1, 120_000_000_000, 3)
-            .expect("create hdrhistogram");
+        let hist =
+            Histogram::<u64>::new_with_bounds(1, 120_000_000_000, 3).expect("create hdrhistogram");
         Self { hist }
     }
 

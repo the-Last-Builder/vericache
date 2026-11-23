@@ -43,7 +43,7 @@ pub struct NvmeError(pub i32);
 
 #[cfg_attr(not(verus_only), allow(dead_code))]
 pub struct NvmeFile {
-    fd: i32,
+    fd: ffi::NvmeFdGuard,
     num_slots: usize,
     slot_len: u64,
     len: u64,
@@ -101,6 +101,108 @@ impl NvmeFile {
         &&& self.len > 0 && self.len % DIRECT_IO_ALIGNMENT == 0
     }
 
+    fn finish_single(
+        Tracked(instance): Tracked<&TransferInstance>,
+        Tracked(source): Tracked<&mut AllocSource>,
+        fd: i32,
+        len: u64,
+    ) -> (result: (NvmeFile, Tracked<SlotToken>))
+        requires
+            len > 0 && len % DIRECT_IO_ALIGNMENT == 0,
+            old(source).well_formed(),
+            old(source).id() == instance.id(),
+        ensures
+            result.0.well_formed(),
+            result.0.instance_id() == instance.id(),
+            result.0.num_slots() == 1,
+            result.0.slot_len() == len,
+            result.0.node() == old(source).node(),
+            result.0.space() == old(source).nvme_space(),
+            result.0.slot_ref(0) == old(source).nvme_slot_ref(len),
+            final(source).allocated_slot(*old(source), result.0.slot_loc(0), result.1@),
+    {
+        let fd = ffi::NvmeFdGuard::new(fd);
+        let ghost node = source.node();
+        let ghost space = source.nvme_space();
+        let tracked tok = source.allocate_nvme_slot();
+        (
+            Self {
+                fd,
+                num_slots: 1,
+                slot_len: len,
+                len,
+                node: Ghost(node),
+                space: Ghost(space),
+                instance: Ghost(instance.id()),
+            },
+            Tracked(tok),
+        )
+    }
+
+    fn slab_total_len(num_slots: usize, slot_len: u64) -> (result: Result<u64, NvmeError>)
+        requires
+            num_slots >= 1,
+            slot_len > 0 && slot_len % DIRECT_IO_ALIGNMENT == 0,
+            (num_slots as nat) * (slot_len as nat) <= u64::MAX,
+        ensures
+            result matches Ok(total) && total == (num_slots as nat) * (slot_len as nat) && total > 0
+                && total % DIRECT_IO_ALIGNMENT == 0,
+    {
+        if num_slots == 0 || slot_len == 0 || slot_len % DIRECT_IO_ALIGNMENT != 0 {
+            return Err(NvmeError(22));
+        }
+        let Some(total) = (num_slots as u64).checked_mul(slot_len) else {
+            return Err(NvmeError(22));
+        };
+        proof {
+            lemma_mul_inequality(1, num_slots as int, slot_len as int);
+            lemma_mul_mod_noop_right(num_slots as int, slot_len as int, DIRECT_IO_ALIGNMENT as int);
+        }
+        Ok(total)
+    }
+
+    fn finish_slab(
+        Tracked(instance): Tracked<&TransferInstance>,
+        Tracked(source): Tracked<&mut AllocSource>,
+        fd: i32,
+        num_slots: usize,
+        slot_len: u64,
+        total: u64,
+    ) -> (result: (NvmeFile, Tracked<Map<usize, SlotToken>>))
+        requires
+            num_slots >= 1,
+            slot_len > 0 && slot_len % DIRECT_IO_ALIGNMENT == 0,
+            total == (num_slots as nat) * (slot_len as nat),
+            total > 0 && total % DIRECT_IO_ALIGNMENT == 0,
+            old(source).well_formed(),
+            old(source).id() == instance.id(),
+        ensures
+            result.0.well_formed(),
+            result.0.instance_id() == instance.id(),
+            result.0.num_slots() == num_slots,
+            result.0.slot_len() == slot_len,
+            result.0.node() == old(source).node(),
+            result.0.space() == old(source).nvme_space(),
+            final(source).allocated_slab(*old(source), result.0.space(), num_slots, result.1@),
+    {
+        let fd = ffi::NvmeFdGuard::new(fd);
+        let ghost node = source.node();
+        let ghost space = source.nvme_space();
+        let tracked tokens = source.allocate_nvme_slab_slots(num_slots);
+        (
+            Self {
+                fd,
+                num_slots,
+                slot_len,
+                len: total,
+                node: Ghost(node),
+                space: Ghost(space),
+                instance: Ghost(instance.id()),
+            },
+            Tracked(tokens),
+        )
+    }
+
     pub fn create_temp(
         _ctx: &HostContext,
         Tracked(instance): Tracked<&TransferInstance>,
@@ -131,23 +233,41 @@ impl NvmeFile {
             return Err(NvmeError(22));
         }
         let fd = ffi::create(dir, len)?;
-        let ghost node = source.node();
-        let ghost space = source.nvme_space();
-        let tracked tok = source.allocate_nvme_slot();
-        Ok(
-            (
-                Self {
-                    fd,
-                    num_slots: 1,
-                    slot_len: len,
-                    len,
-                    node: Ghost(node),
-                    space: Ghost(space),
-                    instance: Ghost(instance.id()),
+        Ok(Self::finish_single(Tracked(instance), Tracked(source), fd, len))
+    }
+
+    pub fn open_path(
+        _ctx: &HostContext,
+        Tracked(instance): Tracked<&TransferInstance>,
+        Tracked(source): Tracked<&mut AllocSource>,
+        path: &str,
+        len: u64,
+        create_if_missing: bool,
+    ) -> (result: Result<(NvmeFile, Tracked<SlotToken>), NvmeError>)
+        requires
+            len > 0 && len % DIRECT_IO_ALIGNMENT == 0,
+            old(source).well_formed(),
+            _ctx.ready(instance.id(), old(source).node()),
+            old(source).id() == instance.id(),
+        ensures
+            match result {
+                Err(_) => *final(source) == *old(source),
+                Ok((file, tok)) => {
+                    &&& file.well_formed() && file.instance_id() == instance.id()
+                    &&& file.num_slots() == 1 && file.slot_len() == len
+                    &&& file.node() == old(source).node() && file.space() == old(
+                        source,
+                    ).nvme_space()
+                    &&& file.slot_ref(0) == old(source).nvme_slot_ref(len)
+                    &&& final(source).allocated_slot(*old(source), file.slot_loc(0), tok@)
                 },
-                Tracked(tok),
-            ),
-        )
+            },
+    {
+        if len == 0 || len % DIRECT_IO_ALIGNMENT != 0 {
+            return Err(NvmeError(22));
+        }
+        let fd = ffi::open_path(path, len, create_if_missing)?;
+        Ok(Self::finish_single(Tracked(instance), Tracked(source), fd, len))
     }
 
     pub fn create_temp_slab(
@@ -178,34 +298,43 @@ impl NvmeFile {
                 },
             },
     {
-        if num_slots == 0 || slot_len == 0 || slot_len % DIRECT_IO_ALIGNMENT != 0 {
-            return Err(NvmeError(22));
-        }
-        let Some(total) = (num_slots as u64).checked_mul(slot_len) else {
-            return Err(NvmeError(22));
-        };
-        proof {
-            lemma_mul_inequality(1, num_slots as int, slot_len as int);
-            lemma_mul_mod_noop_right(num_slots as int, slot_len as int, DIRECT_IO_ALIGNMENT as int);
-        }
+        let total = Self::slab_total_len(num_slots, slot_len)?;
         let fd = ffi::create(dir, total)?;
-        let ghost node = source.node();
-        let ghost space = source.nvme_space();
-        let tracked tokens = source.allocate_nvme_slab_slots(num_slots);
-        Ok(
-            (
-                Self {
-                    fd,
-                    num_slots,
-                    slot_len,
-                    len: total,
-                    node: Ghost(node),
-                    space: Ghost(space),
-                    instance: Ghost(instance.id()),
+        Ok(Self::finish_slab(Tracked(instance), Tracked(source), fd, num_slots, slot_len, total))
+    }
+
+    pub fn open_path_slab(
+        _ctx: &HostContext,
+        Tracked(instance): Tracked<&TransferInstance>,
+        Tracked(source): Tracked<&mut AllocSource>,
+        path: &str,
+        num_slots: usize,
+        slot_len: u64,
+        create_if_missing: bool,
+    ) -> (result: Result<(NvmeFile, Tracked<Map<usize, SlotToken>>), NvmeError>)
+        requires
+            num_slots >= 1,
+            slot_len > 0 && slot_len % DIRECT_IO_ALIGNMENT == 0,
+            (num_slots as nat) * (slot_len as nat) <= u64::MAX,
+            old(source).well_formed(),
+            _ctx.ready(instance.id(), old(source).node()),
+            old(source).id() == instance.id(),
+        ensures
+            match result {
+                Err(_) => *final(source) == *old(source),
+                Ok((file, tokens)) => {
+                    &&& file.well_formed() && file.instance_id() == instance.id()
+                    &&& file.num_slots() == num_slots && file.slot_len() == slot_len
+                    &&& file.node() == old(source).node() && file.space() == old(
+                        source,
+                    ).nvme_space()
+                    &&& final(source).allocated_slab(*old(source), file.space(), num_slots, tokens@)
                 },
-                Tracked(tokens),
-            ),
-        )
+            },
+    {
+        let total = Self::slab_total_len(num_slots, slot_len)?;
+        let fd = ffi::open_path(path, total, create_if_missing)?;
+        Ok(Self::finish_slab(Tracked(instance), Tracked(source), fd, num_slots, slot_len, total))
     }
 
     pub fn as_slice(&self) -> (r: NvmeSlice<'_>)

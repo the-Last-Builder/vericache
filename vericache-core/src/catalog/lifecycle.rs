@@ -142,6 +142,8 @@ impl Catalog {
             final(frames).num_tiers == old(frames).num_tiers,
             final(frames).versions == old(frames).versions,
             final(frames).frame_size == old(frames).frame_size,
+            final(frames).tier_frame_sizes == old(frames).tier_frame_sizes,
+            final(frames).overflow_seqs == old(frames).overflow_seqs,
             forall|key: ObjectKey|
                 key != old(frames).frame(f).bound_key.unwrap()
                     ==> #[trigger] final(self).view().contains_key(key) == old(
@@ -252,6 +254,8 @@ impl Catalog {
             final(frames).num_tiers == old(frames).num_tiers,
             final(frames).versions == old(frames).versions,
             final(frames).frame_size == old(frames).frame_size,
+            final(frames).tier_frame_sizes == old(frames).tier_frame_sizes,
+            final(frames).overflow_seqs == old(frames).overflow_seqs,
             final(frames).metas.len() == old(frames).metas.len(),
             final(frames).ghosts == old(frames).ghosts,
             result.is_ok() ==> final(frames).meta(f).active_remote_leases == old(frames).meta(
@@ -309,8 +313,11 @@ impl Catalog {
         ensures
             final(frames).num_tiers == old(frames).num_tiers && final(frames).frame_size == old(
                 frames,
-            ).frame_size && final(frames).versions == old(frames).versions && final(frames).ghosts
-                == old(frames).ghosts && final(frames).metas.len() == old(frames).metas.len(),
+            ).frame_size && final(frames).tier_frame_sizes == old(frames).tier_frame_sizes
+                && final(frames).overflow_seqs == old(frames).overflow_seqs
+                && final(frames).versions == old(frames).versions && final(frames).ghosts == old(
+                frames,
+            ).ghosts && final(frames).metas.len() == old(frames).metas.len(),
             final(frames).meta(f) == old(frames).meta(f) && final(frames).consistent(v),
             final(self).covers(final(frames), Some(f)) && final(entry).version == old(
                 entry,
@@ -361,8 +368,10 @@ impl Catalog {
                     v,
                 ) && f.0 < committed.metas.len() && committed.meta(f).state == STATE_PUBLISHED,
                 frames.num_tiers == committed.num_tiers && frames.frame_size == committed.frame_size
-                    && frames.versions == committed.versions && frames.ghosts == committed.ghosts
-                    && frames.metas.len() == committed.metas.len(),
+                    && frames.tier_frame_sizes == committed.tier_frame_sizes && frames.overflow_seqs
+                    == committed.overflow_seqs && frames.versions == committed.versions
+                    && frames.ghosts == committed.ghosts && frames.metas.len()
+                    == committed.metas.len(),
                 frames.meta(f) == committed.meta(f) && entry.version == orig_ver,
                 forall|other: ObjectKey|
                     other != key ==> #[trigger] self.view().contains_key(other)
@@ -431,7 +440,8 @@ impl Catalog {
             old(frames).frame(f).bound_version == Some(version),
         ensures
             final(frames).num_tiers == old(frames).num_tiers,
-            final(frames).frame_size == old(frames).frame_size && final(frames).metas.len() == old(
+            final(frames).frame_size == old(frames).frame_size && final(frames).tier_frame_sizes
+                == old(frames).tier_frame_sizes && final(frames).metas.len() == old(
                 frames,
             ).metas.len(),
             final(frames).versions == old(frames).versions,
@@ -540,11 +550,12 @@ impl Catalog {
                 ) ==> #[trigger] certificate_valid_in(cert, h, run),
             old(frames).frame(f).tier.valid(old(frames).num_tiers),
             cert.slot.loc.node == v.node,
-            cert.slot.slot_len == old(frames).frame_size,
+            cert.slot.slot_len == old(frames).tier_frame_size(old(frames).frame(f).tier),
             cert.slot.is_full(),
         ensures
             final(frames).num_tiers == old(frames).num_tiers,
-            final(frames).frame_size == old(frames).frame_size && final(frames).metas.len() == old(
+            final(frames).frame_size == old(frames).frame_size && final(frames).tier_frame_sizes
+                == old(frames).tier_frame_sizes && final(frames).metas.len() == old(
                 frames,
             ).metas.len(),
             final(frames).versions@ == old(frames).versions@.insert(
@@ -645,7 +656,8 @@ impl Catalog {
                 ) ==> #[trigger] certificate_valid_in(cert, h, run),
         ensures
             final(frames).num_tiers == old(frames).num_tiers,
-            final(frames).frame_size == old(frames).frame_size && final(frames).metas.len() == old(
+            final(frames).frame_size == old(frames).frame_size && final(frames).tier_frame_sizes
+                == old(frames).tier_frame_sizes && final(frames).metas.len() == old(
                 frames,
             ).metas.len(),
             final(frames).versions@ == old(frames).versions@.insert(

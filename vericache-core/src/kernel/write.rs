@@ -594,7 +594,7 @@ impl CacheCore {
                 || bound_ver.seq >= before.version_seq_limit,
             before.frames.versions@.contains_key(bound_ver) ==> before.frames.versions@[bound_ver]
                 == cert.bytes,
-            cert.bytes.len() == before.frames.frame_size,
+            cert.bytes.len() == before.frames.tier_frame_size(before.frames.frame(f).tier),
             replica_valid(before.ledger@, before.node(), cert),
             before.citations().contains(cert.writer),
             self.node_id == before.node_id,
@@ -613,6 +613,7 @@ impl CacheCore {
             self.catalog.well_formed(&self.frames),
             self.frames.num_tiers == before.frames.num_tiers,
             self.frames.frame_size == before.frames.frame_size,
+            self.frames.tier_frame_sizes == before.frames.tier_frame_sizes,
             self.frames.metas.len() == before.frames.metas.len(),
             self.frames.versions@ == before.frames.versions@.insert(bound_ver, cert.bytes),
             self.frames.meta(f).state == STATE_PUBLISHED,

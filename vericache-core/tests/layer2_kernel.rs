@@ -1128,6 +1128,307 @@ fn run_rdma_lease_peer_inner(dev_idx: u32, gid_idx: u8, t: TcpTransport) {
     dev1.close().unwrap();
 }
 
+fn perform_host_read_on_tl(
+    core: &mut CacheCore,
+    host: &HostBackend,
+    shares: Tracked<&mut ShareSource>,
+    instance: Tracked<&TransferInstance>,
+    ctx: &mut host::HostContext,
+    tl: u8,
+    frame: FrameId,
+    expected: &Vec<u8>,
+) -> (Ticket, Tracked<Knows>) {
+    let (lease, _v, _cert, Tracked(cap)) = core.acquire_local_lease(
+        frame,
+        false,
+        shares,
+        instance,
+    ).unwrap();
+    let tracked mut perm = ReadPerm::Shared(cap);
+    let slice = host.frame_slice(frame);
+    let mut out = vec![0u8; expected.len()];
+    let Tracked(comp) = host::read_slice(
+        ctx,
+        instance,
+        &slice,
+        &mut out,
+        Tracked(&mut perm),
+        Tracked(&core.ledger.borrow().submitted),
+        Tracked(&core.ledger.borrow().knows),
+        Ghost(core.citations()),
+    );
+    assert!(out == *expected);
+    let tracked cap_back = perm.into_shared();
+    let ticket = core.issue_ticket(tl, Tracked(comp.submitted)).unwrap();
+    core.release_local_lease(lease, Tracked(cap_back), ticket, instance).unwrap();
+    (ticket, Tracked(comp.knows))
+}
+
+fn run_reclamation_liveness_under_continuous_hot_overflow(_src: &mut Sources) {
+    let mut core = CacheCore::new(0, FRAME_SIZE, Vec::new(), 8, Tracked(_src.instance.borrow()));
+    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let mut host = HostBackend::new(
+        &mut core,
+        Tracked(_src.instance.borrow()),
+        Tracked(_src.allocations.borrow_mut()),
+        Tracked(host_src),
+        2,
+        4096,
+    ).unwrap();
+
+    let mut tls: Vec<u8> = Vec::new();
+    let mut ctxs: Vec<host::HostContext> = Vec::new();
+    let mut idx = 0usize;
+    while idx < 5 {
+        let tl = core.register_timeline(TimelineKind::Host).unwrap();
+        let tracked ev_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+        tls.push(tl);
+        ctxs.push(host::HostContext::new(Tracked(ev_src)));
+        idx += 1;
+    }
+
+    let data_a = pattern(0x31);
+    let data_b = pattern(0x62);
+    let (_va, frame_a) = host.put_host(
+        &mut core,
+        Tracked(_src.instance.borrow()),
+        ObjectKey([101, 0, 0, 1]),
+        &data_a,
+    ).unwrap();
+    let (_vb, frame_b) = host.put_host(
+        &mut core,
+        Tracked(_src.instance.borrow()),
+        ObjectKey([101, 0, 0, 2]),
+        &data_b,
+    ).unwrap();
+
+    // Overflow frame_a across all 5 read timelines, then evict frame_a into draining.
+    let mut tickets_a: Vec<Ticket> = Vec::new();
+    let mut knows_a: Vec<Tracked<Knows>> = Vec::new();
+    let mut ctx_idx = 0usize;
+    while ctx_idx < 5 {
+        let tl = tls[ctx_idx];
+        let (ticket, knows) = perform_host_read_on_tl(
+            &mut core,
+            &host,
+            Tracked(_src.shares.borrow_mut()),
+            Tracked(_src.instance.borrow()),
+            &mut ctxs[ctx_idx],
+            tl,
+            frame_a,
+            &data_a,
+        );
+        tickets_a.push(ticket);
+        knows_a.push(knows);
+        ctx_idx += 1;
+    }
+    assert!((core.frames.metas[frame_a.0 as usize].flags & FLAG_READ_OVERFLOW) != 0);
+    core.evict_frame(frame_a).unwrap();
+    assert!(core.frames.metas[frame_a.0 as usize].state == STATE_DRAINING);
+
+    // Hot frame_b continues overflowing across ALL 5 timelines with newer unconfirmed reads.
+    let mut tickets_b: Vec<Ticket> = Vec::new();
+    let mut knows_b: Vec<Tracked<Knows>> = Vec::new();
+    let mut idx_b = 0usize;
+    while idx_b < 5 {
+        let tl = tls[idx_b];
+        let (ticket, knows) = perform_host_read_on_tl(
+            &mut core,
+            &host,
+            Tracked(_src.shares.borrow_mut()),
+            Tracked(_src.instance.borrow()),
+            &mut ctxs[idx_b],
+            tl,
+            frame_b,
+            &data_b,
+        );
+        assert!(ticket.seq() > tickets_a[idx_b].seq());
+        tickets_b.push(ticket);
+        knows_b.push(knows);
+        idx_b += 1;
+    }
+    assert!((core.frames.metas[frame_b.0 as usize].flags & FLAG_READ_OVERFLOW) != 0);
+
+    // Confirm only frame_a's earlier reads; frame_a MUST reclaim immediately while frame_b's
+    // newer reads on all 5 timelines remain unconfirmed!
+    let mut c_idx = 0usize;
+    while c_idx < 5 {
+        let Tracked(k) = knows_a.remove(0);
+        core.mark_timeline_complete(tls[c_idx], tickets_a[c_idx].seq(), Tracked(k));
+        assert!(core.timelines.confirmed_seq[tls[c_idx] as usize] < tickets_b[c_idx].seq());
+        c_idx += 1;
+    }
+    assert!(core.reclaim_draining(host.tier_id(), 4) == 1);
+    assert!(core.frames.metas[frame_a.0 as usize].state == STATE_EMPTY);
+    assert!((core.frames.metas[frame_a.0 as usize].flags & FLAG_READ_OVERFLOW) == 0);
+
+    // Evicting frame_b now stays blocked while its newer reads are unconfirmed, then succeeds once confirmed.
+    core.evict_frame(frame_b).unwrap();
+    assert!(core.reclaim_draining(host.tier_id(), 4) == 0);
+    assert!(core.frames.metas[frame_b.0 as usize].state == STATE_DRAINING);
+
+    let mut d_idx = 0usize;
+    while d_idx < 5 {
+        let Tracked(k) = knows_b.remove(0);
+        core.mark_timeline_complete(tls[d_idx], tickets_b[d_idx].seq(), Tracked(k));
+        d_idx += 1;
+    }
+    assert!(core.reclaim_draining(host.tier_id(), 4) == 1);
+    assert!(core.frames.metas[frame_b.0 as usize].state == STATE_EMPTY);
+}
+
+fn run_multi_size_class_host_tiers_and_copy_hop_rejection(_src: &mut Sources) {
+    let mut core = CacheCore::new(0, 4096, Vec::new(), 4, Tracked(_src.instance.borrow()));
+    let tracked s0 = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let mut host0 = HostBackend::new_with_frame_size(
+        &mut core,
+        Tracked(_src.instance.borrow()),
+        Tracked(_src.allocations.borrow_mut()),
+        Tracked(s0),
+        2,
+        4096,
+        4096,
+    ).unwrap();
+    let tracked s1 = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let mut host1 = HostBackend::new_with_frame_size(
+        &mut core,
+        Tracked(_src.instance.borrow()),
+        Tracked(_src.allocations.borrow_mut()),
+        Tracked(s1),
+        2,
+        4096,
+        16384,
+    ).unwrap();
+    let tracked s2 = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let host2 = HostBackend::new_with_frame_size(
+        &mut core,
+        Tracked(_src.instance.borrow()),
+        Tracked(_src.allocations.borrow_mut()),
+        Tracked(s2),
+        1,
+        4096,
+        4096,
+    ).unwrap();
+
+    assert!(core.tier_frame_size(host0.tier_id()) == 4096);
+    assert!(core.tier_frame_size(host1.tier_id()) == 16384);
+    assert!(core.tier_frame_size(host2.tier_id()) == 4096);
+
+    let data_4k = vec![0xA7u8; 4096];
+    let data_16k = vec![0x5Eu8; 16384];
+    let key_4k = ObjectKey([201, 0, 0, 1]);
+    let key_16k = ObjectKey([201, 0, 0, 2]);
+
+    // Wrong-size writes to each tier are rejected cleanly.
+    match host0.put_host(&mut core, Tracked(_src.instance.borrow()), key_4k, &data_16k) {
+        Err(CoreError::InvalidArgument) => {},
+        _ => assert!(false),
+    }
+    match host1.put_host(&mut core, Tracked(_src.instance.borrow()), key_16k, &data_4k) {
+        Err(CoreError::InvalidArgument) => {},
+        _ => assert!(false),
+    }
+
+    let (v0, f0) = host0.put_host(
+        &mut core,
+        Tracked(_src.instance.borrow()),
+        key_4k,
+        &data_4k,
+    ).unwrap();
+    let (v1, f1) = host1.put_host(
+        &mut core,
+        Tracked(_src.instance.borrow()),
+        key_16k,
+        &data_16k,
+    ).unwrap();
+    assert!(core.lookup_tier(key_4k, host0.tier_id()) == Some((f0, v0)));
+    assert!(core.lookup_tier(key_16k, host1.tier_id()) == Some((f1, v1)));
+
+    let mut out_4k = vec![0u8; 4096];
+    let got_v0 = host0.read_frame_into(
+        &mut core,
+        Tracked(_src.instance.borrow()),
+        Tracked(_src.shares.borrow_mut()),
+        f0,
+        &mut out_4k,
+    ).unwrap();
+    assert!(got_v0 == v0 && out_4k == data_4k);
+
+    let mut out_16k = vec![0u8; 16384];
+    let got_v1 = host1.read_frame_into(
+        &mut core,
+        Tracked(_src.instance.borrow()),
+        Tracked(_src.shares.borrow_mut()),
+        f1,
+        &mut out_16k,
+    ).unwrap();
+    assert!(got_v1 == v1 && out_16k == data_16k);
+
+    // Cross-size copy hop MUST be rejected without pinning or leaking leases.
+    let leases_before = core.free_lease_slots.len();
+    match core.begin_copy_hop(
+        f0,
+        host1.tier_id(),
+        Tracked(_src.shares.borrow_mut()),
+        Tracked(_src.instance.borrow()),
+    ) {
+        Err(CoreError::InvalidArgument) => {},
+        _ => assert!(false),
+    }
+    assert!(core.free_lease_slots.len() == leases_before);
+
+    // Matching-size copy hop succeeds and aborts cleanly.
+    let (hop, Tracked(cap), Tracked(tok)) = core.begin_copy_hop(
+        f0,
+        host2.tier_id(),
+        Tracked(_src.shares.borrow_mut()),
+        Tracked(_src.instance.borrow()),
+    ).unwrap();
+    core.abort_copy_hop(
+        hop,
+        Tracked(cap),
+        Ticket::NONE,
+        Tracked(tok),
+        Tracked(_src.instance.borrow()),
+    );
+    assert!(core.free_lease_slots.len() == leases_before);
+
+    core.evict_frame(f0).unwrap();
+    core.evict_frame(f1).unwrap();
+    assert!(core.reclaim_draining(host0.tier_id(), 4) == 1);
+    assert!(core.reclaim_draining(host1.tier_id(), 4) == 1);
+}
+
+fn run_nvme_backend_explicit_path_and_size(_src: &mut Sources, path: &str) -> Result<
+    usize,
+    CoreError,
+> {
+    let mut core = CacheCore::new(0, FRAME_SIZE, Vec::new(), 4, Tracked(_src.instance.borrow()));
+    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let host = HostBackend::new(
+        &mut core,
+        Tracked(_src.instance.borrow()),
+        Tracked(_src.allocations.borrow_mut()),
+        Tracked(host_src),
+        1,
+        4096,
+    ).unwrap();
+    let tracked ring_src = _src.events.borrow_mut().mint(EventSourceKind::IoUring);
+    let nvme = NvmeBackend::new_with_path(
+        &mut core,
+        &host.ctx,
+        Tracked(_src.instance.borrow()),
+        Tracked(_src.allocations.borrow_mut()),
+        Tracked(ring_src),
+        path,
+        2,
+        8,
+        true,
+        8192,
+    )?;
+    Ok(core.tier_frame_size(nvme.tier_id()))
+}
+
 } // verus!
 const RDMA_SWAP_ROLE: &str = "VERICACHE_CORE_RDMA_SWAP_ROLE";
 const RDMA_SWAP_ADDR: &str = "VERICACHE_CORE_RDMA_SWAP_ADDR";
@@ -1333,4 +1634,45 @@ fn rdma_lease_handle_swap_remove_regression() {
     run_rdma_lease_handle_swap_remove_regression(&mut src, dev_idx, gid_idx, t);
     let status = child.0.take().unwrap().wait().unwrap();
     assert!(status.success(), "rdma peer child failed: {status}");
+}
+
+#[test]
+fn reclamation_liveness_under_continuous_hot_overflow() {
+    let mut src = sources();
+    run_reclamation_liveness_under_continuous_hot_overflow(&mut src);
+}
+
+#[test]
+fn multi_size_class_host_tiers_and_copy_hop_rejection() {
+    let mut src = sources();
+    run_multi_size_class_host_tiers_and_copy_hop_rejection(&mut src);
+}
+
+#[test]
+fn nvme_backend_explicit_path_and_size() {
+    let mut src = sources();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path_buf = std::env::temp_dir().join(format!(
+        "vericache_w2b_{}_{}.slab",
+        std::process::id(),
+        unique
+    ));
+    let path_str = path_buf.to_str().unwrap().to_string();
+    let res = run_nvme_backend_explicit_path_and_size(&mut src, &path_str);
+    let _ = std::fs::remove_file(&path_buf);
+    match res {
+        Ok(sz) => assert_eq!(sz, 8192),
+        Err(CoreError::Backend {
+            kind: BACKEND_NVME,
+            code: errno,
+        }) => {
+            if require_hw() {
+                panic!("VERICACHE_REQUIRE_HW set, but NvmeBackend::new_with_path failed with errno {errno}");
+            }
+        }
+        Err(e) => panic!("unexpected NvmeBackend::new_with_path error: {e:?}"),
+    }
 }

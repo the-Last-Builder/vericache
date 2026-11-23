@@ -1,18 +1,19 @@
 use crate::policy::LruPolicy;
-use crate::schema::{bytes_per_sec_to_gbps, JobSpec, LatencyHist, MetricRecord, ProcSampler};
-use crate::shard::{key_from_hash_id, ShardRouter};
+use crate::schema::{JobSpec, LatencyHist, MetricRecord, ProcSampler, bytes_per_sec_to_gbps};
+use crate::shard::{
+    ShardCapabilityBundle, ShardRouter, ensure_bench_node_allocator, key_from_hash_id,
+};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::time::{Duration, Instant};
-use transfer::context::NodeContext;
 use transfer::host::HostContext;
 use vericache_core::backends::host::HostBackend;
 use vericache_core::engine::LocalEngine;
-use vericache_core::kernel::CacheCore;
 use vericache_core::spec::{FrameId, ObjectKey};
-use vstd::prelude::Tracked;
+#[cfg_attr(not(verus_only), allow(unused_imports))]
+use vstd::prelude::{Tracked, verus};
 
 #[derive(Debug, Deserialize)]
 pub struct TraceRequest {
@@ -48,7 +49,18 @@ pub fn load_trace(path: &str, max_requests: Option<usize>) -> Vec<TraceRequest> 
     reqs
 }
 
+fn box_host_as_static(host: &HostBackend) -> &'static HostBackend {
+    let host_ptr: *const HostBackend = host;
+    // SAFETY: `host` is boxed and owned by `OwnedHostShard`, and `OwnedHostShard::drop`
+    // drops `engine` before dropping `host`.
+    unsafe { &*host_ptr }
+}
+
+verus! {
+
+#[cfg_attr(not(verus_only), allow(dead_code))]
 struct OwnedHostShard {
+    caps: ShardCapabilityBundle,
     host: Box<HostBackend>,
     engine: Option<LocalEngine<'static>>,
     lru: LruPolicy<ObjectKey, FrameId>,
@@ -56,52 +68,54 @@ struct OwnedHostShard {
 
 impl OwnedHostShard {
     fn new(frame_size: usize, cap_frames: usize) -> Self {
-        let mut core = CacheCore::new(0, frame_size, Vec::new(), 64, Tracked::assume_new());
+        let mut caps = ShardCapabilityBundle::take(0);
+        let mut core = caps.make_local_core(frame_size, 64);
+        let host_src = caps.mint_host();
         let host = Box::new(
             HostBackend::new(
                 &mut core,
-                Tracked::assume_new(),
-                Tracked::assume_new(),
-                Tracked::assume_new(),
+                Tracked(caps.instance.borrow()),
+                Tracked(caps.alloc.borrow_mut()),
+                host_src,
                 cap_frames as u32,
                 4096,
             )
             .expect("HostBackend::new shard"),
         );
-        let host_ptr: *const HostBackend = &*host;
-        // SAFETY: `host` is boxed and owned by `Self`, never moved before `engine` is dropped in `Drop`.
-        let host_static: &'static HostBackend = unsafe { &*host_ptr };
-        let eng_ctx = HostContext::new(Tracked::assume_new());
+        let host_static: &'static HostBackend = box_host_as_static(&host);
+        let eng_ctx = HostContext::new(caps.mint_host());
         let engine = LocalEngine::new(core, host_static, eng_ctx, None, None);
         Self {
+            caps,
             host,
             engine: Some(engine),
             lru: LruPolicy::new(cap_frames),
         }
     }
 
-    fn engine_mut(&mut self) -> &mut LocalEngine<'static> {
-        self.engine.as_mut().unwrap()
-    }
-
     /// Try prefix-hit read from Host DRAM into `dst`, touching LRU on hit.
     fn get_hit(&mut self, key: ObjectKey, dst: &mut [u8]) -> bool {
         let eng = self.engine.as_mut().unwrap();
         match eng
-            .get_into_host(Tracked::assume_new(), Tracked::assume_new(), key, dst)
+            .get_into_host(
+                Tracked(self.caps.instance.borrow()),
+                Tracked(self.caps.shares.borrow_mut()),
+                key,
+                dst,
+            )
             .expect("get_into_host")
         {
             Some(_ver) => {
                 self.lru.touch(&key);
                 true
-            }
+            },
             None => false,
         }
     }
 
     /// Writeback a miss block into Host DRAM, evicting & reclaiming the LRU victim if full.
     fn put_with_lru(&mut self, key: ObjectKey, data: &[u8]) {
-        let host_tier = self.engine_mut().host_tier();
+        let host_tier = self.engine.as_ref().unwrap().host_tier();
         // If key already somehow present (e.g. duplicate hash_id inside a single request suffix), touch & return.
         if self.lru.contains(&key) {
             self.lru.touch(&key);
@@ -109,19 +123,21 @@ impl OwnedHostShard {
         }
         if self.lru.is_full() {
             if let Some((_vic_key, vic_frame)) = self.lru.pop_lru() {
-                let eng = self.engine_mut();
+                let eng = self.engine.as_mut().unwrap();
                 eng.evict_frame(vic_frame).expect("evict lru victim");
                 let reclaimed = eng.reclaim_draining(host_tier, 8);
                 assert!(reclaimed >= 1, "expected lru victim reclaim");
             }
         }
-        let (_ver, frame) = self
-            .engine_mut()
-            .put_host(Tracked::assume_new(), key, data)
+        let eng = self.engine.as_mut().unwrap();
+        let (_ver, frame) = eng
+            .put_host(Tracked(self.caps.instance.borrow()), key, data)
             .expect("put_host writeback");
         let _ = self.lru.insert(key, frame);
     }
 }
+
+} // verus!
 
 impl Drop for OwnedHostShard {
     fn drop(&mut self) {
@@ -156,8 +172,13 @@ pub fn run(job: &JobSpec) -> Vec<MetricRecord> {
         target.max(16).min(max_by_mem.max(16))
     });
 
-    let (_inst, _alloc, _ev, _sh) = NodeContext::bootstrap(0).into_sources();
-    let num_shards = job.num_shards.unwrap_or(4).max(1).min(total_cap_frames / 4).max(1);
+    ensure_bench_node_allocator(0);
+    let num_shards = job
+        .num_shards
+        .unwrap_or(4)
+        .max(1)
+        .min(total_cap_frames / 4)
+        .max(1);
     let per_shard_cap = (total_cap_frames + num_shards - 1) / num_shards;
 
     let mut shards = Vec::with_capacity(num_shards);

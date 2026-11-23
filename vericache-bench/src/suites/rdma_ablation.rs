@@ -1,24 +1,31 @@
-use crate::schema::{bytes_per_sec_to_gbps, JobSpec, LatencyHist, MetricRecord, ProcSampler};
+use crate::schema::{JobSpec, LatencyHist, MetricRecord, ProcSampler, bytes_per_sec_to_gbps};
+use crate::shard::ShardCapabilityBundle;
+#[cfg(verus_only)]
+use foundation::tracked::ISet;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+#[cfg_attr(not(verus_only), allow(unused_imports))]
 use transfer::context::*;
 use transfer::cuda::{self, CudaStream};
 use transfer::host::{self, HostContext};
 use transfer::rdma::*;
-use transfer::transport::{ByteTransport, Channel, ReceivedFrame, Statement};
+use transfer::transport::{ByteTransport, Channel, ReceivedFrame};
 use vericache_core::backends::cuda::CudaBackend;
 use vericache_core::backends::host::HostBackend;
+use vericache_core::backends::rdma::RdmaBackend;
 use vericache_core::backends::rdma::peer::{FetchOutcome, PeerSession, ServeOutcome};
 use vericache_core::backends::rdma::protocol::{ControlPayload, VeriCacheAttachment};
 use vericache_core::backends::rdma::pull::PullTarget;
-use vericache_core::backends::rdma::RdmaBackend;
 use vericache_core::engine::{DistributedEngine, DistributedEvent};
 use vericache_core::kernel::CacheCore;
+#[cfg(verus_only)]
+use vericache_core::provenance::{ValueCertificate, ValueProof};
 use vericache_core::spec::ObjectKey;
 use vericache_core::timeline::TimelineKind;
-use vstd::prelude::{Ghost, Tracked};
+#[cfg_attr(not(verus_only), allow(unused_imports))]
+use vstd::prelude::{Ghost, Map, Tracked, verus};
 
 pub struct TcpTransport(TcpStream);
 
@@ -106,9 +113,7 @@ pub fn spawn_two_process_pair(job: &JobSpec) -> Vec<MetricRecord> {
     // Run donor directly in parent process (already NUMA-pinned).
     run_donor_for_suite(job, transport);
 
-    let output = init_child
-        .wait_with_output()
-        .expect("wait initiator child");
+    let output = init_child.wait_with_output().expect("wait initiator child");
     assert!(
         output.status.success(),
         "initiator child failed with status {}",
@@ -172,10 +177,7 @@ pub fn run(job: &JobSpec) -> Vec<MetricRecord> {
 
 pub fn run_role(job: &JobSpec, role: &str, peer_addr: Option<&str>, session: Option<&str>) {
     assert_eq!(role, "initiator", "only initiator spawns as child");
-    let transport = connect_peer(
-        peer_addr.expect("peer_addr"),
-        session.expect("session"),
-    );
+    let transport = connect_peer(peer_addr.expect("peer_addr"), session.expect("session"));
     let rec = run_initiator_for_suite(job, transport);
     println!("{}", serde_json::to_string(&rec).unwrap());
 }
@@ -244,9 +246,11 @@ fn fill_pattern(len: usize, seed: u8) -> Vec<u8> {
     v
 }
 
-fn complete_cq(cq: &mut CompletionQueue) -> Completed {
+verus! {
+
+fn complete_cq(cq: &mut CompletionQueue, Tracked(instance): Tracked<&TransferInstance>) -> Completed {
     loop {
-        let mut batch = poll_completion_queue_batch(cq, 1, Tracked::assume_new())
+        let mut batch = poll_completion_queue_batch(cq, 1, Tracked(instance))
             .expect("poll_completion_queue_batch");
         if let Some(c) = batch.pop() {
             return c;
@@ -259,10 +263,10 @@ fn complete_cq(cq: &mut CompletionQueue) -> Completed {
 // =========================================================================
 fn run_raw_mw_donor(job: &JobSpec, transport: TcpTransport, use_gpu: bool) {
     let frame_size = job.chunk_bytes;
-    let (_inst, _alloc, _ev, _sh) = NodeContext::bootstrap(0).into_sources();
+    let mut caps = ShardCapabilityBundle::take(0);
     let device = open_rdma_device(0, &job.rdma_dev);
-    let pd = ProtectionDomain::new(&device, Tracked::assume_new()).expect("PD");
-    let mut cq = CompletionQueue::new(&device, 128, Tracked::assume_new()).expect("CQ");
+    let pd = ProtectionDomain::new(&device, caps.mint_rdma()).expect("PD");
+    let mut cq = CompletionQueue::new(&device, 128, caps.mint_rdma()).expect("CQ");
     let reset = UnconnectedQueuePair::new(
         &pd,
         &cq,
@@ -270,140 +274,129 @@ fn run_raw_mw_donor(job: &JobSpec, transport: TcpTransport, use_gpu: bool) {
         1,
         job.gid_index,
         0x420,
-        Tracked::assume_new(),
+        caps.mint_rdma(),
     )
     .expect("UnconnectedQueuePair");
     let mut channel: Channel<TcpTransport> =
-        Channel::new(transport, 0, 1, Tracked::assume_new());
+        Channel::new(transport, 0, 1, Tracked(caps.instance.borrow()));
     let peer_ep = channel
-        .exchange_queue_pair_endpoint(&reset.endpoint(), Tracked::assume_new())
+        .exchange_queue_pair_endpoint(&reset.endpoint(), Tracked(caps.instance.borrow()))
         .expect("exchange QP ep");
     let qp = connect_rc(reset, peer_ep, 1).expect("connect_rc");
 
-    let mut host_ctx = HostContext::new(Tracked::assume_new());
+    let mut host_ctx = HostContext::new(caps.mint_host());
     let data = fill_pattern(frame_size, 0x33);
     let flags = AccessFlags {
         local_write: true,
         mw_bind: true,
     };
 
-    let mut host_buf_opt = None;
-    let mut gpu_buf_opt = None;
+    let mut mw = alloc_window(&pd, caps.mint_rdma()).expect("alloc Type-2B MW");
 
-    let mr = if use_gpu {
+    if use_gpu {
         let gpu = job.donor_gpu;
-        let (dev_buf, _) = cuda::alloc_device(Tracked::assume_new(), gpu, frame_size)
-            .expect("alloc donor gpu");
-        let (stage_buf, _) =
-            cuda::alloc_host(Tracked::assume_new(), frame_size).expect("alloc donor stage");
+        let (dev_buf, Tracked(mut dev_tok)) =
+            cuda::alloc_device(Tracked(caps.alloc.borrow_mut()), gpu, frame_size)
+                .expect("alloc donor gpu");
+        let (stage_buf, Tracked(mut stage_tok)) =
+            cuda::alloc_host(Tracked(caps.alloc.borrow_mut()), frame_size)
+                .expect("alloc donor stage");
         let h_slice = stage_buf.as_host_slice();
-        let _ = host::write_slice(
+        let tracked mut sub_map = SubmittedMap::empty(caps.instance.borrow().id());
+        let tracked empty_knows = Knows::empty(caps.instance.borrow().id());
+        let Tracked(h_comp) = host::write_slice(
             &mut host_ctx,
-            Tracked::assume_new(),
+            Tracked(caps.instance.borrow()),
             &h_slice,
             &data,
-            Tracked::assume_new(),
-            Tracked::assume_new(),
-            Tracked::assume_new(),
-            Ghost::assume_new(),
+            Tracked(&mut stage_tok),
+            Tracked(&sub_map),
+            Tracked(&empty_knows),
+            Ghost(ISet::empty()),
         );
-        let mut stream = CudaStream::new(gpu, Tracked::assume_new()).expect("donor stream");
-        let _ = cuda::memcpy_async(
+        let ghost h_ev = h_comp.submitted.key();
+        proof {
+            sub_map.insert(h_comp.submitted);
+        }
+        let mut stream = CudaStream::new(gpu, caps.mint_cuda()).expect("donor stream");
+        let tracked mut stage_perm = ReadPerm::Owned(stage_tok);
+        let (_, Tracked(copy_sub)) = cuda::memcpy_async(
             &mut stream,
-            Tracked::assume_new(),
+            Tracked(caps.instance.borrow()),
             &dev_buf.slot_slice(0),
             &stage_buf.as_cuda_slice(),
-            Tracked::assume_new(),
-            Tracked::assume_new(),
-            Tracked::assume_new(),
-            Tracked::assume_new(),
-            Ghost::assume_new(),
+            Tracked(&mut stage_perm),
+            Tracked(&mut dev_tok),
+            Tracked(&mut sub_map),
+            Tracked(&h_comp.knows),
+            Ghost(ISet::empty().insert(h_ev)),
         )
         .expect("upload donor gpu");
-        let _ = cuda::stream_synchronize(&stream, Tracked::assume_new()).expect("sync upload");
+        let Tracked(k_sync) = cuda::stream_synchronize(&stream, Tracked(caps.instance.borrow()))
+            .expect("sync upload");
         let _ = stream.destroy();
-        gpu_buf_opt = Some(dev_buf);
-        register_memory(
-            &pd,
-            RegistrationBuffer::Cuda(gpu_buf_opt.as_ref().unwrap()),
-            flags,
+        let tracked gpu_writer = Completion {
+            submitted: copy_sub,
+            knows: k_sync,
+        };
+        let mr = register_memory(&pd, RegistrationBuffer::Cuda(&dev_buf), flags)
+            .expect("register donor GPU MR");
+        let (_done, _tok) = read_lifecycle_donor(
+            &mut channel,
+            &qp,
+            &mut cq,
+            mr,
+            &mut mw,
+            &mut host_ctx,
+            Tracked(caps.instance.borrow()),
+            Tracked(dev_tok),
+            Tracked(gpu_writer),
+            Tracked(caps.shares.borrow_mut()),
+            1,
+            b"raw_mw",
         )
-        .expect("register donor GPU MR")
+        .expect("read_lifecycle_donor gpu");
     } else {
-        let (hbuf, _) = host::alloc_aligned(
+        let (hbuf, Tracked(mut h_tok)) = host::alloc_aligned(
             &host_ctx,
-            Tracked::assume_new(),
-            Tracked::assume_new(),
+            Tracked(caps.instance.borrow()),
+            Tracked(caps.alloc.borrow_mut()),
             frame_size,
             4096,
         )
         .expect("alloc host");
-        let _ = host::write_slice(
+        let tracked empty_sub = SubmittedMap::empty(caps.instance.borrow().id());
+        let tracked empty_knows = Knows::empty(caps.instance.borrow().id());
+        let Tracked(writer) = host::write_slice(
             &mut host_ctx,
-            Tracked::assume_new(),
+            Tracked(caps.instance.borrow()),
             &hbuf.as_slice(),
             &data,
-            Tracked::assume_new(),
-            Tracked::assume_new(),
-            Tracked::assume_new(),
-            Ghost::assume_new(),
+            Tracked(&mut h_tok),
+            Tracked(&empty_sub),
+            Tracked(&empty_knows),
+            Ghost(ISet::empty()),
         );
-        host_buf_opt = Some(hbuf);
-        register_memory(
-            &pd,
-            RegistrationBuffer::Host(host_buf_opt.as_ref().unwrap()),
-            flags,
+        let mr = register_memory(&pd, RegistrationBuffer::Host(&hbuf), flags)
+            .expect("register donor Host MR");
+        let (_done, _tok) = read_lifecycle_donor(
+            &mut channel,
+            &qp,
+            &mut cq,
+            mr,
+            &mut mw,
+            &mut host_ctx,
+            Tracked(caps.instance.borrow()),
+            Tracked(h_tok),
+            Tracked(writer),
+            Tracked(caps.shares.borrow_mut()),
+            1,
+            b"raw_mw",
         )
-        .expect("register donor Host MR")
-    };
+        .expect("read_lifecycle_donor host");
+    }
 
-    // Pre-bind Type-2B MW once before benchmark loop.
-    let mut mw = alloc_window(&pd, Tracked::assume_new()).expect("alloc Type-2B MW");
-    let rkey = mw.next_rkey();
-    post_bind_window(
-        &qp,
-        &mut cq,
-        &mr.as_slice(),
-        &mut mw,
-        rkey,
-        RemoteAccess::ReadOnly,
-        Tracked::assume_new(),
-        1,
-    )
-    .map_err(|e| e.0)
-    .expect("post_bind_window");
-    let Completed::WindowBound { witness: bound, .. } = complete_cq(&mut cq) else {
-        panic!("expected WindowBound CQE");
-    };
-    mw.finish_bind(bound);
-
-    let cap = mw.remote_capability();
-    let empty_stmt: Tracked<Statement> = Tracked::assume_new();
-    channel
-        .send_remote_read_grant(1, &cap, b"raw_mw", empty_stmt, Tracked::assume_new())
-        .map_err(|e| e.0)
-        .expect("send pre-bound ReadGrant");
-
-    // Wait for initiator to finish all timed iterations and return release.
-    let _rel = channel
-        .recv_remote_read_release(Tracked::assume_new())
-        .expect("recv ReadRelease");
-
-    post_local_invalidate(&qp, &mut cq, &mut mw, 2).expect("post_local_invalidate");
-    let Completed::WindowInvalidated { witness: inv, .. } = complete_cq(&mut cq) else {
-        panic!("expected WindowInvalidated CQE");
-    };
-    mw.finish_invalidate(inv, Tracked::assume_new());
     dealloc_window(mw).map_err(|e| e.0).expect("dealloc_window");
-    let _ = deregister_memory(
-        &mut host_ctx,
-        Tracked::assume_new(),
-        mr,
-        Tracked::assume_new(),
-        Tracked::assume_new(),
-        Tracked::assume_new(),
-        Ghost::assume_new(),
-    );
     let _ = qp.destroy(&cq);
     let _ = cq.destroy();
     let _ = pd.destroy();
@@ -413,10 +406,10 @@ fn run_raw_mw_donor(job: &JobSpec, transport: TcpTransport, use_gpu: bool) {
 fn run_raw_mw_initiator(job: &JobSpec, transport: TcpTransport, use_gpu: bool) -> MetricRecord {
     let frame_size = job.chunk_bytes;
     let qd = job.concurrency.max(1).min(16);
-    let (_inst, _alloc, _ev, _sh) = NodeContext::bootstrap(1).into_sources();
+    let mut caps = ShardCapabilityBundle::take(1);
     let device = open_rdma_device(1, &job.rdma_dev);
-    let pd = ProtectionDomain::new(&device, Tracked::assume_new()).expect("PD");
-    let mut cq = CompletionQueue::new(&device, 128, Tracked::assume_new()).expect("CQ");
+    let pd = ProtectionDomain::new(&device, caps.mint_rdma()).expect("PD");
+    let mut cq = CompletionQueue::new(&device, 128, caps.mint_rdma()).expect("CQ");
     let reset = UnconnectedQueuePair::new(
         &pd,
         &cq,
@@ -424,17 +417,17 @@ fn run_raw_mw_initiator(job: &JobSpec, transport: TcpTransport, use_gpu: bool) -
         1,
         job.gid_index,
         0x421,
-        Tracked::assume_new(),
+        caps.mint_rdma(),
     )
     .expect("UnconnectedQueuePair");
     let mut channel: Channel<TcpTransport> =
-        Channel::new(transport, 1, 0, Tracked::assume_new());
+        Channel::new(transport, 1, 0, Tracked(caps.instance.borrow()));
     let peer_ep = channel
-        .exchange_queue_pair_endpoint(&reset.endpoint(), Tracked::assume_new())
+        .exchange_queue_pair_endpoint(&reset.endpoint(), Tracked(caps.instance.borrow()))
         .expect("exchange QP ep");
     let mut qp = connect_rc(reset, peer_ep, 0).expect("connect_rc");
 
-    let mut host_ctx = HostContext::new(Tracked::assume_new());
+    let mut host_ctx = HostContext::new(caps.mint_host());
     let flags = AccessFlags {
         local_write: true,
         mw_bind: false,
@@ -442,10 +435,15 @@ fn run_raw_mw_initiator(job: &JobSpec, transport: TcpTransport, use_gpu: bool) -
 
     let mut host_slab_opt = None;
     let mut gpu_slab_opt = None;
+    let tracked mut slot_toks: Map<usize, SlotToken>;
     let mr = if use_gpu {
         let gpu = job.initiator_gpu;
-        let (dev_slab, _) = cuda::alloc_device_slab(Tracked::assume_new(), gpu, qd, frame_size)
-            .expect("alloc init gpu slab");
+        let (dev_slab, Tracked(toks)) =
+            cuda::alloc_device_slab(Tracked(caps.alloc.borrow_mut()), gpu, qd, frame_size)
+                .expect("alloc init gpu slab");
+        proof {
+            slot_toks = toks;
+        }
         gpu_slab_opt = Some(dev_slab);
         register_memory(
             &pd,
@@ -454,15 +452,18 @@ fn run_raw_mw_initiator(job: &JobSpec, transport: TcpTransport, use_gpu: bool) -
         )
         .expect("register init GPU MR")
     } else {
-        let (h_slab, _) = host::alloc_slab(
+        let (h_slab, Tracked(toks)) = host::alloc_slab(
             &host_ctx,
-            Tracked::assume_new(),
-            Tracked::assume_new(),
+            Tracked(caps.instance.borrow()),
+            Tracked(caps.alloc.borrow_mut()),
             qd,
             frame_size,
             4096,
         )
         .expect("alloc host slab");
+        proof {
+            slot_toks = toks;
+        }
         host_slab_opt = Some(h_slab);
         register_memory(
             &pd,
@@ -473,12 +474,19 @@ fn run_raw_mw_initiator(job: &JobSpec, transport: TcpTransport, use_gpu: bool) -
     };
 
     let ReceivedFrame::ReadGrant(grant) = channel
-        .recv_any(Tracked::assume_new())
+        .recv_any(Tracked(caps.instance.borrow()))
         .expect("recv pre-bound ReadGrant")
     else {
         panic!("expected ReadGrant");
     };
     let cap = grant.capability.expect("capability");
+    let Tracked(share_opt) = grant.share;
+    let tracked share_cap = share_opt.tracked_unwrap();
+    let Tracked(stmt) = grant.statement;
+    let tracked mut sub_map = stmt.submitted;
+    let tracked mut knows_map = stmt.knows;
+    let ghost mut cited = stmt.facts;
+    let tracked mut remote_perm = ReadPerm::Shared(share_cap);
 
     let warmup_batches = (job.warmup_iters + qd - 1) / qd;
     let meas_batches = (job.iters + qd - 1) / qd;
@@ -501,65 +509,109 @@ fn run_raw_mw_initiator(job: &JobSpec, transport: TcpTransport, use_gpu: bool) -
             for slot in 0..qd {
                 let wr = next_wr_id;
                 next_wr_id += 1;
-                let (_, _, pending_gdr) = post_rdma_read_gdr(
+                let tracked slot_tok = slot_toks.tracked_remove(slot);
+                let (_ev, Tracked(sub), pending_gdr) = post_rdma_read_gdr(
                     &mut qp,
                     &mut cq,
-                    Tracked::assume_new(),
+                    Tracked(caps.instance.borrow()),
                     &mr.slot_slice(slot),
                     &cap,
                     wr,
                     false,
-                    Tracked::assume_new(),
-                    Tracked::assume_new(),
-                    Tracked::assume_new(),
-                    Tracked::assume_new(),
-                    Ghost::assume_new(),
+                    Tracked(&mut remote_perm),
+                    Tracked(slot_tok),
+                    Tracked(&mut sub_map),
+                    Tracked(&knows_map),
+                    Ghost(cited),
                 )
                 .map_err(|e| e.0)
                 .expect("post_rdma_read_gdr");
-                pendings.push((wr, pending_gdr));
+                proof {
+                    sub_map.insert(sub);
+                }
+                pendings.push((slot, pending_gdr));
             }
-            for (_wr, pending_gdr) in pendings {
-                match complete_cq(&mut cq) {
-                    Completed::Data { .. } => {}
+            for (slot, pending_gdr) in pendings {
+                match complete_cq(&mut cq, Tracked(caps.instance.borrow())) {
+                    Completed::Data {
+                        event,
+                        submitted,
+                        knows,
+                        ..
+                    } => {
+                        proof {
+                            sub_map.insert(submitted.get());
+                            let inst_id = caps.instance.borrow().id();
+                            let tracked mut prev = Knows::empty(inst_id);
+                            vstd::modes::tracked_swap(&mut prev, &mut knows_map);
+                            let tracked mut entries = prev.into_map();
+                            entries.tracked_union_prefer_right(knows.get().into_map());
+                            knows_map = Knows::from_map(inst_id, entries);
+                            cited = cited.insert(event@);
+                        }
+                    }
                     Completed::DataFailed { status, .. } => {
                         panic!("raw_mw GDR RDMA_READ failed status={status}");
                     }
                     _ => panic!("unexpected CQE"),
                 }
                 // Mandatory GPUDirect RDMA BAR1 visibility flush.
-                let _tok = mr
+                let Tracked(tok_back) = mr
                     .complete_gdr_slot(
-                        Tracked::assume_new(),
+                        Tracked(caps.instance.borrow()),
                         pending_gdr,
-                        Tracked::assume_new(),
+                        Tracked(&knows_map),
                     )
                     .map_err(|e| e.0)
                     .expect("complete_gdr_slot BAR1 flush");
+                proof {
+                    slot_toks.tracked_insert(slot, tok_back);
+                }
             }
         } else {
             for slot in 0..qd {
                 let wr = next_wr_id;
                 next_wr_id += 1;
-                let _ = post_rdma_read(
+                let tracked mut slot_tok = slot_toks.tracked_remove(slot);
+                let (_ev, Tracked(sub)) = post_rdma_read(
                     &mut qp,
                     &mut cq,
-                    Tracked::assume_new(),
+                    Tracked(caps.instance.borrow()),
                     &mr.slot_slice(slot),
                     &cap,
                     wr,
                     false,
-                    Tracked::assume_new(),
-                    Tracked::assume_new(),
-                    Tracked::assume_new(),
-                    Tracked::assume_new(),
-                    Ghost::assume_new(),
+                    Tracked(&mut remote_perm),
+                    Tracked(&mut slot_tok),
+                    Tracked(&mut sub_map),
+                    Tracked(&knows_map),
+                    Ghost(cited),
                 )
                 .expect("post_rdma_read");
+                proof {
+                    sub_map.insert(sub);
+                    slot_toks.tracked_insert(slot, slot_tok);
+                }
             }
             for _ in 0..qd {
-                match complete_cq(&mut cq) {
-                    Completed::Data { .. } => {}
+                match complete_cq(&mut cq, Tracked(caps.instance.borrow())) {
+                    Completed::Data {
+                        event,
+                        submitted,
+                        knows,
+                        ..
+                    } => {
+                        proof {
+                            sub_map.insert(submitted.get());
+                            let inst_id = caps.instance.borrow().id();
+                            let tracked mut prev = Knows::empty(inst_id);
+                            vstd::modes::tracked_swap(&mut prev, &mut knows_map);
+                            let tracked mut entries = prev.into_map();
+                            entries.tracked_union_prefer_right(knows.get().into_map());
+                            knows_map = Knows::from_map(inst_id, entries);
+                            cited = cited.insert(event@);
+                        }
+                    }
                     Completed::DataFailed { status, .. } => {
                         panic!("raw_mw Host RDMA_READ failed status={status}");
                     }
@@ -579,24 +631,31 @@ fn run_raw_mw_initiator(job: &JobSpec, transport: TcpTransport, use_gpu: bool) -
     let total_bytes = total_ops * (frame_size as u64);
     let gbps = bytes_per_sec_to_gbps(total_bytes, elapsed_s);
 
+    let tracked sh_out = remote_perm.into_shared();
+    let tracked empty_succ = SucceededMap::empty(caps.instance.borrow().id());
     channel
-        .send_remote_read_release(
+        .send_remote_read_release_with(
             grant.tag,
             b"raw_mw",
-            Tracked::assume_new(),
-            Tracked::assume_new(),
+            Tracked(caps.instance.borrow()),
+            Tracked(&sub_map),
+            Tracked(&knows_map),
+            Tracked(&empty_succ),
+            Ghost(cited),
+            Tracked(sh_out),
+            Tracked(()),
         )
         .map_err(|e| e.0)
         .expect("send ReadRelease");
 
     let _ = deregister_memory_slab(
         &mut host_ctx,
-        Tracked::assume_new(),
+        Tracked(caps.instance.borrow()),
         mr,
-        Tracked::assume_new(),
-        Tracked::assume_new(),
-        Tracked::assume_new(),
-        Ghost::assume_new(),
+        Tracked(slot_toks),
+        Tracked(&sub_map),
+        Tracked(&knows_map),
+        Ghost(cited),
     );
     let _ = qp.destroy(&cq);
     let _ = cq.destroy();
@@ -630,8 +689,9 @@ fn run_raw_mw_initiator(job: &JobSpec, transport: TcpTransport, use_gpu: bool) -
 // Mode B: `vericache_dynamic_lease` (`DistributedEngine` per-lease BIND_MW +
 //         RDMA_READ + BAR1 flush + LOCAL_INV, single-flight & pipelined)
 // =========================================================================
+#[allow(clippy::too_many_arguments)]
 pub fn build_distributed_engine<'a>(
-    node_id: u64,
+    caps: &mut ShardCapabilityBundle,
     _frame_size: usize,
     num_frames: u32,
     num_windows: usize,
@@ -643,8 +703,9 @@ pub fn build_distributed_engine<'a>(
     cuda: Option<&'a CudaBackend<'a>>,
     mut core: CacheCore,
 ) -> DistributedEngine<'a, TcpTransport> {
+    let node_id = caps.node;
     let peer_id = 1 - node_id;
-    let cq = CompletionQueue::new(device, 256, Tracked::assume_new()).expect("CQ");
+    let cq = CompletionQueue::new(device, 256, caps.mint_rdma()).expect("CQ");
     let reset = UnconnectedQueuePair::new(
         pd,
         &cq,
@@ -652,26 +713,27 @@ pub fn build_distributed_engine<'a>(
         1,
         gid_index,
         0x520 + node_id as u32,
-        Tracked::assume_new(),
+        caps.mint_rdma(),
     )
     .expect("UnconnectedQueuePair");
     let mut channel: Channel<TcpTransport, VeriCacheAttachment> = Channel::new_with_protocol(
         transport,
         node_id,
         peer_id,
-        Tracked::assume_new(),
+        Tracked(caps.instance.borrow()),
     );
     let peer_ep = channel
-        .exchange_queue_pair_endpoint(&reset.endpoint(), Tracked::assume_new())
+        .exchange_queue_pair_endpoint(&reset.endpoint(), Tracked(caps.instance.borrow()))
         .expect("exchange QP ep");
     let qp = connect_rc(reset, peer_ep, peer_id).expect("connect_rc");
 
     let mut windows = Vec::with_capacity(num_windows);
     for _ in 0..num_windows {
-        windows.push(alloc_window(pd, Tracked::assume_new()).expect("alloc Type-2B MW"));
+        windows.push(alloc_window(pd, caps.mint_rdma()).expect("alloc Type-2B MW"));
     }
-    let mut rdma =
-        RdmaBackend::new(&mut core, peer_id, qp, cq, windows).map_err(|e| e.0).expect("RdmaBackend::new");
+    let mut rdma = RdmaBackend::new(&mut core, peer_id, qp, cq, windows)
+        .map_err(|e| e.0)
+        .expect("RdmaBackend::new");
     let flags = AccessFlags {
         local_write: true,
         mw_bind: true,
@@ -699,23 +761,9 @@ pub fn build_distributed_engine<'a>(
         .expect("register_gpu_slab");
     }
     let peer = PeerSession::new(rdma, channel, &core);
-    let eng_ctx = HostContext::new(Tracked::assume_new());
+    let eng_ctx = HostContext::new(caps.mint_host());
     let _ = num_frames;
     DistributedEngine::new(core, host, eng_ctx, cuda, peer)
-}
-
-fn make_versioned_core(node_id: u64, frame_size: usize, max_leases: usize) -> CacheCore {
-    let (_inst, _alloc, _ev, _sh, _vi, _vs) =
-        NodeContext::bootstrap(node_id).into_sources_with_versions();
-    let mut core = CacheCore::new(
-        node_id as u16,
-        frame_size,
-        Vec::new(),
-        max_leases,
-        Tracked::assume_new(),
-    );
-    core.enable_version_registry(Tracked::assume_new(), Tracked::assume_new());
-    core
 }
 
 fn run_dynamic_donor(job: &JobSpec, transport: TcpTransport, use_gpu: bool) {
@@ -729,14 +777,15 @@ fn run_dynamic_donor(job: &JobSpec, transport: TcpTransport, use_gpu: bool) {
     let num_frames = (window_w + 4) as u32;
     let num_windows = window_w.max(4);
 
+    let mut caps = ShardCapabilityBundle::take(0);
     let device = open_rdma_device(0, &job.rdma_dev);
-    let pd = ProtectionDomain::new(&device, Tracked::assume_new()).expect("PD");
-    let mut core = make_versioned_core(0, frame_size, 64);
+    let pd = ProtectionDomain::new(&device, caps.mint_rdma()).expect("PD");
+    let mut core = caps.make_versioned_core(frame_size, 64);
     let host = HostBackend::new(
         &mut core,
-        Tracked::assume_new(),
-        Tracked::assume_new(),
-        Tracked::assume_new(),
+        Tracked(caps.instance.borrow()),
+        Tracked(caps.alloc.borrow_mut()),
+        caps.mint_host(),
         num_frames,
         4096,
     )
@@ -745,9 +794,9 @@ fn run_dynamic_donor(job: &JobSpec, transport: TcpTransport, use_gpu: bool) {
     let cuda_opt = if use_gpu {
         let c = CudaBackend::new(
             &mut core,
-            Tracked::assume_new(),
-            Tracked::assume_new(),
-            Tracked::assume_new(),
+            Tracked(caps.instance.borrow()),
+            Tracked(caps.alloc.borrow_mut()),
+            caps.mint_cuda(),
             job.donor_gpu,
             num_frames,
             32,
@@ -765,14 +814,14 @@ fn run_dynamic_donor(job: &JobSpec, transport: TcpTransport, use_gpu: bool) {
                 device: job.donor_gpu,
             })
             .expect("caller_tl");
-        let st = CudaStream::new(job.donor_gpu, Tracked::assume_new()).expect("donor stream");
+        let st = CudaStream::new(job.donor_gpu, caps.mint_cuda()).expect("donor stream");
         Some((st, tl))
     } else {
         None
     };
 
     let mut engine = build_distributed_engine(
-        0,
+        &mut caps,
         frame_size,
         num_frames,
         num_windows,
@@ -793,37 +842,56 @@ fn run_dynamic_donor(job: &JobSpec, transport: TcpTransport, use_gpu: bool) {
 
     // Publish `window_w` distinct keys on Donor so pipelined batches can pull distinct frames concurrently.
     let payload = fill_pattern(frame_size, 0x77);
-    let mut stage_ctx = HostContext::new(Tracked::assume_new());
+    let mut stage_ctx = HostContext::new(caps.mint_host());
     for i in 0..window_w {
         let key = ObjectKey([20, i as u64, frame_size as u64, 0]);
         if use_gpu {
-            let (stage_buf, _) =
-                cuda::alloc_host(Tracked::assume_new(), frame_size).expect("alloc_host stage");
-            let _ = host::write_slice(
+            let (stage_buf, Tracked(mut stage_tok)) =
+                cuda::alloc_host(Tracked(caps.alloc.borrow_mut()), frame_size)
+                    .expect("alloc_host stage");
+            let Tracked(w_comp) = host::write_slice(
                 &mut stage_ctx,
-                Tracked::assume_new(),
+                Tracked(caps.instance.borrow()),
                 &stage_buf.as_host_slice(),
                 &payload,
-                Tracked::assume_new(),
-                Tracked::assume_new(),
-                Tracked::assume_new(),
-                Ghost::assume_new(),
+                Tracked(&mut stage_tok),
+                Tracked(&engine.core.ledger.borrow().submitted),
+                Tracked(&engine.core.ledger.borrow().knows),
+                Ghost(engine.core.citations()),
             );
+            let ghost w_ev = w_comp.submitted.key();
+            let t_w = engine
+                .core
+                .issue_ticket(engine.host.timeline_id(), Tracked(w_comp.submitted))
+                .expect("issue stage ticket");
+            engine.core.mark_timeline_complete(
+                engine.host.timeline_id(),
+                t_w.seq(),
+                Tracked(w_comp.knows),
+            );
+            let stage_cuda = stage_buf.as_cuda_slice();
+            let tracked mut stage_perm = ReadPerm::Owned(stage_tok);
+            let ghost stage_cert = ValueCertificate {
+                slot: stage_cuda.slot_ref(),
+                writer: w_ev,
+                bytes: payload@,
+                proof: ValueProof::HostWrite,
+            };
             let (st, tl) = caller_stream_opt.as_mut().unwrap();
             let _ = engine
                 .put_gpu_sync(
-                    Tracked::assume_new(),
+                    Tracked(caps.instance.borrow()),
                     st,
                     *tl,
                     key,
-                    &stage_buf.as_cuda_slice(),
-                    Tracked::assume_new(),
-                    Ghost::assume_new(),
+                    &stage_cuda,
+                    Tracked(&mut stage_perm),
+                    Ghost(stage_cert),
                 )
                 .expect("put_gpu_sync donor");
         } else {
             let _ = engine
-                .put_host(Tracked::assume_new(), key, &payload)
+                .put_host(Tracked(caps.instance.borrow()), key, &payload)
                 .expect("put_host donor");
         }
     }
@@ -831,7 +899,7 @@ fn run_dynamic_donor(job: &JobSpec, transport: TcpTransport, use_gpu: bool) {
     // Serve events until initiator sends final RevokeAck sentinel (grant_tag == u64::MAX).
     loop {
         match engine
-            .poll_peer_event(Tracked::assume_new())
+            .poll_peer_event(Tracked(caps.instance.borrow()))
             .expect("donor poll_peer_event")
         {
             DistributedEvent::Control(ControlPayload::FetchRequest { request_id, key }) => {
@@ -840,8 +908,8 @@ fn run_dynamic_donor(job: &JobSpec, transport: TcpTransport, use_gpu: bool) {
                         serve_tier,
                         request_id,
                         key,
-                        Tracked::assume_new(),
-                        Tracked::assume_new(),
+                        Tracked(caps.shares.borrow_mut()),
+                        Tracked(caps.instance.borrow()),
                     )
                     .expect("serve_fetch_request");
                 assert!(
@@ -877,14 +945,15 @@ fn run_dynamic_initiator(job: &JobSpec, transport: TcpTransport, use_gpu: bool) 
     let num_frames = (window_w + 4) as u32;
     let num_windows = window_w.max(4);
 
+    let mut caps = ShardCapabilityBundle::take(1);
     let device = open_rdma_device(1, &job.rdma_dev);
-    let pd = ProtectionDomain::new(&device, Tracked::assume_new()).expect("PD");
-    let mut core = make_versioned_core(1, frame_size, 64);
+    let pd = ProtectionDomain::new(&device, caps.mint_rdma()).expect("PD");
+    let mut core = caps.make_versioned_core(frame_size, 64);
     let host = HostBackend::new(
         &mut core,
-        Tracked::assume_new(),
-        Tracked::assume_new(),
-        Tracked::assume_new(),
+        Tracked(caps.instance.borrow()),
+        Tracked(caps.alloc.borrow_mut()),
+        caps.mint_host(),
         num_frames,
         4096,
     )
@@ -893,9 +962,9 @@ fn run_dynamic_initiator(job: &JobSpec, transport: TcpTransport, use_gpu: bool) 
     let cuda_opt = if use_gpu {
         let c = CudaBackend::new(
             &mut core,
-            Tracked::assume_new(),
-            Tracked::assume_new(),
-            Tracked::assume_new(),
+            Tracked(caps.instance.borrow()),
+            Tracked(caps.alloc.borrow_mut()),
+            caps.mint_cuda(),
             job.initiator_gpu,
             num_frames,
             32,
@@ -908,7 +977,7 @@ fn run_dynamic_initiator(job: &JobSpec, transport: TcpTransport, use_gpu: bool) 
     };
 
     let mut engine = build_distributed_engine(
-        1,
+        &mut caps,
         frame_size,
         num_frames,
         num_windows,
@@ -950,7 +1019,7 @@ fn run_dynamic_initiator(job: &JobSpec, transport: TcpTransport, use_gpu: bool) 
 
         if !pipelined || window_w == 1 {
             let outcome = engine
-                .fetch_remote_frame(keys[0], dst_tier, pull_target, Tracked::assume_new())
+                .fetch_remote_frame(keys[0], dst_tier, pull_target, Tracked(caps.instance.borrow()))
                 .expect("fetch_remote_frame");
             let FetchOutcome::Hit { frame, .. } = outcome else {
                 panic!("expected Hit");
@@ -961,14 +1030,14 @@ fn run_dynamic_initiator(job: &JobSpec, transport: TcpTransport, use_gpu: bool) 
             // 1) Burst-send W FetchRequests (overlaps TCP + Donor MW binds)
             for &key in &keys {
                 let _ = engine
-                    .send_fetch_request(key, Tracked::assume_new())
+                    .send_fetch_request(key, Tracked(caps.instance.borrow()))
                     .expect("send_fetch_request");
             }
             // 2) Receive all W ReadGrants
             let mut grants = Vec::with_capacity(window_w);
             for _ in 0..window_w {
                 match engine
-                    .poll_peer_event(Tracked::assume_new())
+                    .poll_peer_event(Tracked(caps.instance.borrow()))
                     .expect("poll ReadGrant")
                 {
                     DistributedEvent::ReadGrant(g) => grants.push(g),
@@ -980,8 +1049,9 @@ fn run_dynamic_initiator(job: &JobSpec, transport: TcpTransport, use_gpu: bool) 
             for (idx, grant) in grants.into_iter().enumerate() {
                 let tag = grant.tag;
                 let req_id = grant.meta.request_id;
-                let pull = engine
-                    .peer
+                let ghost orig_frontier = grant.share@.frontier();
+                let tracked vb = grant.version_binding.get().tracked_unwrap();
+                let pull = engine.peers[0]
                     .fetch_post_pull(
                         &mut engine.core,
                         keys[idx],
@@ -993,23 +1063,22 @@ fn run_dynamic_initiator(job: &JobSpec, transport: TcpTransport, use_gpu: bool) 
                         grant.statement,
                         grant.cert,
                         grant.revoked,
-                        Tracked::assume_new(),
+                        Tracked(caps.instance.borrow()),
                     )
                     .expect("fetch_post_pull");
-                inflight.push((tag, req_id, pull));
+                inflight.push((tag, req_id, pull, Tracked(vb), Ghost(orig_frontier)));
             }
             // 4) Complete all W in-flight RDMA READs (BAR1 flush + finish_write + ReadRelease)
-            for (tag, req_id, pull) in inflight {
-                let outcome = engine
-                    .peer
+            for (tag, req_id, pull, vb, orig_frontier) in inflight {
+                let outcome = engine.peers[0]
                     .fetch_complete_pull(
                         &mut engine.core,
                         tag,
                         req_id,
                         pull,
-                        Tracked::assume_new(),
-                        Ghost::assume_new(),
-                        Tracked::assume_new(),
+                        vb,
+                        orig_frontier,
+                        Tracked(caps.instance.borrow()),
                     )
                     .expect("fetch_complete_pull");
                 let FetchOutcome::Hit { frame, .. } = outcome else {
@@ -1044,7 +1113,7 @@ fn run_dynamic_initiator(job: &JobSpec, transport: TcpTransport, use_gpu: bool) 
             ControlPayload::RevokeAck {
                 grant_tag: u64::MAX,
             },
-            Tracked::assume_new(),
+            Tracked(caps.instance.borrow()),
         )
         .expect("send exit sentinel");
 
@@ -1071,3 +1140,5 @@ fn run_dynamic_initiator(job: &JobSpec, transport: TcpTransport, use_gpu: bool) 
     );
     rec
 }
+
+} // verus!
