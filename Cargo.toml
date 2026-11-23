@@ -5,7 +5,7 @@ members = [
     "vericache-transfer",
     "vericache-core",
 ]
-exclude = ["vericache-bench"]
+exclude = ["vericache-bench", "vericache", "vericache-python"]
 
 [workspace.package]
 version = "0.1.0"

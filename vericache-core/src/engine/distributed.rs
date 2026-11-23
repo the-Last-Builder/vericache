@@ -4,6 +4,7 @@
 //! `O_DIRECT`), and `peers: Vec<PeerSession<'a, T>>` with shared or per-peer MRs,
 //! full-duplex single-QP CQ routing, cooperative-first MW revocation, and Option-A
 //! QP error/reset/reconnect recovery.
+use super::{GpuLease, HostLease};
 #[cfg(verus_only)]
 use crate::backends::compose::*;
 #[cfg(verus_only)]
@@ -3974,6 +3975,899 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             Ok(_) => Ok(dst_frame),
             Err((e, _)) => Err(e),
         }
+    }
+
+    // =========================================================================
+    // Verified Facade Mechanism Primitives (Cross-Tier Hops, Leases, Multi-Tier Serving)
+    // =========================================================================
+    /// Synchronously copy a published GPU-VRAM or Pinned-Host frame into the
+    /// opposite tier (`GPU <-> Pinned Host`) using caller's idle `src_stream` /
+    /// `src_timeline`. Works with both `CudaAttachment::Borrowed` and `Owned`
+    /// while preserving existing `VersionId` and cluster-wide `VersionBinding`.
+    pub fn copy_hop_cuda_sync(
+        &mut self,
+        Tracked(instance): Tracked<&TransferInstance>,
+        Tracked(shares): Tracked<&mut ShareSource>,
+        src_stream: &mut CudaStream,
+        src_timeline: u8,
+        src_frame: FrameId,
+        dst_tier: TierId,
+    ) -> (r: BackendResult<(VersionId, FrameId)>)
+        requires
+            old(self).well_formed(),
+            old(self).cuda.spec_ref() matches Some(c) && {
+                &&& caller_stream_valid(
+                    *old(src_stream),
+                    &old(self).core,
+                    src_timeline,
+                    c.timeline.stream,
+                )
+                &&& src_timeline != old(self).host.timeline
+                &&& src_timeline != c.timeline.timeline_id
+                &&& forall|i: int|
+                    0 <= i < old(self).peers@.len() ==> src_timeline != (#[trigger] old(
+                        self,
+                    ).peers@[i]).rdma.timeline_id
+                &&& (old(self).nvme matches Some(n) ==> src_timeline != n.timeline)
+                &&& old(self).core.timelines.confirmed_seq[src_timeline as int] + 1 == old(
+                    self,
+                ).core.timelines.next_seq[src_timeline as int]
+                &&& old(src_stream).device() == c.device
+            },
+            instance.id() == old(self).core.instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(self).core.instance_id(),
+            old(shares).node() == old(self).core.node(),
+        ensures
+            final(self).well_formed(),
+            final(self).host == old(self).host,
+            final(self).cuda == old(self).cuda,
+            final(self).nvme == old(self).nvme,
+            final(self).peers == old(self).peers,
+            final(self).core.node_id == old(self).core.node_id,
+            final(self).core.instance_id() == old(self).core.instance_id(),
+            final(self).core.tiers == old(self).core.tiers,
+            old(self).core.spec@.versions_monotonic(final(self).core.spec@),
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+            final(self).cuda.spec_ref() matches Some(c) ==> caller_stream_valid(
+                *final(src_stream),
+                &final(self).core,
+                src_timeline,
+                c.timeline.stream,
+            ),
+            r matches Ok((ver, dst_frame)) ==> {
+                &&& final(self).cuda.spec_ref() matches Some(c) && ((dst_tier == c.gpu_tier
+                    && c.owns_gpu(dst_frame)) || c.owns_pinned_host(dst_frame))
+                &&& final(self).core.timelines.confirmed_seq[src_timeline as int] + 1
+                    == final(self).core.timelines.next_seq[src_timeline as int]
+                &&& final(self).core.frames.meta(dst_frame).state == STATE_PUBLISHED
+                &&& final(self).core.frames.frame(dst_frame).tier == dst_tier
+                &&& final(self).core.spec@.versions.contains_key(ver)
+            },
+    {
+        hide(CacheCore::well_formed);
+        let Some(cuda) = self.cuda.as_ref() else {
+            return Err(CoreError::UnsupportedTier);
+        };
+        let ghost before = self.core;
+        let ghost src_source = src_stream.source().source();
+        let res = cuda.copy_hop_sync(
+            &mut self.core,
+            Tracked(instance),
+            Tracked(shares),
+            src_stream,
+            src_timeline,
+            src_frame,
+            dst_tier,
+        );
+        proof {
+            lemma_core_wf_facts(&before);
+            lemma_core_wf_facts(&self.core);
+            Self::lemma_preserve_siblings(
+                &before,
+                &self.core,
+                Some(src_timeline),
+                Some(src_source),
+                FrameTouchMode::PreserveAllInit,
+                self.host,
+                &self.host_ctx,
+                &self.cuda,
+                &self.nvme,
+                self.peers@,
+            );
+            assert(self.core.all_versions_bound());
+        }
+        res
+    }
+
+    /// Synchronously read a specific published Host-DRAM frame into `dst`.
+    pub fn read_host_frame(
+        &mut self,
+        Tracked(instance): Tracked<&TransferInstance>,
+        Tracked(shares): Tracked<&mut ShareSource>,
+        frame: FrameId,
+        dst: &mut [u8],
+    ) -> (r: BackendResult<VersionId>)
+        requires
+            old(self).well_formed(),
+            instance.id() == old(self).core.instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(self).core.instance_id(),
+            old(shares).node() == old(self).core.node(),
+        ensures
+            final(self).well_formed(),
+            final(self).host == old(self).host,
+            final(self).cuda == old(self).cuda,
+            final(self).nvme == old(self).nvme,
+            final(self).peers == old(self).peers,
+            final(self).core.spec == old(self).core.spec,
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+            final(dst)@.len() == old(dst)@.len(),
+            r matches Ok(ver) ==> final(self).core.spec@.versions.contains_key(ver),
+    {
+        hide(CacheCore::well_formed);
+        let ghost before = self.core;
+        let res = self.host.read_frame_into_with(
+            &mut self.host_ctx,
+            &mut self.core,
+            Tracked(instance),
+            Tracked(shares),
+            frame,
+            dst,
+        );
+        proof {
+            lemma_core_wf_facts(&before);
+            lemma_core_wf_facts(&self.core);
+            assert forall|i: int| 0 <= i < self.peers@.len() implies (
+            #[trigger] self.peers@[i]).well_formed(&self.core) by {
+                lemma_core_transition_preserves_peer_session(
+                    &before,
+                    &self.core,
+                    None,
+                    Some(old(self).host_ctx.source@.source()),
+                    FrameTouchMode::PreserveAllInit,
+                    &self.peers@[i],
+                );
+            }
+            match &self.cuda {
+                CudaAttachment::None => {},
+                CudaAttachment::Borrowed(c) => {
+                    lemma_core_transition_preserves_cuda(
+                        &before,
+                        &self.core,
+                        None,
+                        Some(old(self).host_ctx.source@.source()),
+                        FrameTouchMode::PreserveAllInit,
+                        *c,
+                    );
+                },
+                CudaAttachment::Owned(c) => {
+                    lemma_core_transition_preserves_cuda(
+                        &before,
+                        &self.core,
+                        None,
+                        Some(old(self).host_ctx.source@.source()),
+                        FrameTouchMode::PreserveAllInit,
+                        c,
+                    );
+                },
+            }
+            if let Some(ref n) = self.nvme {
+                lemma_core_transition_preserves_nvme(
+                    &before,
+                    &self.core,
+                    None,
+                    Some(old(self).host_ctx.source@.source()),
+                    FrameTouchMode::PreserveAllInit,
+                    n,
+                );
+            }
+            assert(self.core.all_versions_bound()) by {
+                reveal(FrameTable::same_directory);
+            }
+        }
+        res
+    }
+
+    /// Asynchronously read a specific published GPU-VRAM or Pinned-Host frame
+    /// into caller's `CudaSlice` on `dst_stream` (1-hop D2D or H2D Ordered Handoff).
+    pub fn get_into_gpu_frame(
+        &mut self,
+        Tracked(instance): Tracked<&TransferInstance>,
+        Tracked(shares): Tracked<&mut ShareSource>,
+        frame: FrameId,
+        dst_stream: &mut CudaStream,
+        dst_timeline: u8,
+        dst: &CudaSlice,
+        Tracked(dst_tok): Tracked<&mut SlotToken>,
+    ) -> (r: BackendResult<(VersionId, Ticket, Ghost<TransferEvent>)>)
+        requires
+            old(self).well_formed(),
+            old(self).cuda.spec_ref() matches Some(c) && {
+                &&& caller_stream_valid(
+                    *old(dst_stream),
+                    &old(self).core,
+                    dst_timeline,
+                    c.timeline.stream,
+                )
+                &&& dst_timeline != old(self).host.timeline
+                &&& dst_timeline != c.timeline.timeline_id
+                &&& forall|i: int|
+                    0 <= i < old(self).peers@.len() ==> dst_timeline != (#[trigger] old(
+                        self,
+                    ).peers@[i]).rdma.timeline_id
+                &&& (old(self).nvme matches Some(n) ==> dst_timeline != n.timeline)
+                &&& dst.slot_ref().loc.space is GpuAlloc
+                    ==> dst.slot_ref().loc.space->GpuAlloc_device == c.device
+            },
+            instance.id() == old(self).core.instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(self).core.instance_id(),
+            old(shares).node() == old(self).core.node(),
+            dst.well_formed(),
+            dst.instance_id() == old(self).core.instance_id(),
+            dst.slot_ref().loc.node == old(self).core.node(),
+            old(self).cuda.spec_ref() matches Some(c) ==> dst.slot_ref().sub_len == old(
+                self,
+            ).core.frames.tier_frame_size(c.gpu_tier),
+            slot_is_owned(*old(dst_tok), old(self).core.instance_id(), dst.slot_ref().loc),
+            write_admitted(slot_frontier(*old(dst_tok)), old(self).core.citations()),
+            old(self).core.disjoint_from_published(ISet::empty().insert(dst.slot_ref().loc)),
+            forall|f: FrameId|
+                f.0 < old(self).core.frames.metas.len() ==> dst.slot_ref().loc != (#[trigger] old(
+                    self,
+                ).core.frames.frame(f)).slot.loc,
+        ensures
+            final(self).well_formed(),
+            final(self).host == old(self).host,
+            final(self).cuda == old(self).cuda,
+            final(self).nvme == old(self).nvme,
+            final(self).peers == old(self).peers,
+            final(self).core.spec == old(self).core.spec,
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+            final(self).cuda.spec_ref() matches Some(c) ==> caller_stream_valid(
+                *final(dst_stream),
+                &final(self).core,
+                dst_timeline,
+                c.timeline.stream,
+            ),
+            r matches Ok((version, ticket, ev)) ==> {
+                &&& ticket != Ticket::NONE
+                &&& ticket.timeline_id() == dst_timeline
+                &&& final(self).core.spec@.versions.contains_key(version)
+                &&& slot_owned(
+                    *final(dst_tok),
+                    old(self).core.instance_id(),
+                    dst.slot_ref().loc,
+                    Frontier { last_writer: Some(ev@), readers: ISet::empty() },
+                )
+            },
+    {
+        hide(CacheCore::well_formed);
+        let Some(cuda) = self.cuda.as_ref() else {
+            return Err(CoreError::UnsupportedTier);
+        };
+        let ghost before = self.core;
+        let ghost src_ev = dst_stream.source().source();
+        let res = cuda.get_into_gpu(
+            &mut self.core,
+            Tracked(instance),
+            Tracked(shares),
+            frame,
+            dst_stream,
+            dst_timeline,
+            dst,
+            Tracked(dst_tok),
+        );
+        proof {
+            lemma_core_wf_facts(&before);
+            lemma_core_wf_facts(&self.core);
+            Self::lemma_preserve_siblings(
+                &before,
+                &self.core,
+                Some(dst_timeline),
+                Some(src_ev),
+                FrameTouchMode::PreserveAllInit,
+                self.host,
+                &self.host_ctx,
+                &self.cuda,
+                &self.nvme,
+                self.peers@,
+            );
+            assert(self.core.all_versions_bound());
+        }
+        res
+    }
+
+    /// Acquire a zero-copy local read lease on a published Host-DRAM frame.
+    pub fn get_lease_host(
+        &mut self,
+        Tracked(instance): Tracked<&TransferInstance>,
+        Tracked(shares): Tracked<&mut ShareSource>,
+        key: ObjectKey,
+    ) -> (r: BackendResult<Option<HostLease<'a>>>)
+        requires
+            old(self).well_formed(),
+            instance.id() == old(self).core.instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(self).core.instance_id(),
+            old(shares).node() == old(self).core.node(),
+        ensures
+            final(self).well_formed(),
+            final(self).host == old(self).host,
+            final(self).cuda == old(self).cuda,
+            final(self).nvme == old(self).nvme,
+            final(self).peers == old(self).peers,
+            final(self).core.spec == old(self).core.spec,
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+            r matches Ok(Some(lease)) ==> {
+                &&& lease.slice.well_formed()
+                &&& lease.slice.instance_id() == final(self).core.instance_id()
+                &&& lease.slice.slot_ref() == final(self).core.frames.frame(lease.handle.frame).slot
+                &&& final(self).core.active_lease_matches(lease.handle)
+                &&& !final(self).core.active_leases[lease.handle.slot as int]->Some_0.internal
+                &&& lease.cap@.is_local()
+                &&& lease.cap@.instance_id() == final(self).core.instance_id()
+                &&& lease.cap@.loc() == lease.slice.slot_ref().loc
+                &&& lease.cap@.share()
+                    == final(self).core.active_leases[lease.handle.slot as int]->Some_0.share@
+                &&& read_admitted(lease.cap@.frontier(), final(self).core.citations())
+                &&& lease.cap@.frontier().readers.is_empty()
+                &&& final(self).core.frames.returned_reads(
+                    lease.handle.frame,
+                    lease.cap@,
+                    Ticket::NONE,
+                    final(self).core.kernel_view(),
+                )
+            },
+    {
+        hide(CacheCore::well_formed);
+        let Some((frame, _ver)) = self.core.lookup_tier(key, self.host.tier) else {
+            return Ok(None);
+        };
+        let ghost before = self.core;
+        let (handle, version, _cert, cap) = self.core.acquire_local_lease(
+            frame,
+            false,
+            Tracked(shares),
+            Tracked(instance),
+        )?;
+        proof {
+            lemma_core_transition_no_event(&before, &self.core, None, None);
+            Self::lemma_preserve_siblings(
+                &before,
+                &self.core,
+                None,
+                None,
+                FrameTouchMode::PreserveAllInit,
+                self.host,
+                &self.host_ctx,
+                &self.cuda,
+                &self.nvme,
+                self.peers@,
+            );
+            assert(self.core.all_versions_bound()) by {
+                reveal(FrameTable::same_directory);
+            }
+            lemma_slab_owns_tier_frame(
+                &self.core,
+                self.host.tier,
+                self.host.first_frame,
+                self.host.num_frames,
+                self.host.buffer.space(),
+                frame,
+            );
+            lemma_slab_frame_slot(
+                &self.core,
+                self.host.tier,
+                self.host.first_frame,
+                self.host.num_frames,
+                self.host.buffer.space(),
+                frame,
+            );
+        }
+        let slice = self.host.frame_slice(frame);
+        Ok(Some(HostLease { handle, version, slice, cap }))
+    }
+
+    /// Acquire a zero-copy local read lease on a published GPU-VRAM frame.
+    pub fn get_lease_gpu(
+        &mut self,
+        Tracked(instance): Tracked<&TransferInstance>,
+        Tracked(shares): Tracked<&mut ShareSource>,
+        key: ObjectKey,
+    ) -> (r: BackendResult<Option<GpuLease>>)
+        requires
+            old(self).well_formed(),
+            instance.id() == old(self).core.instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(self).core.instance_id(),
+            old(shares).node() == old(self).core.node(),
+        ensures
+            final(self).well_formed(),
+            final(self).host == old(self).host,
+            final(self).cuda == old(self).cuda,
+            final(self).nvme == old(self).nvme,
+            final(self).peers == old(self).peers,
+            final(self).core.spec == old(self).core.spec,
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+            r matches Ok(Some(lease)) ==> {
+                &&& lease.handle.frame == lease.frame
+                &&& final(self).cuda.spec_ref() matches Some(c) && c.owns_gpu(lease.frame)
+                &&& final(self).core.active_lease_matches(lease.handle)
+                &&& !final(self).core.active_leases[lease.handle.slot as int]->Some_0.internal
+                &&& lease.cap@.is_local()
+                &&& lease.cap@.instance_id() == final(self).core.instance_id()
+                &&& lease.cap@.loc() == final(self).core.frames.frame(lease.frame).slot.loc
+                &&& lease.cap@.share()
+                    == final(self).core.active_leases[lease.handle.slot as int]->Some_0.share@
+                &&& read_admitted(lease.cap@.frontier(), final(self).core.citations())
+                &&& lease.cap@.frontier().readers.is_empty()
+                &&& final(self).core.frames.returned_reads(
+                    lease.frame,
+                    lease.cap@,
+                    Ticket::NONE,
+                    final(self).core.kernel_view(),
+                )
+            },
+    {
+        hide(CacheCore::well_formed);
+        let Some(gpu_tier) = self.gpu_tier() else {
+            return Err(CoreError::UnsupportedTier);
+        };
+        let Some((frame, _ver)) = self.core.lookup_tier(key, gpu_tier) else {
+            return Ok(None);
+        };
+        let ghost before = self.core;
+        let (handle, version, _cert, cap) = self.core.acquire_local_lease(
+            frame,
+            false,
+            Tracked(shares),
+            Tracked(instance),
+        )?;
+        let sync_point = match self.cuda.as_ref() {
+            Some(c) => c.frame_sync_point(frame),
+            None => SyncPoint::HostComplete,
+        };
+        proof {
+            lemma_core_transition_no_event(&before, &self.core, None, None);
+            Self::lemma_preserve_siblings(
+                &before,
+                &self.core,
+                None,
+                None,
+                FrameTouchMode::PreserveAllInit,
+                self.host,
+                &self.host_ctx,
+                &self.cuda,
+                &self.nvme,
+                self.peers@,
+            );
+            assert(self.core.all_versions_bound()) by {
+                reveal(FrameTable::same_directory);
+            }
+            let c = self.cuda.spec_ref().unwrap();
+            lemma_slab_owns_tier_frame(
+                &self.core,
+                c.gpu_tier,
+                c.gpu_first_frame,
+                c.gpu_num_frames,
+                c.gpu_buffer.space(),
+                frame,
+            );
+        }
+        Ok(Some(GpuLease { handle, version, frame, sync_point, cap }))
+    }
+
+    /// Release a caller-owned (`!internal`) local read lease, recording its
+    /// optional trailing `read_ticket` for Observed Reclamation.
+    pub fn release_lease(
+        &mut self,
+        Tracked(instance): Tracked<&TransferInstance>,
+        handle: ReadLeaseHandle,
+        Tracked(cap): Tracked<ShareCap>,
+        read_ticket: Ticket,
+    ) -> (r: BackendResult<()>)
+        requires
+            old(self).well_formed(),
+            instance.id() == old(self).core.instance_id(),
+            old(self).core.timelines.valid_ticket(read_ticket),
+            old(self).core.active_lease_matches(handle) ==> {
+                let share = old(self).core.active_leases[handle.slot as int]->Some_0.share@;
+                &&& cap.share() == share
+                &&& old(self).core.frames.returned_reads(
+                    handle.frame,
+                    cap,
+                    read_ticket,
+                    old(self).core.kernel_view(),
+                )
+            },
+        ensures
+            final(self).well_formed(),
+            final(self).host == old(self).host,
+            final(self).cuda == old(self).cuda,
+            final(self).nvme == old(self).nvme,
+            final(self).peers == old(self).peers,
+            final(self).core.spec == old(self).core.spec,
+    {
+        hide(CacheCore::well_formed);
+        let idx = handle.slot as usize;
+        if idx >= self.core.active_leases.len() {
+            return Err(CoreError::InvalidArgument);
+        }
+        let is_internal = match &self.core.active_leases[idx] {
+            Some(lease) => lease.internal,
+            None => false,
+        };
+        if is_internal {
+            return Err(CoreError::WouldConflict);
+        }
+        let ghost before = self.core;
+        let res = self.core.release_local_lease(
+            handle,
+            Tracked(cap),
+            read_ticket,
+            Tracked(instance),
+        );
+        proof {
+            lemma_core_transition_no_event(&before, &self.core, None, None);
+            Self::lemma_preserve_siblings(
+                &before,
+                &self.core,
+                None,
+                None,
+                FrameTouchMode::PreserveAllInit,
+                self.host,
+                &self.host_ctx,
+                &self.cuda,
+                &self.nvme,
+                self.peers@,
+            );
+            assert(self.core.all_versions_bound()) by {
+                reveal(FrameTable::same_directory);
+            }
+        }
+        res
+    }
+
+    /// Donor-side handler for `FetchRequest` checking `primary_tier` first and
+    /// optionally falling back to `fallback_tier` (e.g. GPU HBM -> Host DRAM).
+    pub fn serve_fetch_request_multi_for_peer(
+        &mut self,
+        peer_idx: usize,
+        primary_tier: TierId,
+        fallback_tier: Option<TierId>,
+        request_id: u64,
+        key: ObjectKey,
+        Tracked(shares): Tracked<&mut ShareSource>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<ServeOutcome, CoreError>)
+        requires
+            old(self).well_formed(),
+            (peer_idx as int) < old(self).peers@.len(),
+            old(self).peers@[peer_idx as int].rdma.qp.ready(),
+            old(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
+            old(self).peers@[peer_idx as int].next_grant_tag < u64::MAX,
+            instance.id() == old(self).core.instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(self).core.instance_id(),
+            old(shares).node() == old(self).core.node(),
+        ensures
+            final(self).well_formed(),
+            final(self).host == old(self).host,
+            final(self).cuda == old(self).cuda,
+            final(self).nvme == old(self).nvme,
+            final(self).peers@.len() == old(self).peers@.len(),
+            final(self).core.node_id == old(self).core.node_id,
+            final(self).core.instance_id() == old(self).core.instance_id(),
+            final(self).peers@[peer_idx as int].rdma.qp == old(
+                self,
+            ).peers@[peer_idx as int].rdma.qp,
+            forall|j: int|
+                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+    {
+        hide(CacheCore::well_formed);
+        let ghost before = self.core;
+        let ghost before_peers = self.peers@;
+        let res = self.peers[peer_idx].serve_fetch_request_multi(
+            &mut self.core,
+            primary_tier,
+            fallback_tier,
+            request_id,
+            key,
+            Tracked(shares),
+            Tracked(instance),
+        );
+        self.restore_after_peer_step(
+            peer_idx,
+            Ghost(before),
+            Ghost(before_peers),
+            Tracked(instance),
+        );
+        res
+    }
+
+    /// Full-duplex remote fetch from `peer_idx` that serves inbound `FetchRequest`s
+    /// from `primary_tier` with optional `fallback_tier` (e.g. GPU HBM -> Host DRAM).
+    pub fn fetch_from_peer_duplex_multi(
+        &mut self,
+        peer_idx: usize,
+        primary_serve_tier: TierId,
+        fallback_serve_tier: Option<TierId>,
+        pd: Option<&'a rdma::ProtectionDomain<'a>>,
+        tokens: &mut Vec<Tracked<EventSourceToken>>,
+        key: ObjectKey,
+        dst_tier: TierId,
+        target: PullTarget,
+        Tracked(shares): Tracked<&mut ShareSource>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<FetchOutcome, CoreError>)
+        requires
+            old(self).well_formed(),
+            (peer_idx as int) < old(self).peers@.len(),
+            old(self).peers@[peer_idx as int].rdma.qp.ready(),
+            old(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
+            old(self).peers@[peer_idx as int].next_request_id < u64::MAX,
+            old(self).core.frames.tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
+            instance.id() == old(self).core.instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(self).core.instance_id(),
+            old(shares).node() == old(self).core.node(),
+            pd matches Some(p) ==> p.id() == old(self).peers@[peer_idx as int].rdma.window_pool.pd()
+                && p.node() == old(self).core.node(),
+            forall|k: int|
+                0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
+                    tokens,
+                )@[k]@.source() is RdmaQueuePair && old(tokens)@[k]@.node() == old(
+                    self,
+                ).core.node(),
+            match target {
+                PullTarget::Host => old(
+                    self,
+                ).peers@[peer_idx as int].rdma.effective_host_mr_spec() matches Some(s) && s.tier
+                    == dst_tier && s.mr.access().local_write && s.mr.gpu_device_spec().is_none(),
+                PullTarget::GpuGdr => old(
+                    self,
+                ).peers@[peer_idx as int].rdma.effective_gpu_mr_spec() matches Some(s) && s.tier
+                    == dst_tier && s.mr.access().local_write && s.mr.gpu_device_spec() is Some,
+            },
+        ensures
+            final(self).well_formed(),
+            final(self).host == old(self).host,
+            final(self).cuda == old(self).cuda,
+            final(self).nvme == old(self).nvme,
+            final(self).peers@.len() == old(self).peers@.len(),
+            final(self).peers@[peer_idx as int].rdma.qp.ready(),
+            final(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
+            forall|j: int|
+                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+            forall|k: int|
+                0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
+                    && final(tokens)@[k]@.source() is RdmaQueuePair && final(tokens)@[k]@.node()
+                    == old(self).core.node(),
+    {
+        hide(CacheCore::well_formed);
+        if self.peers[peer_idx].rdma.qp.effective_max_rd_atomic_exec() == 0 {
+            return Err(CoreError::InvalidArgument);
+        }
+        let ghost before = self.core;
+        let ghost before_peers = self.peers@;
+        let res = self.peers[peer_idx].fetch_remote_frame_duplex_multi(
+            &mut self.core,
+            primary_serve_tier,
+            fallback_serve_tier,
+            pd,
+            tokens,
+            key,
+            dst_tier,
+            target,
+            Tracked(shares),
+            Tracked(instance),
+        );
+        self.restore_after_peer_step(
+            peer_idx,
+            Ghost(before),
+            Ghost(before_peers),
+            Tracked(instance),
+        );
+        res
+    }
+
+    /// Non-blocking progress sweep on `peer_idx` serving inbound `FetchRequest`s
+    /// from `primary_serve_tier` with optional `fallback_serve_tier`.
+    pub fn poll_peer_progress_multi(
+        &mut self,
+        peer_idx: usize,
+        primary_serve_tier: TierId,
+        fallback_serve_tier: Option<TierId>,
+        pd: Option<&'a rdma::ProtectionDomain<'a>>,
+        tokens: &mut Vec<Tracked<EventSourceToken>>,
+        Tracked(shares): Tracked<&mut ShareSource>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<PeerProgress, CoreError>)
+        requires
+            old(self).well_formed(),
+            (peer_idx as int) < old(self).peers@.len(),
+            old(self).peers@[peer_idx as int].rdma.qp.ready(),
+            old(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
+            instance.id() == old(self).core.instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(self).core.instance_id(),
+            old(shares).node() == old(self).core.node(),
+            pd matches Some(p) ==> p.id() == old(self).peers@[peer_idx as int].rdma.window_pool.pd()
+                && p.node() == old(self).core.node(),
+            forall|k: int|
+                0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
+                    tokens,
+                )@[k]@.source() is RdmaQueuePair && old(tokens)@[k]@.node() == old(
+                    self,
+                ).core.node(),
+        ensures
+            final(self).well_formed(),
+            final(self).host == old(self).host,
+            final(self).cuda == old(self).cuda,
+            final(self).nvme == old(self).nvme,
+            final(self).peers@.len() == old(self).peers@.len(),
+            final(self).core.node_id == old(self).core.node_id,
+            final(self).core.instance_id() == old(self).core.instance_id(),
+            final(self).peers@[peer_idx as int].rdma.qp == old(
+                self,
+            ).peers@[peer_idx as int].rdma.qp,
+            forall|j: int|
+                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+            forall|k: int|
+                0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
+                    && final(tokens)@[k]@.source() is RdmaQueuePair && final(tokens)@[k]@.node()
+                    == old(self).core.node(),
+    {
+        hide(CacheCore::well_formed);
+        let ghost before = self.core;
+        let ghost before_peers = self.peers@;
+        let res = self.peers[peer_idx].poll_progress_multi(
+            &mut self.core,
+            primary_serve_tier,
+            fallback_serve_tier,
+            pd,
+            tokens,
+            Tracked(shares),
+            Tracked(instance),
+        );
+        self.restore_after_peer_step(
+            peer_idx,
+            Ghost(before),
+            Ghost(before_peers),
+            Tracked(instance),
+        );
+        res
+    }
+
+    /// Round-robin non-blocking progress sweep across all attached `PeerSession`s,
+    /// serving inbound `FetchRequest`s from `primary_serve_tier` with optional `fallback_serve_tier`.
+    pub fn poll_all_peers_progress_multi(
+        &mut self,
+        primary_serve_tier: TierId,
+        fallback_serve_tier: Option<TierId>,
+        pd: Option<&'a rdma::ProtectionDomain<'a>>,
+        tokens: &mut Vec<Tracked<EventSourceToken>>,
+        Tracked(shares): Tracked<&mut ShareSource>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<PeerProgress, CoreError>)
+        requires
+            old(self).well_formed(),
+            forall|i: int|
+                0 <= i < old(self).peers@.len() ==> {
+                    let p = #[trigger] old(self).peers@[i];
+                    &&& p.rdma.qp.ready()
+                    &&& p.rdma.qp.state() is ReadyToSend
+                    &&& (pd matches Some(pd_ref) ==> pd_ref.id() == p.rdma.window_pool.pd())
+                },
+            pd matches Some(pd_ref) ==> pd_ref.node() == old(self).core.node(),
+            instance.id() == old(self).core.instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(self).core.instance_id(),
+            old(shares).node() == old(self).core.node(),
+            forall|k: int|
+                0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
+                    tokens,
+                )@[k]@.source() is RdmaQueuePair && old(tokens)@[k]@.node() == old(
+                    self,
+                ).core.node(),
+        ensures
+            final(self).well_formed(),
+            final(self).host == old(self).host,
+            final(self).cuda == old(self).cuda,
+            final(self).nvme == old(self).nvme,
+            final(self).peers@.len() == old(self).peers@.len(),
+            forall|i: int|
+                0 <= i < final(self).peers@.len() ==> (#[trigger] final(self).peers@[i]).rdma.qp
+                    == old(self).peers@[i].rdma.qp,
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+            forall|k: int|
+                0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
+                    && final(tokens)@[k]@.source() is RdmaQueuePair && final(tokens)@[k]@.node()
+                    == old(self).core.node(),
+    {
+        hide(CacheCore::well_formed);
+        let mut total = PeerProgress::empty();
+        let mut idx: usize = 0;
+        while idx < self.peers.len()
+            invariant
+                idx <= self.peers@.len(),
+                self.well_formed(),
+                self.host == old(self).host,
+                self.cuda == old(self).cuda,
+                self.nvme == old(self).nvme,
+                self.peers@.len() == old(self).peers@.len(),
+                self.core.node_id == old(self).core.node_id,
+                self.core.instance_id() == old(self).core.instance_id(),
+                forall|i: int|
+                    0 <= i < self.peers@.len() ==> {
+                        let p = #[trigger] self.peers@[i];
+                        &&& p.rdma.qp == old(self).peers@[i].rdma.qp
+                        &&& p.rdma.qp.ready()
+                        &&& p.rdma.qp.state() is ReadyToSend
+                    },
+                forall|i: int|
+                    idx <= i < self.peers@.len() ==> (pd matches Some(pd_ref) ==> pd_ref.id() == (
+                    #[trigger] self.peers@[i]).rdma.window_pool.pd()),
+                pd matches Some(pd_ref) ==> pd_ref.node() == self.core.node(),
+                instance.id() == self.core.instance_id(),
+                shares.well_formed(),
+                shares.id() == old(shares).id(),
+                shares.node() == old(shares).node(),
+                shares.id() == self.core.instance_id(),
+                shares.node() == self.core.node(),
+                forall|k: int|
+                    0 <= k < tokens@.len() ==> (#[trigger] tokens@[k])@.well_formed()
+                        && tokens@[k]@.source() is RdmaQueuePair && tokens@[k]@.node()
+                        == self.core.node(),
+            decreases self.peers@.len() - idx,
+        {
+            let p = self.poll_peer_progress_multi(
+                idx,
+                primary_serve_tier,
+                fallback_serve_tier,
+                pd,
+                tokens,
+                Tracked(shares),
+                Tracked(instance),
+            )?;
+            if total.cq_processed <= usize::MAX - p.cq_processed {
+                total.cq_processed += p.cq_processed;
+            }
+            if total.grants_completed <= usize::MAX - p.grants_completed {
+                total.grants_completed += p.grants_completed;
+            }
+            if total.windows_replenished <= usize::MAX - p.windows_replenished {
+                total.windows_replenished += p.windows_replenished;
+            }
+            idx += 1;
+        }
+        Ok(total)
     }
 }
 

@@ -193,6 +193,16 @@ impl<'a> CudaSlice<'a> {
         self.memory.len
     }
 
+    /// Return the raw device/pinned virtual address of this slice as an integer
+    /// (read-only address inspection for external CUDA runtime interop such as
+    /// PyTorch/vLLM `cudaMemcpyAsync`).
+    pub fn device_addr(&self) -> (addr: usize)
+        requires
+            self.well_formed(),
+    {
+        self.memory.ptr.addr()
+    }
+
     pub fn sub_slice(&self, offset: usize, len: usize) -> (s: CudaSlice<'a>)
         requires
             self.well_formed(),

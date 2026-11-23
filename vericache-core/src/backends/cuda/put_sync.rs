@@ -8,7 +8,11 @@ use transfer::cuda::{CudaSlice, CudaStream};
 verus! {
 
 impl<'a> CudaBackend<'a> {
-    proof fn lemma_ticket_covers_self(timelines: &TimelineTable, k: Ticket, e: TransferEvent)
+    pub(super) proof fn lemma_ticket_covers_self(
+        timelines: &TimelineTable,
+        k: Ticket,
+        e: TransferEvent,
+    )
         requires
             k != Ticket::NONE,
             1 <= k.sequence(),
@@ -20,7 +24,7 @@ impl<'a> CudaBackend<'a> {
         assert(1 <= s <= k.sequence() && timelines.events@[(k.timeline_id(), s)] == e);
     }
 
-    proof fn lemma_put_sync_copy_admitted(
+    pub(super) proof fn lemma_put_sync_copy_admitted(
         core: &CacheCore,
         src_stream: CudaStream,
         src_perm: ReadPerm,
@@ -134,7 +138,7 @@ impl<'a> CudaBackend<'a> {
         lemma_core_transition_no_event(before, after, Some(src_timeline), Some(source));
     }
 
-    proof fn lemma_put_sync_preds_closed(
+    pub(super) proof fn lemma_put_sync_preds_closed(
         after_bw: &CacheCore,
         cur: &CacheCore,
         before_stream: CudaStream,
@@ -203,7 +207,7 @@ impl<'a> CudaBackend<'a> {
         lemma_write_disjoint_from_published(cur, frame, sub_val.access.writes);
     }
 
-    proof fn lemma_put_sync_copy_cert(
+    pub(super) proof fn lemma_put_sync_copy_cert(
         before: &CacheCore,
         after: &CacheCore,
         src_stream: CudaStream,

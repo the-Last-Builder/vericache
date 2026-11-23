@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vericache"
+version = "0.1.0"
+description = "Python client and vLLM v1 KVConnector for VeriCache (formally verified, location-transparent distributed KV cache)."
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["python"]

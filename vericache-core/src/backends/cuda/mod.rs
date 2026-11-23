@@ -8,6 +8,7 @@ use transfer::cuda::{self, CudaBuffer, CudaHostRegistration, CudaSlice};
 
 mod copy;
 mod copy_park;
+mod copy_sync;
 mod get;
 mod get_scatter;
 #[cfg(verus_only)]

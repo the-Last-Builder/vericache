@@ -2434,11 +2434,39 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     /// `tier`, binding an RDMA Type-2 MW (polling CQ via `pump_cq` until bind
     /// finishes), and sending a `READ_GRANT` with constructive `VeriCacheAttachment::ReadGrant`
     /// (or `FetchMiss` if absent, bind fails, or bind times out cleanly with async tracking).
+    fn lookup_serve_frame(
+        core: &CacheCore,
+        key: ObjectKey,
+        primary_tier: TierId,
+        fallback_tier: Option<TierId>,
+    ) -> (r: Option<(FrameId, VersionId)>)
+        requires
+            core.well_formed(),
+        ensures
+            r matches Some((f, version)) ==> {
+                &&& f.0 < core.frames.metas.len()
+                &&& core.frames.meta(f).state == STATE_PUBLISHED
+                &&& core.frames.frame(f).bound_key == Some(key)
+                &&& core.frames.frame(f).bound_version == Some(version)
+            },
+    {
+        match core.lookup_tier(key, primary_tier) {
+            Some(hit) => Some(hit),
+            None => match fallback_tier {
+                Some(fb) => core.lookup_tier(key, fb),
+                None => None,
+            },
+        }
+    }
+
+    /// Donor-side handler for `FetchRequest { request_id, key }` checking `primary_tier`
+    /// first and optionally falling back to `fallback_tier` (e.g., GPU HBM -> Host DRAM).
     #[verifier::rlimit(250)]
-    pub fn serve_fetch_request(
+    pub fn serve_fetch_request_multi(
         &mut self,
         core: &mut CacheCore,
-        tier: TierId,
+        primary_tier: TierId,
+        fallback_tier: Option<TierId>,
         request_id: u64,
         key: ObjectKey,
         Tracked(shares): Tracked<&mut ShareSource>,
@@ -2486,7 +2514,12 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         hide(super::protocol::statement_replica_valid);
         hide(replica_valid);
         hide(complete_receipts);
-        let Some((frame, version)) = core.lookup_tier(key, tier) else {
+        let Some((frame, version)) = Self::lookup_serve_frame(
+            core,
+            key,
+            primary_tier,
+            fallback_tier,
+        ) else {
             let _ = self.send_control(
                 core,
                 ControlPayload::FetchMiss { request_id },
@@ -6132,7 +6165,8 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     fn queue_pending_inbound_fetches(
         &mut self,
         core: &mut CacheCore,
-        tier: TierId,
+        primary_tier: TierId,
+        fallback_tier: Option<TierId>,
         Tracked(shares): Tracked<&mut ShareSource>,
         Tracked(instance): Tracked<&TransferInstance>,
     )
@@ -6243,7 +6277,12 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             decreases self.pending_inbound_fetches@.len(),
         {
             let (request_id, key) = self.pending_inbound_fetches.remove(0);
-            let Some((frame, version)) = core.lookup_tier(key, tier) else {
+            let Some((frame, version)) = Self::lookup_serve_frame(
+                core,
+                key,
+                primary_tier,
+                fallback_tier,
+            ) else {
                 let _ = self.send_control(
                     core,
                     ControlPayload::FetchMiss { request_id },
@@ -8180,10 +8219,11 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     /// freshly completed binds, completes outbound `BindReady` grants, and
     /// acknowledges/replenishes quarantined MWs.
     #[verifier::rlimit(250)]
-    pub fn poll_progress(
+    pub fn poll_progress_multi(
         &mut self,
         core: &mut CacheCore,
-        serve_tier: TierId,
+        primary_tier: TierId,
+        fallback_tier: Option<TierId>,
         pd: Option<&'a rdma::ProtectionDomain<'a>>,
         tokens: &mut Vec<Tracked<EventSourceToken>>,
         Tracked(shares): Tracked<&mut ShareSource>,
@@ -8288,7 +8328,13 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         let ghost step2_core = *core;
         let ghost step2_leases = self.rdma.active_leases@;
         let ghost step2_rdma = self.rdma;
-        self.queue_pending_inbound_fetches(core, serve_tier, Tracked(shares), Tracked(instance));
+        self.queue_pending_inbound_fetches(
+            core,
+            primary_tier,
+            fallback_tier,
+            Tracked(shares),
+            Tracked(instance),
+        );
         proof {
             lemma_peer_core_step_trans(old(core), &step2_core, core, self.rdma.timeline_id);
             lemma_foreign_shares_trans(
@@ -8793,10 +8839,11 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     /// peers can safely call `fetch_remote_frame_duplex` against each other
     /// simultaneously even over blocking `TcpTransport`.
     #[verifier::rlimit(350)]
-    pub fn fetch_remote_frame_duplex(
+    pub fn fetch_remote_frame_duplex_multi(
         &mut self,
         core: &mut CacheCore,
-        serve_tier: TierId,
+        primary_tier: TierId,
+        fallback_tier: Option<TierId>,
         pd: Option<&'a rdma::ProtectionDomain<'a>>,
         tokens: &mut Vec<Tracked<EventSourceToken>>,
         key: ObjectKey,
@@ -8987,7 +9034,8 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 let ghost step2_leases = self.rdma.active_leases@;
                 self.queue_pending_inbound_fetches(
                     core,
-                    serve_tier,
+                    primary_tier,
+                    fallback_tier,
                     Tracked(shares),
                     Tracked(instance),
                 );
@@ -9375,7 +9423,8 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             let ghost pstep2_rdma = self.rdma;
             self.queue_pending_inbound_fetches(
                 core,
-                serve_tier,
+                primary_tier,
+                fallback_tier,
                 Tracked(shares),
                 Tracked(instance),
             );
@@ -10313,6 +10362,224 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             );
         }
         res
+    }
+
+    /// Single-tier compatibility wrapper over `serve_fetch_request_multi`.
+    pub fn serve_fetch_request(
+        &mut self,
+        core: &mut CacheCore,
+        tier: TierId,
+        request_id: u64,
+        key: ObjectKey,
+        Tracked(shares): Tracked<&mut ShareSource>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<ServeOutcome, CoreError>)
+        requires
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            old(self).rdma.qp.ready(),
+            old(self).rdma.qp.state() is ReadyToSend,
+            old(self).next_grant_tag < u64::MAX,
+            instance.id() == old(core).instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(core).instance_id(),
+            old(shares).node() == old(core).node(),
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(self).well_formed(final(core)),
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+            final(core).node_id == old(core).node_id,
+            final(core).instance_id() == old(core).instance_id(),
+            final(core).tiers == old(core).tiers,
+            final(core).version_registry == old(core).version_registry,
+            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
+            final(self).rdma.qp == old(self).rdma.qp,
+    {
+        self.serve_fetch_request_multi(
+            core,
+            tier,
+            None,
+            request_id,
+            key,
+            Tracked(shares),
+            Tracked(instance),
+        )
+    }
+
+    /// Single-tier compatibility wrapper over `poll_progress_multi`.
+    pub fn poll_progress(
+        &mut self,
+        core: &mut CacheCore,
+        serve_tier: TierId,
+        pd: Option<&'a rdma::ProtectionDomain<'a>>,
+        tokens: &mut Vec<Tracked<EventSourceToken>>,
+        Tracked(shares): Tracked<&mut ShareSource>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<PeerProgress, CoreError>)
+        requires
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            old(self).rdma.qp.ready(),
+            old(self).rdma.qp.state() is ReadyToSend,
+            instance.id() == old(core).instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(core).instance_id(),
+            old(shares).node() == old(core).node(),
+            pd matches Some(p) ==> p.id() == old(self).rdma.window_pool.pd() && p.node() == old(
+                core,
+            ).node(),
+            forall|k: int|
+                0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
+                    tokens,
+                )@[k]@.source() is RdmaQueuePair && old(tokens)@[k]@.node() == old(core).node(),
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(self).well_formed(final(core)),
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+            final(core).node_id == old(core).node_id,
+            final(core).instance_id() == old(core).instance_id(),
+            final(core).tiers == old(core).tiers,
+            final(core).frames.versions@ == old(core).frames.versions@,
+            final(core).version_registry == old(core).version_registry,
+            final(core).timelines.count == old(core).timelines.count,
+            final(core).timelines.kinds == old(core).timelines.kinds,
+            final(core).timelines.events == old(core).timelines.events,
+            final(core).timelines.next_seq == old(core).timelines.next_seq,
+            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
+            final(self).rdma.peer_node == old(self).rdma.peer_node,
+            final(self).rdma.qp == old(self).rdma.qp,
+            final(self).rdma.host_mr == old(self).rdma.host_mr,
+            final(self).rdma.gpu_mr == old(self).rdma.gpu_mr,
+            final(self).rdma.shared_host_mr == old(self).rdma.shared_host_mr,
+            final(self).rdma.shared_gpu_mr == old(self).rdma.shared_gpu_mr,
+            final(self).channel.same_session(old(self).channel),
+            forall|k: int|
+                0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
+                    && final(tokens)@[k]@.source() is RdmaQueuePair && final(tokens)@[k]@.node()
+                    == old(core).node(),
+            forall|seq: u64, writer: TransferEvent| #[trigger]
+                pull_tracked_or_done(&old(self).rdma, seq, writer) ==> pull_tracked_or_done(
+                    &final(self).rdma,
+                    seq,
+                    writer,
+                ),
+    {
+        self.poll_progress_multi(
+            core,
+            serve_tier,
+            None,
+            pd,
+            tokens,
+            Tracked(shares),
+            Tracked(instance),
+        )
+    }
+
+    /// Single-tier compatibility wrapper over `fetch_remote_frame_duplex_multi`.
+    pub fn fetch_remote_frame_duplex(
+        &mut self,
+        core: &mut CacheCore,
+        serve_tier: TierId,
+        pd: Option<&'a rdma::ProtectionDomain<'a>>,
+        tokens: &mut Vec<Tracked<EventSourceToken>>,
+        key: ObjectKey,
+        dst_tier: TierId,
+        target: PullTarget,
+        Tracked(shares): Tracked<&mut ShareSource>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<FetchOutcome, CoreError>)
+        requires
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            old(self).rdma.qp.ready(),
+            old(self).rdma.qp.state() is ReadyToSend,
+            old(self).rdma.qp.source().well_formed(),
+            old(self).rdma.qp.effective_max_rd_atomic() > 0,
+            old(self).rdma.peer_node != old(core).node(),
+            old(self).next_request_id < u64::MAX,
+            old(core).frames.tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
+            instance.id() == old(core).instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(core).instance_id(),
+            old(shares).node() == old(core).node(),
+            pd matches Some(p) ==> p.id() == old(self).rdma.window_pool.pd() && p.node() == old(
+                core,
+            ).node(),
+            forall|k: int|
+                0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
+                    tokens,
+                )@[k]@.source() is RdmaQueuePair && old(tokens)@[k]@.node() == old(core).node(),
+            match target {
+                PullTarget::Host => old(self).rdma.effective_host_mr_spec() matches Some(s)
+                    && s.tier == dst_tier && s.mr.access().local_write
+                    && s.mr.gpu_device_spec().is_none(),
+                PullTarget::GpuGdr => old(self).rdma.effective_gpu_mr_spec() matches Some(s)
+                    && s.tier == dst_tier && s.mr.access().local_write
+                    && s.mr.gpu_device_spec() is Some,
+            },
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(self).well_formed(final(core)),
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+            final(core).node_id == old(core).node_id,
+            final(core).instance_id() == old(core).instance_id(),
+            final(core).tiers == old(core).tiers,
+            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
+            final(self).rdma.peer_node == old(self).rdma.peer_node,
+            final(self).rdma.qp.ready(),
+            final(self).rdma.qp.state() is ReadyToSend,
+            final(self).rdma.qp.source().well_formed(),
+            final(self).rdma.qp.source().source() == old(self).rdma.qp.source().source(),
+            forall|k: int|
+                0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
+                    && final(tokens)@[k]@.source() is RdmaQueuePair && final(tokens)@[k]@.node()
+                    == old(core).node(),
+    {
+        self.fetch_remote_frame_duplex_multi(
+            core,
+            serve_tier,
+            None,
+            pd,
+            tokens,
+            key,
+            dst_tier,
+            target,
+            Tracked(shares),
+            Tracked(instance),
+        )
     }
 }
 
