@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name = "vericache-python"
+version = "0.1.0"
+edition = "2024"
+description = "Zero-external-dependency C ABI / Python binding and vLLM v1 KVConnector for VeriCache."
+
+[lib]
+name = "vericache_python"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vericache = { path = "../vericache" }
+vericache-core = { path = "../vericache-core" }
