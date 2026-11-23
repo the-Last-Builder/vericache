@@ -44,6 +44,15 @@ use vstd::prelude::{Ghost, Tracked, verus};
 
 const PEER_DONE_TAG: u64 = 0xDEAD_BEEF_CAFE_0005;
 const COORD_CHANNEL_ID: u8 = 255;
+const SPILL_PIPELINE_QD: usize = 4;
+const SPILL_HIGH_WATER: usize = 4;
+
+struct PendingSpill {
+    key: ObjectKey,
+    dram_frame: FrameId,
+    nvme_frame: FrameId,
+    ticket: Ticket,
+}
 
 /// Deterministic 2-node 70/30 session-sticky routing + 8-shard affinity.
 /// Exact bit-for-bit match with Python baselines (`experiments/baselines/common.py`).
@@ -389,38 +398,257 @@ fn ensure_nvme_space(
     }
 }
 
+/// Non-blockingly poll NVMe io_uring completions and retire any completed async spills,
+/// reclaiming their source DRAM frames back to `ready_queue` and inserting them into `nvme_lru`.
+#[allow(clippy::too_many_arguments)]
+fn reap_completed_spills(
+    caps: &mut ShardCapabilityBundle,
+    engine: &mut DistributedEngine<'_, ScaleupTcpTransport>,
+    pending_spills: &mut Vec<PendingSpill>,
+    nvme_lru: &mut LruPolicy<ObjectKey, FrameId>,
+    gpu_tier: TierId,
+    host_tier: TierId,
+    peer_done: &mut bool,
+) -> usize {
+    if pending_spills.is_empty() {
+        return 0;
+    }
+    let _ = engine.poll_nvme_completions(Tracked(caps.instance.borrow()), 32);
+    let mut retired = 0usize;
+    let mut idx = 0usize;
+    while idx < pending_spills.len() {
+        if engine.core.timelines.is_retired(pending_spills[idx].ticket) {
+            let sp = pending_spills.swap_remove(idx);
+            evict_and_reclaim(
+                caps,
+                engine,
+                host_tier,
+                sp.dram_frame,
+                gpu_tier,
+                host_tier,
+                peer_done,
+            );
+            let _ = nvme_lru.insert(sp.key, sp.nvme_frame);
+            retired += 1;
+        } else {
+            idx += 1;
+        }
+    }
+    retired
+}
+
+/// Wait until a specific `key` is no longer in `pending_spills` (rare hit on an in-flight victim).
+#[allow(clippy::too_many_arguments)]
+fn wait_pending_spill_for_key(
+    caps: &mut ShardCapabilityBundle,
+    engine: &mut DistributedEngine<'_, ScaleupTcpTransport>,
+    peek_sock: &TcpStream,
+    pending_spills: &mut Vec<PendingSpill>,
+    nvme_lru: &mut LruPolicy<ObjectKey, FrameId>,
+    gpu_tier: TierId,
+    host_tier: TierId,
+    key: ObjectKey,
+    peer_done: &mut bool,
+) {
+    while pending_spills.iter().any(|p| p.key == key) {
+        drain_peer_nonblocking(caps, engine, peek_sock, gpu_tier, host_tier, peer_done);
+        if reap_completed_spills(
+            caps,
+            engine,
+            pending_spills,
+            nvme_lru,
+            gpu_tier,
+            host_tier,
+            peer_done,
+        ) == 0
+        {
+            let _ = engine.wait_nvme_completion(Tracked(caps.instance.borrow()));
+            let _ = reap_completed_spills(
+                caps,
+                engine,
+                pending_spills,
+                nvme_lru,
+                gpu_tier,
+                host_tier,
+                peer_done,
+            );
+        }
+    }
+}
+
+/// Drain all remaining in-flight async NVMe spills (called before peer shutdown).
+#[allow(clippy::too_many_arguments)]
+fn drain_all_pending_spills(
+    caps: &mut ShardCapabilityBundle,
+    engine: &mut DistributedEngine<'_, ScaleupTcpTransport>,
+    peek_sock: &TcpStream,
+    pending_spills: &mut Vec<PendingSpill>,
+    nvme_lru: &mut LruPolicy<ObjectKey, FrameId>,
+    gpu_tier: TierId,
+    host_tier: TierId,
+    peer_done: &mut bool,
+) {
+    while !pending_spills.is_empty() {
+        drain_peer_nonblocking(caps, engine, peek_sock, gpu_tier, host_tier, peer_done);
+        if reap_completed_spills(
+            caps,
+            engine,
+            pending_spills,
+            nvme_lru,
+            gpu_tier,
+            host_tier,
+            peer_done,
+        ) == 0
+        {
+            let _ = engine.wait_nvme_completion(Tracked(caps.instance.borrow()));
+            let _ = reap_completed_spills(
+                caps,
+                engine,
+                pending_spills,
+                nvme_lru,
+                gpu_tier,
+                host_tier,
+                peer_done,
+            );
+        }
+    }
+}
+
+/// Proactively submit async io_uring NVMe spills up to `SPILL_PIPELINE_QD` whenever DRAM
+/// free frames dip to `SPILL_HIGH_WATER`, keeping spills off the request critical path.
+#[allow(clippy::too_many_arguments)]
+fn kick_async_spills(
+    caps: &mut ShardCapabilityBundle,
+    engine: &mut DistributedEngine<'_, ScaleupTcpTransport>,
+    peek_sock: &TcpStream,
+    dram_lru: &mut LruPolicy<ObjectKey, FrameId>,
+    nvme_lru: &mut LruPolicy<ObjectKey, FrameId>,
+    pending_spills: &mut Vec<PendingSpill>,
+    gpu_tier: TierId,
+    host_tier: TierId,
+    nvme_tier: TierId,
+    peer_done: &mut bool,
+) {
+    let _ = reap_completed_spills(
+        caps,
+        engine,
+        pending_spills,
+        nvme_lru,
+        gpu_tier,
+        host_tier,
+        peer_done,
+    );
+    while engine.core.frames.ready_queue[host_tier.as_index()].len() <= SPILL_HIGH_WATER
+        && pending_spills.len() < SPILL_PIPELINE_QD
+        && dram_lru.len() > 0
+    {
+        let Some((dk, df)) = dram_lru.pop_lru() else {
+            break;
+        };
+        if pending_spills.iter().any(|p| p.key == dk) {
+            wait_pending_spill_for_key(
+                caps,
+                engine,
+                peek_sock,
+                pending_spills,
+                nvme_lru,
+                gpu_tier,
+                host_tier,
+                dk,
+                peer_done,
+            );
+        }
+        if let Some(old_nf) = nvme_lru.remove(&dk) {
+            evict_and_reclaim(caps, engine, nvme_tier, old_nf, gpu_tier, host_tier, peer_done);
+        }
+        ensure_nvme_space(caps, engine, nvme_lru, gpu_tier, host_tier, nvme_tier, peer_done);
+        if engine.lookup_tier(dk, host_tier).is_some() {
+            let (nf, ticket) = engine
+                .spill_host_to_nvme(
+                    Tracked(caps.instance.borrow()),
+                    Tracked(caps.shares.borrow_mut()),
+                    dk,
+                )
+                .expect("spill_host_to_nvme async");
+            pending_spills.push(PendingSpill {
+                key: dk,
+                dram_frame: df,
+                nvme_frame: nf,
+                ticket,
+            });
+        } else {
+            evict_and_reclaim(caps, engine, host_tier, df, gpu_tier, host_tier, peer_done);
+        }
+    }
+}
+
 /// Ensure Host DRAM has at least 1 free frame in `ready_queue`
-/// (cascading LRU victim -> NVMe via io_uring O_DIRECT).
+/// (pipelined async io_uring O_DIRECT spills -> NVMe).
 #[allow(clippy::too_many_arguments)]
 fn ensure_dram_space(
     caps: &mut ShardCapabilityBundle,
     engine: &mut DistributedEngine<'_, ScaleupTcpTransport>,
+    peek_sock: &TcpStream,
     dram_lru: &mut LruPolicy<ObjectKey, FrameId>,
     nvme_lru: &mut LruPolicy<ObjectKey, FrameId>,
+    pending_spills: &mut Vec<PendingSpill>,
     gpu_tier: TierId,
     host_tier: TierId,
     nvme_tier: TierId,
     peer_done: &mut bool,
 ) {
     let _ = engine.reclaim_draining(host_tier, 8);
+    kick_async_spills(
+        caps,
+        engine,
+        peek_sock,
+        dram_lru,
+        nvme_lru,
+        pending_spills,
+        gpu_tier,
+        host_tier,
+        nvme_tier,
+        peer_done,
+    );
     while engine.core.frames.ready_queue[host_tier.as_index()].is_empty() {
-        if let Some((dk, df)) = dram_lru.pop_lru() {
-            if let Some(old_nf) = nvme_lru.remove(&dk) {
-                evict_and_reclaim(caps, engine, nvme_tier, old_nf, gpu_tier, host_tier, peer_done);
-            }
-            ensure_nvme_space(caps, engine, nvme_lru, gpu_tier, host_tier, nvme_tier, peer_done);
-            // Only spill if dk is still published in host_tier (not already superseded).
-            if engine.lookup_tier(dk, host_tier).is_some() {
-                let nf = engine
-                    .spill_host_to_nvme_sync(
-                        Tracked(caps.instance.borrow()),
-                        Tracked(caps.shares.borrow_mut()),
-                        dk,
-                    )
-                    .expect("spill_host_to_nvme_sync");
-                let _ = nvme_lru.insert(dk, nf);
-            }
-            evict_and_reclaim(caps, engine, host_tier, df, gpu_tier, host_tier, peer_done);
+        drain_peer_nonblocking(caps, engine, peek_sock, gpu_tier, host_tier, peer_done);
+        let _ = reap_completed_spills(
+            caps,
+            engine,
+            pending_spills,
+            nvme_lru,
+            gpu_tier,
+            host_tier,
+            peer_done,
+        );
+        let _ = engine.reclaim_draining(host_tier, 8);
+        if !engine.core.frames.ready_queue[host_tier.as_index()].is_empty() {
+            break;
+        }
+        if !pending_spills.is_empty() {
+            let _ = engine.wait_nvme_completion(Tracked(caps.instance.borrow()));
+            let _ = reap_completed_spills(
+                caps,
+                engine,
+                pending_spills,
+                nvme_lru,
+                gpu_tier,
+                host_tier,
+                peer_done,
+            );
+        } else if dram_lru.len() > 0 {
+            kick_async_spills(
+                caps,
+                engine,
+                peek_sock,
+                dram_lru,
+                nvme_lru,
+                pending_spills,
+                gpu_tier,
+                host_tier,
+                nvme_tier,
+                peer_done,
+            );
         } else {
             let _ = handle_peer_event(caps, engine, gpu_tier, host_tier, peer_done);
             let _ = engine.reclaim_draining(host_tier, 8);
@@ -429,14 +657,16 @@ fn ensure_dram_space(
 }
 
 /// Ensure GPU HBM has at least 1 free frame in `ready_queue`
-/// (cascading LRU victim -> DRAM via D2H + put_host -> NVMe).
+/// (cascading LRU victim -> DRAM via D2H + put_host -> pipelined async NVMe).
 #[allow(clippy::too_many_arguments)]
 fn ensure_hbm_space(
     caps: &mut ShardCapabilityBundle,
     engine: &mut DistributedEngine<'_, ScaleupTcpTransport>,
+    peek_sock: &TcpStream,
     hbm_lru: &mut LruPolicy<ObjectKey, FrameId>,
     dram_lru: &mut LruPolicy<ObjectKey, FrameId>,
     nvme_lru: &mut LruPolicy<ObjectKey, FrameId>,
+    pending_spills: &mut Vec<PendingSpill>,
     gpu_tier: TierId,
     host_tier: TierId,
     nvme_tier: TierId,
@@ -509,17 +739,51 @@ fn ensure_hbm_space(
     }
     evict_and_reclaim(caps, engine, gpu_tier, vf, gpu_tier, host_tier, peer_done);
 
-    // Demote victim into L2 DRAM (evicting any stale copy and cascading to NVMe if DRAM is full).
+    // Demote victim into L2 DRAM (evicting any stale copy and cascading to NVMe if DRAM is low).
+    if pending_spills.iter().any(|p| p.key == vk) {
+        wait_pending_spill_for_key(
+            caps,
+            engine,
+            peek_sock,
+            pending_spills,
+            nvme_lru,
+            gpu_tier,
+            host_tier,
+            vk,
+            peer_done,
+        );
+    }
     if let Some(old_df) = dram_lru.remove(&vk) {
         evict_and_reclaim(caps, engine, host_tier, old_df, gpu_tier, host_tier, peer_done);
     }
     ensure_dram_space(
-        caps, engine, dram_lru, nvme_lru, gpu_tier, host_tier, nvme_tier, peer_done,
+        caps,
+        engine,
+        peek_sock,
+        dram_lru,
+        nvme_lru,
+        pending_spills,
+        gpu_tier,
+        host_tier,
+        nvme_tier,
+        peer_done,
     );
     let (_v_host, new_df) = engine
         .put_host(Tracked(caps.instance.borrow()), vk, d2h_scratch)
         .expect("put_host demote HBM->DRAM");
     let _ = dram_lru.insert(vk, new_df);
+    kick_async_spills(
+        caps,
+        engine,
+        peek_sock,
+        dram_lru,
+        nvme_lru,
+        pending_spills,
+        gpu_tier,
+        host_tier,
+        nvme_tier,
+        peer_done,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -570,16 +834,15 @@ fn run_shard_worker(
         .attach_pinned_host(&core, &host)
         .expect("attach_pinned_host");
 
-    let shard_nvme_path = format!("{}/node{}_shard{}", job.nvme_dir, node_id, shard_id);
     let nvme = NvmeBackend::new(
         &mut core,
         &host.ctx,
         Tracked(caps.instance.borrow()),
         Tracked(caps.alloc.borrow_mut()),
         caps.mint_nvme(),
-        &shard_nvme_path,
+        job.nvme_dir_for_node(node_id),
         cfg.nvme_frames_per_shard as u32,
-        32,
+        64,
     )
     .expect("NvmeBackend::new (O_DIRECT io_uring shard slab)");
 
@@ -665,6 +928,7 @@ fn run_shard_worker(
     let mut hbm_lru: LruPolicy<ObjectKey, FrameId> = LruPolicy::new(cfg.hbm_frames_per_shard);
     let mut dram_lru: LruPolicy<ObjectKey, FrameId> = LruPolicy::new(cfg.dram_frames_per_shard);
     let mut nvme_lru: LruPolicy<ObjectKey, FrameId> = LruPolicy::new(cfg.nvme_frames_per_shard);
+    let mut pending_spills: Vec<PendingSpill> = Vec::with_capacity(SPILL_PIPELINE_QD);
 
     let mut stats = ShardStats {
         init_time_s,
@@ -683,15 +947,35 @@ fn run_shard_worker(
             host_tier,
             &mut peer_done,
         );
+        let _ = reap_completed_spills(
+            &mut caps,
+            &mut engine,
+            &mut pending_spills,
+            &mut nvme_lru,
+            gpu_tier,
+            host_tier,
+            &mut peer_done,
+        );
 
         let req_t0 = Instant::now();
         let mut prefix_open = true;
+        let mut pending_l1_hit_ticket: Option<Ticket> = None;
 
-        for &hid in hash_ids {
+        for (blk_idx, &hid) in hash_ids.iter().enumerate() {
+            if (blk_idx & 7) == 7 {
+                drain_peer_nonblocking(
+                    &mut caps,
+                    &mut engine,
+                    &peek_sock,
+                    gpu_tier,
+                    host_tier,
+                    &mut peer_done,
+                );
+            }
             let key = key_from_hash_id(hid);
 
             if prefix_open {
-                // Tier 1: L1 Local GPU HBM hit -> compute-ready D2D read into compute slot
+                // Tier 1: L1 Local GPU HBM hit -> batched D2D read into compute slot (sync once at prefix end)
                 if hbm_lru.contains(&key) {
                     if let Some((_ver, t_hit, _ev)) = engine
                         .get_into_gpu(
@@ -705,16 +989,21 @@ fn run_shard_worker(
                         )
                         .expect("get_into_gpu L1 HBM hit")
                     {
-                        let k_hit =
-                            cuda::stream_synchronize(&caller_stream, Tracked(caps.instance.borrow()))
-                                .expect("sync L1 HBM hit");
-                        engine
-                            .core
-                            .mark_timeline_complete(caller_tl, t_hit.seq(), k_hit);
+                        pending_l1_hit_ticket = Some(t_hit);
                         hbm_lru.touch(&key);
                         stats.hbm_hits += 1;
                         continue;
                     }
+                }
+
+                // Flush any batched L1 HBM hits before using caller_stream for H2D/D2H transfers.
+                if let Some(t_last) = pending_l1_hit_ticket.take() {
+                    let k_hit =
+                        cuda::stream_synchronize(&caller_stream, Tracked(caps.instance.borrow()))
+                            .expect("sync batched L1 HBM hits");
+                    engine
+                        .core
+                        .mark_timeline_complete(caller_tl, t_last.seq(), k_hit);
                 }
 
                 // Tier 2: L2 Local Pinned DRAM hit -> 1-hop DMA H2D promote into L1 HBM
@@ -722,9 +1011,11 @@ fn run_shard_worker(
                     ensure_hbm_space(
                         &mut caps,
                         &mut engine,
+                        &peek_sock,
                         &mut hbm_lru,
                         &mut dram_lru,
                         &mut nvme_lru,
+                        &mut pending_spills,
                         gpu_tier,
                         host_tier,
                         nvme_tier,
@@ -784,13 +1075,30 @@ fn run_shard_worker(
                     continue;
                 }
 
+                // If this key is currently in flight to NVMe, wait for its spill to retire into nvme_lru.
+                if pending_spills.iter().any(|p| p.key == key) {
+                    wait_pending_spill_for_key(
+                        &mut caps,
+                        &mut engine,
+                        &peek_sock,
+                        &mut pending_spills,
+                        &mut nvme_lru,
+                        gpu_tier,
+                        host_tier,
+                        key,
+                        &mut peer_done,
+                    );
+                }
+
                 // Tier 3: L3 Local NVMe hit -> io_uring O_DIRECT warm to DRAM -> DMA H2D promote to HBM
                 if nvme_lru.contains(&key) {
                     ensure_dram_space(
                         &mut caps,
                         &mut engine,
+                        &peek_sock,
                         &mut dram_lru,
                         &mut nvme_lru,
+                        &mut pending_spills,
                         gpu_tier,
                         host_tier,
                         nvme_tier,
@@ -803,6 +1111,15 @@ fn run_shard_worker(
                             key,
                         )
                         .expect("warm_host_from_nvme_sync");
+                    let _ = reap_completed_spills(
+                        &mut caps,
+                        &mut engine,
+                        &mut pending_spills,
+                        &mut nvme_lru,
+                        gpu_tier,
+                        host_tier,
+                        &mut peer_done,
+                    );
                     if let Some(nf) = nvme_lru.remove(&key) {
                         evict_and_reclaim(
                             &mut caps,
@@ -817,9 +1134,11 @@ fn run_shard_worker(
                     ensure_hbm_space(
                         &mut caps,
                         &mut engine,
+                        &peek_sock,
                         &mut hbm_lru,
                         &mut dram_lru,
                         &mut nvme_lru,
+                        &mut pending_spills,
                         gpu_tier,
                         host_tier,
                         nvme_tier,
@@ -881,9 +1200,11 @@ fn run_shard_worker(
                 ensure_hbm_space(
                     &mut caps,
                     &mut engine,
+                    &peek_sock,
                     &mut hbm_lru,
                     &mut dram_lru,
                     &mut nvme_lru,
+                    &mut pending_spills,
                     gpu_tier,
                     host_tier,
                     nvme_tier,
@@ -950,6 +1271,16 @@ fn run_shard_worker(
                 }
             }
 
+            // Flush any batched L1 HBM hits before cold miss writeback on caller_stream.
+            if let Some(t_last) = pending_l1_hit_ticket.take() {
+                let k_hit =
+                    cuda::stream_synchronize(&caller_stream, Tracked(caps.instance.borrow()))
+                        .expect("sync batched L1 HBM hits before miss");
+                engine
+                    .core
+                    .mark_timeline_complete(caller_tl, t_last.seq(), k_hit);
+            }
+
             // Tier 5: Cold Miss -> close prefix match and writeback suffix block into L1 HBM
             prefix_open = false;
             stats.cold_misses += 1;
@@ -957,6 +1288,19 @@ fn run_shard_worker(
             if hbm_lru.contains(&key) {
                 hbm_lru.touch(&key);
                 continue;
+            }
+            if pending_spills.iter().any(|p| p.key == key) {
+                wait_pending_spill_for_key(
+                    &mut caps,
+                    &mut engine,
+                    &peek_sock,
+                    &mut pending_spills,
+                    &mut nvme_lru,
+                    gpu_tier,
+                    host_tier,
+                    key,
+                    &mut peer_done,
+                );
             }
             if let Some(df) = dram_lru.remove(&key) {
                 evict_and_reclaim(
@@ -983,9 +1327,11 @@ fn run_shard_worker(
             ensure_hbm_space(
                 &mut caps,
                 &mut engine,
+                &peek_sock,
                 &mut hbm_lru,
                 &mut dram_lru,
                 &mut nvme_lru,
+                &mut pending_spills,
                 gpu_tier,
                 host_tier,
                 nvme_tier,
@@ -1011,10 +1357,30 @@ fn run_shard_worker(
             let _ = hbm_lru.insert(key, new_hbm_f);
         }
 
+        // Flush any trailing batched L1 HBM hits at request completion.
+        if let Some(t_last) = pending_l1_hit_ticket.take() {
+            let k_hit = cuda::stream_synchronize(&caller_stream, Tracked(caps.instance.borrow()))
+                .expect("sync trailing L1 HBM hits");
+            engine
+                .core
+                .mark_timeline_complete(caller_tl, t_last.seq(), k_hit);
+        }
+
         let req_ns = req_t0.elapsed().as_nanos() as u64;
         hist.record_ns(req_ns);
         stats.reqs += 1;
     }
+
+    drain_all_pending_spills(
+        &mut caps,
+        &mut engine,
+        &peek_sock,
+        &mut pending_spills,
+        &mut nvme_lru,
+        gpu_tier,
+        host_tier,
+        &mut peer_done,
+    );
 
     // Notify peer shard we finished all our local requests, then keep serving peer FetchRequests
     // until peer also signals PEER_DONE_TAG and all remote leases are released!
@@ -1070,7 +1436,7 @@ fn run_node(
     }));
     // Bootstrap NodeContext -> ShardAllocator once per OS process; each worker thread carves its own disjoint ShardSources.
     ensure_bench_node_allocator(node_id);
-    fs::create_dir_all(&job.nvme_dir).expect("create nvme_dir");
+    fs::create_dir_all(job.nvme_dir_for_node(node_id)).expect("create nvme_dir");
     let per_shard_reqs =
         partition_requests_for_node(reqs, node_id, cfg.shards_per_node, cfg.sticky_pct);
     let init_done_barrier = Arc::new(Barrier::new(cfg.shards_per_node + 1));

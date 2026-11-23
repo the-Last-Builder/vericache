@@ -33,10 +33,10 @@ EOF
 )"
 check_exact_list "ffi-rust-files" "$actual_ffi" "$expected_ffi"
 
-# 2. Exact native C/C++/header/assembly file inventory across workspace
+# 2. Exact native C/C++/header/assembly file inventory across workspace (excluding third-party baseline harnesses)
 actual_native="$(
   find . \
-    \( -path './target' -o -path './.git' -o -path './.clice' \) -prune -o \
+    \( -path './target' -o -path './.git' -o -path './.clice' -o -path './experiments/baselines' \) -prune -o \
     -type f \( -name '*.c' -o -name '*.h' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cu' -o -name '*.s' -o -name '*.S' \) \
     -print | sed 's|^\./||' | LC_ALL=C sort
 )"
@@ -47,10 +47,10 @@ EOF
 )"
 check_exact_list "native-c-files" "$actual_native" "$expected_native"
 
-# 3. Exact build.rs file inventory across workspace
+# 3. Exact build.rs file inventory across workspace (excluding third-party baseline harnesses)
 actual_build="$(
   find . \
-    \( -path './target' -o -path './.git' -o -path './.clice' \) -prune -o \
+    \( -path './target' -o -path './.git' -o -path './.clice' -o -path './experiments/baselines' \) -prune -o \
     -type f -name 'build.rs' -print | sed 's|^\./||' | LC_ALL=C sort
 )"
 expected_build="vericache-transfer/build.rs"

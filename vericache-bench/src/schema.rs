@@ -63,6 +63,10 @@ pub struct JobSpec {
     pub num_shards: Option<usize>,
     #[serde(default = "default_nvme_dir")]
     pub nvme_dir: String,
+    #[serde(default)]
+    pub nvme_dir_node0: Option<String>,
+    #[serde(default)]
+    pub nvme_dir_node1: Option<String>,
     #[serde(default = "default_rdma_dev")]
     pub rdma_dev: String,
     #[serde(default = "default_gid_index")]
@@ -83,6 +87,16 @@ pub struct JobSpec {
     pub shards_per_node: Option<usize>,
     #[serde(default)]
     pub sticky_ratio: Option<f64>,
+}
+
+impl JobSpec {
+    pub fn nvme_dir_for_node(&self, node_id: u64) -> &str {
+        match node_id {
+            0 => self.nvme_dir_node0.as_deref().unwrap_or(&self.nvme_dir),
+            1 => self.nvme_dir_node1.as_deref().unwrap_or(&self.nvme_dir),
+            _ => &self.nvme_dir,
+        }
+    }
 }
 
 /// Unified JSONL MetricRecord emitted by VeriCache, Mooncake, and LMCache runners.

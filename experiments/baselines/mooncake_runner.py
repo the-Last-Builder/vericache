@@ -604,7 +604,8 @@ def _s5_node_proc(node_id: int, job: dict[str, Any], peer_ports: dict[str, Any],
     sticky_pct = cfg["sticky_pct"]
     gpu_id = int(job.get("donor_gpu", 0) if node_id == 0 else job.get("initiator_gpu", 1))
     rdma_dev = str(job.get("rdma_dev", "mlx5_3"))
-    nvme_dir = str(job.get("nvme_dir", "/workspace/target/bench-nvme"))
+    nvme_key = f"nvme_dir_node{node_id}"
+    nvme_dir = str(job.get(nvme_key) or job.get("nvme_dir", "/workspace/target/bench-nvme"))
     os.makedirs(nvme_dir, exist_ok=True)
 
     torch.cuda.set_device(gpu_id)

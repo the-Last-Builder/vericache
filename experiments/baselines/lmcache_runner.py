@@ -506,7 +506,8 @@ def _lmc_s5_node_proc(node_id: int, job: dict[str, Any], ctrl_conn) -> None:
     sticky_pct = cfg["sticky_pct"]
     gpu_id = int(job.get("donor_gpu", 0) if node_id == 0 else job.get("initiator_gpu", 1))
     rdma_dev = str(job.get("rdma_dev", "mlx5_3"))
-    nvme_base = pathlib.Path(str(job.get("nvme_dir", "/workspace/target/bench-nvme")))
+    nvme_key = f"nvme_dir_node{node_id}"
+    nvme_base = pathlib.Path(str(job.get(nvme_key) or job.get("nvme_dir", "/workspace/target/bench-nvme")))
     nvme_base.mkdir(parents=True, exist_ok=True)
     node_disk_root = nvme_base / f"lmcache_s5_{os.getpid()}_n{node_id}"
     if node_disk_root.exists():
@@ -1055,10 +1056,16 @@ def run_suite5(job: dict[str, Any]) -> list[str]:
             if p.is_alive():
                 p.kill()
                 p.join(timeout=5)
-        # Belt-and-suspenders sweep for any lmcache_s5_* directories under bench-nvme
-        if nvme_base.exists():
-            for child in nvme_base.glob("lmcache_s5_*"):
-                shutil.rmtree(child, ignore_errors=True)
+        # Belt-and-suspenders sweep for any lmcache_s5_* directories under all configured NVMe dirs
+        nvme_dirs = {
+            nvme_base,
+            pathlib.Path(str(job.get("nvme_dir_node0") or nvme_base)),
+            pathlib.Path(str(job.get("nvme_dir_node1") or nvme_base)),
+        }
+        for d in nvme_dirs:
+            if d.exists():
+                for child in d.glob("lmcache_s5_*"):
+                    shutil.rmtree(child, ignore_errors=True)
 
     lat = LatencyRecorder()
     lat.extend_ns(r0["samples_ns"])

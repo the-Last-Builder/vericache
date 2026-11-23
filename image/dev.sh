@@ -103,6 +103,15 @@ case "$cmd" in
     for g in "${gpu_list[@]}"; do
       dev_args+=(--device "nvidia.com/gpu=$g")
     done
+    extra_mounts=()
+    if [[ -n "${VERICACHE_EXTRA_MOUNTS:-}" ]]; then
+      IFS=':' read -ra mount_list <<< "$VERICACHE_EXTRA_MOUNTS"
+      for d in "${mount_list[@]}"; do
+        if [[ -n "$d" && -d "$d" ]]; then
+          extra_mounts+=(-v "$d:$d")
+        fi
+      done
+    fi
     # Podman forbids combining --shm-size with --ipc=host; --ipc=host shares host /dev/shm directly.
     exec podman run --rm \
       --http-proxy=false \
@@ -115,6 +124,7 @@ case "$cmd" in
       --security-opt seccomp=unconfined \
       --security-opt=label=disable \
       -v "$ROOT:/workspace" \
+      "${extra_mounts[@]}" \
       -w /workspace \
       -e CARGO_NET_OFFLINE=true \
       -e VERICACHE_REQUIRE_HW=1 \

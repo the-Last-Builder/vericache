@@ -208,9 +208,9 @@ def generate_summary(run_dir: pathlib.Path) -> pathlib.Path:
         "`vericache-transfer` primitives directly with zero FFI/C shims added outside the TCB whitelist."
     )
     lines.append(
-        "- **Mooncake `0.3.14`**: Official `mooncake-transfer-engine-cuda13` wheel (`TransferEngine` `transfer_sync_read` / "
-        "`batch_transfer_sync_read` over `mlx5_3` with static MR `rkey`; `MooncakeDistributedStore` + `mooncake_master` "
-        "in Suite 3; static-`rkey` concurrent eviction/overwrite integrity check in Suite 4)."
+        "- **Mooncake `0.3.14`**: Native Rust/C++ driver (`mooncake-bench`) invoking `mooncake::TransferEngine` "
+        "(`libmooncake_pg.so`) + `libcudart` + POSIX `O_DIRECT` directly without Python in Suites 2, 4, and 5 "
+        "(static MR `rkey`, GPUDirect RDMA); `MooncakeDistributedStore` + `mooncake_master` in Suite 3."
     )
     lines.append(
         "- **LMCache `0.5.7.post1`**: Official `lmcache.cuda_ops.multi_layer_kv_transfer` with `LocalCPUBackend` pinned "

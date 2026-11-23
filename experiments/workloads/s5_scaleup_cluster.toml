@@ -14,6 +14,10 @@ gid_index = 3
 donor_gpu = 0
 initiator_gpu = 1
 nvme_dir = "/workspace/target/bench-nvme"
+# Optional per-node NVMe directories for hosts with dedicated NVMe drives per node
+# (bind-mount them into the container via VERICACHE_EXTRA_MOUNTS="/path/nvme0:/path/nvme1"):
+# nvme_dir_node0 = "/mnt/nvme0/bench-nvme"
+# nvme_dir_node1 = "/mnt/nvme1/bench-nvme"
 
 # Full FAST'25 Mooncake toolagent_trace.jsonl (all 23,608 requests, 409,616 blocks = 800 GiB total, 358 GiB unique)
 [[jobs]]
@@ -29,4 +33,26 @@ case = "5_conversation_full_600g"
 mode = "cluster_4tier"
 systems = ["vericache", "mooncake", "lmcache"]
 trace_path = "/workspace/target/bench-traces/conversation_trace.jsonl"
+chunk_bytes_list = [2097152]
+
+# 160 GiB 2-Node 4-Tier Pressure Profile (10 GiB HBM + 20 GiB DRAM + 50 GiB NVMe per node = 160 GiB cluster)
+# Forces full 4-tier cascading (HBM -> DRAM -> NVMe O_DIRECT spill ~380 GiB & NVMe warm hits 2.4%-3.9%)
+[[jobs]]
+case = "5_toolagent_full_160g"
+mode = "cluster_4tier"
+systems = ["vericache", "mooncake", "lmcache"]
+trace_path = "/workspace/target/bench-traces/toolagent_trace.jsonl"
+hbm_gb_per_node = 10.0
+dram_gb_per_node = 20.0
+nvme_gb_per_node = 50.0
+chunk_bytes_list = [2097152]
+
+[[jobs]]
+case = "5_conversation_full_160g"
+mode = "cluster_4tier"
+systems = ["vericache", "mooncake", "lmcache"]
+trace_path = "/workspace/target/bench-traces/conversation_trace.jsonl"
+hbm_gb_per_node = 10.0
+dram_gb_per_node = 20.0
+nvme_gb_per_node = 50.0
 chunk_bytes_list = [2097152]

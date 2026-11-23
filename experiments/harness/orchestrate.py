@@ -178,9 +178,30 @@ def _build_vericache_bench() -> pathlib.Path:
     return bin_path
 
 
+def _build_mooncake_bench() -> pathlib.Path:
+    print("[orchestrate] Building native Rust/C++ mooncake-bench (--release --offline)...", flush=True)
+    _run_cmd(
+        [
+            "cargo",
+            "build",
+            "--release",
+            "--manifest-path",
+            str(BASELINES_DIR / "mooncake-bench" / "Cargo.toml"),
+            "--target-dir",
+            str(ROOT / "target"),
+            "--offline",
+        ]
+    )
+    bin_path = ROOT / "target" / "release" / "mooncake-bench"
+    if not bin_path.exists():
+        raise RuntimeError(f"missing release binary at {bin_path}")
+    return bin_path
+
+
 def _execute_job(
     numa_prefix: list[str],
     vericache_bin: pathlib.Path,
+    mooncake_bin: pathlib.Path | None,
     sys_name: str,
     spec: dict[str, Any],
 ) -> list[dict[str, Any]]:
@@ -191,12 +212,16 @@ def _execute_job(
         if sys_name == "vericache":
             cmd = numa_prefix + [str(vericache_bin), "--job-file", job_file]
         elif sys_name == "mooncake":
-            cmd = numa_prefix + [
-                sys.executable,
-                str(BASELINES_DIR / "mooncake_runner.py"),
-                "--job-file",
-                job_file,
-            ]
+            if spec["suite"] in ("s2_rdma_ablation", "s4_safety_revoke", "s5_scaleup_cluster"):
+                assert mooncake_bin is not None, "mooncake-bench binary not built"
+                cmd = numa_prefix + [str(mooncake_bin), "--job-file", job_file]
+            else:
+                cmd = numa_prefix + [
+                    sys.executable,
+                    str(BASELINES_DIR / "mooncake_runner.py"),
+                    "--job-file",
+                    job_file,
+                ]
         elif sys_name == "lmcache":
             cmd = numa_prefix + [
                 sys.executable,
@@ -266,6 +291,8 @@ def main() -> None:
 
     _ensure_traces_and_nvme()
     vericache_bin = _build_vericache_bench()
+    need_mooncake = not args.systems or "mooncake" in args.systems
+    mooncake_bin = _build_mooncake_bench() if need_mooncake else None
     numa_strict = _detect_numa_prefix(preferred=False)
     numa_preferred = _detect_numa_prefix(preferred=True)
     # Record effective NUMA policy in manifest
@@ -308,9 +335,14 @@ def main() -> None:
             for idx, (sys_name, spec) in enumerate(jobs, 1):
                 t0 = time.perf_counter()
                 try:
-                    recs = _execute_job(suite_numa, vericache_bin, sys_name, spec)
+                    recs = _execute_job(suite_numa, vericache_bin, mooncake_bin, sys_name, spec)
                 finally:
-                    _verify_and_clean_nvme_dir(nvme_dir, f"{sys_name} {suite}/{spec['case']}")
+                    dirs_to_clean = {nvme_dir}
+                    for k in ("nvme_dir", "nvme_dir_node0", "nvme_dir_node1"):
+                        if spec.get(k):
+                            dirs_to_clean.add(pathlib.Path(str(spec[k])))
+                    for d in sorted(dirs_to_clean):
+                        _verify_and_clean_nvme_dir(d, f"{sys_name} {suite}/{spec['case']}")
                 dt = time.perf_counter() - t0
                 for r in recs:
                     rf.write(json.dumps(r, separators=(",", ":")) + "\n")
