@@ -54,11 +54,14 @@ case "$cmd" in
     for g in "${gpu_list[@]}"; do
       dev_args+=(--device "nvidia.com/gpu=$g")
     done
+    IFS=',' read -ra uverbs_list <<< "$uverbs"
+    for u in "${uverbs_list[@]}"; do
+      dev_args+=(--device "/dev/infiniband/$u")
+    done
     exec podman run --rm \
       --http-proxy=false \
       --net=host \
       "${dev_args[@]}" \
-      --device "/dev/infiniband/$uverbs" \
       --device /dev/infiniband/rdma_cm \
       --ulimit memlock=-1 \
       --security-opt seccomp=unconfined \
@@ -103,6 +106,10 @@ case "$cmd" in
     for g in "${gpu_list[@]}"; do
       dev_args+=(--device "nvidia.com/gpu=$g")
     done
+    IFS=',' read -ra uverbs_list <<< "$uverbs"
+    for u in "${uverbs_list[@]}"; do
+      dev_args+=(--device "/dev/infiniband/$u")
+    done
     extra_mounts=()
     if [[ -n "${VERICACHE_EXTRA_MOUNTS:-}" ]]; then
       IFS=':' read -ra mount_list <<< "$VERICACHE_EXTRA_MOUNTS"
@@ -118,7 +125,6 @@ case "$cmd" in
       --net=host \
       --ipc=host \
       "${dev_args[@]}" \
-      --device "/dev/infiniband/$uverbs" \
       --device /dev/infiniband/rdma_cm \
       --ulimit memlock=-1 \
       --security-opt seccomp=unconfined \

@@ -150,6 +150,30 @@ def load_lib() -> ctypes.CDLL:
     ]
     lib.vericache_put_gpu_batch.restype = ctypes.c_int32
 
+    lib.vericache_put_gpu_dram_batch.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+    ]
+    lib.vericache_put_gpu_dram_batch.restype = ctypes.c_int32
+
+    lib.vericache_put_gpu_paged_dram_batch.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+    ]
+    lib.vericache_put_gpu_paged_dram_batch.restype = ctypes.c_int32
+
     lib.vericache_get_gpu_batch.argtypes = [
         ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_uint64),
@@ -161,6 +185,36 @@ def load_lib() -> ctypes.CDLL:
     ]
     lib.vericache_get_gpu_batch.restype = ctypes.c_int32
 
+    lib.vericache_get_gpu_paged_batch.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.POINTER(VeriCacheHitInfoC),
+    ]
+    lib.vericache_get_gpu_paged_batch.restype = ctypes.c_int32
+
+    lib.vericache_get_gpu_paged_batch_flags.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_uint8),
+    ]
+    lib.vericache_get_gpu_paged_batch_flags.restype = ctypes.c_int32
+
     lib.vericache_contains_batch_local.argtypes = [
         ctypes.c_void_p,
         ctypes.POINTER(ctypes.c_uint64),
@@ -168,6 +222,21 @@ def load_lib() -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_int32),
     ]
     lib.vericache_contains_batch_local.restype = ctypes.c_int32
+
+    lib.vericache_contains_batch_local_flags.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_uint8),
+    ]
+    lib.vericache_contains_batch_local_flags.restype = ctypes.c_int32
+
+    lib.vericache_take_evicted_keys.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.c_size_t,
+    ]
+    lib.vericache_take_evicted_keys.restype = ctypes.c_size_t
 
     lib.vericache_spill_to_nvme.argtypes = [
         ctypes.c_void_p,

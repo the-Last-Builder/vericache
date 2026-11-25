@@ -6,7 +6,7 @@
 //! safety, lease/RDMA MW fencing, and `VersionBinding` value integrity even if a
 //! policy suggests an invalid, stale, or actively-leased `FrameId`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use vericache_core::spec::{FrameId, ObjectKey, TierKind};
 
@@ -58,6 +58,12 @@ pub struct SpillWatermark {
 /// `DistributedEngine` enforcement layer safely drains/fences or rejects it.
 pub trait EvictionPolicy {
     fn on_insert(&mut self, tier: TierKind, key: ObjectKey, frame: FrameId);
+    /// Insert a frame at the cold (LRU) tail so transient/cold-warmed entries are
+    /// evicted first without displacing hot entries. Defaults to [`Self::on_insert`]
+    /// for backwards compatibility with external policy wrappers.
+    fn on_insert_cold(&mut self, tier: TierKind, key: ObjectKey, frame: FrameId) {
+        self.on_insert(tier, key, frame);
+    }
     fn on_access(&mut self, tier: TierKind, key: ObjectKey, frame: FrameId);
     fn on_remove(&mut self, tier: TierKind, key: ObjectKey, frame: FrameId);
     fn select_victim(&mut self, tier: TierKind) -> Option<(ObjectKey, FrameId)>;
@@ -234,6 +240,37 @@ impl<K: Eq + Hash + Copy, V: Copy> LruList<K, V> {
         self.map.insert(key, idx);
     }
 
+    /// Insert `(key, val)` at the LRU tail without displacing MRU entries.
+    /// If `key` is already tracked, updates its value in place without promoting it.
+    pub fn insert_cold(&mut self, key: K, val: V) {
+        if let Some(&idx) = self.map.get(&key) {
+            if let Some(node) = self.nodes[idx].as_mut() {
+                node.val = val;
+            }
+            return;
+        }
+        let idx = if let Some(free_idx) = self.free.pop() {
+            self.nodes[free_idx] = Some(LruNode {
+                key,
+                val,
+                prev: None,
+                next: None,
+            });
+            free_idx
+        } else {
+            let idx = self.nodes.len();
+            self.nodes.push(Some(LruNode {
+                key,
+                val,
+                prev: None,
+                next: None,
+            }));
+            idx
+        };
+        self.push_back(idx);
+        self.map.insert(key, idx);
+    }
+
     pub fn touch(&mut self, key: &K) -> Option<V> {
         let &idx = self.map.get(key)?;
         self.detach(idx);
@@ -287,6 +324,68 @@ impl<K: Eq + Hash + Copy, V: Copy> LruList<K, V> {
         }
         self.head = Some(idx);
     }
+
+    fn push_back(&mut self, idx: usize) {
+        let old_tail = self.tail;
+        {
+            let n = self.nodes[idx].as_mut().expect("valid LRU node");
+            n.prev = old_tail;
+            n.next = None;
+        }
+        if let Some(t) = old_tail {
+            self.nodes[t].as_mut().expect("tail node").next = Some(idx);
+        } else {
+            self.head = Some(idx);
+        }
+        self.tail = Some(idx);
+    }
+}
+
+/// Bounded O(1) two-generation 2-hit promotion gate for NVMe -> DRAM reads.
+///
+/// The first NVMe hit records the key and returns `false` (transient read — DRAM copy
+/// is reclaimed immediately after DMA with zero NVMe write amplification). A second hit
+/// within two generations returns `true` so genuinely hot keys promote into DRAM.
+pub struct NvmePromoFilter {
+    current: HashSet<ObjectKey>,
+    previous: HashSet<ObjectKey>,
+    max_entries_per_gen: usize,
+}
+
+impl Default for NvmePromoFilter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NvmePromoFilter {
+    pub const DEFAULT_MAX_ENTRIES_PER_GEN: usize = 131_072;
+
+    pub fn new() -> Self {
+        Self::with_capacity_per_gen(Self::DEFAULT_MAX_ENTRIES_PER_GEN)
+    }
+
+    pub fn with_capacity_per_gen(max_entries_per_gen: usize) -> Self {
+        Self {
+            current: HashSet::new(),
+            previous: HashSet::new(),
+            max_entries_per_gen: max_entries_per_gen.max(1),
+        }
+    }
+
+    /// Record an NVMe read hit for `key`. Returns `true` iff `key` has already been seen
+    /// in the current or previous generation (2nd+ hit -> promote into DRAM).
+    pub fn record_hit_and_should_promote(&mut self, key: ObjectKey) -> bool {
+        if self.current.contains(&key) {
+            return true;
+        }
+        let seen_prev = self.previous.contains(&key);
+        if self.current.len() >= self.max_entries_per_gen {
+            self.previous = std::mem::take(&mut self.current);
+        }
+        self.current.insert(key);
+        seen_prev
+    }
 }
 
 /// Per-tier O(1) LRU eviction policy across GPU VRAM, Host DRAM, and Local NVMe.
@@ -316,6 +415,12 @@ impl EvictionPolicy for LruEviction {
     fn on_insert(&mut self, tier: TierKind, key: ObjectKey, frame: FrameId) {
         if let Some(list) = self.list_mut(tier) {
             list.insert(key, frame);
+        }
+    }
+
+    fn on_insert_cold(&mut self, tier: TierKind, key: ObjectKey, frame: FrameId) {
+        if let Some(list) = self.list_mut(tier) {
+            list.insert_cold(key, frame);
         }
     }
 
@@ -375,6 +480,31 @@ impl Default for CascadeTiering {
             demote_gpu_to_dram: true,
             demote_dram_to_nvme: true,
             spill_watermark: None,
+        }
+    }
+}
+
+impl CascadeTiering {
+    /// Serving-oriented policy for inference engines (e.g., vLLM) that already
+    /// maintain their own large hot GPU KV cache:
+    /// - Avoids write amplification from promoting cold DRAM/NVMe hits into a
+    ///   secondary GPU HBM tier (reads stream directly via 1-hop pinned H2D).
+    /// - Proactively spills cold DRAM frames to NVMe asynchronously via `io_uring`
+    ///   before DRAM fills up.
+    pub fn serving_dram_first(high_water_free_frames: usize, max_in_flight: usize) -> Self {
+        let wm = if high_water_free_frames > 0 && max_in_flight > 0 {
+            Some(SpillWatermark {
+                high_water_free_frames,
+                max_in_flight,
+            })
+        } else {
+            None
+        };
+        Self {
+            promote_gpu_on_cold_hit: false,
+            demote_gpu_to_dram: true,
+            demote_dram_to_nvme: true,
+            spill_watermark: wm,
         }
     }
 }
@@ -461,5 +591,53 @@ impl PeerRoutingPolicy for ConsistentHashPeers {
                 out.push(peers[(start + offset) % peers.len()].index);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(id: u64) -> ObjectKey {
+        ObjectKey([id, 0, 0, 0])
+    }
+
+    #[test]
+    fn lru_list_insert_cold_places_at_tail_without_displacing_mru() {
+        let mut lru: LruList<u64, u32> = LruList::new();
+        lru.insert(1, 10);
+        lru.insert(2, 20);
+        // Order: head=2, tail=1. Insert 3 at cold tail -> head=2, 1, tail=3.
+        lru.insert_cold(3, 30);
+        assert_eq!(lru.pop_lru(), Some((3, 30)));
+        assert_eq!(lru.pop_lru(), Some((1, 10)));
+        assert_eq!(lru.pop_lru(), Some((2, 20)));
+        assert_eq!(lru.pop_lru(), None);
+
+        // insert_cold on empty list works cleanly.
+        lru.insert_cold(9, 90);
+        assert_eq!(lru.pop_lru(), Some((9, 90)));
+
+        // insert_cold on existing key updates val without moving it to MRU.
+        lru.insert(1, 10);
+        lru.insert(2, 20);
+        lru.insert_cold(1, 11);
+        assert_eq!(lru.pop_lru(), Some((1, 11)));
+    }
+
+    #[test]
+    fn nvme_promo_filter_two_hit_gate_and_rotation() {
+        let mut filter = NvmePromoFilter::with_capacity_per_gen(4);
+        assert!(!filter.record_hit_and_should_promote(key(1)));
+        assert!(filter.record_hit_and_should_promote(key(1)));
+
+        // Fill generation 1 and rotate into generation 2.
+        assert!(!filter.record_hit_and_should_promote(key(2)));
+        assert!(!filter.record_hit_and_should_promote(key(3)));
+        assert!(!filter.record_hit_and_should_promote(key(4)));
+        // Triggers rotation: previous = {1,2,3,4}, current = {5}.
+        assert!(!filter.record_hit_and_should_promote(key(5)));
+        // key(2) is still in `previous`, so 2nd hit promotes!
+        assert!(filter.record_hit_and_should_promote(key(2)));
     }
 }

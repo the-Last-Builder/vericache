@@ -43,6 +43,17 @@ impl Catalog {
         self.num_tiers
     }
 
+    pub closed spec fn num_buckets(&self) -> usize {
+        self.num_buckets
+    }
+
+    pub fn bucket_count(&self) -> (n: usize)
+        ensures
+            n == self.num_buckets(),
+    {
+        self.num_buckets
+    }
+
     pub open spec fn bucket_index_spec(key: ObjectKey, num_buckets: usize) -> usize {
         (((key.0[0] ^ key.0[1]) as usize) % num_buckets) as usize
     }
@@ -136,6 +147,7 @@ impl Catalog {
         ensures
             c.indexed(),
             c.num_tiers() == num_tiers,
+            c.num_buckets() == num_buckets,
             c.view() == Map::<ObjectKey, CatalogEntry>::empty(),
     {
         let mut buckets = Vec::<Vec<(ObjectKey, CatalogEntry)>>::with_capacity(num_buckets);

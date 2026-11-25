@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import array
 import ctypes
 from dataclasses import dataclass
 from enum import IntEnum
@@ -80,20 +81,57 @@ def key_from_u64(val: int, salt: int = 0) -> ObjectKey:
     return key_from_bytes(struct.pack("<2Q", val & 0xFFFFFFFFFFFFFFFF, salt & 0xFFFFFFFFFFFFFFFF))
 
 
-def _pack_key(key: ObjectKey):
-    arr = (ctypes.c_uint64 * 4)(*key)
-    return arr
+_HIT_LOC_BY_CODE = tuple(HitLocation(i) for i in range(6))
+_SIZE_T_CODE = "Q" if ctypes.sizeof(ctypes.c_size_t) == 8 else "L"
 
 
-def _pack_keys(keys: Sequence[ObjectKey]):
-    flat = (ctypes.c_uint64 * (len(keys) * 4))()
-    for i, k in enumerate(keys):
-        base = i * 4
-        flat[base] = k[0]
-        flat[base + 1] = k[1]
-        flat[base + 2] = k[2]
-        flat[base + 3] = k[3]
-    return flat
+def _pack_key(key: ObjectKey | bytes):
+    if isinstance(key, (bytes, bytearray, memoryview)):
+        mv = memoryview(key)
+        if mv.nbytes != 32:
+            raise ValueError(f"Expected 32-byte key, got {mv.nbytes} bytes")
+        return (ctypes.c_uint64 * 4).from_buffer_copy(mv)
+    return (ctypes.c_uint64 * 4)(*key)
+
+
+def _pack_keys(keys: Sequence[ObjectKey | bytes]):
+    n = len(keys)
+    if n == 0:
+        return (ctypes.c_uint64 * 0)()
+    first = keys[0]
+    if isinstance(first, (bytes, bytearray, memoryview)):
+        raw = bytearray(n * 32)
+        off = 0
+        for i, k in enumerate(keys):
+            if len(k) != 32:  # type: ignore[arg-type]
+                raise ValueError(f"keys[{i}] must be 32 bytes, got {len(k)}")  # type: ignore[arg-type]
+            raw[off : off + 32] = k  # type: ignore[assignment]
+            off += 32
+        return (ctypes.c_uint64 * (n * 4)).from_buffer(raw)
+    arr = array.array("Q")
+    extend = arr.extend
+    for k in keys:
+        extend(k)  # type: ignore[arg-type]
+    if len(arr) != n * 4:
+        raise ValueError("each ObjectKey must be a 4-tuple of uint64")
+    return (ctypes.c_uint64 * (n * 4)).from_buffer(arr)
+
+
+def _pack_size_array(vals: Sequence[int], name: str):
+    n = len(vals)
+    if n == 0:
+        return (ctypes.c_size_t * 0)()
+    try:
+        arr = array.array(_SIZE_T_CODE, vals)
+    except (OverflowError, TypeError):
+        c_arr = (ctypes.c_size_t * n)()
+        for i, v in enumerate(vals):
+            iv = int(v)
+            if iv < 0:
+                raise ValueError(f"{name}[{i}] must be non-negative, got {iv}")
+            c_arr[i] = iv
+        return c_arr
+    return (ctypes.c_size_t * n).from_buffer(arr)
 
 
 class VeriCacheError(RuntimeError):
@@ -295,6 +333,28 @@ class VeriCacheClient:
             raise VeriCacheError(last_error(self._lib))
         return int(rc)
 
+    def put_gpu_dram_batch(
+        self,
+        keys: Sequence[ObjectKey],
+        src_dev_ptrs: Sequence[int],
+        *,
+        cuda_stream: int = 0,
+    ) -> int:
+        """Store GPU frames directly into Pinned Host DRAM via batched async D2H DMA."""
+        if len(keys) != len(src_dev_ptrs):
+            raise ValueError("keys and src_dev_ptrs length mismatch")
+        if not keys:
+            return 0
+        h = self._require_handle()
+        k_arr = _pack_keys(keys)
+        p_arr = (ctypes.c_size_t * len(src_dev_ptrs))(*[int(p) for p in src_dev_ptrs])
+        rc = self._lib.vericache_put_gpu_dram_batch(
+            h, k_arr, p_arr, len(keys), self._frame_size, int(cuda_stream)
+        )
+        if rc < 0:
+            raise VeriCacheError(last_error(self._lib))
+        return int(rc)
+
     def get_gpu_batch(
         self,
         keys: Sequence[ObjectKey],
@@ -321,7 +381,7 @@ class VeriCacheClient:
             if info.found:
                 results.append(
                     HitInfo(
-                        location=HitLocation(info.location),
+                        location=_HIT_LOC_BY_CODE[info.location],
                         version=VersionId(info.version_origin, info.version_seq),
                         peer_node_id=info.peer_node_id,
                     )
@@ -329,6 +389,166 @@ class VeriCacheClient:
             else:
                 results.append(None)
         return results
+
+    def put_gpu_paged_dram_batch(
+        self,
+        keys: Sequence[ObjectKey],
+        region_base_ptrs: Sequence[int],
+        region_block_strides: Sequence[int],
+        region_offsets: Sequence[int],
+        region_sizes: Sequence[int],
+        gpu_block_ids: Sequence[int],
+        cuda_stream: int = 0,
+    ) -> int:
+        """Store paged multi-layer GPU KV blocks directly into Host DRAM via batched D2H DMA."""
+        if len(keys) != len(gpu_block_ids):
+            raise ValueError("keys and gpu_block_ids length mismatch")
+        num_regions = len(region_base_ptrs)
+        if (
+            num_regions == 0
+            or len(region_block_strides) != num_regions
+            or len(region_offsets) != num_regions
+            or len(region_sizes) != num_regions
+        ):
+            raise ValueError("region descriptor sequences must be non-empty and equal length")
+        if not keys:
+            return 0
+        h = self._require_handle()
+        k_arr = _pack_keys(keys)
+        b_arr = _pack_size_array(gpu_block_ids, "gpu_block_ids")
+        base_arr = _pack_size_array(region_base_ptrs, "region_base_ptrs")
+        stride_arr = _pack_size_array(region_block_strides, "region_block_strides")
+        off_arr = _pack_size_array(region_offsets, "region_offsets")
+        size_arr = _pack_size_array(region_sizes, "region_sizes")
+        rc = self._lib.vericache_put_gpu_paged_dram_batch(
+            h,
+            k_arr,
+            b_arr,
+            len(keys),
+            base_arr,
+            stride_arr,
+            off_arr,
+            size_arr,
+            num_regions,
+            int(cuda_stream),
+        )
+        if rc < 0:
+            raise VeriCacheError(last_error(self._lib))
+        return int(rc)
+
+    def get_gpu_paged_batch(
+        self,
+        keys: Sequence[ObjectKey],
+        region_base_ptrs: Sequence[int],
+        region_block_strides: Sequence[int],
+        region_offsets: Sequence[int],
+        region_sizes: Sequence[int],
+        gpu_block_ids: Sequence[int],
+        cuda_stream: int = 0,
+    ) -> list[HitInfo | None]:
+        """Load cached blocks directly into paged multi-layer GPU KV tensors via batched DMA."""
+        if len(keys) != len(gpu_block_ids):
+            raise ValueError("keys and gpu_block_ids length mismatch")
+        num_regions = len(region_base_ptrs)
+        if (
+            num_regions == 0
+            or len(region_block_strides) != num_regions
+            or len(region_offsets) != num_regions
+            or len(region_sizes) != num_regions
+        ):
+            raise ValueError("region descriptor sequences must be non-empty and equal length")
+        if not keys:
+            return []
+        h = self._require_handle()
+        k_arr = _pack_keys(keys)
+        b_arr = _pack_size_array(gpu_block_ids, "gpu_block_ids")
+        base_arr = _pack_size_array(region_base_ptrs, "region_base_ptrs")
+        stride_arr = _pack_size_array(region_block_strides, "region_block_strides")
+        off_arr = _pack_size_array(region_offsets, "region_offsets")
+        size_arr = _pack_size_array(region_sizes, "region_sizes")
+        out_arr = (VeriCacheHitInfoC * len(keys))()
+        rc = self._lib.vericache_get_gpu_paged_batch(
+            h,
+            k_arr,
+            b_arr,
+            len(keys),
+            base_arr,
+            stride_arr,
+            off_arr,
+            size_arr,
+            num_regions,
+            int(cuda_stream),
+            out_arr,
+        )
+        if rc < 0:
+            raise VeriCacheError(last_error(self._lib))
+        results: list[HitInfo | None] = []
+        for i in range(len(keys)):
+            info = out_arr[i]
+            if info.found:
+                results.append(
+                    HitInfo(
+                        location=_HIT_LOC_BY_CODE[info.location],
+                        version=VersionId(info.version_origin, info.version_seq),
+                        peer_node_id=info.peer_node_id,
+                    )
+                )
+            else:
+                results.append(None)
+        return results
+
+    def get_gpu_paged_batch_flags(
+        self,
+        keys: Sequence[ObjectKey | bytes],
+        region_base_ptrs: Sequence[int],
+        region_block_strides: Sequence[int],
+        region_offsets: Sequence[int],
+        region_sizes: Sequence[int],
+        gpu_block_ids: Sequence[int],
+        cuda_stream: int = 0,
+    ) -> bytes:
+        """Fast zero-dataclass variant of `get_gpu_paged_batch` returning 1 byte/key.
+
+        Each byte is a `HitLocation` code (`0=MISS, 1=LOCAL_GPU, 2=LOCAL_DRAM,
+        3=LOCAL_NVME, 4=REMOTE_RDMA_HOST, 5=REMOTE_GDR_GPU`).
+        """
+        if len(keys) != len(gpu_block_ids):
+            raise ValueError("keys and gpu_block_ids length mismatch")
+        num_regions = len(region_base_ptrs)
+        if (
+            num_regions == 0
+            or len(region_block_strides) != num_regions
+            or len(region_offsets) != num_regions
+            or len(region_sizes) != num_regions
+        ):
+            raise ValueError("region descriptor sequences must be non-empty and equal length")
+        if not keys:
+            return b""
+        h = self._require_handle()
+        k_arr = _pack_keys(keys)
+        b_arr = _pack_size_array(gpu_block_ids, "gpu_block_ids")
+        base_arr = _pack_size_array(region_base_ptrs, "region_base_ptrs")
+        stride_arr = _pack_size_array(region_block_strides, "region_block_strides")
+        off_arr = _pack_size_array(region_offsets, "region_offsets")
+        size_arr = _pack_size_array(region_sizes, "region_sizes")
+        out_buf = bytearray(len(keys))
+        out_arr = (ctypes.c_uint8 * len(keys)).from_buffer(out_buf)
+        rc = self._lib.vericache_get_gpu_paged_batch_flags(
+            h,
+            k_arr,
+            b_arr,
+            len(keys),
+            base_arr,
+            stride_arr,
+            off_arr,
+            size_arr,
+            num_regions,
+            int(cuda_stream),
+            out_arr,
+        )
+        if rc < 0:
+            raise VeriCacheError(last_error(self._lib))
+        return bytes(out_buf)
 
     def put_tensor(self, key: ObjectKey, tensor) -> VersionId:
         """Store a contiguous CPU or CUDA `torch.Tensor` of size `frame_size` bytes."""
@@ -368,7 +588,7 @@ class VeriCacheClient:
     # Metadata, Tier Control & Progress
     # ------------------------------------------------------------------
 
-    def contains_batch_local(self, keys: Sequence[ObjectKey]) -> list[HitLocation]:
+    def contains_batch_local(self, keys: Sequence[ObjectKey | bytes]) -> list[HitLocation]:
         if not keys:
             return []
         h = self._require_handle()
@@ -377,7 +597,33 @@ class VeriCacheClient:
         rc = self._lib.vericache_contains_batch_local(h, k_arr, len(keys), out_arr)
         if rc != 0:
             raise VeriCacheError(last_error(self._lib))
-        return [HitLocation(out_arr[i]) for i in range(len(keys))]
+        return [_HIT_LOC_BY_CODE[out_arr[i]] for i in range(len(keys))]
+
+    def contains_batch_local_flags(self, keys: Sequence[ObjectKey | bytes]) -> bytes:
+        """Lock-free local tier membership check returning 1 byte/key (`0=miss, 1=GPU, 2=DRAM, 3=NVMe`)."""
+        if not keys:
+            return b""
+        h = self._require_handle()
+        k_arr = _pack_keys(keys)
+        out_buf = bytearray(len(keys))
+        out_arr = (ctypes.c_uint8 * len(keys)).from_buffer(out_buf)
+        rc = self._lib.vericache_contains_batch_local_flags(h, k_arr, len(keys), out_arr)
+        if rc != 0:
+            raise VeriCacheError(last_error(self._lib))
+        return bytes(out_buf)
+
+    def take_evicted_keys(self, max_keys: int = 4096) -> list[bytes]:
+        """Drain up to `max_keys` locally evicted keys as 32-byte `<4Q` raw byte buffers."""
+        if max_keys <= 0:
+            return []
+        h = self._require_handle()
+        buf = bytearray(max_keys * 32)
+        c_buf = (ctypes.c_uint8 * (max_keys * 32)).from_buffer(buf)
+        n = int(self._lib.vericache_take_evicted_keys(h, c_buf, max_keys))
+        if n <= 0:
+            return []
+        mv = memoryview(buf)
+        return [bytes(mv[i * 32 : (i + 1) * 32]) for i in range(n)]
 
     def spill_to_nvme(self, key: ObjectKey) -> bool:
         h = self._require_handle()

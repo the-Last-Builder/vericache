@@ -117,18 +117,20 @@ impl ShardCaps {
         &mut self,
         frame_size: usize,
         max_leases: usize,
+        catalog_buckets: usize,
     ) -> Result<CacheCore, CacheError> {
         let ver_src = self
             .versions
             .take()
             .ok_or_else(|| CacheError::Init("shard VersionSource already consumed".into()))?;
-        Ok(CacheCore::from_shard_versions(
+        Ok(CacheCore::from_shard_versions_with_buckets(
             self.node as u16,
             frame_size,
             Vec::new(),
             max_leases,
             self.version_start,
             self.version_limit,
+            catalog_buckets.max(vericache_core::catalog::DEFAULT_BUCKETS),
             Tracked(self.instance.borrow()),
             Tracked(self.version_instance.borrow()),
             ver_src,
@@ -556,7 +558,19 @@ verus! {
 impl NodeStorage {
     pub fn new(config: StorageConfig) -> Result<Self, CacheError> {
         let mut caps = ShardCaps::take(config.node_id)?;
-        let mut core = Box::new(caps.make_versioned_core(config.frame_size, config.max_leases)?);
+        let total_frames = (config.dram_frames as usize)
+            .saturating_add(config.gpu.as_ref().map_or(0, |g| g.hbm_frames as usize))
+            .saturating_add(config.nvme.as_ref().map_or(0, |n| n.nvme_frames as usize));
+        let catalog_buckets = total_frames
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .max(vericache_core::catalog::DEFAULT_BUCKETS)
+            .min(4 * 1024 * 1024);
+        let mut core = Box::new(caps.make_versioned_core(
+            config.frame_size,
+            config.max_leases,
+            catalog_buckets,
+        )?);
         let host = Box::new(
             HostBackend::new(
                 &mut core,
@@ -670,7 +684,7 @@ impl<'s> AttachedStorage<'s> {
     ) -> Result<VeriCache<'a, T, E, P, R>, CacheError>
     where
         's: 'a,
-        T: ByteTransport,
+        T: ByteTransport + 'static,
         E: EvictionPolicy,
         P: TieringPolicy,
         R: PeerRoutingPolicy,
@@ -709,6 +723,7 @@ impl<'s> AttachedStorage<'s> {
 
         let mut peer_sessions = Vec::with_capacity(peers.len());
         let mut peer_metas = Vec::with_capacity(peers.len());
+        let mut peer_recv_paused = Vec::with_capacity(peers.len());
         if !peers.is_empty() {
             let rcfg = self.config.rdma.as_ref().ok_or_else(|| {
                 CacheError::Init("peers supplied without RdmaConfig in StorageConfig".into())
@@ -722,6 +737,10 @@ impl<'s> AttachedStorage<'s> {
                 .ok_or_else(|| CacheError::Init("RDMA ProtectionDomain not initialized".into()))?;
 
             for (idx, link) in peers.into_iter().enumerate() {
+                let pause_handle = (&link.transport as &dyn std::any::Any)
+                    .downcast_ref::<crate::transport::TcpTransport>()
+                    .map(|t| t.recv_pause_handle());
+                peer_recv_paused.push(pause_handle);
                 let cq = CompletionQueue::new(dev, rcfg.cq_depth as i32, caps.mint_rdma())
                     .map_err(|e| CacheError::Init(format!("CompletionQueue::new failed: {e:?}")))?;
                 let psn = link
@@ -851,6 +870,7 @@ impl<'s> AttachedStorage<'s> {
             caps,
             self.pd.as_ref(),
             peer_metas,
+            peer_recv_paused,
             policy,
             internal_gpu_stream,
             gpu_staging,

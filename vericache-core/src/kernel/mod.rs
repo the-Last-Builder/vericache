@@ -392,10 +392,57 @@ impl CacheCore {
             core.spec@.catalog == Map::empty(),
             !core.has_version_registry(),
     {
+        Self::new_with_version_range_and_buckets(
+            node_id,
+            frame_size,
+            tiers,
+            max_leases,
+            version_seq_start,
+            version_seq_limit,
+            DEFAULT_BUCKETS,
+            Tracked(instance),
+        )
+    }
+
+    pub fn new_with_version_range_and_buckets(
+        node_id: u16,
+        frame_size: usize,
+        tiers: Vec<TierDescriptor>,
+        max_leases: usize,
+        version_seq_start: u64,
+        version_seq_limit: u64,
+        num_buckets: usize,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (core: Self)
+        requires
+            0 < frame_size,
+            tiers.len() <= MAX_TIERS,
+            forall|i: int| 0 <= i < tiers.len() ==> (#[trigger] tiers[i]).id.0 as usize == i,
+            max_leases <= u32::MAX,
+            1 <= version_seq_start <= version_seq_limit <= MAX_VERSION_SEQ + 1,
+            num_buckets > 0,
+        ensures
+            core.well_formed(),
+            core.node_id == node_id,
+            core.instance_id() == instance.id(),
+            core.frames.frame_size == frame_size,
+            core.tiers@ == tiers@,
+            core.frames.metas.len() == 0,
+            core.timelines.count == 0,
+            core.version_seq_start == version_seq_start,
+            core.next_version_seq == version_seq_start,
+            core.version_seq_limit == version_seq_limit,
+            core.active_leases.len() == max_leases,
+            core.free_lease_slots.len() == max_leases,
+            core.catalog.num_buckets() == num_buckets,
+            core.spec@.versions == Map::empty(),
+            core.spec@.catalog == Map::empty(),
+            !core.has_version_registry(),
+    {
         let num_tiers = tiers.len();
         let timelines = TimelineTable::new();
         let frames = FrameTable::new(num_tiers, frame_size);
-        let catalog = Catalog::new(num_tiers);
+        let catalog = Catalog::with_capacity(num_tiers, num_buckets);
         let tracked ledger = KnowledgeLedger::empty(instance.id());
         let mut active_leases = Vec::<Option<ActiveLocalLease>>::with_capacity(max_leases);
         let mut free_lease_slots = Vec::<u32>::with_capacity(max_leases);
@@ -492,13 +539,71 @@ impl CacheCore {
             core.spec@.versions == Map::empty(),
             core.spec@.catalog == Map::empty(),
     {
-        let mut core = Self::new_with_version_range(
+        Self::from_shard_versions_with_buckets(
             node_id,
             frame_size,
             tiers,
             max_leases,
             version_seq_start,
             version_seq_limit,
+            DEFAULT_BUCKETS,
+            Tracked(instance),
+            Tracked(ver_inst),
+            Tracked(ver_src),
+        )
+    }
+
+    pub fn from_shard_versions_with_buckets(
+        node_id: u16,
+        frame_size: usize,
+        tiers: Vec<TierDescriptor>,
+        max_leases: usize,
+        version_seq_start: u64,
+        version_seq_limit: u64,
+        num_buckets: usize,
+        Tracked(instance): Tracked<&TransferInstance>,
+        Tracked(ver_inst): Tracked<&VersionInstance>,
+        Tracked(ver_src): Tracked<VersionSource>,
+    ) -> (core: Self)
+        requires
+            0 < frame_size,
+            tiers.len() <= MAX_TIERS,
+            forall|i: int| 0 <= i < tiers.len() ==> (#[trigger] tiers[i]).id.0 as usize == i,
+            max_leases <= u32::MAX,
+            1 <= version_seq_start <= version_seq_limit <= MAX_VERSION_SEQ + 1,
+            num_buckets > 0,
+            ver_inst.id() == cluster_version_instance_id(),
+            ver_src.well_formed(),
+            ver_src.id() == ver_inst.id(),
+            ver_src.node() == node_id as NodeId,
+            ver_src.min_seq() <= version_seq_start as nat,
+            ver_src.max_seq() matches Some(lim) ==> lim >= version_seq_limit as nat,
+        ensures
+            core.well_formed(),
+            core.has_version_registry(),
+            core.node_id == node_id,
+            core.instance_id() == instance.id(),
+            core.frames.frame_size == frame_size,
+            core.tiers@ == tiers@,
+            core.frames.metas.len() == 0,
+            core.timelines.count == 0,
+            core.version_seq_start == version_seq_start,
+            core.next_version_seq == version_seq_start,
+            core.version_seq_limit == version_seq_limit,
+            core.active_leases.len() == max_leases,
+            core.free_lease_slots.len() == max_leases,
+            core.catalog.num_buckets() == num_buckets,
+            core.spec@.versions == Map::empty(),
+            core.spec@.catalog == Map::empty(),
+    {
+        let mut core = Self::new_with_version_range_and_buckets(
+            node_id,
+            frame_size,
+            tiers,
+            max_leases,
+            version_seq_start,
+            version_seq_limit,
+            num_buckets,
             Tracked(instance),
         );
         let tracked dup_inst = ver_inst.duplicate();

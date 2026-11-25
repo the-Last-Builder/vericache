@@ -28,7 +28,7 @@ pub mod transport;
 use std::fmt;
 use vericache_core::spec::{CoreError, Ticket, VersionId};
 
-pub use cache::VeriCache;
+pub use cache::{BatchReadSource, VeriCache};
 pub use lease::{GpuLeaseGuard, HostLeaseGuard};
 pub use policy::{
     CascadeTiering, ConsistentHashPeers, DataDomain, DefaultPolicy, EvictionPolicy, HitLocation,
