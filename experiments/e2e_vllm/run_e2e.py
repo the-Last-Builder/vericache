@@ -792,6 +792,8 @@ def replay_command(cluster: ClusterContext, args: argparse.Namespace, system: st
         "--system", system, "--case", "toolagent",
         "--model-path", args.model_path, "--served-model-name", args.served_model_name,
         "--node0-url", cluster.url0, "--node1-url", cluster.url1,
+        "--warmup-requests", str(args.warmup_requests),
+        "--measure-requests", str(args.measure_requests),
         "--max-model-len", str(args.max_model_len), "--max-input-tokens", "32768",
         "--max-concurrency", str(args.max_concurrency), "--timeout-s", str(args.timeout_s),
         "--deployment-id", cluster.deployment_id(),
@@ -844,6 +846,8 @@ def main() -> None:
     source.add_argument("--frozen-window")
     source.add_argument("--trace-path")
     parser.add_argument("--start-index", type=int, default=0)
+    parser.add_argument("--warmup-requests", type=int, default=500)
+    parser.add_argument("--measure-requests", type=int, default=1500)
     parser.add_argument("--max-concurrency", type=int, default=32)
     parser.add_argument("--timeout-s", type=float, default=300)
     parser.add_argument("--clamp-output-max", type=int)
@@ -879,7 +883,7 @@ def main() -> None:
     for qps in args.qps_list:
         case = f"qps{qps:g}" if qps else "closed"
         for system in args.systems:
-            if system == "baseline" and qps == 0:
+            if system == "baseline" and qps == 0 and len(args.systems) > 1:
                 continue
             work_dir = run_dir / f"{case}_{system}"
             summary = work_dir / "summary.json"
