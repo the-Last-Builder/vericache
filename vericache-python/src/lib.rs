@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -80,7 +80,7 @@ pub struct VeriCacheConfigC {
     pub node_id: u64,
     pub frame_size: usize,
     pub dram_frames: u32,
-    /// CUDA device ordinal, or `-1` to disable GPU tier.
+    /// CUDA device ordinal for pinned-host DMA and optional HBM, or `-1` for CPU only.
     pub gpu_device_id: i32,
     pub hbm_frames: u32,
     /// Null-terminated directory path for NVMe `io_uring` slab, or null to disable NVMe.
@@ -131,6 +131,49 @@ impl From<CacheStats> for VeriCacheStatsC {
             misses: s.misses,
             policy_victims_rejected: s.policy_victims_rejected,
             policy_victims_pinned: s.policy_victims_pinned,
+        }
+    }
+}
+
+/// Step 1 path statistics. The legacy vericache_stats ABI is retained.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct VeriCachePathStatsC {
+    pub base: VeriCacheStatsC,
+    pub remote_nvme_warm_hits: u64,
+    pub donor_nvme_warms: u64,
+    pub put_attempts: u64,
+    pub nvme_spills: u64,
+    pub nvme_evictions: u64,
+    pub dram_evictions: u64,
+    pub dram_reclaims: u64,
+    pub mw_coop_revokes: u64,
+    pub mw_unilateral_revokes: u64,
+    pub host_pinned: u8,
+    pub hbm_frames: u32,
+    pub dram_frames: u32,
+    pub nvme_frames: u32,
+    pub gdr_enabled: u8,
+}
+
+impl From<CacheStats> for VeriCachePathStatsC {
+    fn from(s: CacheStats) -> Self {
+        Self {
+            base: s.into(),
+            remote_nvme_warm_hits: s.remote_nvme_warm_hits,
+            donor_nvme_warms: s.donor_nvme_warms,
+            put_attempts: s.put_attempts,
+            nvme_spills: s.nvme_spills,
+            nvme_evictions: s.nvme_evictions,
+            dram_evictions: s.dram_evictions,
+            dram_reclaims: s.dram_reclaims,
+            mw_coop_revokes: s.mw_coop_revokes,
+            mw_unilateral_revokes: s.mw_unilateral_revokes,
+            host_pinned: s.host_pinned,
+            hbm_frames: s.hbm_frames,
+            dram_frames: s.dram_frames,
+            nvme_frames: s.nvme_frames,
+            gdr_enabled: s.gdr_enabled,
         }
     }
 }
@@ -297,6 +340,7 @@ enum LowCommand {
         reply: Sender<Result<bool, String>>,
     },
     Poll {
+        drain: bool,
         reply: Sender<Result<(), String>>,
     },
     Shutdown {
@@ -681,56 +725,17 @@ impl EvictionPolicy for MirroredLruEviction {
     }
 }
 
-/// Lock-free atomic mirror of `CacheStats` so `vericache_stats` never blocks on `worker_loop`.
-struct AtomicCacheStats {
-    puts: AtomicU64,
-    gpu_hits: AtomicU64,
-    dram_hits: AtomicU64,
-    nvme_hits: AtomicU64,
-    remote_hits: AtomicU64,
-    misses: AtomicU64,
-    policy_victims_rejected: AtomicU64,
-    policy_victims_pinned: AtomicU64,
-}
+/// Publish a coherent snapshot without queueing work on the cache worker.
+#[derive(Default)]
+struct StatsMirror(Mutex<CacheStats>);
 
-impl AtomicCacheStats {
-    fn new() -> Self {
-        Self {
-            puts: AtomicU64::new(0),
-            gpu_hits: AtomicU64::new(0),
-            dram_hits: AtomicU64::new(0),
-            nvme_hits: AtomicU64::new(0),
-            remote_hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            policy_victims_rejected: AtomicU64::new(0),
-            policy_victims_pinned: AtomicU64::new(0),
-        }
+impl StatsMirror {
+    fn sync_from(&self, stats: &CacheStats) {
+        *self.0.lock().unwrap() = *stats;
     }
 
-    fn sync_from(&self, s: &CacheStats) {
-        self.puts.store(s.puts, Ordering::Relaxed);
-        self.gpu_hits.store(s.gpu_hits, Ordering::Relaxed);
-        self.dram_hits.store(s.dram_hits, Ordering::Relaxed);
-        self.nvme_hits.store(s.nvme_hits, Ordering::Relaxed);
-        self.remote_hits.store(s.remote_hits, Ordering::Relaxed);
-        self.misses.store(s.misses, Ordering::Relaxed);
-        self.policy_victims_rejected
-            .store(s.policy_victims_rejected, Ordering::Relaxed);
-        self.policy_victims_pinned
-            .store(s.policy_victims_pinned, Ordering::Relaxed);
-    }
-
-    fn snapshot(&self) -> VeriCacheStatsC {
-        VeriCacheStatsC {
-            puts: self.puts.load(Ordering::Relaxed),
-            gpu_hits: self.gpu_hits.load(Ordering::Relaxed),
-            dram_hits: self.dram_hits.load(Ordering::Relaxed),
-            nvme_hits: self.nvme_hits.load(Ordering::Relaxed),
-            remote_hits: self.remote_hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
-            policy_victims_rejected: self.policy_victims_rejected.load(Ordering::Relaxed),
-            policy_victims_pinned: self.policy_victims_pinned.load(Ordering::Relaxed),
-        }
+    fn snapshot(&self) -> CacheStats {
+        *self.0.lock().unwrap()
     }
 }
 
@@ -738,7 +743,7 @@ impl AtomicCacheStats {
 pub struct VeriCacheHandle {
     queue: Arc<WorkQueue>,
     key_mirror: Arc<LocalKeyMirror>,
-    stats_mirror: Arc<AtomicCacheStats>,
+    stats_mirror: Arc<StatsMirror>,
     worker: Option<JoinHandle<()>>,
     frame_size: usize,
 }
@@ -1032,6 +1037,11 @@ fn exec_high_cmd<E, P, R>(
                                     BatchReadSource::PinnedHost(addr) => {
                                         (addr, cuda_copy::CUDA_MEMCPY_HOST_TO_DEVICE)
                                     }
+                                    BatchReadSource::PageableHost(_) => {
+                                        return Err(CacheError::Init(
+                                            "batched GPU restore requires a CUDA-pinned host slab".into(),
+                                        ));
+                                    }
                                 };
                                 if let Err(code) = batch.push(dst_ptr, src_addr, len, kind) {
                                     batch.clear();
@@ -1116,6 +1126,11 @@ fn exec_high_cmd<E, P, R>(
                                     }
                                     BatchReadSource::PinnedHost(addr) => {
                                         (addr, cuda_copy::CUDA_MEMCPY_HOST_TO_DEVICE)
+                                    }
+                                    BatchReadSource::PageableHost(_) => {
+                                        return Err(CacheError::Init(
+                                            "batched GPU restore requires a CUDA-pinned host slab".into(),
+                                        ));
                                     }
                                 };
                                 let block_id = gpu_block_ids[gi];
@@ -1213,7 +1228,7 @@ fn exec_high_cmd<E, P, R>(
 fn drain_high_pri<E, P, R>(
     cache: &mut VeriCache<'_, TcpTransport, E, P, R>,
     queue: &WorkQueue,
-    stats_mirror: &AtomicCacheStats,
+    stats_mirror: &StatsMirror,
     load_sync_events: &mut Option<[cuda_copy::BlockingCudaEvent; 2]>,
     load_batch_bufs: &[RefCell<cuda_copy::BatchCopyBuf>; 2],
 ) where
@@ -1235,7 +1250,7 @@ fn worker_loop(
     cfg: OwnedConfig,
     queue: Arc<WorkQueue>,
     key_mirror: Arc<LocalKeyMirror>,
-    stats_mirror: Arc<AtomicCacheStats>,
+    stats_mirror: Arc<StatsMirror>,
     ready_tx: Sender<Result<(), String>>,
 ) {
     let _close_guard = CloseQueueOnDrop(Arc::clone(&queue));
@@ -1305,6 +1320,14 @@ fn worker_loop(
                 RefCell::new(cuda_copy::BatchCopyBuf::new()),
             ];
 
+            let stats = cache.stats();
+            stats_mirror.sync_from(stats);
+            eprintln!(
+                "[VeriCache][node={}] hbm_frames={} dram_frames={} nvme_frames={} is_host_pinned={} direct_slab_dma={} host_rdma={} gdr_enabled={} frame_bytes={}",
+                cache.node_id(), stats.hbm_frames, stats.dram_frames, stats.nvme_frames,
+                cache.is_host_pinned(), cache.is_host_pinned(), !cache.peer_metas().is_empty(),
+                stats.gdr_enabled != 0, cache.frame_size(),
+            );
             if let Some(tx) = ready_tx.take() {
                 let _ = tx.send(Ok(()));
             }
@@ -2157,8 +2180,13 @@ fn worker_loop(
                             let _ = reply
                                 .send(cache.evict_from_tier(key, tier).map_err(|e| e.to_string()));
                         }
-                        LowCommand::Poll { reply } => {
-                            let _ = reply.send(cache.poll().map(|_| ()).map_err(|e| e.to_string()));
+                        LowCommand::Poll { drain, reply } => {
+                            let result = cache.poll();
+                            if drain && result.is_ok() {
+                                cache.drain_background_io();
+                            }
+                            stats_mirror.sync_from(cache.stats());
+                            let _ = reply.send(result.map(|_| ()).map_err(|e| e.to_string()));
                         }
                         LowCommand::Shutdown { reply } => {
                             let _ = cache.poll();
@@ -2248,8 +2276,17 @@ pub unsafe extern "C" fn vericache_create(cfg: *const VeriCacheConfigC) -> *mut 
     let c = unsafe { &*cfg };
     let mut storage = StorageConfig::new(c.node_id, c.frame_size, c.dram_frames);
     storage.max_leases = 256;
-    if c.gpu_device_id >= 0 && c.hbm_frames > 0 {
-        storage = storage.with_gpu(GpuConfig::new(c.gpu_device_id as u32, c.hbm_frames));
+    if c.hbm_frames > 0 && c.gpu_device_id < 0 {
+        set_last_error("hbm_frames > 0 requires a CUDA device");
+        return core::ptr::null_mut();
+    }
+    if c.gpu_device_id >= 0 {
+        let device = c.gpu_device_id as u32;
+        storage = if c.hbm_frames > 0 {
+            storage.with_gpu(GpuConfig::new(device, c.hbm_frames))
+        } else {
+            storage.with_pinned_host(device)
+        };
     }
     match unsafe { cstr_to_string(c.nvme_dir) } {
         Ok(Some(dir)) if c.nvme_frames > 0 => {
@@ -2319,7 +2356,7 @@ pub unsafe extern "C" fn vericache_create(cfg: *const VeriCacheConfigC) -> *mut 
     };
     let queue = Arc::new(WorkQueue::new());
     let key_mirror = Arc::new(LocalKeyMirror::new());
-    let stats_mirror = Arc::new(AtomicCacheStats::new());
+    let stats_mirror = Arc::new(StatsMirror::default());
     let worker_queue = Arc::clone(&queue);
     let worker_key_mirror = Arc::clone(&key_mirror);
     let worker_stats_mirror = Arc::clone(&stats_mirror);
@@ -3170,13 +3207,22 @@ pub unsafe extern "C" fn vericache_evict_tier(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vericache_poll(handle: *mut VeriCacheHandle) -> i32 {
+    unsafe { poll_worker(handle, false) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vericache_drain(handle: *mut VeriCacheHandle) -> i32 {
+    unsafe { poll_worker(handle, true) }
+}
+
+unsafe fn poll_worker(handle: *mut VeriCacheHandle, drain: bool) -> i32 {
     if handle.is_null() {
         set_last_error("null handle");
         return -1;
     }
     let h = unsafe { &*handle };
     let (rtx, rrx) = mpsc::channel();
-    if h.send_low(LowCommand::Poll { reply: rtx }).is_err() {
+    if h.send_low(LowCommand::Poll { drain, reply: rtx }).is_err() {
         set_last_error("worker channel closed");
         return -3;
     }
@@ -3203,7 +3249,21 @@ pub unsafe extern "C" fn vericache_stats(
         return -1;
     }
     let h = unsafe { &*handle };
-    unsafe { *out_stats = h.stats_mirror.snapshot() };
+    unsafe { *out_stats = h.stats_mirror.snapshot().into() };
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vericache_path_stats(
+    handle: *mut VeriCacheHandle,
+    out_stats: *mut VeriCachePathStatsC,
+) -> i32 {
+    if handle.is_null() || out_stats.is_null() {
+        set_last_error("null handle or out_stats");
+        return -1;
+    }
+    let h = unsafe { &*handle };
+    unsafe { *out_stats = h.stats_mirror.snapshot().into() };
     0
 }
 
@@ -3275,7 +3335,7 @@ mod tests {
     fn work_queue_prioritizes_high_over_low_and_wakes() {
         let q = Arc::new(WorkQueue::new());
         let (ltx, _lrx) = mpsc::channel();
-        q.send_low(LowCommand::Poll { reply: ltx }).unwrap();
+        q.send_low(LowCommand::Poll { drain: false, reply: ltx }).unwrap();
         assert!(!q.has_high_pri());
         q.send_high(HighCommand::Noop).unwrap();
         assert!(q.has_high_pri());
@@ -3324,7 +3384,7 @@ mod tests {
         let mut handle = VeriCacheHandle {
             queue: Arc::clone(&queue),
             key_mirror: Arc::clone(&mirror),
-            stats_mirror: Arc::new(AtomicCacheStats::new()),
+            stats_mirror: Arc::new(StatsMirror::default()),
             worker: None,
             frame_size: 4096,
         };
@@ -3362,7 +3422,7 @@ mod tests {
             })
             .unwrap();
         let (lrtx, lrrx) = mpsc::channel();
-        queue.send_low(LowCommand::Poll { reply: lrtx }).unwrap();
+        queue.send_low(LowCommand::Poll { drain: false, reply: lrtx }).unwrap();
 
         // Simulate worker panic / unwind via CloseQueueOnDrop
         let q_drop = Arc::clone(&queue);
@@ -3470,8 +3530,8 @@ mod tests {
     }
 
     #[test]
-    fn atomic_stats_mirror_round_trip() {
-        let m = AtomicCacheStats::new();
+    fn path_stats_mirror_round_trip() {
+        let m = StatsMirror::default();
         let s = CacheStats {
             puts: 7,
             gpu_hits: 1,
@@ -3481,9 +3541,19 @@ mod tests {
             misses: 5,
             policy_victims_rejected: 6,
             policy_victims_pinned: 8,
+            remote_nvme_warm_hits: 2,
+            host_pinned: 1,
+            dram_frames: 32,
+            ..CacheStats::default()
         };
         m.sync_from(&s);
-        let snap = m.snapshot();
+        assert_eq!(m.snapshot(), s);
+        let path = VeriCachePathStatsC::from(m.snapshot());
+        assert_eq!(path.remote_nvme_warm_hits, 2);
+        assert_eq!(path.host_pinned, 1);
+        assert_eq!(path.hbm_frames, 0);
+        assert_eq!(path.dram_frames, 32);
+        let snap = path.base;
         assert_eq!(snap.puts, 7);
         assert_eq!(snap.gpu_hits, 1);
         assert_eq!(snap.dram_hits, 2);

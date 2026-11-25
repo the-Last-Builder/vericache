@@ -53,6 +53,20 @@ class VeriCacheStatsC(ctypes.Structure):
         ("misses", ctypes.c_uint64),
         ("policy_victims_rejected", ctypes.c_uint64),
         ("policy_victims_pinned", ctypes.c_uint64),
+        ("remote_nvme_warm_hits", ctypes.c_uint64),
+        ("donor_nvme_warms", ctypes.c_uint64),
+        ("put_attempts", ctypes.c_uint64),
+        ("nvme_spills", ctypes.c_uint64),
+        ("nvme_evictions", ctypes.c_uint64),
+        ("dram_evictions", ctypes.c_uint64),
+        ("dram_reclaims", ctypes.c_uint64),
+        ("mw_coop_revokes", ctypes.c_uint64),
+        ("mw_unilateral_revokes", ctypes.c_uint64),
+        ("host_pinned", ctypes.c_uint8),
+        ("hbm_frames", ctypes.c_uint32),
+        ("dram_frames", ctypes.c_uint32),
+        ("nvme_frames", ctypes.c_uint32),
+        ("gdr_enabled", ctypes.c_uint8),
     ]
 
 
@@ -253,12 +267,14 @@ def load_lib() -> ctypes.CDLL:
 
     lib.vericache_poll.argtypes = [ctypes.c_void_p]
     lib.vericache_poll.restype = ctypes.c_int32
+    lib.vericache_drain.argtypes = [ctypes.c_void_p]
+    lib.vericache_drain.restype = ctypes.c_int32
 
-    lib.vericache_stats.argtypes = [
+    lib.vericache_path_stats.argtypes = [
         ctypes.c_void_p,
         ctypes.POINTER(VeriCacheStatsC),
     ]
-    lib.vericache_stats.restype = ctypes.c_int32
+    lib.vericache_path_stats.restype = ctypes.c_int32
 
     _LIB = lib
     return lib

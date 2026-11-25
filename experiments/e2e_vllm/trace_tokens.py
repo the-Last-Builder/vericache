@@ -18,7 +18,10 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
+import pickle
 import struct
+from functools import lru_cache
+from itertools import islice
 from typing import Any
 
 
@@ -65,6 +68,86 @@ def hash_id_to_tokens(hash_id: int, tokens_per_block: int, safe_vocab: list[int]
     return out
 
 
+FRAME_BYTES = 16 * 96 * 1024
+MASK64 = (1 << 64) - 1
+
+
+def splitmix64(value: int) -> int:
+    value = (value + 0x9E3779B97F4A7C15) & MASK64
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & MASK64
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & MASK64
+    return value ^ (value >> 31)
+
+
+def route_request(req_idx: int, hash_ids: list[int], sticky_ratio: float = 0.70) -> tuple[int, int]:
+    session_key = hash_ids[1] if len(hash_ids) > 1 else hash_ids[-1]
+    home = splitmix64(session_key) & 1
+    drift = splitmix64(req_idx ^ ((session_key * 0x9E3779B97F4A7C15) & MASK64))
+    return session_key, home if drift % 100 < round(sticky_ratio * 100) else 1 - home
+
+
+def sha256_vllm(value: Any) -> bytes:
+    return hashlib.sha256(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)).digest()
+
+
+def prefix_block_keys(token_ids: list[int], block_size: int = 16) -> tuple[bytes, ...]:
+    """vLLM SHA-256 with PYTHONHASHSEED=0 and no salt, adapters or multimodal keys."""
+    parent = sha256_vllm("0")
+    keys = []
+    for start in range(0, len(token_ids) - block_size + 1, block_size):
+        parent = sha256_vllm((parent, tuple(token_ids[start:start + block_size]), None))
+        keys.append(parent)
+    return tuple(keys)
+
+
+def iter_trace_requests(
+    trace_path: str | pathlib.Path,
+    safe_vocab: list[int],
+    *,
+    tokens_per_hash_id: int = 512,
+    max_input_tokens: int = 32768,
+    sticky_ratio: float = 0.70,
+):
+    if tokens_per_hash_id < 1 or max_input_tokens < 1:
+        raise ValueError("Token limits must be positive")
+
+    @lru_cache(maxsize=4096)
+    def expand(hash_id: int) -> list[int]:
+        return hash_id_to_tokens(hash_id, tokens_per_hash_id, safe_vocab)
+
+    with open(trace_path, encoding="utf-8") as source:
+        req_idx = 0
+        previous_ts = None
+        for line in source:
+            if not line.strip():
+                continue
+            raw = json.loads(line)
+            hash_ids = [int(h) for h in raw["hash_ids"]]
+            input_tokens = min(int(raw["input_length"]), max_input_tokens)
+            output_tokens = int(raw["output_length"])
+            timestamp_ms = int(raw["timestamp"])
+            if not (0 < input_tokens <= len(hash_ids) * tokens_per_hash_id) or output_tokens < 1:
+                raise ValueError(f"Request {req_idx} has inconsistent input/output lengths")
+            if previous_ts is not None and timestamp_ms < previous_ts:
+                raise ValueError(f"Request {req_idx} is out of timestamp order")
+            previous_ts = timestamp_ms
+            session_key, dest_node = route_request(req_idx, hash_ids, sticky_ratio)
+            token_ids: list[int] = []
+            for hash_id in hash_ids[:(input_tokens + tokens_per_hash_id - 1) // tokens_per_hash_id]:
+                token_ids.extend(expand(hash_id))
+            yield {
+                "req_idx": req_idx,
+                "timestamp_ms": timestamp_ms,
+                "prompt_token_ids": token_ids[:input_tokens],
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "hash_ids": hash_ids,
+                "session_key": session_key,
+                "dest_node": dest_node,
+            }
+            req_idx += 1
+
+
 def prepare_trace_requests(
     trace_path: str | pathlib.Path,
     safe_vocab: list[int],
@@ -72,92 +155,41 @@ def prepare_trace_requests(
     start_index: int = 0,
     max_requests: int = 200,
     tokens_per_hash_id: int = 512,
-    max_input_tokens: int = 16384,
+    max_input_tokens: int = 32768,
     fixed_output_tokens: int | None = None,
-    max_output_tokens: int = 128,
-    min_output_tokens: int = 16,
+    max_output_tokens: int | None = None,
+    min_output_tokens: int = 1,
+    sticky_ratio: float = 0.70,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Load a contiguous window of FAST'25 trace entries and convert them to raw token IDs."""
-    raw_reqs: list[dict[str, Any]] = []
-    with open(trace_path, "r", encoding="utf-8") as f:
-        seen = 0
-        for line in f:
-            s = line.strip()
-            if not s:
-                continue
-            obj = json.loads(s)
-            hids = obj.get("hash_ids")
-            if not hids:
-                continue
-            if seen < start_index:
-                seen += 1
-                continue
-            raw_reqs.append(obj)
-            seen += 1
-            if max_requests > 0 and len(raw_reqs) >= max_requests:
-                break
-
-    if not raw_reqs:
+    """Load a contiguous input window, preserving partial hash blocks."""
+    stop = start_index + max_requests if max_requests > 0 else None
+    requests = list(islice(iter_trace_requests(
+        trace_path, safe_vocab,
+        tokens_per_hash_id=tokens_per_hash_id,
+        max_input_tokens=max_input_tokens,
+        sticky_ratio=sticky_ratio,
+    ), start_index, stop))
+    if not requests:
         raise RuntimeError(f"No trace requests loaded from {trace_path}")
 
-    max_blocks = max(1, max_input_tokens // tokens_per_hash_id)
-    block_cache: dict[int, list[int]] = {}
-    prepared: list[dict[str, Any]] = []
-    base_ts = int(raw_reqs[0].get("timestamp", 0))
-
-    total_blocks = 0
-    unique_hids: set[int] = set()
-    # Track theoretical infinite-cache prefix hit rate on this exact window
-    seen_prefix_hids: set[int] = set()
-    ideal_prefix_hits = 0
-
-    for idx, obj in enumerate(raw_reqs):
-        hids = [int(h) for h in obj["hash_ids"][:max_blocks]]
-        token_ids: list[int] = []
-        prefix_open = True
-        for h in hids:
-            toks = block_cache.get(h)
-            if toks is None:
-                toks = hash_id_to_tokens(h, tokens_per_hash_id, safe_vocab)
-                block_cache[h] = toks
-            token_ids.extend(toks)
-            unique_hids.add(h)
-            if prefix_open and h in seen_prefix_hids:
-                ideal_prefix_hits += 1
-            else:
-                prefix_open = False
-                seen_prefix_hids.add(h)
-        total_blocks += len(hids)
-
+    base_ts = requests[0]["timestamp_ms"]
+    for req in requests:
+        req["timestamp_ms"] -= base_ts
+        output = req["output_tokens"]
         if fixed_output_tokens is not None:
-            out_len = int(fixed_output_tokens)
-        else:
-            raw_out = int(obj.get("output_length", min_output_tokens))
-            out_len = max(min_output_tokens, min(max_output_tokens, raw_out))
-
-        prepared.append(
-            {
-                "req_idx": idx,
-                "timestamp_ms": max(0, int(obj.get("timestamp", base_ts)) - base_ts),
-                "hash_ids": hids,
-                "prompt_token_ids": token_ids,
-                "input_tokens": len(token_ids),
-                "max_tokens": out_len,
-            }
-        )
+            output = fixed_output_tokens
+        elif max_output_tokens is not None:
+            output = min(max_output_tokens, max(min_output_tokens, output))
+        req["max_tokens"] = output
 
     summary = {
         "trace_path": str(trace_path),
         "start_index": start_index,
-        "num_requests": len(prepared),
-        "tokens_per_hash_id": tokens_per_hash_id,
-        "total_blocks": total_blocks,
-        "unique_blocks": len(unique_hids),
-        "total_input_tokens": sum(r["input_tokens"] for r in prepared),
-        "avg_input_tokens": sum(r["input_tokens"] for r in prepared) / len(prepared),
-        "max_input_tokens": max(r["input_tokens"] for r in prepared),
-        "avg_output_tokens": sum(r["max_tokens"] for r in prepared) / len(prepared),
-        "ideal_prefix_hit_rate": ideal_prefix_hits / max(1, total_blocks),
-        "trace_span_s": (prepared[-1]["timestamp_ms"] - prepared[0]["timestamp_ms"]) / 1000.0,
+        "num_requests": len(requests),
+        "total_input_tokens": sum(r["input_tokens"] for r in requests),
+        "avg_input_tokens": sum(r["input_tokens"] for r in requests) / len(requests),
+        "max_input_tokens": max(r["input_tokens"] for r in requests),
+        "avg_output_tokens": sum(r["max_tokens"] for r in requests) / len(requests),
+        "trace_span_s": requests[-1]["timestamp_ms"] / 1000.0,
     }
-    return prepared, summary
+    return requests, summary

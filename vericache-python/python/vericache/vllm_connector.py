@@ -23,10 +23,11 @@ Supports two usage modes through the same `VeriCacheConnector` class:
 from __future__ import annotations
 
 from collections import OrderedDict, deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 import hashlib
 import inspect
+import json
 import logging
 import os
 import socket
@@ -181,6 +182,8 @@ def _is_fatal_worker_error(exc: BaseException) -> bool:
 _LOOKUP_HDR = struct.Struct("<I")
 _LOOKUP_KEY_STRUCT = struct.Struct("<4Q")
 _MAX_LOOKUP_BATCH = 1_000_000
+_STATS_SNAPSHOT = 0xFFFFFFFF
+_STATS_DRAIN = 0xFFFFFFFE
 
 
 def _recv_exact_unix(sock: socket.socket, n: int) -> bytes:
@@ -228,10 +231,12 @@ class _LocalLookupServer:
         sock_path: str,
         contains_fn: Callable[[Sequence[ObjectKey]], Sequence[HitLocation]],
         contains_flags_fn: Optional[Callable[[Sequence[Any]], bytes]] = None,
+        stats_fn: Optional[Callable[[bool], dict[str, Any]]] = None,
     ) -> None:
         self._sock_path = sock_path
         self._contains_fn = contains_fn
         self._contains_flags_fn = contains_flags_fn
+        self._stats_fn = stats_fn
         self._stop = threading.Event()
         self._sock: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
@@ -283,6 +288,9 @@ class _LocalLookupServer:
                     name="vericache-local-lookup-conn",
                     daemon=True,
                 )
+                self._handler_threads = [
+                    worker for worker in self._handler_threads if worker.is_alive()
+                ]
                 self._handler_threads.append(t)
                 t.start()
 
@@ -291,6 +299,10 @@ class _LocalLookupServer:
             while not self._stop.is_set():
                 hdr = _recv_exact_unix(conn, _LOOKUP_HDR.size)
                 (count,) = _LOOKUP_HDR.unpack(hdr)
+                if count in (_STATS_SNAPSHOT, _STATS_DRAIN) and self._stats_fn is not None:
+                    reply = json.dumps(self._stats_fn(count == _STATS_DRAIN)).encode()
+                    conn.sendall(_LOOKUP_HDR.pack(len(reply)) + reply)
+                    continue
                 if count > _MAX_LOOKUP_BATCH:
                     break
                 if count == 0:
@@ -591,6 +603,7 @@ class _VeriCacheHmaWorker:
 
         # Cumulative diagnostics for observability in vLLM logs.
         self._total_blocks_stored: int = 0
+        self._total_blocks_store_offered: int = 0
         self._total_blocks_loaded: int = 0
         self._total_blocks_missed: int = 0
         self._total_blocks_store_skipped_pressure: int = 0
@@ -744,6 +757,9 @@ class _VeriCacheHmaWorker:
             peers=peers,
         )
 
+        snapshot = self._stats_snapshot(False)
+        logger.warning("VeriCacheConnector[WORKER] storage paths %s", json.dumps(snapshot))
+
         par_cfg = getattr(self.vllm_config, "parallel_config", None)
         worker_rank = int(getattr(par_cfg, "rank", 0) or 0) if par_cfg is not None else 0
         if bool(self.extra_config.get("enable_local_lookup", True)) and worker_rank == 0:
@@ -769,6 +785,7 @@ class _VeriCacheHmaWorker:
                 sock_path,
                 _safe_contains,
                 contains_flags_fn=contains_flags_fn,
+                stats_fn=self._stats_snapshot,
             )
             self._local_lookup_server.start()
             logger.warning(
@@ -798,6 +815,39 @@ class _VeriCacheHmaWorker:
             )
             self._load_thread.start()
             self._store_thread.start()
+
+    def _stats_snapshot(self, drain: bool) -> dict[str, Any]:
+        assert self.client is not None
+        if drain:
+            self._flush_all_io()
+            self.client.drain()
+        stats = asdict(self.client.stats())
+        groups = self.kv_cache_config.kv_cache_groups
+        block_sizes = [int(group.kv_cache_spec.block_size) for group in groups]
+        with self._io_lock:
+            stats.update(
+                frame_bytes=self._frame_size,
+                num_kv_groups=len(groups),
+                block_size=block_sizes[0] if len(set(block_sizes)) == 1 else None,
+                is_host_pinned=bool(stats["host_pinned"]),
+                direct_slab_dma=bool(stats["host_pinned"]),
+                load_direct_slab_dma=bool(stats["host_pinned"]),
+                host_rdma=bool(self.extra_config.get("peers")),
+                staging_fallback=not bool(stats["host_pinned"]),
+                worker_pid=os.getpid(),
+                store_committed_blocks=self._total_blocks_stored,
+                store_offered_blocks=self._total_blocks_store_offered,
+                store_failed_blocks=max(
+                    0, self._total_blocks_store_offered - self._total_blocks_stored
+                    - self._total_blocks_store_skipped_pressure - self._pending_store_blocks
+                ),
+                store_pressure_skipped_blocks=self._total_blocks_store_skipped_pressure,
+                load_failed_blocks=self._total_blocks_missed,
+                pending_store_blocks=self._pending_store_blocks,
+                pending_loads=len(self._load_queue) + self._in_flight_loads,
+                worker_dead=self._worker_dead,
+            )
+        return stats
 
     def _evict_sync_loop(self) -> None:
         """Periodically drain evicted local keys from Rust and unregister from directory."""
@@ -1249,6 +1299,9 @@ class _VeriCacheHmaWorker:
         meta = self._connector_metadata
         if meta is None or meta.store_event < 0:
             return
+        n_new = len(meta.store_gpu_blocks)
+        with self._io_lock:
+            self._total_blocks_store_offered += n_new
         if not meta.store_gpu_blocks or self._worker_dead:
             # All blocks dedup-filtered on Scheduler (or native worker dead);
             # immediately mark complete so GPU block pins release on the next step.
@@ -1258,7 +1311,6 @@ class _VeriCacheHmaWorker:
             return
         assert self.client is not None and self.device is not None
 
-        n_new = len(meta.store_gpu_blocks)
         if self._async_io and self._max_pending_store_blocks > 0:
             with self._io_lock:
                 if (
@@ -1555,19 +1607,21 @@ class VeriCacheConnector(KVConnectorBase_V1, SupportsHMA):
         if nvme_dir and nvme_frames <= 0:
             nvme_frames = max(dram_frames * 2, 256)
 
-        # Track up to the largest persistent tier capacity (or explicit override)
-        # so CascadeTiering (HBM -> DRAM -> NVMe) keeps all indexed blocks alive.
-        default_cap = max(hbm_frames, dram_frames, nvme_frames, 16)
+        # The shadow pool indexes DRAM and NVMe together when the disk tier is enabled.
+        default_cap = dram_frames + nvme_frames if nvme_frames else max(hbm_frames + dram_frames, 16)
         max_blocks = int(extra_config.get("max_cached_blocks", default_cap))
         max_blocks = max(max_blocks, 4)
 
         num_gpu_blocks = max(1, int(kv_cache_config.num_blocks))
         if kv_cache_config.kv_cache_tensors:
+            # vLLM describes each placement against the same backing allocation.
             gpu_total = int(kv_cache_config.kv_cache_tensors[0].size)
         else:
             gpu_total = num_gpu_blocks * 65536
         gpu_bytes_per_block = max(1, gpu_total // num_gpu_blocks)
-        nominal_capacity_bytes = max_blocks * gpu_bytes_per_block
+        # Invert vLLM's floor(gpu_blocks * offload_bytes / gpu_total_bytes)
+        # so padding in the allocation cannot make the shadow pool one block short.
+        nominal_capacity_bytes = (max_blocks * gpu_total + num_gpu_blocks - 1) // num_gpu_blocks
 
         dir_addr = extra_config.get("directory_addr")
         if dir_addr:
@@ -1602,7 +1656,6 @@ class VeriCacheConnector(KVConnectorBase_V1, SupportsHMA):
         sig = inspect.signature(SimpleCPUOffloadScheduler.__init__)
         if "num_cpu_blocks" in sig.parameters:
             sched_kwargs["num_cpu_blocks"] = max_blocks
-            nominal_capacity_bytes = max_blocks * gpu_bytes_per_block * 2
 
         self._hma_scheduler = SimpleCPUOffloadScheduler(
             vllm_config,

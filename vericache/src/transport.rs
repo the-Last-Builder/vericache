@@ -4,12 +4,58 @@
 //!   `set_nonblocking`/`MSG_PEEK` toggles.
 //! - [`NoTransport`]: zero-cost placeholder transport for local-only caches (0 peers).
 
+use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use transfer::transport::ByteTransport;
+use transfer::transport::{ByteTransport, GrantTag};
+use vericache_core::backends::rdma::protocol::{
+    PROTOCOL_MAGIC, READ_GRANT_META_LEN, ReadGrantMeta, decode_read_grant_meta,
+};
+
+const NVME_WARM_FLAG: u32 = 1 << 31;
+const MAX_TELEMETRY_REQUESTS: usize = 4096;
+
+/// Metadata on the TCP envelope only. The verified channel receives the
+/// original bytes, including its original integrity trailer.
+#[derive(Default)]
+pub(crate) struct PeerPathTelemetry {
+    outgoing: BTreeMap<u64, (u64, u64)>,
+    incoming: BTreeMap<u64, GrantTag>,
+}
+
+impl PeerPathTelemetry {
+    pub(crate) fn mark_donor_warm(&mut self, request_id: u64, address: u64, version: u64) {
+        self.outgoing.insert(request_id, (address, version));
+        if self.outgoing.len() > MAX_TELEMETRY_REQUESTS {
+            self.outgoing.pop_first();
+        }
+    }
+
+    pub(crate) fn take_donor_warm(&mut self, request_id: u64, tag: GrantTag) -> bool {
+        self.incoming.remove(&request_id) == Some(tag)
+    }
+}
+
+fn read_grant(frame: &[u8]) -> Option<(ReadGrantMeta, GrantTag, u64)> {
+    // Transfer channel framing: magic prefix, READ_GRANT header, payload, CRC32.
+    const MAGIC_PREFIX: usize = 5;
+    const GRANT_HEADER: usize = 29;
+    let meta_start = MAGIC_PREFIX + GRANT_HEADER;
+    if frame.len() != meta_start + READ_GRANT_META_LEN + 4
+        || frame[0] != 0xff
+        || frame[1..5] != PROTOCOL_MAGIC.to_le_bytes()
+        || frame[5] != 1
+    {
+        return None;
+    }
+    let tag = u64::from_le_bytes(frame[6..14].try_into().ok()?);
+    let address = u64::from_le_bytes(frame[14..22].try_into().ok()?);
+    let meta = decode_read_grant_meta(&frame[meta_start..meta_start + READ_GRANT_META_LEN])?;
+    Some((meta, tag, address))
+}
 
 const MAX_FRAME_LEN: usize = 32 * 1024 * 1024;
 const READ_CHUNK_SIZE: usize = 16 * 1024;
@@ -25,6 +71,7 @@ pub struct TcpTransport {
     read_pos: usize,
     write_buf: Vec<u8>,
     recv_paused: Arc<AtomicBool>,
+    path_telemetry: Arc<Mutex<PeerPathTelemetry>>,
 }
 
 impl TcpTransport {
@@ -42,6 +89,7 @@ impl TcpTransport {
             read_pos: 0,
             write_buf: Vec::with_capacity(256),
             recv_paused: Arc::new(AtomicBool::new(false)),
+            path_telemetry: Arc::default(),
         })
     }
 
@@ -54,6 +102,10 @@ impl TcpTransport {
     /// Toggle whether non-blocking `try_recv_frame` suppresses reading new frames.
     pub fn set_recv_paused(&self, paused: bool) {
         self.recv_paused.store(paused, Ordering::Release);
+    }
+
+    pub(crate) fn path_telemetry(&self) -> Arc<Mutex<PeerPathTelemetry>> {
+        Arc::clone(&self.path_telemetry)
     }
 
     pub fn inner(&self) -> &TcpStream {
@@ -84,7 +136,8 @@ impl TcpTransport {
         let len_bytes: [u8; 4] = self.read_buf[self.read_pos..self.read_pos + 4]
             .try_into()
             .expect("4-byte prefix");
-        let n = u32::from_be_bytes(len_bytes) as usize;
+        let wire_len = u32::from_be_bytes(len_bytes);
+        let n = (wire_len & !NVME_WARM_FLAG) as usize;
         if n > MAX_FRAME_LEN {
             return Err(io::Error::other("frame exceeds limit"));
         }
@@ -94,6 +147,15 @@ impl TcpTransport {
         let start = self.read_pos + 4;
         let end = start + n;
         let frame = self.read_buf[start..end].to_vec();
+        if wire_len & NVME_WARM_FLAG != 0 {
+            if let Some((meta, tag, _)) = read_grant(&frame) {
+                let mut telemetry = self.path_telemetry.lock().unwrap();
+                telemetry.incoming.insert(meta.request_id, tag);
+                if telemetry.incoming.len() > MAX_TELEMETRY_REQUESTS {
+                    telemetry.incoming.pop_first();
+                }
+            }
+        }
         self.read_pos = end;
         self.maybe_compact();
         Ok(Some(frame))
@@ -108,7 +170,7 @@ impl TcpTransport {
         let len_bytes: [u8; 4] = self.read_buf[self.read_pos..self.read_pos + 4]
             .try_into()
             .expect("4-byte prefix");
-        let n = u32::from_be_bytes(len_bytes) as usize;
+        let n = (u32::from_be_bytes(len_bytes) & !NVME_WARM_FLAG) as usize;
         if n > MAX_FRAME_LEN {
             return Err(io::Error::other("frame exceeds limit"));
         }
@@ -151,9 +213,15 @@ impl ByteTransport for TcpTransport {
     type Error = io::Error;
 
     fn send_frame(&mut self, frame: &[u8]) -> io::Result<()> {
-        let n = u32::try_from(frame.len()).map_err(|_| io::Error::other("frame too large"))?;
+        let mut n = u32::try_from(frame.len()).map_err(|_| io::Error::other("frame too large"))?;
         if frame.len() > MAX_FRAME_LEN {
             return Err(io::Error::other("frame exceeds limit"));
+        }
+        if let Some((meta, _, address)) = read_grant(frame) {
+            let mut telemetry = self.path_telemetry.lock().unwrap();
+            if telemetry.outgoing.remove(&meta.request_id) == Some((address, meta.version.pack())) {
+                n |= NVME_WARM_FLAG;
+            }
         }
         // Coalesce 4-byte length prefix + payload so control frames go out in a single write().
         self.write_buf.clear();
@@ -284,6 +352,46 @@ impl ByteTransport for NoTransport {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn donor_warm_metadata_crosses_tcp_without_changing_verified_grant_bytes() {
+        use vericache_core::backends::rdma::protocol::encode_read_grant_meta;
+        use vericache_core::spec::{ObjectKey, VersionId};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut tx = TcpTransport::new(client).unwrap();
+        let mut rx = TcpTransport::new(server).unwrap();
+        let meta = ReadGrantMeta {
+            request_id: 7,
+            key: ObjectKey([11, 12, 13, 14]),
+            version: VersionId { origin_node: 1, seq: 3 },
+            frame_size: 4096,
+        };
+        let (tag, address) = (21u64, 8192u64);
+        let mut frame = vec![0xff];
+        frame.extend_from_slice(&PROTOCOL_MAGIC.to_le_bytes());
+        frame.push(1);
+        frame.extend_from_slice(&tag.to_le_bytes());
+        frame.extend_from_slice(&address.to_le_bytes());
+        frame.extend_from_slice(&meta.frame_size.to_le_bytes());
+        frame.extend_from_slice(&0u32.to_le_bytes());
+        frame.extend_from_slice(&encode_read_grant_meta(meta));
+        // The transport deliberately leaves the CRC bytes opaque.
+        frame.extend_from_slice(&[1, 2, 3, 4]);
+
+        tx.path_telemetry().lock().unwrap().mark_donor_warm(7, address + 4096, meta.version.pack());
+        tx.send_frame(&frame).unwrap();
+        assert_eq!(rx.recv_frame().unwrap(), frame);
+        assert!(!rx.path_telemetry().lock().unwrap().take_donor_warm(7, tag));
+
+        tx.path_telemetry().lock().unwrap().mark_donor_warm(7, address, meta.version.pack());
+        tx.send_frame(&frame).unwrap();
+        assert_eq!(rx.recv_frame().unwrap(), frame);
+        assert!(rx.path_telemetry().lock().unwrap().take_donor_warm(7, tag));
+        assert!(!rx.path_telemetry().lock().unwrap().take_donor_warm(7, tag));
+    }
 
     #[test]
     fn tcp_transport_nonblocking_buffered_burst_and_large_frame() {

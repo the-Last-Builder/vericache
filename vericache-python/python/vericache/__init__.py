@@ -68,6 +68,20 @@ class CacheStats:
     misses: int
     policy_victims_rejected: int
     policy_victims_pinned: int
+    remote_nvme_warm_hits: int = 0
+    donor_nvme_warms: int = 0
+    put_attempts: int = 0
+    nvme_spills: int = 0
+    nvme_evictions: int = 0
+    dram_evictions: int = 0
+    dram_reclaims: int = 0
+    mw_coop_revokes: int = 0
+    mw_unilateral_revokes: int = 0
+    host_pinned: int = 0
+    hbm_frames: int = 0
+    dram_frames: int = 0
+    nvme_frames: int = 0
+    gdr_enabled: int = 0
 
 
 def key_from_bytes(payload: bytes) -> ObjectKey:
@@ -160,6 +174,7 @@ class VeriCacheClient:
         rdma_windows_per_peer: int = 8,
         peers: Sequence[PeerSpec] = (),
     ) -> None:
+        # A CUDA device also enables pinned-host DMA when hbm_frames is zero.
         self._lib = load_lib()
         self._frame_size = int(frame_size)
         self._node_id = int(node_id)
@@ -645,22 +660,18 @@ class VeriCacheClient:
         if rc != 0:
             raise VeriCacheError(last_error(self._lib))
 
+    def drain(self) -> None:
+        """Wait for the worker's submitted background I/O."""
+        if self._lib.vericache_drain(self._require_handle()) != 0:
+            raise VeriCacheError(last_error(self._lib))
+
     def stats(self) -> CacheStats:
         h = self._require_handle()
-        s = VeriCacheStatsC()
-        rc = self._lib.vericache_stats(h, ctypes.byref(s))
+        snapshot = VeriCacheStatsC()
+        rc = self._lib.vericache_path_stats(h, ctypes.byref(snapshot))
         if rc != 0:
             raise VeriCacheError(last_error(self._lib))
-        return CacheStats(
-            puts=s.puts,
-            gpu_hits=s.gpu_hits,
-            dram_hits=s.dram_hits,
-            nvme_hits=s.nvme_hits,
-            remote_hits=s.remote_hits,
-            misses=s.misses,
-            policy_victims_rejected=s.policy_victims_rejected,
-            policy_victims_pinned=s.policy_victims_pinned,
-        )
+        return CacheStats(**{name: getattr(snapshot, name) for name, _ in snapshot._fields_})
 
 
 __all__ = [

@@ -10,7 +10,7 @@ use transfer::context::{
     ShardAllocator, ShardSources, ShareSource, SlotToken, TransferInstance, VersionInstance,
     VersionSource,
 };
-use transfer::cuda::{self, CudaBuffer, CudaHostBuffer, CudaStream};
+use transfer::cuda::{self, CudaBuffer, CudaHostBuffer, CudaHostRegistration, CudaStream};
 use transfer::domain::DeviceId;
 use transfer::host::{self, HostContext};
 use transfer::rdma::{
@@ -493,6 +493,8 @@ pub struct StorageConfig {
     pub dram_frames: u32,
     pub max_leases: usize,
     pub gpu: Option<GpuConfig>,
+    /// CUDA device for direct host DMA when no HBM tier is configured.
+    pub pin_host_cuda_device: Option<DeviceId>,
     pub nvme: Option<NvmeConfig>,
     pub rdma: Option<RdmaConfig>,
 }
@@ -505,6 +507,7 @@ impl StorageConfig {
             dram_frames,
             max_leases: 64,
             gpu: None,
+            pin_host_cuda_device: None,
             nvme: None,
             rdma: None,
         }
@@ -512,6 +515,11 @@ impl StorageConfig {
 
     pub fn with_gpu(mut self, gpu: GpuConfig) -> Self {
         self.gpu = Some(gpu);
+        self
+    }
+
+    pub fn with_pinned_host(mut self, device_id: DeviceId) -> Self {
+        self.pin_host_cuda_device = Some(device_id);
         self
     }
 
@@ -618,8 +626,9 @@ impl NodeStorage {
             .take()
             .ok_or_else(|| CacheError::Init("NodeStorage::attach_tiers already called".into()))?;
 
-        let cuda = match &self.config.gpu {
+        let cuda = match self.config.gpu.as_ref().filter(|gpu| gpu.hbm_frames > 0) {
             Some(gcfg) => {
+                let pin = gcfg.pin_host_dram || self.config.pin_host_cuda_device.is_some();
                 let mut cb = Box::new(
                     CudaBackend::new(
                         &mut core,
@@ -629,17 +638,29 @@ impl NodeStorage {
                         gcfg.device_id,
                         gcfg.hbm_frames,
                         gcfg.event_ring_size,
-                        gcfg.pin_host_dram,
+                        pin,
                     )
                     .map_err(CacheError::Core)?,
                 );
-                if gcfg.pin_host_dram {
+                if pin {
                     cb.attach_pinned_host(&core, &self.host)
                         .map_err(CacheError::Core)?;
                 }
                 Some(cb)
             }
             None => None,
+        };
+
+        // Portable CUDA host registration needs no GPU allocation. The owning
+        // worker selects its CUDA device before attaching storage.
+        let pin_host = self.config.pin_host_cuda_device.is_some()
+            || self.config.gpu.as_ref().is_some_and(|gpu| gpu.pin_host_dram);
+        let host_registration = if cuda.is_none() && pin_host {
+            Some(cuda::host_register(self.host.buffer()).map_err(|e| {
+                CacheError::Init(format!("register CUDA host slab failed: {e:?}"))
+            })?)
+        } else {
+            None
         };
 
         let pd = match &self.rdma_device {
@@ -658,6 +679,7 @@ impl NodeStorage {
             pd,
             pending_core: Some(core),
             pending_caps: Some(caps),
+            host_registration,
         })
     }
 }
@@ -665,6 +687,8 @@ impl NodeStorage {
 /// Step 2 of zero-`unsafe` initialization: borrows `&'s HostBackend` / `&'s DeviceContext`
 /// and owns optional `CudaBackend<'s>` and `ProtectionDomain<'s>`.
 pub struct AttachedStorage<'s> {
+    // Caches borrow this storage, so their DMA and MRs retire before unpinning.
+    host_registration: Option<CudaHostRegistration<'s>>,
     pub(crate) config: StorageConfig,
     pub(crate) host: &'s HostBackend,
     pub(crate) cuda: Option<Box<CudaBackend<'s>>>,
@@ -724,6 +748,7 @@ impl<'s> AttachedStorage<'s> {
         let mut peer_sessions = Vec::with_capacity(peers.len());
         let mut peer_metas = Vec::with_capacity(peers.len());
         let mut peer_recv_paused = Vec::with_capacity(peers.len());
+        let mut peer_path_telemetry = Vec::with_capacity(peers.len());
         if !peers.is_empty() {
             let rcfg = self.config.rdma.as_ref().ok_or_else(|| {
                 CacheError::Init("peers supplied without RdmaConfig in StorageConfig".into())
@@ -737,10 +762,10 @@ impl<'s> AttachedStorage<'s> {
                 .ok_or_else(|| CacheError::Init("RDMA ProtectionDomain not initialized".into()))?;
 
             for (idx, link) in peers.into_iter().enumerate() {
-                let pause_handle = (&link.transport as &dyn std::any::Any)
-                    .downcast_ref::<crate::transport::TcpTransport>()
-                    .map(|t| t.recv_pause_handle());
-                peer_recv_paused.push(pause_handle);
+                let tcp = (&link.transport as &dyn std::any::Any)
+                    .downcast_ref::<crate::transport::TcpTransport>();
+                peer_recv_paused.push(tcp.map(crate::transport::TcpTransport::recv_pause_handle));
+                peer_path_telemetry.push(tcp.map(crate::transport::TcpTransport::path_telemetry));
                 let cq = CompletionQueue::new(dev, rcfg.cq_depth as i32, caps.mint_rdma())
                     .map_err(|e| CacheError::Init(format!("CompletionQueue::new failed: {e:?}")))?;
                 let psn = link
@@ -866,11 +891,13 @@ impl<'s> AttachedStorage<'s> {
         Ok(VeriCache::from_parts(
             self.config.node_id,
             self.config.frame_size,
+            self.host_registration.is_some(),
             engine,
             caps,
             self.pd.as_ref(),
             peer_metas,
             peer_recv_paused,
+            peer_path_telemetry,
             policy,
             internal_gpu_stream,
             gpu_staging,
