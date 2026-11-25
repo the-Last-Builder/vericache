@@ -11,8 +11,10 @@
 
 mod backend_mode;
 mod cuda_copy;
+mod distributed;
 mod local;
 
+pub use distributed::*;
 pub use local::*;
 
 use core::ffi::{CStr, c_char};

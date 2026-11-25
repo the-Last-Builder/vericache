@@ -66,7 +66,7 @@ impl ShardCapabilityBundle {
             self.node as u16,
             frame_size,
             Vec::new(),
-            64,
+            16384,
             self.version_start,
             self.version_limit,
             Tracked(self.instance.borrow()),

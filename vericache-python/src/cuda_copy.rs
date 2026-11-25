@@ -3,6 +3,8 @@
 
 use core::ffi::{c_int, c_void};
 
+const CUDA_MEMCPY_HOST_TO_DEVICE: c_int = 1;
+const CUDA_MEMCPY_DEVICE_TO_HOST: c_int = 2;
 const CUDA_MEMCPY_DEVICE_TO_DEVICE: c_int = 3;
 
 #[link(name = "cudart")]
@@ -16,6 +18,58 @@ unsafe extern "C" {
     ) -> c_int;
 
     fn cudaStreamSynchronize(stream: *mut c_void) -> c_int;
+}
+
+/// Asynchronously copy `len` bytes from pinned host memory to GPU HBM on
+/// `cuda_stream_ptr` (or default stream 0 if null).
+pub(crate) fn memcpy_h2d_async(
+    dst_gpu: usize,
+    src_host: usize,
+    len: usize,
+    cuda_stream_ptr: usize,
+) -> Result<(), i32> {
+    if len == 0 {
+        return Ok(());
+    }
+    if dst_gpu == 0 || src_host == 0 {
+        return Err(-1);
+    }
+    let rc = unsafe {
+        cudaMemcpyAsync(
+            dst_gpu as *mut c_void,
+            src_host as *const c_void,
+            len,
+            CUDA_MEMCPY_HOST_TO_DEVICE,
+            cuda_stream_ptr as *mut c_void,
+        )
+    };
+    if rc != 0 { Err(rc) } else { Ok(()) }
+}
+
+/// Asynchronously copy `len` bytes from GPU HBM to pinned host memory on
+/// `cuda_stream_ptr` (or default stream 0 if null).
+pub(crate) fn memcpy_d2h_async(
+    dst_host: usize,
+    src_gpu: usize,
+    len: usize,
+    cuda_stream_ptr: usize,
+) -> Result<(), i32> {
+    if len == 0 {
+        return Ok(());
+    }
+    if dst_host == 0 || src_gpu == 0 {
+        return Err(-1);
+    }
+    let rc = unsafe {
+        cudaMemcpyAsync(
+            dst_host as *mut c_void,
+            src_gpu as *const c_void,
+            len,
+            CUDA_MEMCPY_DEVICE_TO_HOST,
+            cuda_stream_ptr as *mut c_void,
+        )
+    };
+    if rc != 0 { Err(rc) } else { Ok(()) }
 }
 
 /// Synchronously copy `len` bytes from `src_addr` to `dst_addr` in GPU HBM on

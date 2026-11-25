@@ -66,6 +66,8 @@ pub(crate) struct ExtendedStats {
     pub async_writebacks: u64,
     pub clean_dram_evictions: u64,
     pub active_leases: u64,
+    pub nvme_read_bytes: u64,
+    pub nvme_write_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -166,6 +168,9 @@ struct Directory {
     host_capacity: usize,
     nvme_capacity: usize,
     high_watermark: usize,
+    spill_depth: usize,
+    promotion_depth: usize,
+    probation_enabled: bool,
     evicted: Option<VecDeque<ObjectKey>>,
     stats: Stats,
     extended: ExtendedStats,
@@ -343,7 +348,7 @@ impl VericacheVllmEngine {
                 let depth = if dir.high_watermark == usize::MAX {
                     1
                 } else {
-                    SPILL_DEPTH
+                    dir.spill_depth
                 };
                 dir.put(engine, caps, key, src, depth)
             })
@@ -500,7 +505,7 @@ impl VericacheVllmEngine {
                 let src = src
                     .filter(|src| src.len() <= self.frame_size)
                     .ok_or(Error::Invalid)?;
-                shard.with_engine(|engine, caps, dir| dir.put(engine, caps, key, src, SPILL_DEPTH))
+                shard.with_engine(|engine, caps, dir| dir.put(engine, caps, key, src, dir.spill_depth))
             },
         )
     }
@@ -630,8 +635,28 @@ impl VericacheVllmEngine {
             total.async_writebacks += s.async_writebacks;
             total.clean_dram_evictions += s.clean_dram_evictions;
             total.active_leases += shard.data.leases.len() as u64;
+            total.nvme_read_bytes += s.nvme_read_bytes;
+            total.nvme_write_bytes += s.nvme_write_bytes;
         }
         Ok(total)
+    }
+
+    pub(crate) fn set_nvme_policy(&self, depth: usize, probation: bool) -> Result<(), Error> {
+        if !matches!(depth, 1 | 4) {
+            return Err(Error::Invalid);
+        }
+        let mut shards = (0..self.num_shards())
+            .map(|index| self.lock_shard(index))
+            .collect::<Result<Vec<_>, _>>()?;
+        if shards.iter().any(|shard| !shard.data.entries.is_empty()) {
+            return Err(Error::Busy);
+        }
+        for shard in &mut shards {
+            shard.data.spill_depth = depth;
+            shard.data.promotion_depth = depth;
+            shard.data.probation_enabled = probation;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -794,6 +819,9 @@ impl Directory {
             host_capacity,
             nvme_capacity,
             high_watermark: host_capacity,
+            spill_depth: SPILL_DEPTH,
+            promotion_depth: PROMOTION_DEPTH,
+            probation_enabled: true,
             evicted: track.then(VecDeque::new),
             stats: Stats::default(),
             extended: ExtendedStats::default(),
@@ -963,6 +991,7 @@ impl Directory {
             if let Some((nvme_frame, _)) = engine.core.lookup_tier(spill.key, nvme_tier) {
                 let host_frame = entry.residency.host().ok_or(Error::Backend)?;
                 entry.residency = Residency::Dual { host_frame, nvme_frame };
+                self.extended.nvme_write_bytes += engine.core.frames.frame_size as u64;
                 if spill.eager { self.extended.async_writebacks += 1; }
             } else {
                 engine.reclaim_draining(nvme_tier, usize::MAX);
@@ -984,8 +1013,9 @@ impl Directory {
                 let nvme_frame = entry.residency.nvme().ok_or(Error::Backend)?;
                 entry.residency = Residency::Dual { host_frame, nvme_frame };
                 entry.prefetched = promotion.prefetched;
-                entry.probation = true;
+                entry.probation = self.probation_enabled;
                 self.extended.nvme_promotions += 1;
+                self.extended.nvme_read_bytes += engine.core.frames.frame_size as u64;
                 self.set(promotion.key, Some(entry));
             } else {
                 engine.reclaim_draining(engine.host_tier(), usize::MAX);
@@ -1031,7 +1061,7 @@ impl Directory {
         {
             return Ok(());
         }
-        while self.inflight_spills.len() < SPILL_DEPTH {
+        while self.inflight_spills.len() < self.spill_depth {
             let Some((&seq, &key)) = self.dirty.first_key_value() else { break; };
             if self.nvme_used() == self.nvme_capacity {
                 // Prioritize writeback of cold DRAM entries. Rotate replicas
@@ -1223,7 +1253,7 @@ impl Directory {
             }
             if !self.make_promotion_room(engine, Some(requested))? { break; }
             self.start_promotion(engine, caps, key, true)?;
-            if self.promotions.len() == PROMOTION_DEPTH {
+            if self.promotions.len() == self.promotion_depth {
                 self.finish_promotions(engine, caps)?;
             }
         }

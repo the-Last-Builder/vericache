@@ -315,6 +315,25 @@ fn completed_writeback_enables_clean_eviction_and_promotion() {
 }
 
 #[test]
+fn depth_one_without_probation_tracks_aligned_nvme_io() {
+    let file = TestFile::new();
+    let engine = VericacheVllmEngine::new(1, 1, 2, 67, Some(file.path())).unwrap();
+    assert_eq!(engine.set_nvme_policy(3, false), Err(Error::Invalid));
+    engine.set_nvme_policy(1, false).unwrap();
+    engine.set_writeback_policy(0).unwrap();
+    engine.put(object_key(1), b"one").unwrap();
+    assert_eq!(engine.set_nvme_policy(4, true), Err(Error::Busy));
+    engine.put(object_key(2), b"two").unwrap();
+    let mut dst = [0; 3];
+    assert_eq!(engine.get(object_key(1), &mut dst), Ok(Some(3)));
+    assert_eq!(&dst, b"one");
+    let stats = engine.extended_stats().unwrap();
+    assert_eq!(stats.nvme_read_bytes, 4096);
+    assert_eq!(stats.nvme_write_bytes, 4096);
+    assert_eq!(stats.async_writebacks, 0);
+}
+
+#[test]
 fn batch_abi_preserves_positions_and_exact_lengths() {
     unsafe {
         let engine = vericache_engine_create(3, 8, 0, 32, ptr::null(), 0);

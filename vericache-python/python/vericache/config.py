@@ -22,8 +22,20 @@ class VeriCacheConfig:
     ipc_endpoint: str | None = None
     tp_rank: int | None = None
     world_size: int | None = None
+    # Scheme A distributed cross-instance Type-2B MW RDMA settings (Stage 2)
+    distributed_mode: bool = False
+    node_id: int = 0
+    instance_id: int | None = None
+    rdma_device: str | None = None
+    rdma_gid_index: int = 3
+    rdma_windows_per_peer: int = 16
+    peer_fetch_enabled: bool = True
+    peers: tuple[dict, ...] = ()
+    global_directory_endpoint: str | None = None
 
     def __post_init__(self):
+        if isinstance(self.peers, list):
+            object.__setattr__(self, "peers", tuple(self.peers))
         for name in (
             "num_shards",
             "host_frames_per_shard",

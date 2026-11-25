@@ -18,12 +18,14 @@ from ._ffi import (
     load_lib,
 )
 from ._native import (
+    DistributedVeriCacheEngine,
     NativeVeriCacheEngine,
     NativeVeriCacheError,
     PinnedStagingBuffer,
     ReadLease,
 )
 from .config import VeriCacheConfig
+from .global_directory import GlobalDirectoryClient, GlobalDirectoryServer
 from .hashing import compute_prefix_block_hashes, derive_layer_block_key
 from .ipc import MetadataClient, MetadataServer
 

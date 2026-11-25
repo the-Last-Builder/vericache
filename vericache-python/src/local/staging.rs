@@ -1,7 +1,8 @@
 use super::shard_cap::ShardCapabilityBundle;
+use crate::distributed::shard_cap::DistShardCaps;
 use crate::{backend_mode, set_last_error};
 use std::sync::{Mutex, OnceLock};
-use transfer::context::SlotToken;
+use transfer::context::{AllocSource, SlotToken, TransferInstance};
 use transfer::cuda::{self, CudaHostBuffer};
 use transfer::host::{self, HostBuffer, HostContext};
 use vericache_core::kernel::CacheCore;
@@ -12,9 +13,14 @@ enum Storage {
     Host(HostBuffer),
 }
 
+enum StagingCaps {
+    Local(ShardCapabilityBundle),
+    Dist(DistShardCaps),
+}
+
 #[cfg_attr(not(verus_only), allow(dead_code))]
 struct StagingAllocator {
-    caps: ShardCapabilityBundle,
+    caps: StagingCaps,
     ctx: HostContext,
     core: CacheCore,
 }
@@ -28,17 +34,40 @@ pub struct StagingBuffer {
 
 verus! {
 
+impl StagingCaps {
+    fn instance(&self) -> &Tracked<TransferInstance> {
+        match self {
+            Self::Local(c) => &c.instance,
+            Self::Dist(c) => &c.instance,
+        }
+    }
+
+    fn alloc_mut(&mut self) -> &mut Tracked<AllocSource> {
+        match self {
+            Self::Local(c) => &mut c.alloc,
+            Self::Dist(c) => &mut c.alloc,
+        }
+    }
+}
+
 impl StagingAllocator {
     fn new() -> Option<Self> {
-        let mut caps = ShardCapabilityBundle::take()?;
-        let core = caps.make_local_core(1);
-        let ctx = HostContext::new(caps.mint_host());
-        Some(Self { caps, ctx, core })
+        if backend_mode::is_distributed_vllm() {
+            let mut caps = DistShardCaps::take_current()?;
+            let core = caps.make_core(1).ok()?;
+            let ctx = HostContext::new(caps.mint_host());
+            Some(Self { caps: StagingCaps::Dist(caps), ctx, core })
+        } else {
+            let mut caps = ShardCapabilityBundle::take()?;
+            let core = caps.make_local_core(1);
+            let ctx = HostContext::new(caps.mint_host());
+            Some(Self { caps: StagingCaps::Local(caps), ctx, core })
+        }
     }
 
     fn allocate(&mut self, len: usize, prefer_cuda: bool) -> Option<StagingBuffer> {
         let pinned = if prefer_cuda {
-            cuda::alloc_host(Tracked(self.caps.alloc.borrow_mut()), len).ok()
+            cuda::alloc_host(Tracked(self.caps.alloc_mut().borrow_mut()), len).ok()
         } else {
             None
         };
@@ -46,8 +75,8 @@ impl StagingAllocator {
             Some((buf, token)) => (Storage::Cuda(buf), token),
             None => {
                 let (buf, token) = host::alloc_aligned(
-                    &self.ctx, Tracked(self.caps.instance.borrow()),
-                    Tracked(self.caps.alloc.borrow_mut()), len, 4096,
+                    &self.ctx, Tracked(self.caps.instance().borrow()),
+                    Tracked(self.caps.alloc_mut().borrow_mut()), len, 4096,
                 )?;
                 (Storage::Host(buf), token)
             },
@@ -60,7 +89,7 @@ impl StagingAllocator {
             Storage::Cuda(buf) => {
                 let _ = cuda::free_host(
                     &mut self.ctx,
-                    Tracked(self.caps.instance.borrow()),
+                    Tracked(self.caps.instance().borrow()),
                     buf,
                     token,
                     Tracked(&self.core.ledger.borrow().submitted),
@@ -71,7 +100,7 @@ impl StagingAllocator {
             Storage::Host(buf) => {
                 let _ = host::free(
                     &mut self.ctx,
-                    Tracked(self.caps.instance.borrow()),
+                    Tracked(self.caps.instance().borrow()),
                     buf,
                     token,
                     Tracked(&self.core.ledger.borrow().submitted),
@@ -90,9 +119,11 @@ impl StagingBuffer {
         if len == 0 || len > isize::MAX as usize {
             return None;
         }
-        if let Err(error) = backend_mode::claim_local() {
-            set_last_error(error);
-            return None;
+        if !backend_mode::is_distributed_vllm() {
+            if let Err(error) = backend_mode::claim_local() {
+                set_last_error(error);
+                return None;
+            }
         }
         ALLOCATOR
             .get_or_init(|| StagingAllocator::new().map(Mutex::new))

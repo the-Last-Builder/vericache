@@ -361,6 +361,8 @@ def test_factory_multilayer_cold_warm_and_partial_prefix(
         monkeypatch, registration, prefer_pinned=device == "cuda"
     )
     try:
+        if device == "cuda":
+            assert worker.engine.is_slab_cuda_pinned is True
         kv, context = _register_worker(worker, device)
         tokens = list(range(3 * BLOCK_SIZE + 1))
         cold = _request("cold", tokens)

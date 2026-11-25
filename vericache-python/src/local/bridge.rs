@@ -948,6 +948,54 @@ pub unsafe extern "C" fn vericache_engine_set_writeback_policy(
 }
 
 /// # Safety
+/// A nonnull engine must stay live for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vericache_engine_set_nvme_policy(
+    engine: *mut VericacheVllmEngine,
+    depth: usize,
+    probation: i32,
+) -> i32 {
+    boundary(BACKEND, || {
+        let Some(engine) = (unsafe { engine.as_ref() }) else {
+            return INVALID;
+        };
+        if !matches!(probation, 0 | 1) {
+            return INVALID;
+        }
+        engine
+            .set_nvme_policy(depth, probation != 0)
+            .map_or_else(status, |()| 0)
+    })
+}
+
+/// # Safety
+/// A nonnull engine must stay live. Outputs must be disjoint writable storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vericache_engine_nvme_io_stats(
+    engine: *const VericacheVllmEngine,
+    read_bytes: *mut u64,
+    write_bytes: *mut u64,
+) -> i32 {
+    boundary(BACKEND, || {
+        let Some(engine) = (unsafe { engine.as_ref() }) else {
+            return INVALID;
+        };
+        if read_bytes.is_null() || write_bytes.is_null() {
+            return INVALID;
+        }
+        let stats = match engine.extended_stats() {
+            Ok(stats) => stats,
+            Err(error) => return status(error),
+        };
+        unsafe {
+            read_bytes.write(stats.nvme_read_bytes);
+            write_bytes.write(stats.nvme_write_bytes);
+        }
+        0
+    })
+}
+
+/// # Safety
 /// A nonnull engine must stay live. Outputs must be disjoint writable storage.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vericache_engine_extended_stats(
@@ -1036,5 +1084,178 @@ pub unsafe extern "C" fn vericache_engine_drain_evictions_key256(
                 out.add(i).write(key.0.map(u64::to_le));
             })
             .map_or_else(|error| status(error) as isize, |count| count as isize)
+    })
+}
+
+/// Acquire zero-copy read leases for `count` keys and issue asynchronous pinned
+/// H2D `cudaMemcpyAsync` copies for both K and V slices directly into a vLLM
+/// paged KV cache layer tensor without Python/GIL overhead.
+///
+/// # Safety
+/// `engine` must be live; input/output arrays must have `count` valid elements;
+/// `kv_layer_ptr` must address a live CUDA tensor large enough for all `block_ids`
+/// with strides `k_stride_bytes` (dim 0) and `block_stride_bytes` (block dim).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vericache_engine_load_kv_h2d_async(
+    engine: *mut VericacheVllmEngine,
+    keys4_ptr: *const u64,
+    block_ids_ptr: *const u32,
+    count: usize,
+    kv_layer_ptr: usize,
+    k_stride_bytes: usize,
+    block_stride_bytes: usize,
+    kv_slice_bytes: usize,
+    cuda_stream_ptr: usize,
+    out_lease_ids: *mut u64,
+    out_statuses: *mut i32,
+) -> i32 {
+    boundary(BACKEND, || {
+        let Some(engine) = (unsafe { engine.as_ref() }) else {
+            return INVALID;
+        };
+        if kv_layer_ptr == 0 || kv_slice_bytes == 0 || block_stride_bytes < kv_slice_bytes {
+            return INVALID;
+        }
+        let (Some(keys), Some(block_ids)) = (unsafe {
+            (
+                input_array(keys4_ptr.cast::<[u64; 4]>(), count),
+                input_array(block_ids_ptr, count),
+            )
+        }) else {
+            return INVALID;
+        };
+        if !valid_array(out_lease_ids, count) || !valid_array(out_statuses, count) {
+            return INVALID;
+        }
+        let expected_len = match kv_slice_bytes.checked_mul(2) {
+            Some(v) => v,
+            None => return INVALID,
+        };
+        let results = engine.acquire_batch(keys.iter().copied().map(AbiKey::into_key));
+        for (i, result) in results.into_iter().enumerate() {
+            let (lease_id, code) = match result {
+                Ok(Some(lease)) => {
+                    let bid = block_ids[i] as usize;
+                    let addrs = if lease.len == expected_len {
+                        bid.checked_mul(block_stride_bytes)
+                            .and_then(|off| kv_layer_ptr.checked_add(off))
+                            .and_then(|dst_k| {
+                                dst_k.checked_add(k_stride_bytes).and_then(|dst_v| {
+                                    lease
+                                        .address
+                                        .checked_add(kv_slice_bytes)
+                                        .map(|src_v| (dst_k, dst_v, src_v))
+                                })
+                            })
+                    } else {
+                        None
+                    };
+                    if let Some((dst_k, dst_v, src_v)) = addrs {
+                        let rc = crate::cuda_copy::memcpy_h2d_async(
+                            dst_k,
+                            lease.address,
+                            kv_slice_bytes,
+                            cuda_stream_ptr,
+                        )
+                        .and_then(|()| {
+                            crate::cuda_copy::memcpy_h2d_async(
+                                dst_v,
+                                src_v,
+                                kv_slice_bytes,
+                                cuda_stream_ptr,
+                            )
+                        });
+                        if rc.is_ok() {
+                            (lease.id, 0)
+                        } else {
+                            let _ = engine.release(lease.id);
+                            (0, BACKEND)
+                        }
+                    } else {
+                        let _ = engine.release(lease.id);
+                        (0, INVALID)
+                    }
+                }
+                Ok(None) => (0, 1),
+                Err(error) => (0, status(error)),
+            };
+            unsafe {
+                out_lease_ids.add(i).write(lease_id);
+                out_statuses.add(i).write(code);
+            }
+        }
+        0
+    })
+}
+
+/// Issue asynchronous pinned D2H `cudaMemcpyAsync` copies for `count` KV blocks
+/// (both K and V slices) from a vLLM paged KV cache layer tensor directly into
+/// a contiguous pinned host staging buffer without GPU gather kernels or GIL.
+///
+/// # Safety
+/// `dst_host_base` must address at least `count * 2 * kv_slice_bytes` writable
+/// host bytes; `kv_layer_ptr` must address a live CUDA tensor large enough for
+/// all `block_ids`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vericache_cuda_gather_kv_d2h_async(
+    dst_host_base: *mut u8,
+    kv_layer_ptr: usize,
+    k_stride_bytes: usize,
+    block_stride_bytes: usize,
+    kv_slice_bytes: usize,
+    block_ids_ptr: *const u32,
+    count: usize,
+    cuda_stream_ptr: usize,
+) -> i32 {
+    boundary(BACKEND, || {
+        if count == 0 {
+            return 0;
+        }
+        if dst_host_base.is_null()
+            || kv_layer_ptr == 0
+            || kv_slice_bytes == 0
+            || block_stride_bytes < kv_slice_bytes
+        {
+            return INVALID;
+        }
+        let Some(block_ids) = (unsafe { input_array(block_ids_ptr, count) }) else {
+            return INVALID;
+        };
+        let Some(frame_bytes) = kv_slice_bytes.checked_mul(2) else {
+            return INVALID;
+        };
+        let dst_base = dst_host_base as usize;
+        for (i, &bid_u32) in block_ids.iter().enumerate() {
+            let bid = bid_u32 as usize;
+            let Some(block_off) = bid.checked_mul(block_stride_bytes) else {
+                return INVALID;
+            };
+            let Some(src_k) = kv_layer_ptr.checked_add(block_off) else {
+                return INVALID;
+            };
+            let Some(src_v) = src_k.checked_add(k_stride_bytes) else {
+                return INVALID;
+            };
+            let Some(dst_k) = i.checked_mul(frame_bytes).and_then(|o| dst_base.checked_add(o))
+            else {
+                return INVALID;
+            };
+            let Some(dst_v) = dst_k.checked_add(kv_slice_bytes) else {
+                return INVALID;
+            };
+            if crate::cuda_copy::memcpy_d2h_async(dst_k, src_k, kv_slice_bytes, cuda_stream_ptr)
+                .is_err()
+                || crate::cuda_copy::memcpy_d2h_async(
+                    dst_v,
+                    src_v,
+                    kv_slice_bytes,
+                    cuda_stream_ptr,
+                )
+                .is_err()
+            {
+                return BACKEND;
+            }
+        }
+        0
     })
 }
