@@ -9,7 +9,7 @@ broadcast use {
 };
 
 pub tracked enum WindowBindGrant {
-    ReadOnly(WindowBindRight),
+    ReadOnly(FenceRight),
     ReadWrite,
 }
 
@@ -26,100 +26,6 @@ impl WindowBindGrant {
             Self::ReadOnly(right) => Some(right.share()),
             Self::ReadWrite => None,
         }
-    }
-}
-
-pub struct RemoteCapability {
-    pub(super) share: Ghost<Option<TransferShare>>,
-    pub(super) addr: u64,
-    pub(super) len: u64,
-    pub(super) rkey: u32,
-    #[cfg_attr(not(verus_only), allow(dead_code))]
-    pub(super) slot: Ghost<SlotRef>,
-    pub(super) access: Ghost<RemoteAccess>,
-}
-
-impl RemoteCapability {
-    pub closed spec fn share(&self) -> Option<TransferShare> {
-        self.share@
-    }
-
-    pub closed spec fn slot_ref(&self) -> SlotRef {
-        self.slot@
-    }
-
-    pub closed spec fn access(&self) -> RemoteAccess {
-        self.access@
-    }
-
-    pub closed spec fn descriptor(&self) -> (u64, u64, u32) {
-        (self.addr, self.len, self.rkey)
-    }
-
-    pub closed spec fn well_formed(&self) -> bool {
-        self.len == self.slot@.sub_len && self.slot@.well_formed() && self.addr + self.len
-            <= u64::MAX && self.len > 0
-    }
-
-    pub fn len(&self) -> (n: u64)
-        requires
-            self.well_formed(),
-        ensures
-            n == self.slot_ref().sub_len,
-    {
-        self.len
-    }
-
-    pub(crate) fn from_wire(
-        addr: u64,
-        len: u64,
-        rkey: u32,
-        Ghost(sent): Ghost<RemoteCapability>,
-    ) -> (r: Self)
-        requires
-            sent.descriptor() == (addr, len, rkey),
-        ensures
-            r == sent,
-    {
-        Self {
-            addr,
-            len,
-            rkey,
-            share: Ghost(sent.share()),
-            slot: Ghost(sent.slot_ref()),
-            access: Ghost(sent.access()),
-        }
-    }
-
-    /// A narrower descriptor keeps the original window key, slot identity, and access rights.
-    pub fn sub_slice(&self, offset: u64, len: u64) -> (s: Self)
-        requires
-            self.well_formed(),
-            0 < len,
-            offset + len <= self.slot_ref().sub_len,
-        ensures
-            s.well_formed(),
-            s.slot_ref() == self.slot_ref().sub_slice(offset, len),
-            s.share() == self.share(),
-            s.access() == self.access(),
-            s.descriptor() == ((self.descriptor().0 + offset) as u64, len, self.descriptor().2),
-    {
-        assert!(len > 0 && offset <= self.len && len <= self.len - offset);
-        Self {
-            addr: self.addr + offset,
-            len,
-            rkey: self.rkey,
-            share: self.share,
-            access: self.access,
-            slot: Ghost(self.slot_ref().sub_slice(offset, len)),
-        }
-    }
-
-    pub fn wire_fields(&self) -> (r: (u64, u64, u32))
-        ensures
-            r == self.descriptor(),
-    {
-        (self.addr, self.len, self.rkey)
     }
 }
 
@@ -157,17 +63,17 @@ pub enum WindowState {
 }
 
 pub struct MemoryWindow<'a> {
-    raw: ffi::RawMwGuard,
-    pd: &'a ProtectionDomain<'a>,
+    pub(super) raw: ffi::RawMwGuard,
+    pub(super) pd: &'a ProtectionDomain<'a>,
     #[cfg_attr(not(verus_only), allow(dead_code))]
     window_id: Ghost<nat>,
     #[cfg_attr(not(verus_only), allow(dead_code))]
     state: Ghost<WindowState>,
     #[cfg_attr(not(verus_only), allow(dead_code))]
     pending_grant: Tracked<Option<WindowBindGrant>>,
-    addr: u64,
-    len: u64,
-    rkey: u32,
+    pub(super) addr: u64,
+    pub(super) len: u64,
+    pub(super) rkey: u32,
 }
 
 pub fn alloc_window<'a>(
@@ -176,11 +82,11 @@ pub fn alloc_window<'a>(
 ) -> (r: Result<MemoryWindow<'a>, RdmaError>)
     requires
         name.well_formed(),
-        name.source() is RdmaQueuePair,
+        name.source().is_rdma_qp(),
         name.node() == pd.node(),
     ensures
         r matches Ok(w) ==> w.state() == WindowState::Unbound && w.pd_id() == pd.id() && w.node()
-            == pd.node() && w.id() == name.source()->RdmaQueuePair_id,
+            == pd.node() && w.id() == name.source().id(),
 {
     if !pd.context.supports_type_2()? {
         return Err(RdmaError(95));
@@ -190,7 +96,7 @@ pub fn alloc_window<'a>(
         MemoryWindow {
             raw,
             pd,
-            window_id: Ghost(name.source()->RdmaQueuePair_id),
+            window_id: Ghost(name.source().id()),
             state: Ghost(WindowState::Unbound),
             pending_grant: Tracked(None),
             addr: 0,
@@ -216,6 +122,10 @@ pub fn dealloc_window<'a>(w: MemoryWindow<'a>) -> (r: Result<(), (RdmaError, Mem
 }
 
 impl<'a> MemoryWindow<'a> {
+    pub fn protection_domain(&self) -> &'a ProtectionDomain<'a> {
+        self.pd
+    }
+
     pub closed spec fn state(&self) -> WindowState {
         self.state@
     }
@@ -339,14 +249,14 @@ impl<'a> MemoryWindow<'a> {
                 self.state()->Bound_rkey,
             ),
     {
-        RemoteCapability {
-            addr: self.addr,
-            len: self.len,
-            rkey: self.rkey,
-            share: Ghost(self.state@->Bound_share),
-            slot: Ghost(self.state@->Bound_slot),
-            access: Ghost(self.state@->Bound_access),
-        }
+        ffi::bound_capability(
+            self.addr,
+            self.len,
+            self.rkey,
+            Ghost(self.state@->Bound_slot),
+            Ghost(self.state@->Bound_access),
+            Ghost(self.state@->Bound_share),
+        )
     }
 
     pub fn finish_invalidate(
@@ -373,7 +283,7 @@ impl<'a> MemoryWindow<'a> {
 
     pub open spec fn can_revoke(
         &self,
-        host: HostContext,
+        host: SyncContext,
         instance: InstanceId,
         lent: SlotToken,
     ) -> bool {
@@ -437,41 +347,30 @@ pub open spec fn revocation_result(
 }
 
 fn perform_revocation(
-    host: &mut HostContext,
+    host: &mut SyncContext,
     Tracked(instance): Tracked<&TransferInstance>,
     Ghost(share): Ghost<TransferShare>,
     Tracked(lent): Tracked<SlotToken>,
+    Tracked(completed): Tracked<CompletedFence>,
 ) -> (result: Revocation)
     requires
         old(host).ready(instance.id(), old(host).source@.node()),
         slot_is_lent_with(lent, instance.id(), lent.key(), share),
+        completed.matches(instance.id(), lent.key(), share),
     ensures
         final(host).stepped(*old(host)),
         revocation_result(result, instance.id(), lent, share, old(host).source@.next_event()),
 {
-    let ghost event = host.source@.next_event();
     let tracked name = host.source.borrow_mut().take_next();
-    let tracked (Tracked(submitted), Tracked(revoked), Tracked(slot)) = instance.revoke_slot(
-        share,
-        lent,
-        name,
-    );
-    let tracked mut infos = SubmittedMap::empty(instance.id());
-    proof {
-        infos.insert(submitted);
-    }
-    let ghost one = ISet::empty().insert(event);
-    let tracked knows = instance.observe(event.observer, one, &infos);
-    proof {
-        assert(closure_from(infos.map(), one) =~= one);
-    }
+    let tracked (Tracked(submitted), Tracked(revoked), Tracked(slot), Tracked(knows)) =
+        instance.revoke_slot(share, lent, name, completed);
     (Tracked(Completion { submitted, knows }), Tracked(revoked), Tracked(slot))
 }
 
 /// IBTA-strict unilateral MW revocation: deallocates the invalidated MW (`ibv_dealloc_mw` == 0,
 /// IBTA C10-67..70) before minting the `Revocation` fence witness.
 pub fn revoke_read_share_with_window<'a>(
-    host: &mut HostContext,
+    host: &mut SyncContext,
     Tracked(instance): Tracked<&TransferInstance>,
     mw: MemoryWindow<'a>,
     Tracked(witness): Tracked<InvalidateWitness>,
@@ -495,18 +394,19 @@ pub fn revoke_read_share_with_window<'a>(
             old(host).source@.next_event(),
         ),
 {
-    if let Err(e) = ffi::dealloc_window(mw.raw.as_ptr()) {
-        return Err((e, mw, Tracked(witness), Tracked(lent)));
-    }
+    let evidence = match ffi::dealloc_fenced_window(&mw) {
+        Err(e) => return Err((e, mw, Tracked(witness), Tracked(lent))),
+        Ok(evidence) => evidence,
+    };
     let _ = mw.raw.into_raw();
     let ghost share = mw.state().binding().share->Some_0;
-    Ok(perform_revocation(host, Tracked(instance), Ghost(share), Tracked(lent)))
+    Ok(perform_revocation(host, Tracked(instance), Ghost(share), Tracked(lent), evidence))
 }
 
 /// Unilateral MW revocation after resetting the bound QP (`IBV_QPS_RESET`) and deallocating
 /// the window (`ibv_dealloc_mw` == 0).
 pub fn revoke_read_share_on_reset_qp<'a>(
-    host: &mut HostContext,
+    host: &mut SyncContext,
     Tracked(instance): Tracked<&TransferInstance>,
     mw: MemoryWindow<'a>,
     Tracked(qp_reset): Tracked<&QpResetWitness>,
@@ -526,12 +426,13 @@ pub fn revoke_read_share_on_reset_qp<'a>(
             old(host).source@.next_event(),
         ),
 {
-    if let Err(e) = ffi::dealloc_window(mw.raw.as_ptr()) {
-        return Err((e, mw, Tracked(lent)));
-    }
+    let evidence = match ffi::dealloc_fenced_window(&mw) {
+        Err(e) => return Err((e, mw, Tracked(lent))),
+        Ok(evidence) => evidence,
+    };
     let _ = mw.raw.into_raw();
     let ghost share = mw.state().binding().share->Some_0;
-    Ok(perform_revocation(host, Tracked(instance), Ghost(share), Tracked(lent)))
+    Ok(perform_revocation(host, Tracked(instance), Ghost(share), Tracked(lent), evidence))
 }
 
 /// Deallocate a `Binding` or cooperative `Invalidating` window once its QP has been reset.
@@ -629,6 +530,79 @@ pub fn post_bind_window(
             },
         ),
 {
+    match post_or_prepare_bind_window(
+        qp,
+        cq,
+        slice,
+        mw,
+        next_rkey,
+        access,
+        Tracked(grant),
+        wr_id,
+        false,
+    ) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+pub fn post_or_prepare_bind_window(
+    qp: &QueuePair,
+    cq: &mut CompletionQueue,
+    slice: &MemoryRegionSlice,
+    mw: &mut MemoryWindow,
+    next_rkey: u32,
+    access: RemoteAccess,
+    Tracked(grant): Tracked<WindowBindGrant>,
+    wr_id: u64,
+    prepare: bool,
+) -> (r: Result<Option<PreparedBind>, (RdmaError, Tracked<WindowBindGrant>)>)
+    requires
+        qp.can_post(*old(cq), wr_id),
+        old(mw).state() == WindowState::Unbound,
+        slice.well_formed(),
+        slice.slot_ref().sub_len > 0,
+        grant.access() == access,
+        grant matches WindowBindGrant::ReadOnly(right) ==> right.instance_id()
+            == slice.registration().instance_id() && right.loc() == slice.slot_ref().loc,
+        slice.registration().access().mw_bind,
+        access == RemoteAccess::ReadWrite ==> slice.registration().access().local_write,
+        slice.registration().pd_id() == qp.pd_id(),
+        old(mw).pd_id() == qp.pd_id(),
+        old(mw).node() == qp.source().node(),
+        slice.slot_ref().loc.node == qp.source().node(),
+    ensures
+        r matches Err((_, returned)) ==> returned@ == grant && *final(cq) == *old(cq) && *final(mw)
+            == *old(mw),
+        r.is_ok() ==> final(cq).same_queue(*old(cq)) && final(cq).well_formed()
+            && final(mw).consistent() && final(mw).id() == old(mw).id() && final(mw).node() == old(
+            mw,
+        ).node() && final(mw).pd_id() == old(mw).pd_id() && final(mw).state() is Binding
+            && final(mw).state()->Binding_qp_id == qp.id() && final(mw).state()->Binding_share
+            == grant.share() && final(mw).state()->Binding_instance_id
+            == slice.registration().instance_id() && final(mw).state()->Binding_wr_id == wr_id
+            && final(mw).state()->Binding_target_slot == slice.slot_ref()
+            && final(mw).state()->Binding_access == access && final(mw).state()->Binding_next_rkey
+            == next_rkey && final(cq).pending() == old(cq).pending().insert(
+            wr_id,
+            PendingWorkRequest {
+                kind: PendingKind::BindWindow {
+                    qp_id: qp.id(),
+                    share: grant.share(),
+                    window_id: old(mw).id(),
+                    target_slot: slice.slot_ref(),
+                    addr: final(mw).state()->Binding_addr,
+                    next_rkey,
+                    access,
+                },
+            },
+        ),
+        r matches Ok(reserved) ==> {
+            &&& reserved.is_some() == prepare
+            &&& reserved matches Some(p) ==> p.matches(qp, final(cq), final(mw), *slice)
+                && p.matches_window(qp, final(cq), final(mw)) && p.id() == wr_id
+        },
+{
     let mr = slice.mr;
     let addr = slice.addr;
     let len = slice.len;
@@ -637,17 +611,19 @@ pub fn post_bind_window(
         != qp.connection.pd.raw.as_ptr() || mw.pd.raw.as_ptr() != mr.pd.raw.as_ptr() {
         return Err((RdmaError(22), Tracked(grant)));
     }
-    if let Err(e) = ffi::bind(
-        qp.connection.raw.as_ptr(),
-        mw.raw.as_ptr(),
-        mr.raw.as_ptr(),
-        addr,
-        len,
-        next_rkey,
-        access,
-        wr_id,
-    ) {
-        return Err((e, Tracked(grant)));
+    if !prepare {
+        if let Err(e) = ffi::bind(
+            qp.connection.raw.as_ptr(),
+            mw.raw.as_ptr(),
+            mr.raw.as_ptr(),
+            addr,
+            len,
+            next_rkey,
+            access,
+            wr_id,
+        ) {
+            return Err((e, Tracked(grant)));
+        }
     }
     mw.addr = addr;
     mw.len = len;
@@ -686,7 +662,137 @@ pub fn post_bind_window(
             ),
         );
     }
-    Ok(())
+    let reservation = if prepare {
+        Some(
+            PreparedBind {
+                wr_id,
+                access,
+                queue: Ghost(cq.id()),
+                window: Ghost(mw.id()),
+                qp: Ghost(qp.id()),
+                slot: Ghost(slice.slot_ref()),
+            },
+        )
+    } else {
+        None
+    };
+    Ok(reservation)
+}
+
+/// A reservation owns the right to submit one pending bind. The window remains
+/// in Binding until its actual completion or an unposted-suffix failure.
+pub struct PreparedBind {
+    pub(super) wr_id: u64,
+    pub(super) access: RemoteAccess,
+    queue: Ghost<nat>,
+    window: Ghost<nat>,
+    qp: Ghost<nat>,
+    slot: Ghost<SlotRef>,
+}
+
+impl PreparedBind {
+    pub closed spec fn matches(
+        &self,
+        qp: &QueuePair,
+        cq: &CompletionQueue,
+        mw: &MemoryWindow,
+        slice: MemoryRegionSlice,
+    ) -> bool {
+        &&& self.matches_window(qp, cq, mw)
+        &&& slice.well_formed() && slice.slot_ref() == self.slot@
+        &&& slice.registration().pd_id() == qp.pd_id()
+    }
+
+    pub closed spec fn matches_window(
+        &self,
+        qp: &QueuePair,
+        cq: &CompletionQueue,
+        mw: &MemoryWindow,
+    ) -> bool {
+        &&& qp.ready() && qp.cq_id() == cq.id() && self.queue@ == cq.id() && self.qp@ == qp.id()
+        &&& self.window@ == mw.id()
+        &&& mw.pd_id() == qp.pd_id()
+        &&& mw.state() is Binding && mw.consistent()
+        &&& mw.state()->Binding_target_slot == self.slot@
+        &&& mw.state()->Binding_access == self.access
+        &&& mw.state()->Binding_wr_id == self.wr_id
+        &&& self.is_pending(*cq)
+    }
+
+    pub proof fn lemma_matches_slice(
+        &self,
+        qp: &QueuePair,
+        cq: &CompletionQueue,
+        mw: &MemoryWindow,
+        slice: MemoryRegionSlice,
+    )
+        requires
+            self.matches_window(qp, cq, mw),
+            slice.well_formed(),
+            slice.slot_ref() == mw.state()->Binding_target_slot,
+            slice.registration().pd_id() == qp.pd_id(),
+        ensures
+            self.matches(qp, cq, mw, slice),
+            self.id() == mw.state()->Binding_wr_id,
+    {
+    }
+
+    pub closed spec fn is_pending(&self, cq: CompletionQueue) -> bool {
+        &&& cq.id() == self.queue@
+        &&& cq.pending().contains_key(self.wr_id)
+        &&& cq.pending()[self.wr_id].kind is BindWindow
+        &&& cq.pending()[self.wr_id].kind->BindWindow_window_id == self.window@
+    }
+
+    pub closed spec fn id(&self) -> u64 {
+        self.wr_id
+    }
+
+    pub proof fn lemma_matches_preserved(
+        &self,
+        qp: &QueuePair,
+        before: &CompletionQueue,
+        after: &CompletionQueue,
+        mw: &MemoryWindow,
+    )
+        requires
+            self.matches_window(qp, before, mw),
+            after.same_queue(*before),
+            before.in_flight().submap_of(after.in_flight()),
+        ensures
+            self.matches_window(qp, after, mw),
+    {
+    }
+}
+
+pub struct BindBatchRequest<'w, 'a> {
+    pub prepared: PreparedBind,
+    pub window: &'w MemoryWindow<'a>,
+    pub slice: MemoryRegionSlice<'w>,
+}
+
+/// One doorbell for the reserved WRs, in list order. The returned count is
+/// the exact native prefix. Polling also reports an error for each unposted
+/// reservation, allowing callers to return its grant and unpin its frame.
+pub fn post_bind_batch(
+    qp: &QueuePair,
+    cq: &CompletionQueue,
+    requests: Vec<BindBatchRequest>,
+) -> (out: (usize, Option<RdmaError>))
+    requires
+        forall|i: int|
+            0 <= i < requests.len() ==> {
+                let r = #[trigger] requests[i];
+                r.prepared.matches(qp, cq, r.window, r.slice)
+            },
+        forall|i: int, j: int|
+            0 <= i < j < requests.len() ==> (#[trigger] requests[i]).prepared.id() != (
+            #[trigger] requests[j]).prepared.id(),
+    ensures
+        out.0 <= requests.len(),
+        out.1.is_none() ==> out.0 == requests.len(),
+{
+    ffi::bind_batch(qp, cq, requests.as_slice())
 }
 
 pub fn post_local_invalidate(
@@ -724,6 +830,42 @@ pub fn post_local_invalidate(
         ),
 {
     ffi::invalidate(qp.connection.raw.as_ptr(), mw.rkey, wr_id)?;
+    record_local_invalidate(qp, cq, mw, wr_id);
+    Ok(())
+}
+
+fn record_local_invalidate(
+    qp: &QueuePair,
+    cq: &mut CompletionQueue,
+    mw: &mut MemoryWindow,
+    wr_id: u64,
+)
+    requires
+        qp.can_post(*old(cq), wr_id),
+        old(mw).state() is Bound,
+        old(mw).state()->Bound_qp_id == qp.id(),
+        old(mw).consistent(),
+        old(mw).pd_id() == qp.pd_id(),
+        old(mw).node() == qp.source().node(),
+    ensures
+        final(cq).well_formed() && final(cq).same_queue(*old(cq)) && final(mw).consistent()
+            && final(mw).id() == old(mw).id() && final(mw).node() == old(mw).node()
+            && final(mw).pd_id() == old(mw).pd_id() && final(mw).state() == (
+        WindowState::Invalidating {
+            wr_id,
+            instance_id: old(mw).state()->Bound_instance_id,
+            qp_id: qp.id(),
+            share: old(mw).state()->Bound_share,
+            slot: old(mw).state()->Bound_slot,
+            access: old(mw).state()->Bound_access,
+            prev_rkey: old(mw).state()->Bound_rkey,
+        }) && final(cq).pending() == old(cq).pending().insert(
+            wr_id,
+            PendingWorkRequest {
+                kind: PendingKind::LocalInvalidate { qp_id: qp.id(), window_id: old(mw).id() },
+            },
+        ),
+{
     cq.in_flight_count += 1;
     proof {
         mw.state = Ghost(
@@ -746,7 +888,154 @@ pub fn post_local_invalidate(
             ),
         );
     }
-    Ok(())
+}
+
+pub struct InvalidateRequest<'a> {
+    pub window: MemoryWindow<'a>,
+    pub wr_id: u64,
+}
+
+impl InvalidateRequest<'_> {
+    pub open spec fn entry(self, qp: &QueuePair) -> PendingWorkRequest {
+        PendingWorkRequest {
+            kind: PendingKind::LocalInvalidate { qp_id: qp.id(), window_id: self.window.id() },
+        }
+    }
+
+    pub open spec fn admissible(self, qp: &QueuePair) -> bool {
+        &&& self.window.state() is Bound
+        &&& self.window.state()->Bound_qp_id == qp.id()
+        &&& self.window.consistent()
+        &&& self.window.pd_id() == qp.pd_id()
+        &&& self.window.node() == qp.source().node()
+    }
+
+    pub open spec fn invalidates(self, prior: Self, qp: &QueuePair) -> bool {
+        let w = prior.window.state();
+        &&& self.wr_id == prior.wr_id
+        &&& self.window.id() == prior.window.id()
+        &&& self.window.pd_id() == prior.window.pd_id()
+        &&& self.window.node() == prior.window.node()
+        &&& self.window.consistent()
+        &&& self.window.state() == (WindowState::Invalidating {
+            wr_id: prior.wr_id,
+            instance_id: w->Bound_instance_id,
+            qp_id: qp.id(),
+            share: w->Bound_share,
+            slot: w->Bound_slot,
+            access: w->Bound_access,
+            prev_rkey: w->Bound_rkey,
+        })
+    }
+}
+
+/// Post one signaled LOCAL_INV per window in a single doorbell. Only the
+/// accepted prefix enters Invalidating. The caller retains every window.
+pub fn post_invalidate_batch(
+    qp: &QueuePair,
+    cq: &mut CompletionQueue,
+    requests: &mut Vec<InvalidateRequest>,
+) -> (out: (usize, Option<RdmaError>))
+    requires
+        qp.ready(),
+        old(cq).well_formed(),
+        old(cq).id() == qp.cq_id(),
+        old(cq).observer() == qp.source().node(),
+        old(cq).infos().instance_id() == qp.source().id(),
+        old(cq).pending().len() + old(requests).len() <= old(cq).capacity(),
+        forall|i: int|
+            0 <= i < old(requests).len() ==> {
+                let r = #[trigger] old(requests)[i];
+                r.admissible(qp) && !old(cq).pending().contains_key(r.wr_id)
+            },
+        forall|i: int, j: int|
+            0 <= i < j < old(requests).len() ==> (#[trigger] old(requests)[i]).wr_id != (
+            #[trigger] old(requests)[j]).wr_id,
+    ensures
+        out.0 <= old(requests).len(),
+        out.1.is_none() ==> out.0 == old(requests).len(),
+        final(requests).len() == old(requests).len(),
+        final(cq).well_formed(),
+        final(cq).same_queue(*old(cq)),
+        final(cq).pending().len() == old(cq).pending().len() + out.0,
+        old(cq).pending().submap_of(final(cq).pending()),
+        forall|i: int|
+            0 <= i < out.0 ==> {
+                &&& (#[trigger] final(requests)[i]).invalidates(old(requests)[i], qp)
+                &&& final(cq).pending().contains_key(old(requests)[i].wr_id)
+                &&& final(cq).pending()[old(requests)[i].wr_id] == old(requests)[i].entry(qp)
+            },
+        forall|i: int|
+            out.0 <= i < old(requests).len() ==> (#[trigger] final(requests)[i]) == old(requests)[i]
+                && !final(cq).pending().contains_key(old(requests)[i].wr_id),
+{
+    let (count, error) = ffi::invalidate_batch(qp, requests.as_slice());
+    let mut i = 0;
+    while i < count
+        invariant
+            qp.ready(),
+            i <= count <= old(requests).len() == requests.len(),
+            old(cq).pending().len() + old(requests).len() <= old(cq).capacity(),
+            cq.well_formed(),
+            cq.same_queue(*old(cq)),
+            old(cq).id() == qp.cq_id(),
+            old(cq).observer() == qp.source().node(),
+            old(cq).infos().instance_id() == qp.source().id(),
+            cq.pending().len() == old(cq).pending().len() + i,
+            old(cq).pending().submap_of(cq.pending()),
+            forall|j: int|
+                0 <= j < i ==> {
+                    &&& (#[trigger] requests[j]).invalidates(old(requests)[j], qp)
+                    &&& cq.pending().contains_key(old(requests)[j].wr_id)
+                    &&& cq.pending()[old(requests)[j].wr_id] == old(requests)[j].entry(qp)
+                },
+            forall|j: int|
+                i <= j < requests.len() ==> (#[trigger] requests[j]) == old(requests)[j]
+                    && !cq.pending().contains_key(old(requests)[j].wr_id),
+            forall|j: int|
+                0 <= j < old(requests).len() ==> (#[trigger] old(requests)[j]).admissible(qp),
+            forall|j: int, k: int|
+                0 <= j < k < old(requests).len() ==> (#[trigger] old(requests)[j]).wr_id != (
+                #[trigger] old(requests)[k]).wr_id,
+        decreases count - i,
+    {
+        let wr_id = requests[i].wr_id;
+        let ghost before = cq.pending();
+        let ghost prior = requests@;
+        let ghost entry = old(requests)[i as int];
+        assert(requests@[i as int] == entry && wr_id == entry.wr_id);
+        record_local_invalidate(qp, cq, &mut requests[i].window, wr_id);
+        proof {
+            assert(cq.pending() == before.insert(wr_id, entry.entry(qp)));
+            assert(requests@[i as int].invalidates(entry, qp));
+            assert forall|j: int| 0 <= j < i + 1 implies {
+                &&& (#[trigger] requests@[j]).invalidates(old(requests)[j], qp)
+                &&& cq.pending().contains_key(old(requests)[j].wr_id)
+                &&& cq.pending()[old(requests)[j].wr_id] == old(requests)[j].entry(qp)
+            } by {
+                if j < i {
+                    assert(requests@[j] == prior[j]);
+                    assert(old(requests)[j].wr_id != wr_id);
+                }
+            }
+            assert forall|j: int| i < j < requests.len() implies (#[trigger] requests@[j]) == old(
+                requests,
+            )[j] && !cq.pending().contains_key(old(requests)[j].wr_id) by {
+                assert(requests@[j] == prior[j]);
+                assert(!before.contains_key(prior[j].wr_id));
+                assert(old(requests)[i as int].wr_id != old(requests)[j].wr_id);
+            }
+        }
+        i += 1;
+    }
+    assert forall|j: int| 0 <= j < count implies {
+        &&& (#[trigger] requests@[j]).invalidates(old(requests)[j], qp)
+        &&& cq.pending().contains_key(old(requests)[j].wr_id)
+        &&& cq.pending()[old(requests)[j].wr_id] == old(requests)[j].entry(qp)
+    } by {
+        assert(j < i);
+    }
+    (count, error)
 }
 
 } // verus!

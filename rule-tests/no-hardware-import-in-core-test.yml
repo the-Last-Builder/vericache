@@ -5,6 +5,7 @@ valid:
     use transfer::context::*;
     use transfer::domain::*;
     use transfer::context::{Knows, Submitted};
+    use transfer_core::transport::QueuePairEndpoint;
     verus! {
         fn clean() { let host = 1usize; let cuda = 2usize; }
     }

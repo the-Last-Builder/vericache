@@ -1,0 +1,18 @@
+[package]
+name = "vericache-transfer-core"
+version.workspace = true
+edition.workspace = true
+description = "Verified transfer permissions, memory capabilities, and wire protocol for VeriCache."
+
+[package.metadata.verus]
+verify = true
+
+[lib]
+name = "transfer_core"
+
+[dependencies]
+foundation.workspace = true
+vstd.workspace = true
+
+[lints]
+workspace = true

@@ -1,7 +1,7 @@
 id: no-cuda-dep
 language: verus
 severity: error
-message: "CUDA backend modules may not be referenced from Host or NVMe backend layers."
+message: "CUDA backend modules may not be referenced from Host or NVMe backends or generic engine modules."
 rule:
   any:
     - kind: use_declaration

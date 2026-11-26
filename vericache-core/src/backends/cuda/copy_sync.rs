@@ -14,83 +14,83 @@ impl<'a> CudaBackend<'a> {
         after: &CacheCore,
         dst_frame: FrameId,
         lease_slot: u32,
-        src_timeline: u8,
+        src_timeline: TimelineId,
         source: EventSource,
     )
         requires
             before.well_formed(),
             mid.well_formed(),
             after.well_formed(),
-            dst_frame.0 < before.frames.metas.len(),
-            before.frames.meta(dst_frame).state != STATE_INITIALIZING,
-            mid.frames.same_directory(&before.frames),
-            after.frames.same_directory(&mid.frames),
-            mid.frames.preserves_initializing(&before.frames, None),
-            after.frames.preserves_initializing(&mid.frames, Some(dst_frame)),
-            mid.frames.preserves_remote_leases(&before.frames),
-            after.frames.preserves_remote_leases(&mid.frames),
-            after.node_id == before.node_id,
-            after.tiers == before.tiers,
-            after.timelines.only_watermarks(&before.timelines),
-            after.ledger == before.ledger,
-            after.next_version_seq >= before.next_version_seq,
-            after.version_seq_limit == before.version_seq_limit,
-            after.active_leases.len() == before.active_leases.len(),
-            (lease_slot as usize) < before.active_leases.len(),
-            before.active_leases[lease_slot as int].is_none(),
+            dst_frame.0 < before.frames_spec().metas_spec().len(),
+            before.frames_spec().meta(dst_frame).state != STATE_INITIALIZING,
+            mid.frames_spec().same_directory(&before.frames_spec()),
+            after.frames_spec().same_directory(&mid.frames_spec()),
+            mid.frames_spec().preserves_initializing(&before.frames_spec(), None),
+            after.frames_spec().preserves_initializing(&mid.frames_spec(), Some(dst_frame)),
+            mid.frames_spec().preserves_fenced_leases(&before.frames_spec()),
+            after.frames_spec().preserves_fenced_leases(&mid.frames_spec()),
+            after.node_id_spec() == before.node_id_spec(),
+            after.tiers_spec() == before.tiers_spec(),
+            after.timelines_spec().only_watermarks(&before.timelines_spec()),
+            after.ledger_spec() == before.ledger_spec(),
+            after.next_version_seq_spec() >= before.next_version_seq_spec(),
+            after.version_seq_limit_spec() == before.version_seq_limit_spec(),
+            after.active_leases_spec().len() == before.active_leases_spec().len(),
+            (lease_slot as usize) < before.active_leases_spec().len(),
+            before.active_leases_spec()[lease_slot as int].is_none(),
             forall|s: int|
-                0 <= s < before.active_leases.len() && s != lease_slot as int
-                    ==> #[trigger] mid.active_leases[s] == before.active_leases[s],
+                0 <= s < before.active_leases_spec().len() && s != lease_slot as int
+                    ==> #[trigger] mid.active_leases_spec()[s] == before.active_leases_spec()[s],
             forall|s: int|
-                0 <= s < before.active_leases.len() && s != lease_slot as int
-                    ==> #[trigger] after.active_leases[s] == mid.active_leases[s],
+                0 <= s < before.active_leases_spec().len() && s != lease_slot as int
+                    ==> #[trigger] after.active_leases_spec()[s] == mid.active_leases_spec()[s],
         ensures
             core_transition(
                 before,
                 after,
-                Some(src_timeline),
-                Some(source),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(Some(src_timeline), Some(source)),
             ),
     {
         hide(CacheCore::well_formed);
-        assert(after.frames.same_directory(&before.frames)) by {
+        assert(after.frames_spec().same_directory(&before.frames_spec())) by {
             reveal(FrameTable::same_directory);
         }
-        assert(after.frames.preserves_initializing(&before.frames, None)) by {
+        assert(after.frames_spec().preserves_initializing(&before.frames_spec(), None)) by {
             reveal(FrameTable::preserves_initializing);
             assert forall|f: FrameId|
-                f.0 < before.frames.metas.len() && (#[trigger] before.frames.meta(f)).state
-                    == STATE_INITIALIZING implies {
-                &&& after.frames.meta(f) == before.frames.meta(f)
-                &&& after.frames.frame(f) == before.frames.frame(f)
+                f.0 < before.frames_spec().metas_spec().len() && (
+                #[trigger] before.frames_spec().meta(f)).state == STATE_INITIALIZING implies {
+                &&& after.frames_spec().meta(f) == before.frames_spec().meta(f)
+                &&& after.frames_spec().frame(f) == before.frames_spec().frame(f)
             } by {
                 assert(f != dst_frame);
-                assert(mid.frames.meta(f) == before.frames.meta(f));
-                assert(mid.frames.frame(f) == before.frames.frame(f));
+                assert(mid.frames_spec().meta(f) == before.frames_spec().meta(f));
+                assert(mid.frames_spec().frame(f) == before.frames_spec().frame(f));
             }
         }
-        assert(after.frames.preserves_remote_leases(&before.frames)) by {
-            assert forall|f: FrameId| f.0 < before.frames.metas.len() implies {
-                &&& (#[trigger] after.frames.frame(f)).remote_shares == before.frames.frame(
+        assert(after.frames_spec().preserves_fenced_leases(&before.frames_spec())) by {
+            assert forall|f: FrameId| f.0 < before.frames_spec().metas_spec().len() implies {
+                &&& (#[trigger] after.frames_spec().frame(f)).fenced_shares
+                    == before.frames_spec().frame(f).fenced_shares
+                &&& after.frames_spec().meta(f).active_fenced_leases == before.frames_spec().meta(
                     f,
-                ).remote_shares
-                &&& after.frames.meta(f).active_remote_leases == before.frames.meta(
-                    f,
-                ).active_remote_leases
+                ).active_fenced_leases
             } by {
-                assert(mid.frames.frame(f).remote_shares == before.frames.frame(f).remote_shares);
-                assert(mid.frames.meta(f).active_remote_leases == before.frames.meta(
+                assert(mid.frames_spec().frame(f).fenced_shares == before.frames_spec().frame(
                     f,
-                ).active_remote_leases);
+                ).fenced_shares);
+                assert(mid.frames_spec().meta(f).active_fenced_leases == before.frames_spec().meta(
+                    f,
+                ).active_fenced_leases);
             }
         }
         assert forall|s: int|
-            0 <= s < before.active_leases.len() && (#[trigger] before.active_leases[s] matches Some(
-                l,
-            ) && l.internal) implies after.active_leases[s] == before.active_leases[s] by {
+            0 <= s < before.active_leases_spec().len() && (
+            #[trigger] before.active_leases_spec()[s] matches Some(l)
+                && l.internal) implies after.active_leases_spec()[s]
+            == before.active_leases_spec()[s] by {
             assert(s != lease_slot as int);
-            assert(mid.active_leases[s] == before.active_leases[s]);
+            assert(mid.active_leases_spec()[s] == before.active_leases_spec()[s]);
         }
         lemma_core_transition_no_event(before, after, Some(src_timeline), Some(source));
     }
@@ -102,7 +102,7 @@ impl<'a> CudaBackend<'a> {
         after: &CacheCore,
         before_stream: CudaStream,
         after_stream: CudaStream,
-        src_timeline: u8,
+        src_timeline: TimelineId,
         ev: TransferEvent,
         dst_frame: FrameId,
         dst_loc: SlotLoc,
@@ -113,67 +113,70 @@ impl<'a> CudaBackend<'a> {
             mid.well_formed(),
             after.well_formed(),
             self.well_formed(before),
-            before.timelines.bounds(),
+            before.timelines_spec().bounds(),
             src_timeline != self.timeline.timeline_id,
             before_stream.source().source() != self.timeline.stream.source().source(),
-            dst_frame.0 < before.frames.metas.len(),
-            before.frames.meta(dst_frame).state != STATE_INITIALIZING,
-            before.frames.frame(dst_frame).slot.loc == dst_loc,
-            after.node_id == before.node_id,
+            dst_frame.0 < before.frames_spec().metas_spec().len(),
+            before.frames_spec().meta(dst_frame).state != STATE_INITIALIZING,
+            before.frames_spec().frame(dst_frame).slot.loc == dst_loc,
+            after.node_id_spec() == before.node_id_spec(),
             after.instance_id() == before.instance_id(),
-            after.tiers == before.tiers,
-            after.next_version_seq >= before.next_version_seq,
-            after.version_seq_limit == before.version_seq_limit,
-            after.frames.versions@ == before.frames.versions@,
-            after.active_leases.len() == before.active_leases.len(),
-            (lease_slot as usize) < before.active_leases.len(),
-            before.active_leases[lease_slot as int].is_none(),
+            after.tiers_spec() == before.tiers_spec(),
+            after.next_version_seq_spec() >= before.next_version_seq_spec(),
+            after.version_seq_limit_spec() == before.version_seq_limit_spec(),
+            after.frames_spec().versions_spec()@ == before.frames_spec().versions_spec()@,
+            after.active_leases_spec().len() == before.active_leases_spec().len(),
+            (lease_slot as usize) < before.active_leases_spec().len(),
+            before.active_leases_spec()[lease_slot as int].is_none(),
             forall|s: int|
-                0 <= s < before.active_leases.len() && s != lease_slot as int
-                    ==> #[trigger] mid.active_leases[s] == before.active_leases[s],
+                0 <= s < before.active_leases_spec().len() && s != lease_slot as int
+                    ==> #[trigger] mid.active_leases_spec()[s] == before.active_leases_spec()[s],
             forall|s: int|
-                0 <= s < before.active_leases.len() && s != lease_slot as int
-                    ==> #[trigger] after.active_leases[s] == mid.active_leases[s],
-            after.timelines.count == before.timelines.count,
-            after.timelines.kinds == before.timelines.kinds,
-            forall|tl: u8|
-                tl < before.timelines.count && tl != src_timeline ==> {
-                    &&& (#[trigger] after.timelines.next_seq[tl as int])
-                        == before.timelines.next_seq[tl as int]
-                    &&& after.timelines.confirmed_seq[tl as int]
-                        == before.timelines.confirmed_seq[tl as int]
+                0 <= s < before.active_leases_spec().len() && s != lease_slot as int
+                    ==> #[trigger] after.active_leases_spec()[s] == mid.active_leases_spec()[s],
+            after.timelines_spec().count_spec() == before.timelines_spec().count_spec(),
+            after.timelines_spec().kinds_spec() == before.timelines_spec().kinds_spec(),
+            forall|tl: TimelineId|
+                tl < before.timelines_spec().count_spec() && tl != src_timeline ==> {
+                    &&& (#[trigger] after.timelines_spec().next_seq_spec()[tl as int])
+                        == before.timelines_spec().next_seq_spec()[tl as int]
+                    &&& after.timelines_spec().confirmed_seq_spec()[tl as int]
+                        == before.timelines_spec().confirmed_seq_spec()[tl as int]
                     &&& forall|s: u64|
-                        1 <= s < before.timelines.next_seq[tl as int]
-                            ==> #[trigger] after.timelines.events@[(tl, s)]
-                            == before.timelines.events@[(tl, s)]
+                        1 <= s < before.timelines_spec().next_seq_spec()[tl as int]
+                            ==> #[trigger] after.timelines_spec().events_spec()@[(tl, s)]
+                            == before.timelines_spec().events_spec()@[(tl, s)]
                 },
-            mid.frames.same_directory(&before.frames),
-            after.frames.same_layout(&mid.frames),
-            mid.frames.preserves_initializing(&before.frames, None),
-            after.frames.preserves_initializing(&mid.frames, Some(dst_frame)),
-            mid.frames.preserves_remote_leases(&before.frames),
-            after.frames.preserves_remote_leases(&mid.frames),
-            before.ledger@.submitted.map().submap_of(after.ledger@.submitted.map()),
-            after.ledger@.submitted.dom() == before.ledger@.submitted.dom().insert(ev),
-            before.ledger@.knows.set().subset_of(after.ledger@.knows.set()),
-            before.ledger@.succeeded.dom().subset_of(after.ledger@.succeeded.dom()),
-            revoked_submap(before.ledger@.revoked, after.ledger@.revoked),
+            mid.frames_spec().same_directory(&before.frames_spec()),
+            after.frames_spec().same_layout(&mid.frames_spec()),
+            mid.frames_spec().preserves_initializing(&before.frames_spec(), None),
+            after.frames_spec().preserves_initializing(&mid.frames_spec(), Some(dst_frame)),
+            mid.frames_spec().preserves_fenced_leases(&before.frames_spec()),
+            after.frames_spec().preserves_fenced_leases(&mid.frames_spec()),
+            before.ledger_spec()@.submitted.map().submap_of(after.ledger_spec()@.submitted.map()),
+            after.ledger_spec()@.submitted.dom() == before.ledger_spec()@.submitted.dom().insert(
+                ev,
+            ),
+            before.ledger_spec()@.knows.set().subset_of(after.ledger_spec()@.knows.set()),
+            before.ledger_spec()@.succeeded.dom().subset_of(after.ledger_spec()@.succeeded.dom()),
+            revoked_submap(before.ledger_spec()@.revoked, after.ledger_spec()@.revoked),
             ev == before_stream.source().next_event(),
-            after.ledger@.submitted.map()[ev].access.writes == ISet::empty().insert(dst_loc),
+            after.ledger_spec()@.submitted.map()[ev].access.writes == ISet::empty().insert(dst_loc),
             after_stream.source().source() == before_stream.source().source(),
             after_stream.source().node() == before_stream.source().node(),
             after_stream.source().next_seq() == before_stream.source().next_seq() + 1,
-            source_fresh_for_ledger(before_stream.source(), before.ledger@),
-            before.spec@.versions_monotonic(after.spec@),
+            source_fresh_for_ledger(before_stream.source(), before.ledger_spec()@),
+            before.spec_spec()@.versions_monotonic(after.spec_spec()@),
         ensures
-            source_fresh_for_ledger(after_stream.source(), after.ledger@),
+            source_fresh_for_ledger(after_stream.source(), after.ledger_spec()@),
             self.well_formed(after),
             core_transition(
                 before,
                 after,
-                Some(src_timeline),
-                Some(before_stream.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(src_timeline),
+                    Some(before_stream.source().source()),
+                ),
             ),
     {
         hide(CacheCore::well_formed);
@@ -189,48 +192,50 @@ impl<'a> CudaBackend<'a> {
         lemma_source_fresh_stepped(
             before_stream.source(),
             after_stream.source(),
-            before.ledger@,
-            after.ledger@,
+            before.ledger_spec()@,
+            after.ledger_spec()@,
             ev,
         );
-        assert(after.frames.same_layout(&before.frames)) by {
+        assert(after.frames_spec().same_layout(&before.frames_spec())) by {
             reveal(FrameTable::same_directory);
             reveal(FrameTable::same_layout);
         }
-        assert(after.frames.preserves_initializing(&before.frames, None)) by {
+        assert(after.frames_spec().preserves_initializing(&before.frames_spec(), None)) by {
             reveal(FrameTable::preserves_initializing);
             assert forall|f: FrameId|
-                f.0 < before.frames.metas.len() && (#[trigger] before.frames.meta(f)).state
-                    == STATE_INITIALIZING implies {
-                &&& after.frames.meta(f) == before.frames.meta(f)
-                &&& after.frames.frame(f) == before.frames.frame(f)
+                f.0 < before.frames_spec().metas_spec().len() && (
+                #[trigger] before.frames_spec().meta(f)).state == STATE_INITIALIZING implies {
+                &&& after.frames_spec().meta(f) == before.frames_spec().meta(f)
+                &&& after.frames_spec().frame(f) == before.frames_spec().frame(f)
             } by {
                 assert(f != dst_frame);
-                assert(mid.frames.meta(f) == before.frames.meta(f));
-                assert(mid.frames.frame(f) == before.frames.frame(f));
+                assert(mid.frames_spec().meta(f) == before.frames_spec().meta(f));
+                assert(mid.frames_spec().frame(f) == before.frames_spec().frame(f));
             }
         }
-        assert(after.frames.preserves_remote_leases(&before.frames)) by {
-            assert forall|f: FrameId| f.0 < before.frames.metas.len() implies {
-                &&& (#[trigger] after.frames.frame(f)).remote_shares == before.frames.frame(
+        assert(after.frames_spec().preserves_fenced_leases(&before.frames_spec())) by {
+            assert forall|f: FrameId| f.0 < before.frames_spec().metas_spec().len() implies {
+                &&& (#[trigger] after.frames_spec().frame(f)).fenced_shares
+                    == before.frames_spec().frame(f).fenced_shares
+                &&& after.frames_spec().meta(f).active_fenced_leases == before.frames_spec().meta(
                     f,
-                ).remote_shares
-                &&& after.frames.meta(f).active_remote_leases == before.frames.meta(
-                    f,
-                ).active_remote_leases
+                ).active_fenced_leases
             } by {
-                assert(mid.frames.frame(f).remote_shares == before.frames.frame(f).remote_shares);
-                assert(mid.frames.meta(f).active_remote_leases == before.frames.meta(
+                assert(mid.frames_spec().frame(f).fenced_shares == before.frames_spec().frame(
                     f,
-                ).active_remote_leases);
+                ).fenced_shares);
+                assert(mid.frames_spec().meta(f).active_fenced_leases == before.frames_spec().meta(
+                    f,
+                ).active_fenced_leases);
             }
         }
         assert forall|s: int|
-            0 <= s < before.active_leases.len() && (#[trigger] before.active_leases[s] matches Some(
-                l,
-            ) && l.internal) implies after.active_leases[s] == before.active_leases[s] by {
+            0 <= s < before.active_leases_spec().len() && (
+            #[trigger] before.active_leases_spec()[s] matches Some(l)
+                && l.internal) implies after.active_leases_spec()[s]
+            == before.active_leases_spec()[s] by {
             assert(s != lease_slot as int);
-            assert(mid.active_leases[s] == before.active_leases[s]);
+            assert(mid.active_leases_spec()[s] == before.active_leases_spec()[s]);
         }
         lemma_non_init_frame_disjoint_from_init(before, dst_frame);
         lemma_core_transition_single_event(
@@ -245,9 +250,7 @@ impl<'a> CudaBackend<'a> {
         lemma_core_transition_preserves_cuda(
             before,
             after,
-            Some(src_timeline),
-            Some(before_stream.source().source()),
-            FrameTouchMode::PreserveAllInit,
+            CoreFootprint::preserve_all(Some(src_timeline), Some(before_stream.source().source())),
             self,
         );
     }
@@ -260,7 +263,7 @@ impl<'a> CudaBackend<'a> {
         Tracked(src_cap): Tracked<ShareCap>,
         Tracked(dst_tok): Tracked<SlotToken>,
         ticket: Ticket,
-        src_timeline: u8,
+        src_timeline: TimelineId,
         Ghost(before): Ghost<CacheCore>,
         Ghost(after_hop): Ghost<CacheCore>,
         Ghost(before_stream): Ghost<CudaStream>,
@@ -272,58 +275,59 @@ impl<'a> CudaBackend<'a> {
             after_hop.well_formed(),
             old(core).well_formed(),
             self.well_formed(&before),
-            before.timelines.bounds(),
+            before.timelines_spec().bounds(),
             src_timeline != self.timeline.timeline_id,
             before_stream.source().source() != self.timeline.stream.source().source(),
             after_stream.well_formed(),
             after_stream.source().id() == old(core).instance_id(),
             after_stream.source().node() == old(core).node(),
-            after_stream.source().source() is CudaStream,
+            after_stream.source().source().is_cuda_stream(),
             after_stream.source().source() == before_stream.source().source(),
             after_stream.source().node() == before_stream.source().node(),
             after_stream.source().next_seq() == before_stream.source().next_seq() + 1,
-            source_fresh_for_ledger(before_stream.source(), before.ledger@),
-            after_stream.infos().map().submap_of(old(core).ledger@.submitted.map()),
+            source_fresh_for_ledger(before_stream.source(), before.ledger_spec()@),
+            after_stream.infos().map().submap_of(old(core).ledger_spec()@.submitted.map()),
             after_stream.tail().subset_of(after_stream.infos().dom()),
-            src_timeline < old(core).timelines.count <= MAX_TIMELINES,
-            old(core).timelines.kinds[src_timeline as int] == (TimelineKind::CudaStream {
-                device: after_stream.device(),
-            }),
+            src_timeline < old(core).timelines_spec().count_spec() <= MAX_TIMELINES,
+            old(core).timelines_spec().kinds_spec()[src_timeline as int] == (
+            TimelineKind::CudaStream { device: after_stream.device() }),
             instance.id() == old(core).instance_id(),
-            old(core).node_id == before.node_id,
+            old(core).node_id_spec() == before.node_id_spec(),
             old(core).instance_id() == before.instance_id(),
-            old(core).tiers == before.tiers,
-            old(core).next_version_seq == before.next_version_seq,
-            old(core).version_seq_limit == before.version_seq_limit,
-            old(core).frames == after_hop.frames,
-            old(core).spec == before.spec,
-            old(core).version_registry == before.version_registry,
-            old(core).active_leases == after_hop.active_leases,
-            after_hop.frames.same_directory(&before.frames),
-            after_hop.frames.preserves_initializing(&before.frames, None),
-            after_hop.frames.preserves_remote_leases(&before.frames),
-            after_hop.active_leases.len() == before.active_leases.len(),
-            (hop.src_lease.slot as usize) < before.active_leases.len(),
-            before.active_leases[hop.src_lease.slot as int].is_none(),
+            old(core).tiers_spec() == before.tiers_spec(),
+            old(core).next_version_seq_spec() == before.next_version_seq_spec(),
+            old(core).version_seq_limit_spec() == before.version_seq_limit_spec(),
+            old(core).frames_spec() == after_hop.frames_spec(),
+            old(core).spec_spec() == before.spec_spec(),
+            old(core).version_registry_spec() == before.version_registry_spec(),
+            old(core).active_leases_spec() == after_hop.active_leases_spec(),
+            after_hop.frames_spec().same_directory(&before.frames_spec()),
+            after_hop.frames_spec().preserves_initializing(&before.frames_spec(), None),
+            after_hop.frames_spec().preserves_fenced_leases(&before.frames_spec()),
+            after_hop.active_leases_spec().len() == before.active_leases_spec().len(),
+            (hop.src_lease.slot_spec() as usize) < before.active_leases_spec().len(),
+            before.active_leases_spec()[hop.src_lease.slot_spec() as int].is_none(),
             forall|s: int|
-                0 <= s < before.active_leases.len() && s != hop.src_lease.slot as int
-                    ==> #[trigger] after_hop.active_leases[s] == before.active_leases[s],
+                0 <= s < before.active_leases_spec().len() && s != hop.src_lease.slot_spec() as int
+                    ==> #[trigger] after_hop.active_leases_spec()[s]
+                    == before.active_leases_spec()[s],
             old(core).active_lease_matches(hop.src_lease),
-            old(core).active_leases[hop.src_lease.slot as int]->Some_0.share@ == src_cap.share(),
-            hop.src_lease.frame == hop.src_frame,
-            hop.src_frame.0 < old(core).frames.metas.len(),
-            hop.dst_frame.0 < before.frames.metas.len(),
-            hop.dst_frame.0 < old(core).frames.metas.len(),
-            before.frames.meta(hop.dst_frame).state != STATE_INITIALIZING,
-            before.frames.frame(hop.dst_frame).slot == hop.dst_slot@,
-            old(core).frames.meta(hop.dst_frame).state == STATE_INITIALIZING,
-            !old(core).frames.meta(hop.dst_frame).queued(),
-            old(core).frames.frame(hop.dst_frame).tier == hop.dst_tier,
-            old(core).frames.frame(hop.dst_frame).slot == hop.dst_slot@,
-            old(core).frames.frame(hop.dst_frame).token is None,
+            old(core).active_leases_spec()[hop.src_lease.slot_spec() as int]->Some_0.share@
+                == src_cap.share(),
+            hop.src_lease.frame_spec() == hop.src_frame,
+            hop.src_frame.0 < old(core).frames_spec().metas_spec().len(),
+            hop.dst_frame.0 < before.frames_spec().metas_spec().len(),
+            hop.dst_frame.0 < old(core).frames_spec().metas_spec().len(),
+            before.frames_spec().meta(hop.dst_frame).state != STATE_INITIALIZING,
+            before.frames_spec().frame(hop.dst_frame).slot == hop.dst_slot@,
+            old(core).frames_spec().meta(hop.dst_frame).state == STATE_INITIALIZING,
+            !old(core).frames_spec().meta(hop.dst_frame).queued(),
+            old(core).frames_spec().frame(hop.dst_frame).tier == hop.dst_tier,
+            old(core).frames_spec().frame(hop.dst_frame).slot == hop.dst_slot@,
+            old(core).frames_spec().frame(hop.dst_frame).token is None,
             src_cap.well_formed(),
             src_cap.instance_id() == old(core).instance_id(),
-            src_cap.loc() == old(core).frames.frame(hop.src_frame).slot.loc,
+            src_cap.loc() == old(core).frames_spec().frame(hop.src_frame).slot.loc,
             src_cap.frontier().readers == ISet::empty().insert(ev),
             slot_owned(
                 dst_tok,
@@ -331,49 +335,55 @@ impl<'a> CudaBackend<'a> {
                 hop.dst_slot@.loc,
                 Frontier { last_writer: Some(ev), readers: ISet::empty() },
             ),
-            old(core).timelines.count == before.timelines.count,
-            old(core).timelines.kinds == before.timelines.kinds,
-            forall|tl: u8|
-                tl < before.timelines.count && tl != src_timeline ==> {
-                    &&& (#[trigger] old(core).timelines.next_seq[tl as int])
-                        == before.timelines.next_seq[tl as int]
-                    &&& old(core).timelines.confirmed_seq[tl as int]
-                        == before.timelines.confirmed_seq[tl as int]
+            old(core).timelines_spec().count_spec() == before.timelines_spec().count_spec(),
+            old(core).timelines_spec().kinds_spec() == before.timelines_spec().kinds_spec(),
+            forall|tl: TimelineId|
+                tl < before.timelines_spec().count_spec() && tl != src_timeline ==> {
+                    &&& (#[trigger] old(core).timelines_spec().next_seq_spec()[tl as int])
+                        == before.timelines_spec().next_seq_spec()[tl as int]
+                    &&& old(core).timelines_spec().confirmed_seq_spec()[tl as int]
+                        == before.timelines_spec().confirmed_seq_spec()[tl as int]
                     &&& forall|s: u64|
-                        1 <= s < before.timelines.next_seq[tl as int] ==> #[trigger] old(
-                            core,
-                        ).timelines.events@[(tl, s)] == before.timelines.events@[(tl, s)]
+                        1 <= s < before.timelines_spec().next_seq_spec()[tl as int]
+                            ==> #[trigger] old(core).timelines_spec().events_spec()@[(tl, s)]
+                            == before.timelines_spec().events_spec()@[(tl, s)]
                 },
             ticket != Ticket::NONE,
             ticket.timeline_id() == src_timeline,
             1 <= ticket.sequence(),
-            old(core).timelines.issued(src_timeline, ticket.sequence()),
-            old(core).timelines.events@[(src_timeline, ticket.sequence())] == ev,
+            old(core).timelines_spec().issued(src_timeline, ticket.sequence()),
+            old(core).timelines_spec().events_spec()@[(src_timeline, ticket.sequence())] == ev,
             ev == before_stream.source().next_event(),
-            before.ledger@.submitted.map().submap_of(old(core).ledger@.submitted.map()),
-            old(core).ledger@.submitted.dom() == before.ledger@.submitted.dom().insert(ev),
-            before.ledger@.knows.set().subset_of(old(core).ledger@.knows.set()),
-            before.ledger@.succeeded.dom().subset_of(old(core).ledger@.succeeded.dom()),
-            revoked_submap(before.ledger@.revoked, old(core).ledger@.revoked),
-            old(core).ledger@.submitted.map()[ev].access.writes == ISet::empty().insert(
+            before.ledger_spec()@.submitted.map().submap_of(
+                old(core).ledger_spec()@.submitted.map(),
+            ),
+            old(core).ledger_spec()@.submitted.dom()
+                == before.ledger_spec()@.submitted.dom().insert(ev),
+            before.ledger_spec()@.knows.set().subset_of(old(core).ledger_spec()@.knows.set()),
+            before.ledger_spec()@.succeeded.dom().subset_of(
+                old(core).ledger_spec()@.succeeded.dom(),
+            ),
+            revoked_submap(before.ledger_spec()@.revoked, old(core).ledger_spec()@.revoked),
+            old(core).ledger_spec()@.submitted.map()[ev].access.writes == ISet::empty().insert(
                 hop.dst_slot@.loc,
             ),
         ensures
             final(core).well_formed(),
             self.well_formed(final(core)),
             caller_stream_valid(after_stream, final(core), src_timeline, self.timeline.stream),
-            final(core).node_id == before.node_id,
+            final(core).node_id_spec() == before.node_id_spec(),
             final(core).instance_id() == before.instance_id(),
-            final(core).tiers == before.tiers,
-            final(core).frames.versions@ == before.frames.versions@,
-            final(core).version_registry == before.version_registry,
-            before.spec@.versions_monotonic(final(core).spec@),
+            final(core).tiers_spec() == before.tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == before.frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == before.version_registry_spec(),
+            before.spec_spec()@.versions_monotonic(final(core).spec_spec()@),
             core_transition(
                 &before,
                 final(core),
-                Some(src_timeline),
-                Some(before_stream.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(src_timeline),
+                    Some(before_stream.source().source()),
+                ),
             ),
     {
         hide(CacheCore::well_formed);
@@ -383,21 +393,21 @@ impl<'a> CudaBackend<'a> {
         hide(FrameTable::same_directory);
         hide(FrameTable::same_layout);
         hide(FrameTable::preserves_initializing);
-        hide(FrameTable::preserves_remote_leases);
+        hide(FrameTable::preserves_fenced_leases);
         let ghost dst_frame = hop.dst_frame;
         let ghost dst_loc = hop.dst_slot@.loc;
-        let ghost lease_slot = hop.src_lease.slot;
+        let ghost lease_slot = hop.src_lease.slot_spec();
         proof {
             assert forall|x: TransferEvent| #[trigger]
                 src_cap.frontier().readers.contains(x) implies core.citations().contains(x)
                 || exists|s: u64|
-                1 <= s <= ticket.sequence() && #[trigger] core.timelines.events@[(
+                1 <= s <= ticket.sequence() && #[trigger] core.timelines_spec().events_spec()@[(
                     ticket.timeline_id(),
                     s,
                 )] == x by {
                 assert(x == ev);
                 let s = ticket.sequence();
-                assert(1 <= s <= ticket.sequence() && core.timelines.events@[(
+                assert(1 <= s <= ticket.sequence() && core.timelines_spec().events_spec()@[(
                     ticket.timeline_id(),
                     s,
                 )] == x);
@@ -412,10 +422,12 @@ impl<'a> CudaBackend<'a> {
         ).unwrap();
         let ghost after_rel = *core;
         proof {
-            assert(core.frames.metas.len() == after_hop.frames.metas.len() && core.frames.meta(
+            assert(core.frames_spec().metas_spec().len()
+                == after_hop.frames_spec().metas_spec().len() && core.frames_spec().meta(
                 dst_frame,
-            ).state == STATE_INITIALIZING && !core.frames.meta(dst_frame).queued()
-                && core.frames.frame(dst_frame) == after_hop.frames.frame(dst_frame)) by {
+            ).state == STATE_INITIALIZING && !core.frames_spec().meta(dst_frame).queued()
+                && core.frames_spec().frame(dst_frame) == after_hop.frames_spec().frame(dst_frame))
+                by {
                 reveal(FrameTable::same_directory);
                 reveal(FrameTable::preserves_initializing);
             }
@@ -423,7 +435,7 @@ impl<'a> CudaBackend<'a> {
                 broadcast use vstd::iset::group_iset_lemmas;
 
             }
-            Self::lemma_ticket_covers_self(&core.timelines, ticket, ev);
+            Self::lemma_ticket_covers_self(&core.timelines_spec(), ticket, ev);
         }
         let write_handle = WriteHandle {
             frame: hop.dst_frame,
@@ -434,42 +446,42 @@ impl<'a> CudaBackend<'a> {
         };
         core.park_write(write_handle, Tracked(dst_tok), ticket);
         proof {
-            assert(core.frames.same_layout(&after_hop.frames)) by {
+            assert(core.frames_spec().same_layout(&after_hop.frames_spec())) by {
                 reveal(FrameTable::same_directory);
                 reveal(FrameTable::same_layout);
             }
-            assert(core.frames.preserves_initializing(&after_hop.frames, Some(dst_frame))) by {
+            assert(core.frames_spec().preserves_initializing(
+                &after_hop.frames_spec(),
+                Some(dst_frame),
+            )) by {
                 reveal(FrameTable::preserves_initializing);
                 assert forall|f: FrameId|
-                    f.0 < after_hop.frames.metas.len() && (#[trigger] after_hop.frames.meta(
-                        f,
-                    )).state == STATE_INITIALIZING && f != dst_frame implies {
-                    &&& core.frames.meta(f) == after_hop.frames.meta(f)
-                    &&& core.frames.frame(f) == after_hop.frames.frame(f)
+                    f.0 < after_hop.frames_spec().metas_spec().len() && (
+                    #[trigger] after_hop.frames_spec().meta(f)).state == STATE_INITIALIZING && f
+                        != dst_frame implies {
+                    &&& core.frames_spec().meta(f) == after_hop.frames_spec().meta(f)
+                    &&& core.frames_spec().frame(f) == after_hop.frames_spec().frame(f)
                 } by {
-                    assert(after_rel.frames.meta(f) == after_hop.frames.meta(f));
-                    assert(after_rel.frames.frame(f) == after_hop.frames.frame(f));
+                    assert(after_rel.frames_spec().meta(f) == after_hop.frames_spec().meta(f));
+                    assert(after_rel.frames_spec().frame(f) == after_hop.frames_spec().frame(f));
                 }
             }
-            assert(core.frames.preserves_remote_leases(&after_hop.frames)) by {
-                reveal(FrameTable::preserves_remote_leases);
-                assert forall|f: FrameId| f.0 < after_hop.frames.metas.len() implies {
-                    &&& (#[trigger] core.frames.frame(f)).remote_shares == after_hop.frames.frame(
-                        f,
-                    ).remote_shares
-                    &&& core.frames.meta(f).active_remote_leases == after_hop.frames.meta(
-                        f,
-                    ).active_remote_leases
+            assert(core.frames_spec().preserves_fenced_leases(&after_hop.frames_spec())) by {
+                reveal(FrameTable::preserves_fenced_leases);
+                assert forall|f: FrameId| f.0 < after_hop.frames_spec().metas_spec().len() implies {
+                    &&& (#[trigger] core.frames_spec().frame(f)).fenced_shares
+                        == after_hop.frames_spec().frame(f).fenced_shares
+                    &&& core.frames_spec().meta(f).active_fenced_leases
+                        == after_hop.frames_spec().meta(f).active_fenced_leases
                 } by {
-                    assert(after_rel.frames.frame(f).remote_shares == after_hop.frames.frame(
-                        f,
-                    ).remote_shares);
-                    assert(after_rel.frames.meta(f).active_remote_leases == after_hop.frames.meta(
-                        f,
-                    ).active_remote_leases);
+                    assert(after_rel.frames_spec().frame(f).fenced_shares
+                        == after_hop.frames_spec().frame(f).fenced_shares);
+                    assert(after_rel.frames_spec().meta(f).active_fenced_leases
+                        == after_hop.frames_spec().meta(f).active_fenced_leases);
                 }
             }
-            assert(core.frames.versions@ == before.frames.versions@) by {
+            assert(core.frames_spec().versions_spec()@ == before.frames_spec().versions_spec()@)
+                by {
                 reveal(FrameTable::same_directory);
             }
             self.lemma_copy_hop_sync_step_transition(
@@ -496,7 +508,7 @@ impl<'a> CudaBackend<'a> {
         Tracked(dst_tok): Tracked<SlotToken>,
         Tracked(knows): Tracked<Knows>,
         ticket: Ticket,
-        src_timeline: u8,
+        src_timeline: TimelineId,
         dst_tier: TierId,
         dst_is_gpu: bool,
         Ghost(before): Ghost<CacheCore>,
@@ -512,74 +524,78 @@ impl<'a> CudaBackend<'a> {
             after_hop.well_formed(),
             old(core).well_formed(),
             self.well_formed(&before),
-            before.timelines.bounds(),
+            before.timelines_spec().bounds(),
             src_timeline != self.timeline.timeline_id,
             before_stream.source().source() != self.timeline.stream.source().source(),
             after_stream.well_formed(),
             after_stream.source().id() == old(core).instance_id(),
             after_stream.source().node() == old(core).node(),
-            after_stream.source().source() is CudaStream,
+            after_stream.source().source().is_cuda_stream(),
             after_stream.source().source() == before_stream.source().source(),
             after_stream.source().node() == before_stream.source().node(),
             after_stream.source().next_seq() == before_stream.source().next_seq() + 1,
-            source_fresh_for_ledger(before_stream.source(), before.ledger@),
-            after_stream.infos().map().submap_of(old(core).ledger@.submitted.map()),
+            source_fresh_for_ledger(before_stream.source(), before.ledger_spec()@),
+            after_stream.infos().map().submap_of(old(core).ledger_spec()@.submitted.map()),
             after_stream.tail() == ISet::empty().insert(ev),
             after_stream.infos().map().dom().contains(ev),
             after_stream.infos().map()[ev] == sub_val,
-            src_timeline < old(core).timelines.count <= MAX_TIMELINES,
-            old(core).timelines.kinds[src_timeline as int] == (TimelineKind::CudaStream {
-                device: after_stream.device(),
-            }),
-            old(core).timelines.confirmed_seq[src_timeline as int] + 2 == old(
+            src_timeline < old(core).timelines_spec().count_spec() <= MAX_TIMELINES,
+            old(core).timelines_spec().kinds_spec()[src_timeline as int] == (
+            TimelineKind::CudaStream { device: after_stream.device() }),
+            old(core).timelines_spec().confirmed_seq_spec()[src_timeline as int] + 2 == old(
                 core,
-            ).timelines.next_seq[src_timeline as int],
-            ticket.sequence() + 1 == old(core).timelines.next_seq[src_timeline as int],
+            ).timelines_spec().next_seq_spec()[src_timeline as int],
+            ticket.sequence() + 1 == old(
+                core,
+            ).timelines_spec().next_seq_spec()[src_timeline as int],
             instance.id() == old(core).instance_id(),
-            old(core).node_id == before.node_id && after_hop.node_id == before.node_id,
+            old(core).node_id_spec() == before.node_id_spec() && after_hop.node_id_spec()
+                == before.node_id_spec(),
             old(core).instance_id() == before.instance_id() && after_hop.instance_id()
                 == before.instance_id(),
-            old(core).tiers == before.tiers,
-            old(core).next_version_seq == before.next_version_seq,
-            old(core).version_seq_limit == before.version_seq_limit,
-            old(core).frames == after_hop.frames,
-            old(core).spec == before.spec,
-            old(core).version_registry == before.version_registry,
-            old(core).active_leases == after_hop.active_leases,
-            after_hop.frames.same_directory(&before.frames),
-            after_hop.frames.preserves_initializing(&before.frames, None),
-            after_hop.frames.preserves_remote_leases(&before.frames),
-            after_hop.active_leases.len() == before.active_leases.len(),
-            (hop.src_lease.slot as usize) < before.active_leases.len(),
-            before.active_leases[hop.src_lease.slot as int].is_none(),
+            old(core).tiers_spec() == before.tiers_spec(),
+            old(core).next_version_seq_spec() == before.next_version_seq_spec(),
+            old(core).version_seq_limit_spec() == before.version_seq_limit_spec(),
+            old(core).frames_spec() == after_hop.frames_spec(),
+            old(core).spec_spec() == before.spec_spec(),
+            old(core).version_registry_spec() == before.version_registry_spec(),
+            old(core).active_leases_spec() == after_hop.active_leases_spec(),
+            after_hop.frames_spec().same_directory(&before.frames_spec()),
+            after_hop.frames_spec().preserves_initializing(&before.frames_spec(), None),
+            after_hop.frames_spec().preserves_fenced_leases(&before.frames_spec()),
+            after_hop.active_leases_spec().len() == before.active_leases_spec().len(),
+            (hop.src_lease.slot_spec() as usize) < before.active_leases_spec().len(),
+            before.active_leases_spec()[hop.src_lease.slot_spec() as int].is_none(),
             forall|s: int|
-                0 <= s < before.active_leases.len() && s != hop.src_lease.slot as int
-                    ==> #[trigger] after_hop.active_leases[s] == before.active_leases[s],
+                0 <= s < before.active_leases_spec().len() && s != hop.src_lease.slot_spec() as int
+                    ==> #[trigger] after_hop.active_leases_spec()[s]
+                    == before.active_leases_spec()[s],
             old(core).active_lease_matches(hop.src_lease),
-            old(core).active_leases[hop.src_lease.slot as int]->Some_0.share@ == src_cap.share(),
-            hop.src_lease.frame == hop.src_frame,
-            hop.src_frame.0 < old(core).frames.metas.len(),
-            hop.dst_frame.0 < before.frames.metas.len(),
-            hop.dst_frame.0 < old(core).frames.metas.len(),
-            before.frames.meta(hop.dst_frame).state != STATE_INITIALIZING,
-            before.frames.frame(hop.dst_frame).slot == hop.dst_slot@,
-            old(core).frames.meta(hop.dst_frame).state == STATE_INITIALIZING,
-            !old(core).frames.meta(hop.dst_frame).queued(),
-            old(core).frames.frame(hop.dst_frame).tier == dst_tier,
+            old(core).active_leases_spec()[hop.src_lease.slot_spec() as int]->Some_0.share@
+                == src_cap.share(),
+            hop.src_lease.frame_spec() == hop.src_frame,
+            hop.src_frame.0 < old(core).frames_spec().metas_spec().len(),
+            hop.dst_frame.0 < before.frames_spec().metas_spec().len(),
+            hop.dst_frame.0 < old(core).frames_spec().metas_spec().len(),
+            before.frames_spec().meta(hop.dst_frame).state != STATE_INITIALIZING,
+            before.frames_spec().frame(hop.dst_frame).slot == hop.dst_slot@,
+            old(core).frames_spec().meta(hop.dst_frame).state == STATE_INITIALIZING,
+            !old(core).frames_spec().meta(hop.dst_frame).queued(),
+            old(core).frames_spec().frame(hop.dst_frame).tier == dst_tier,
             hop.dst_tier == dst_tier,
-            old(core).frames.frame(hop.dst_frame).slot == hop.dst_slot@,
-            old(core).frames.frame(hop.dst_frame).bound_version == Some(hop.version),
-            old(core).frames.frame(hop.dst_frame).token is None,
-            old(core).frames.versions@.contains_key(hop.version),
-            old(core).frames.versions@[hop.version] == hop.src_cert@.bytes,
-            hop.version.origin_node != old(core).node_id || hop.version.seq < old(
+            old(core).frames_spec().frame(hop.dst_frame).slot == hop.dst_slot@,
+            old(core).frames_spec().frame(hop.dst_frame).bound_version == Some(hop.version),
+            old(core).frames_spec().frame(hop.dst_frame).token is None,
+            old(core).frames_spec().versions_spec()@.contains_key(hop.version),
+            old(core).frames_spec().versions_spec()@[hop.version] == hop.src_cert@.bytes,
+            hop.version.origin_node != old(core).node_id_spec() || hop.version.seq < old(
                 core,
-            ).next_version_seq || hop.version.seq >= old(core).version_seq_limit,
+            ).next_version_seq_spec() || hop.version.seq >= old(core).version_seq_limit_spec(),
             dst_is_gpu ==> dst_tier == self.gpu_tier && self.owns_gpu(hop.dst_frame),
             !dst_is_gpu ==> self.owns_pinned_host(hop.dst_frame),
             src_cap.well_formed(),
             src_cap.instance_id() == old(core).instance_id(),
-            src_cap.loc() == old(core).frames.frame(hop.src_frame).slot.loc,
+            src_cap.loc() == old(core).frames_spec().frame(hop.src_frame).slot.loc,
             src_cap.frontier().readers == ISet::empty().insert(ev),
             slot_owned(
                 dst_tok,
@@ -587,47 +603,45 @@ impl<'a> CudaBackend<'a> {
                 hop.dst_slot@.loc,
                 Frontier { last_writer: Some(ev), readers: ISet::empty() },
             ),
-            old(core).timelines.count == before.timelines.count,
-            old(core).timelines.kinds == before.timelines.kinds,
-            forall|tl: u8|
-                tl < before.timelines.count && tl != src_timeline ==> {
-                    &&& (#[trigger] old(core).timelines.next_seq[tl as int])
-                        == before.timelines.next_seq[tl as int]
-                    &&& old(core).timelines.confirmed_seq[tl as int]
-                        == before.timelines.confirmed_seq[tl as int]
+            old(core).timelines_spec().count_spec() == before.timelines_spec().count_spec(),
+            old(core).timelines_spec().kinds_spec() == before.timelines_spec().kinds_spec(),
+            forall|tl: TimelineId|
+                tl < before.timelines_spec().count_spec() && tl != src_timeline ==> {
+                    &&& (#[trigger] old(core).timelines_spec().next_seq_spec()[tl as int])
+                        == before.timelines_spec().next_seq_spec()[tl as int]
+                    &&& old(core).timelines_spec().confirmed_seq_spec()[tl as int]
+                        == before.timelines_spec().confirmed_seq_spec()[tl as int]
                     &&& forall|s: u64|
-                        1 <= s < before.timelines.next_seq[tl as int] ==> #[trigger] old(
-                            core,
-                        ).timelines.events@[(tl, s)] == before.timelines.events@[(tl, s)]
+                        1 <= s < before.timelines_spec().next_seq_spec()[tl as int]
+                            ==> #[trigger] old(core).timelines_spec().events_spec()@[(tl, s)]
+                            == before.timelines_spec().events_spec()@[(tl, s)]
                 },
             ticket != Ticket::NONE,
             ticket.timeline_id() == src_timeline,
             1 <= ticket.sequence(),
-            old(core).timelines.issued(src_timeline, ticket.sequence()),
-            old(core).timelines.events@[(src_timeline, ticket.sequence())] == ev,
+            old(core).timelines_spec().issued(src_timeline, ticket.sequence()),
+            old(core).timelines_spec().events_spec()@[(src_timeline, ticket.sequence())] == ev,
             ev == before_stream.source().next_event(),
             ev.source.succeeds_on_observe(),
-            !after_hop.ledger@.submitted.dom().contains(ev),
-            after_hop.ledger@ == before.ledger@,
+            !after_hop.ledger_spec()@.submitted.dom().contains(ev),
+            after_hop.ledger_spec()@ == before.ledger_spec()@,
             cited == after_hop.citations(),
             cited.subset_of(sub_val.preds),
-            sub_val.preds.subset_of(after_hop.ledger@.submitted.dom()),
+            sub_val.preds.subset_of(after_hop.ledger_spec()@.submitted.dom()),
             sub_val.access.reads.contains(hop.src_slot@.loc),
             sub_val.access.writes == ISet::empty().insert(hop.dst_slot@.loc),
             sub_val.effect == copy_effect(hop.src_slot@, hop.dst_slot@),
-            old(core).ledger@.submitted.map() == after_hop.ledger@.submitted.map().insert(
-                ev,
-                sub_val,
-            ),
-            old(core).ledger@.knows == after_hop.ledger@.knows,
-            old(core).ledger@.succeeded == after_hop.ledger@.succeeded,
-            old(core).ledger@.revoked == after_hop.ledger@.revoked,
+            old(core).ledger_spec()@.submitted.map()
+                == after_hop.ledger_spec()@.submitted.map().insert(ev, sub_val),
+            old(core).ledger_spec()@.knows == after_hop.ledger_spec()@.knows,
+            old(core).ledger_spec()@.succeeded == after_hop.ledger_spec()@.succeeded,
+            old(core).ledger_spec()@.revoked == after_hop.ledger_spec()@.revoked,
             knows.instance_id() == old(core).instance_id(),
             knows.set() == foundation::tracked::knowledge_of(
                 old(core).node(),
                 closure_from(after_stream.infos().map(), after_stream.tail()),
             ),
-            replica_valid(after_hop.ledger@, after_hop.node(), hop.src_cert@),
+            replica_valid(after_hop.ledger_spec()@, after_hop.node(), hop.src_cert@),
             source_slice_valid(hop.src_cert@, hop.src_slot@),
             hop.src_cert@.slot == hop.src_slot@,
             hop.src_slot@.well_formed(),
@@ -639,25 +653,26 @@ impl<'a> CudaBackend<'a> {
             final(core).well_formed(),
             self.well_formed(final(core)),
             caller_stream_valid(after_stream, final(core), src_timeline, self.timeline.stream),
-            final(core).node_id == before.node_id,
+            final(core).node_id_spec() == before.node_id_spec(),
             final(core).instance_id() == before.instance_id(),
-            final(core).tiers == before.tiers,
-            final(core).frames.versions@ == before.frames.versions@,
-            final(core).version_registry == before.version_registry,
-            before.spec@.versions_monotonic(final(core).spec@),
+            final(core).tiers_spec() == before.tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == before.frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == before.version_registry_spec(),
+            before.spec_spec()@.versions_monotonic(final(core).spec_spec()@),
             core_transition(
                 &before,
                 final(core),
-                Some(src_timeline),
-                Some(before_stream.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(src_timeline),
+                    Some(before_stream.source().source()),
+                ),
             ),
             ((dst_tier == self.gpu_tier && self.owns_gpu(r.1)) || self.owns_pinned_host(r.1)),
-            final(core).timelines.confirmed_seq[src_timeline as int] + 1
-                == final(core).timelines.next_seq[src_timeline as int],
-            final(core).frames.meta(r.1).state == STATE_PUBLISHED,
-            final(core).frames.frame(r.1).tier == dst_tier,
-            final(core).spec@.versions.contains_key(r.0),
+            final(core).timelines_spec().confirmed_seq_spec()[src_timeline as int] + 1
+                == final(core).timelines_spec().next_seq_spec()[src_timeline as int],
+            final(core).frames_spec().meta(r.1).state == STATE_PUBLISHED,
+            final(core).frames_spec().frame(r.1).tier == dst_tier,
+            final(core).spec_spec()@.versions.contains_key(r.0),
     {
         hide(CacheCore::well_formed);
         hide(replica_valid);
@@ -666,20 +681,25 @@ impl<'a> CudaBackend<'a> {
         hide(FrameTable::same_directory);
         hide(FrameTable::same_layout);
         hide(FrameTable::preserves_initializing);
-        hide(FrameTable::preserves_remote_leases);
+        hide(FrameTable::preserves_fenced_leases);
         let ghost knows_val = knows;
         proof {
             assert(closure_from(after_stream.infos().map(), after_stream.tail()).contains(ev)) by {
                 broadcast use vstd::iset::group_iset_lemmas;
 
             }
-            assert(core.timelines.observed(src_timeline, ticket.sequence(), core.node(), knows));
+            assert(core.timelines_spec().observed(
+                src_timeline,
+                ticket.sequence(),
+                core.node(),
+                knows,
+            ));
         }
         core.mark_timeline_complete(src_timeline, ticket.seq(), Tracked(knows));
         let ver = hop.version;
         let dst_frame = hop.dst_frame;
         let ghost dst_slot = hop.dst_slot@;
-        let ghost lease_slot = hop.src_lease.slot;
+        let ghost lease_slot = hop.src_lease.slot_spec();
         let ghost cert;
         proof {
             cert =
@@ -698,13 +718,13 @@ impl<'a> CudaBackend<'a> {
             assert forall|x: TransferEvent| #[trigger]
                 src_cap.frontier().readers.contains(x) implies core.citations().contains(x)
                 || exists|s: u64|
-                1 <= s <= ticket.sequence() && #[trigger] core.timelines.events@[(
+                1 <= s <= ticket.sequence() && #[trigger] core.timelines_spec().events_spec()@[(
                     ticket.timeline_id(),
                     s,
                 )] == x by {
                 assert(x == ev);
                 let s = ticket.sequence();
-                assert(1 <= s <= ticket.sequence() && core.timelines.events@[(
+                assert(1 <= s <= ticket.sequence() && core.timelines_spec().events_spec()@[(
                     ticket.timeline_id(),
                     s,
                 )] == x);
@@ -722,20 +742,22 @@ impl<'a> CudaBackend<'a> {
             Tracked(instance),
         );
         proof {
-            assert(core.ledger@.submitted.dom() =~= before.ledger@.submitted.dom().insert(ev)) by {
+            assert(core.ledger_spec()@.submitted.dom()
+                =~= before.ledger_spec()@.submitted.dom().insert(ev)) by {
                 broadcast use vstd::imap::group_imap_lemmas;
 
             }
-            assert(core.frames.versions@ =~= before.frames.versions@) by {
+            assert(core.frames_spec().versions_spec()@ =~= before.frames_spec().versions_spec()@)
+                by {
                 broadcast use vstd::map::group_map_lemmas;
 
                 reveal(CacheCore::well_formed);
             }
-            assert(core.spec@.versions.contains_key(ver)) by {
+            assert(core.spec_spec()@.versions.contains_key(ver)) by {
                 broadcast use vstd::map::group_map_lemmas;
 
             }
-            assert(core.frames.frame(dst_frame).tier == dst_tier) by {
+            assert(core.frames_spec().frame(dst_frame).tier == dst_tier) by {
                 reveal(FrameTable::same_layout);
             }
             self.lemma_copy_hop_sync_step_transition(
@@ -759,13 +781,13 @@ impl<'a> CudaBackend<'a> {
     /// `src_timeline`, keeping `&self` shared so RDMA GPU/Host MRs remain valid.
     /// Preserves the existing `VersionId` and `VersionRegistry` without minting
     /// a new version.
-    pub fn copy_hop_sync(
+    pub(crate) fn copy_hop_sync(
         &self,
         core: &mut CacheCore,
         Tracked(instance): Tracked<&TransferInstance>,
         Tracked(shares): Tracked<&mut ShareSource>,
         src_stream: &mut CudaStream,
-        src_timeline: u8,
+        src_timeline: TimelineId,
         src_frame: FrameId,
         dst_tier: TierId,
     ) -> (r: BackendResult<(VersionId, FrameId)>)
@@ -774,9 +796,9 @@ impl<'a> CudaBackend<'a> {
             self.well_formed(old(core)),
             caller_stream_valid(*old(src_stream), old(core), src_timeline, self.timeline.stream),
             src_timeline != self.timeline.timeline_id,
-            old(core).timelines.confirmed_seq[src_timeline as int] + 1 == old(
+            old(core).timelines_spec().confirmed_seq_spec()[src_timeline as int] + 1 == old(
                 core,
-            ).timelines.next_seq[src_timeline as int],
+            ).timelines_spec().next_seq_spec()[src_timeline as int],
             old(src_stream).device() == self.device,
             instance.id() == old(core).instance_id(),
             old(shares).well_formed(),
@@ -794,27 +816,28 @@ impl<'a> CudaBackend<'a> {
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames.versions@ == old(core).frames.versions@,
-            final(core).version_registry == old(core).version_registry,
-            old(core).spec@.versions_monotonic(final(core).spec@),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            old(core).spec_spec()@.versions_monotonic(final(core).spec_spec()@),
             core_transition(
                 old(core),
                 final(core),
-                Some(src_timeline),
-                Some(old(src_stream).source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(src_timeline),
+                    Some(old(src_stream).source().source()),
+                ),
             ),
             r matches Ok((ver, dst_frame)) ==> {
                 &&& ((dst_tier == self.gpu_tier && self.owns_gpu(dst_frame))
                     || self.owns_pinned_host(dst_frame))
-                &&& final(core).timelines.confirmed_seq[src_timeline as int] + 1
-                    == final(core).timelines.next_seq[src_timeline as int]
-                &&& final(core).frames.meta(dst_frame).state == STATE_PUBLISHED
-                &&& final(core).frames.frame(dst_frame).tier == dst_tier
-                &&& final(core).spec@.versions.contains_key(ver)
+                &&& final(core).timelines_spec().confirmed_seq_spec()[src_timeline as int] + 1
+                    == final(core).timelines_spec().next_seq_spec()[src_timeline as int]
+                &&& final(core).frames_spec().meta(dst_frame).state == STATE_PUBLISHED
+                &&& final(core).frames_spec().frame(dst_frame).tier == dst_tier
+                &&& final(core).spec_spec()@.versions.contains_key(ver)
             },
     {
         hide(CacheCore::well_formed);
@@ -824,7 +847,7 @@ impl<'a> CudaBackend<'a> {
         hide(FrameTable::same_directory);
         hide(FrameTable::same_layout);
         hide(FrameTable::preserves_initializing);
-        hide(FrameTable::preserves_remote_leases);
+        hide(FrameTable::preserves_fenced_leases);
         let ghost before = *core;
         let ghost before_stream = *src_stream;
         let src_is_gpu = self.owns_gpu_frame(src_frame);
@@ -839,9 +862,10 @@ impl<'a> CudaBackend<'a> {
             proof {
                 lemma_core_transition_refl(
                     core,
-                    Some(src_timeline),
-                    Some(before_stream.source().source()),
-                    FrameTouchMode::PreserveAllInit,
+                    CoreFootprint::preserve_all(
+                        Some(src_timeline),
+                        Some(before_stream.source().source()),
+                    ),
                 );
             }
             return Err(CoreError::UnsupportedTier);
@@ -851,10 +875,12 @@ impl<'a> CudaBackend<'a> {
                 &&& self.gpu_buffer.well_formed()
                 &&& self.gpu_buffer.node() == before.node()
                 &&& self.gpu_buffer.instance_id() == before.instance_id()
-                &&& self.gpu_buffer.space() is GpuAlloc
-                &&& self.gpu_buffer.space()->GpuAlloc_device == self.device
+                &&& self.gpu_buffer.space().is_gpu()
+                &&& self.gpu_buffer.space().gpu_device() == self.device
                 &&& self.gpu_buffer.num_slots() == self.gpu_num_frames
-                &&& self.gpu_buffer.slot_len() == before.frames.tier_frame_size(self.gpu_tier)
+                &&& self.gpu_buffer.slot_len() == before.frames_spec().tier_frame_size(
+                    self.gpu_tier,
+                )
                 &&& slab_bound_to_core(
                     &before,
                     self.gpu_tier,
@@ -867,10 +893,9 @@ impl<'a> CudaBackend<'a> {
                     &&& h.reg.node() == before.node()
                     &&& h.reg.instance_id() == before.instance_id()
                     &&& h.reg.num_slots() == h.num_frames
-                    &&& h.reg.slot_len() == before.frames.tier_frame_size(h.tier)
-                    &&& before.frames.tier_frame_size(h.tier) == before.frames.tier_frame_size(
-                        self.gpu_tier,
-                    )
+                    &&& h.reg.slot_len() == before.frames_spec().tier_frame_size(h.tier)
+                    &&& before.frames_spec().tier_frame_size(h.tier)
+                        == before.frames_spec().tier_frame_size(self.gpu_tier)
                     &&& slab_bound_to_core(
                         &before,
                         h.tier,
@@ -892,7 +917,8 @@ impl<'a> CudaBackend<'a> {
             Ok(v) => v,
             Err(e) => {
                 proof {
-                    assert(core.frames.versions@ == before.frames.versions@) by {
+                    assert(core.frames_spec().versions_spec()@
+                        == before.frames_spec().versions_spec()@) by {
                         reveal(FrameTable::same_directory);
                     }
                     lemma_core_transition_no_event(
@@ -904,9 +930,10 @@ impl<'a> CudaBackend<'a> {
                     lemma_core_transition_preserves_cuda(
                         &before,
                         core,
-                        Some(src_timeline),
-                        Some(before_stream.source().source()),
-                        FrameTouchMode::PreserveAllInit,
+                        CoreFootprint::preserve_all(
+                            Some(src_timeline),
+                            Some(before_stream.source().source()),
+                        ),
                         self,
                     );
                 }
@@ -928,13 +955,13 @@ impl<'a> CudaBackend<'a> {
                 src_cap.frontier(),
                 slot_frontier(dst_tok),
             );
-            assert(before.frames.frame(hop.dst_frame).slot == hop.dst_slot@) by {
+            assert(before.frames_spec().frame(hop.dst_frame).slot == hop.dst_slot@) by {
                 reveal(FrameTable::same_directory);
             }
         }
-        if core.timelines.next_seq[src_timeline as usize] > MAX_TICKET_SEQ {
+        if core.timelines().next_sequences()[src_timeline as usize] > MAX_TICKET_SEQ {
             let ghost dst_frame = hop.dst_frame;
-            let ghost lease_slot = hop.src_lease.slot;
+            let ghost lease_slot = hop.src_lease.slot_spec();
             core.abort_copy_hop(
                 hop,
                 Tracked(src_cap),
@@ -943,7 +970,8 @@ impl<'a> CudaBackend<'a> {
                 Tracked(instance),
             );
             proof {
-                assert(core.frames.versions@ == before.frames.versions@) by {
+                assert(core.frames_spec().versions_spec()@ == before.frames_spec().versions_spec()@)
+                    by {
                     reveal(FrameTable::same_directory);
                 }
                 Self::lemma_copy_hop_sync_abort_transition(
@@ -958,9 +986,10 @@ impl<'a> CudaBackend<'a> {
                 lemma_core_transition_preserves_cuda(
                     &before,
                     core,
-                    Some(src_timeline),
-                    Some(before_stream.source().source()),
-                    FrameTouchMode::PreserveAllInit,
+                    CoreFootprint::preserve_all(
+                        Some(src_timeline),
+                        Some(before_stream.source().source()),
+                    ),
                     self,
                 );
             }
@@ -999,7 +1028,7 @@ impl<'a> CudaBackend<'a> {
             Self::lemma_put_sync_copy_admitted(core, *src_stream, src_perm, dst_tok, cited);
         }
         let copy_res = {
-            let tracked ledger_ref = core.ledger.borrow_mut();
+            let tracked ledger_ref = core.borrow_ledger_mut();
             cuda::memcpy_async(
                 src_stream,
                 Tracked(instance),
@@ -1017,7 +1046,7 @@ impl<'a> CudaBackend<'a> {
             Ok(v) => v,
             Err(e) => {
                 let ghost dst_frame = hop.dst_frame;
-                let ghost lease_slot = hop.src_lease.slot;
+                let ghost lease_slot = hop.src_lease.slot_spec();
                 core.abort_copy_hop(
                     hop,
                     Tracked(src_cap),
@@ -1026,7 +1055,8 @@ impl<'a> CudaBackend<'a> {
                     Tracked(instance),
                 );
                 proof {
-                    assert(core.frames.versions@ == before.frames.versions@) by {
+                    assert(core.frames_spec().versions_spec()@
+                        == before.frames_spec().versions_spec()@) by {
                         reveal(FrameTable::same_directory);
                     }
                     Self::lemma_copy_hop_sync_abort_transition(
@@ -1041,9 +1071,10 @@ impl<'a> CudaBackend<'a> {
                     lemma_core_transition_preserves_cuda(
                         &before,
                         core,
-                        Some(src_timeline),
-                        Some(before_stream.source().source()),
-                        FrameTouchMode::PreserveAllInit,
+                        CoreFootprint::preserve_all(
+                            Some(src_timeline),
+                            Some(before_stream.source().source()),
+                        ),
                         self,
                     );
                 }
@@ -1070,9 +1101,8 @@ impl<'a> CudaBackend<'a> {
         match sync_res {
             Err(e) => {
                 proof {
-                    assert(core.ledger@.submitted.dom() =~= before.ledger@.submitted.dom().insert(
-                        ev,
-                    )) by {
+                    assert(core.ledger_spec()@.submitted.dom()
+                        =~= before.ledger_spec()@.submitted.dom().insert(ev)) by {
                         broadcast use vstd::imap::group_imap_lemmas;
 
                     }
@@ -1100,13 +1130,13 @@ impl<'a> CudaBackend<'a> {
                         broadcast use vstd::iset::group_iset_lemmas;
 
                     }
-                    assert(sub_val.preds.subset_of(after_hop.ledger@.submitted.dom())) by {
+                    assert(sub_val.preds.subset_of(after_hop.ledger_spec()@.submitted.dom())) by {
                         broadcast use vstd::iset::group_iset_lemmas;
 
                         assert forall|x: TransferEvent| #[trigger]
                             sub_val.preds.contains(
                                 x,
-                            ) implies after_hop.ledger@.submitted.dom().contains(x) by {
+                            ) implies after_hop.ledger_spec()@.submitted.dom().contains(x) by {
                             assert(x != ev);
                         }
                     }

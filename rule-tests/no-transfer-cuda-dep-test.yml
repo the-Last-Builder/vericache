@@ -1,0 +1,22 @@
+id: no-transfer-cuda-dep
+valid:
+  - |
+    use super::*;
+    use crate::memory::HostSlice;
+    use transfer_core::transport::QueuePairEndpoint;
+  - |
+    // use crate::cuda;
+    mod cuda;
+invalid:
+  - |
+    use crate::cuda::Buffer;
+  - |
+    pub use crate::{memory::HostSlice, cuda as driver};
+  - |
+    use super::super::cuda::Buffer;
+  - |
+    verus! {
+        fn cross_driver(_: crate::cuda::Buffer) {}
+    }
+  - |
+    use crate::*;

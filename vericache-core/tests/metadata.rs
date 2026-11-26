@@ -47,7 +47,7 @@ fn run_custom_tier_lifecycle(_src: &mut Sources) {
     assert!(descriptor.id == custom_tier);
     assert!(descriptor.kind == TierKind::Custom(12));
 
-    let tracked host_source = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_source = _src.events.borrow_mut().mint(EventSourceKind::host());
     let mut host_ctx = host::HostContext::new(Tracked(host_source));
     let mut table = TimelineTable::new();
     let host_tl = table.register_timeline(TimelineKind::Custom(12)).unwrap();
@@ -65,7 +65,7 @@ fn run_custom_tier_lifecycle(_src: &mut Sources) {
     ).unwrap();
     let ghost slots = Seq::new(2nat, |i: int| buf.slot_ref(i as nat));
     frames.register_slab(custom_tier, Ghost(slots), tokens, 2, &table, Tracked(&ledger), Ghost(0));
-    assert!(frames.ready_queue[custom_tier.as_index()].len() == 2);
+    assert!(frames.tier_ready_count(custom_tier).unwrap() == 2);
 
     let key = ObjectKey([1, 2, 3, 4]);
     let version = VersionId { origin_node: 7, seq: 42 };
@@ -134,7 +134,7 @@ fn run_custom_tier_lifecycle(_src: &mut Sources) {
         Ghost(KernelView::of(&table, &ledger, 0)),
     );
     assert!(reclaimed == 1);
-    assert!(frames.ready_queue[custom_tier.as_index()].len() == 2);
+    assert!(frames.tier_ready_count(custom_tier).unwrap() == 2);
 }
 
 fn run_cache_core_end_to_end(_src: &mut Sources) {
@@ -167,14 +167,14 @@ fn run_cache_core_end_to_end(_src: &mut Sources) {
     assert!(
         bounded.begin_write(TierId(0), ObjectKey([9, 9, 9, 9])).is_err()
     );
-    assert!(bounded.next_version_seq == 10);
+    assert!(bounded.next_version_sequence() == 10);
     assert!(bounded.allocate_version() == Ok(VersionId { origin_node: 0, seq: 10 }));
     assert!(bounded.allocate_version() == Ok(VersionId { origin_node: 0, seq: 11 }));
     assert!(bounded.allocate_version() == Err(CoreError::SequenceExhausted));
 
     // 2. Two-custom-tier CacheCore lifecycle starting empty and calling `register_tier`.
     let mut core = CacheCore::new(0, frame_size, Vec::new(), 2, Tracked(_src.instance.borrow()));
-    let tracked host_source = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_source = _src.events.borrow_mut().mint(EventSourceKind::host());
     let mut host_ctx = host::HostContext::new(Tracked(host_source));
     let tl = core.register_timeline(TimelineKind::Custom(100)).unwrap();
 
@@ -212,15 +212,15 @@ fn run_cache_core_end_to_end(_src: &mut Sources) {
     let (tier1, first1) = core.register_tier(desc1, Ghost(slots1), 1, tokens1).unwrap();
     assert!(tier0 == TierId(0) && first0 == FrameId(0));
     assert!(tier1 == TierId(1) && first1 == FrameId(2));
-    assert!(core.frames.ready_queue[0].len() == 2);
-    assert!(core.frames.ready_queue[1].len() == 1);
+    assert!(core.tier_ready_count(TierId(0)).unwrap() == 2);
+    assert!(core.tier_ready_count(TierId(1)).unwrap() == 1);
 
     // 3. `begin_write` / `abort_write` returns frame to ready_queue.
     let key_abort = ObjectKey([10, 20, 30, 40]);
     let (handle_abort, tok_abort) = core.begin_write(tier0, key_abort).unwrap();
-    assert!(core.frames.ready_queue[0].len() == 1);
+    assert!(core.tier_ready_count(TierId(0)).unwrap() == 1);
     core.abort_write(handle_abort, tok_abort);
-    assert!(core.frames.ready_queue[0].len() == 2);
+    assert!(core.tier_ready_count(TierId(0)).unwrap() == 2);
 
     // 4. Write and publish into tier0 using ergonomic single-key `CacheCore` transactions.
     let key = ObjectKey([1, 2, 3, 4]);
@@ -233,8 +233,8 @@ fn run_cache_core_end_to_end(_src: &mut Sources) {
         &slice0,
         &payload,
         Tracked(&mut dst_tok),
-        Tracked(&core.ledger.borrow().submitted),
-        Tracked(&core.ledger.borrow().knows),
+        Tracked(&core.ledger().borrow().submitted),
+        Tracked(&core.ledger().borrow().knows),
         Ghost(core.citations()),
     );
     let ticket = core.issue_ticket(tl, Tracked(comp.submitted)).unwrap();
@@ -248,7 +248,7 @@ fn run_cache_core_end_to_end(_src: &mut Sources) {
         Ghost(
             ValueCertificate {
                 slot: slice0.slot_ref(),
-                writer: core.timelines.events@[(tl, ticket.sequence())],
+                writer: core.timeline_event(tl, ticket.sequence()),
                 bytes: payload@,
                 proof: ValueProof::HostWrite,
             },
@@ -272,8 +272,8 @@ fn run_cache_core_end_to_end(_src: &mut Sources) {
         Tracked(_src.instance.borrow()),
     ).unwrap();
     assert!(v1 == write_version && v2 == write_version);
-    assert!(h1.slot != h2.slot);
-    assert!(core.free_lease_slots.is_empty());
+    assert!(h1.slot() != h2.slot());
+    assert!(core.free_lease_count() == 0);
     let extra_lease = core.acquire_local_lease(
         write_frame,
         false,
@@ -282,18 +282,18 @@ fn run_cache_core_end_to_end(_src: &mut Sources) {
     );
     assert!(extra_lease.is_err());
     core.release_local_lease(h1, cap1, Ticket::NONE, Tracked(_src.instance.borrow())).unwrap();
-    assert!(core.free_lease_slots.len() == 1);
+    assert!(core.free_lease_count() == 1);
     let (h3, _v3, _c3, cap3) = core.acquire_local_lease(
         write_frame,
         false,
         Tracked(_src.shares.borrow_mut()),
         Tracked(_src.instance.borrow()),
     ).unwrap();
-    assert!(h3.slot == h1.slot);
-    assert!(h3.generation > h1.generation);
+    assert!(h3.slot() == h1.slot());
+    assert!(h3.generation() > h1.generation());
     core.release_local_lease(h2, cap2, Ticket::NONE, Tracked(_src.instance.borrow())).unwrap();
     core.release_local_lease(h3, cap3, Ticket::NONE, Tracked(_src.instance.borrow())).unwrap();
-    assert!(core.free_lease_slots.len() == 2);
+    assert!(core.free_lease_count() == 2);
 
     // 6. `begin_copy_hop` -> `abort_copy_hop`, then `begin_copy_hop` -> `finish_copy_hop`,
     //    then atomic rollback when `tier1` is exhausted.
@@ -303,7 +303,7 @@ fn run_cache_core_end_to_end(_src: &mut Sources) {
         Tracked(_src.shares.borrow_mut()),
         Tracked(_src.instance.borrow()),
     ).unwrap();
-    assert!(core.frames.ready_queue[1].len() == 0);
+    assert(core.tier_ready_count(TierId(1)).unwrap() != 0);
     core.abort_copy_hop(
         hop_abort,
         src_cap_abort,
@@ -311,8 +311,8 @@ fn run_cache_core_end_to_end(_src: &mut Sources) {
         dst_tok_abort,
         Tracked(_src.instance.borrow()),
     );
-    assert!(core.frames.ready_queue[1].len() == 1);
-    assert!(core.free_lease_slots.len() == 2);
+    assert!(core.tier_ready_count(TierId(1)).unwrap() == 1);
+    assert!(core.free_lease_count() == 2);
 
     let (hop, Tracked(src_cap), Tracked(mut copy_dst_tok)) = core.begin_copy_hop(
         write_frame,
@@ -330,8 +330,8 @@ fn run_cache_core_end_to_end(_src: &mut Sources) {
         &slice0,
         Tracked(&mut src_perm),
         Tracked(&mut copy_dst_tok),
-        Tracked(&core.ledger.borrow().submitted),
-        Tracked(&core.ledger.borrow().knows),
+        Tracked(&core.ledger().borrow().submitted),
+        Tracked(&core.ledger().borrow().knows),
         Ghost(core.citations()),
     );
     let tracked returned_cap = src_perm.into_shared();
@@ -339,7 +339,7 @@ fn run_cache_core_end_to_end(_src: &mut Sources) {
     core.mark_timeline_complete(tl, copy_ticket.seq(), Tracked(copy_comp.knows));
     let ghost dst_cert = copied_certificate(
         hop.src_cert@,
-        core.timelines.events@[(tl, copy_ticket.sequence())],
+        core.timeline_event(tl, copy_ticket.sequence()),
         dst_slice.slot_ref(),
     );
     core.finish_copy_hop(
@@ -351,7 +351,7 @@ fn run_cache_core_end_to_end(_src: &mut Sources) {
         Ghost(dst_cert),
         Tracked(_src.instance.borrow()),
     );
-    assert!(core.free_lease_slots.len() == 2);
+    assert!(core.free_lease_count() == 2);
     assert!(core.lookup_tier(key, tier1) == Some((first1, write_version)));
     assert!(core.lookup_best(key, &[tier1, tier0]) == Some((first1, tier1, write_version)));
 
@@ -364,8 +364,8 @@ fn run_cache_core_end_to_end(_src: &mut Sources) {
         Tracked(_src.instance.borrow()),
     );
     assert!(full_hop.is_err());
-    assert!(core.free_lease_slots.len() == 2);
-    assert!(core.frames.metas[write_frame.0 as usize].active_local_reads == 0);
+    assert!(core.free_lease_count() == 2);
+    assert!(core.frame_meta(write_frame).unwrap().active_local_reads == 0);
 
     // 7. `evict_frame` on both tiers + `reclaim_all_draining`.
     core.evict_frame(write_frame).unwrap();
@@ -373,8 +373,8 @@ fn run_cache_core_end_to_end(_src: &mut Sources) {
     assert!(core.lookup_best(key, &[tier0, tier1]).is_none());
     let reclaimed = core.reclaim_all_draining();
     assert!(reclaimed == 2);
-    assert!(core.frames.ready_queue[0].len() == 2);
-    assert!(core.frames.ready_queue[1].len() == 1);
+    assert!(core.tier_ready_count(TierId(0)).unwrap() == 2);
+    assert!(core.tier_ready_count(TierId(1)).unwrap() == 1);
 }
 
 fn run_sibling_shard_version_range_import(_src: &mut Sources) {
@@ -388,7 +388,7 @@ fn run_sibling_shard_version_range_import(_src: &mut Sources) {
         100,
         Tracked(_src.instance.borrow()),
     );
-    let tracked host_source = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_source = _src.events.borrow_mut().mint(EventSourceKind::host());
     let mut host_ctx = host::HostContext::new(Tracked(host_source));
     let tl = core.register_timeline(TimelineKind::Custom(100)).unwrap();
 
@@ -433,8 +433,8 @@ fn run_sibling_shard_version_range_import(_src: &mut Sources) {
         &slice0,
         &payload,
         Tracked(&mut dst_tok),
-        Tracked(&core.ledger.borrow().submitted),
-        Tracked(&core.ledger.borrow().knows),
+        Tracked(&core.ledger().borrow().submitted),
+        Tracked(&core.ledger().borrow().knows),
         Ghost(core.citations()),
     );
     let ticket = core.issue_ticket(tl, Tracked(comp.submitted)).unwrap();
@@ -447,7 +447,7 @@ fn run_sibling_shard_version_range_import(_src: &mut Sources) {
         Ghost(
             ValueCertificate {
                 slot: slice0.slot_ref(),
-                writer: core.timelines.events@[(tl, ticket.sequence())],
+                writer: core.timeline_event(tl, ticket.sequence()),
                 bytes: payload@,
                 proof: ValueProof::HostWrite,
             },
@@ -489,12 +489,61 @@ fn version_id_and_ticket_packing_round_trip() {
     }
     assert!(Ticket::NONE.is_none());
     assert_eq!(VersionId::NONE.pack(), 0);
-    for timeline in 0..MAX_TIMELINES as u8 {
-        for seq in [1, 255, 1 << 55, MAX_TICKET_SEQ] {
+    for timeline in [
+        0,
+        1,
+        63,
+        255,
+        256,
+        (MAX_TIMELINES - 1) as TimelineId,
+        u16::MAX,
+    ] {
+        for seq in [1, 255, 1 << 47, MAX_TICKET_SEQ] {
             let ticket = Ticket::pack(timeline, seq);
+            assert_eq!(ticket.0, (u64::from(timeline) << 48) | seq);
             assert_eq!((ticket.timeline(), ticket.seq()), (timeline, seq));
             assert!(!ticket.is_none());
         }
+    }
+}
+
+#[test]
+fn timeline_table_appends_until_capacity() {
+    let mut table = TimelineTable::new();
+    assert_eq!(table.kind(0), None);
+    assert_eq!(table.next_sequence(0), None);
+    assert_eq!(table.confirmed_sequence(0), None);
+
+    let kind = TimelineKind::Custom(1);
+    for idx in 0..MAX_TIMELINES {
+        assert_eq!(table.register_timeline(kind), Ok(idx as TimelineId));
+    }
+    assert_eq!(
+        table.register_timeline(TimelineKind::Host),
+        Err(CoreError::CapacityExhausted)
+    );
+    assert_eq!(table.count(), MAX_TIMELINES);
+    for t in 0..MAX_TIMELINES as TimelineId {
+        assert_eq!(table.kind(t), Some(kind));
+        assert_eq!(table.next_sequence(t), Some(1));
+        assert_eq!(table.confirmed_sequence(t), Some(0));
+    }
+}
+
+#[test]
+fn recommended_catalog_buckets_round_up_and_cap() {
+    let cap = MAX_RECOMMENDED_BUCKETS;
+    for (frames, expected) in [
+        (0, DEFAULT_BUCKETS),
+        (DEFAULT_BUCKETS / 2, DEFAULT_BUCKETS),
+        (DEFAULT_BUCKETS / 2 + 1, DEFAULT_BUCKETS * 2),
+        (5000, 16384),
+        (cap / 2, cap),
+        (cap / 2 + 1, cap),
+        (usize::MAX, cap),
+    ] {
+        let buckets = Catalog::recommended_buckets(frames);
+        assert_eq!(buckets, expected);
     }
 }
 

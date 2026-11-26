@@ -1,0 +1,22 @@
+id: no-transfer-host-dep
+valid:
+  - |
+    use super::*;
+    use crate::memory::HostSlice;
+    use transfer_core::transport::QueuePairEndpoint;
+  - |
+    // use crate::host;
+    mod host;
+invalid:
+  - |
+    use crate::host::Buffer;
+  - |
+    pub use crate::{memory::HostSlice, host as driver};
+  - |
+    use super::super::host::Buffer;
+  - |
+    verus! {
+        fn cross_driver(_: crate::host::Buffer) {}
+    }
+  - |
+    use crate::*;

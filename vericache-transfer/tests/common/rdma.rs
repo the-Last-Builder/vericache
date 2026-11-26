@@ -118,12 +118,12 @@ impl Node {
         let (instance, alloc, Tracked(mut sources), shares) = NodeContext::bootstrap(
             id,
         ).into_sources();
-        let host = HostContext::new(Tracked(sources.mint(EventSourceKind::Host)));
+        let host = HostContext::new(Tracked(sources.mint(EventSourceKind::host())));
         Self { id, instance, alloc, sources: Tracked(sources), shares, host }
     }
 
     pub fn name(&mut self) -> Tracked<EventSourceToken> {
-        Tracked(self.sources.borrow_mut().mint(EventSourceKind::RdmaQueuePair))
+        Tracked(self.sources.borrow_mut().mint(EventSourceKind::rdma_qp()))
     }
 
     pub fn channel(&self, t: TcpTransport) -> Channel<TcpTransport> {

@@ -45,6 +45,9 @@ pub struct JobSpec {
     pub num_blocks: usize,
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
+    /// Number of QPs for the pre-bound raw MW benchmark.
+    #[serde(default)]
+    pub raw_qps: Option<usize>,
     #[serde(default = "default_warmup")]
     pub warmup_iters: usize,
     #[serde(default = "default_iters")]

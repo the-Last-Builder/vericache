@@ -13,8 +13,7 @@ audit:
     ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-unsafe.yml src tests
     ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-unverified-code.yml src
     ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-panicking-stubs.yml src
-    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-hardware-import-in-core.yml src/spec.rs src/provenance src/timeline src/frame src/catalog src/kernel
-    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-cuda-dep.yml src/backends/host src/backends/nvme
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-cuda-dep.yml src/backends/host src/backends/nvme src/engine
     ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-nvme-dep.yml src/backends/host src/backends/cuda src/backends/rdma
     ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-remote-dep.yml src/backends/host src/backends/cuda src/backends/nvme
 

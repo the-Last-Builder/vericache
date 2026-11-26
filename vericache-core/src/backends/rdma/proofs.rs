@@ -9,16 +9,16 @@ pub(super) proof fn lemma_rdma_init_window_wf(
     ops: [Option<PendingOperation>; BITMAP_SLOTS],
     bitmap: SlidingBitmap,
     table: &TimelineTable,
-    t: u8,
+    t: TimelineId,
     ledger: &KnowledgeLedger,
     cq: rdma::CqSnapshot,
     id: InstanceId,
 )
     requires
-        t < table.count,
+        t < table.count_spec(),
         table.well_formed(id, cq.observer, ledger),
-        table.next_seq[t as int] == 1,
-        table.confirmed_seq[t as int] == 0,
+        table.next_seq_spec()[t as int] == 1,
+        table.confirmed_seq_spec()[t as int] == 0,
         bitmap.well_formed(),
         forall|j: int| !#[trigger] bitmap.bit_set(j),
         forall|j: int| 0 <= j < BITMAP_CAPACITY ==> #[trigger] ops[j] == None,
@@ -40,7 +40,7 @@ pub(super) proof fn lemma_rdma_control_wr_id_fresh(
     ops: [Option<PendingOperation>; BITMAP_SLOTS],
     bitmap: SlidingBitmap,
     table: &TimelineTable,
-    t: u8,
+    t: TimelineId,
     ledger: &KnowledgeLedger,
     cq: rdma::CqSnapshot,
     id: InstanceId,
@@ -58,8 +58,8 @@ pub(super) proof fn lemma_rdma_control_wr_id_fresh(
     if cq.pending.contains_key(next_control_wr_id) {
         if cq.pending[next_control_wr_id].kind is DataTransfer {
             assert(rdma_data_events(cq).contains_key(next_control_wr_id));
-            assert(next_control_wr_id < table.next_seq[t as int]);
-            assert(table.next_seq[t as int] <= MAX_TICKET_SEQ + 1);
+            assert(next_control_wr_id < table.next_seq_spec()[t as int]);
+            assert(table.next_seq_spec()[t as int] <= MAX_TICKET_SEQ + 1);
             assert(false);
         } else {
             assert(next_control_wr_id < next_control_wr_id);
@@ -74,7 +74,7 @@ pub(super) proof fn lemma_rdma_window_after_control_post(
     ops: [Option<PendingOperation>; BITMAP_SLOTS],
     bitmap: SlidingBitmap,
     table: &TimelineTable,
-    t: u8,
+    t: TimelineId,
     ledger: &KnowledgeLedger,
     before_cq: rdma::CqSnapshot,
     after_cq: rdma::CqSnapshot,
@@ -98,13 +98,13 @@ pub(super) proof fn lemma_rdma_window_after_control_post(
 }
 
 /// Preserve `rdma_window_wf` when `table` only changes watermarks (`only_watermarks`)
-/// and `ledger`, `cq`, `ops`, `bitmap` are unchanged (e.g., `unpin_remote_lease`).
+/// and `ledger`, `cq`, `ops`, `bitmap` are unchanged (e.g., `unpin_fenced_lease`).
 pub(super) proof fn lemma_rdma_window_after_watermarks(
     ops: [Option<PendingOperation>; BITMAP_SLOTS],
     bitmap: SlidingBitmap,
     before_table: &TimelineTable,
     after_table: &TimelineTable,
-    t: u8,
+    t: TimelineId,
     ledger: &KnowledgeLedger,
     cq: rdma::CqSnapshot,
     id: InstanceId,
@@ -126,7 +126,7 @@ pub(super) proof fn lemma_rdma_window_after_fence_ledger(
     ops: [Option<PendingOperation>; BITMAP_SLOTS],
     bitmap: SlidingBitmap,
     table: &TimelineTable,
-    t: u8,
+    t: TimelineId,
     before_ledger: &KnowledgeLedger,
     after_ledger: &KnowledgeLedger,
     cq: rdma::CqSnapshot,
@@ -145,10 +145,10 @@ pub(super) proof fn lemma_rdma_window_after_fence_ledger(
     reveal(rdma_window_wf);
     assert(bitmap.observations(table, t, cq.observer, after_ledger)) by {
         assert forall|i: int| #[trigger] bitmap.bit_set(i) implies {
-            let s = (table.confirmed_seq[t as int] + 1 + i) as u64;
+            let s = (table.confirmed_seq_spec()[t as int] + 1 + i) as u64;
             table.issued(t, s) && table.observed(t, s, cq.observer, after_ledger.knows)
         } by {
-            let s = (table.confirmed_seq[t as int] + 1 + i) as u64;
+            let s = (table.confirmed_seq_spec()[t as int] + 1 + i) as u64;
             assert(table.observed(t, s, cq.observer, before_ledger.knows));
         }
     }
@@ -167,6 +167,7 @@ pub(super) proof fn lemma_rdma_leases_empty<'a>(
         rdma_leases_valid(leases, pool, qp, core),
 {
     reveal(rdma_leases_disjoint);
+    reveal(rdma_pinned_shares_disjoint);
     reveal(rdma_leases_valid);
 }
 
@@ -211,8 +212,8 @@ pub(super) proof fn lemma_rdma_free_slot_not_in_leases<'a>(
 }
 
 /// Preserve one `ActiveRemoteLease` across a `CacheCore` + `WindowPool` update
-/// that only touches `touched_slot` (disjoint from `lease.mw_slot`) and optionally
-/// adds or removes one remote share on `touched_frame` (disjoint from `lease.share@`).
+/// that only touches `touched_slot` (disjoint from `lease.mw_slot`) and preserves
+/// the lease's fenced share if it touches the lease's frame.
 proof fn lemma_rdma_one_lease_preserved<'a>(
     lease: &ActiveRemoteLease,
     before_pool: &WindowPool<'a>,
@@ -223,8 +224,6 @@ proof fn lemma_rdma_one_lease_preserved<'a>(
     after_core: &CacheCore,
     touched_slot: Option<u32>,
     touched_frame: Option<FrameId>,
-    removed_share: Option<TransferShare>,
-    added_share: Option<TransferShare>,
 )
     requires
         lease.valid(before_pool, before_qp, before_core),
@@ -237,41 +236,10 @@ proof fn lemma_rdma_one_lease_preserved<'a>(
         forall|j: int|
             0 <= j < after_pool.slots.len() && (touched_slot matches Some(ts) ==> j != ts as int)
                 ==> (#[trigger] after_pool.slots[j]) == before_pool.slots[j],
-        after_core.frames.same_directory(&before_core.frames),
-        after_core.frames.same_other_pins(&before_core.frames, touched_frame),
-        touched_frame == Some(lease.frame) && !lease.is_unpinned() ==> {
-            let tf = lease.frame;
-            &&& removed_share is None || added_share is None
-            &&& match removed_share {
-                None => true,
-                Some(rs) => {
-                    &&& rs != lease.share@
-                    &&& after_core.frames.frame(tf).remote_shares == before_core.frames.frame(
-                        tf,
-                    ).remote_shares.remove(rs)
-                },
-            }
-            &&& match added_share {
-                None => true,
-                Some(as_) => {
-                    &&& as_ != lease.share@
-                    &&& after_core.frames.frame(tf).remote_shares.contains_key(as_)
-                    &&& forall|s: TransferShare|
-                        s != as_ && #[trigger] before_core.frames.frame(
-                            tf,
-                        ).remote_shares.contains_key(s) ==> after_core.frames.frame(
-                            tf,
-                        ).remote_shares.contains_key(s) && after_core.frames.frame(
-                            tf,
-                        ).remote_shares[s] == before_core.frames.frame(tf).remote_shares[s]
-                },
-            }
-            &&& (removed_share is None && added_share is None) ==> after_core.frames.frame(
-                tf,
-            ).remote_shares == before_core.frames.frame(tf).remote_shares && after_core.frames.meta(
-                tf,
-            ).active_remote_leases == before_core.frames.meta(tf).active_remote_leases
-        },
+        after_core.frames_spec().same_directory(&before_core.frames_spec()),
+        after_core.frames_spec().same_other_pins(&before_core.frames_spec(), touched_frame),
+        touched_frame == Some(lease.frame) && !lease.is_unpinned()
+            ==> after_core.frames_spec().frame(lease.frame).has_fenced_share(lease.share@),
     ensures
         lease.valid(after_pool, after_qp, after_core),
 {
@@ -280,61 +248,50 @@ proof fn lemma_rdma_one_lease_preserved<'a>(
     hide(complete_receipts);
     hide(FrameTable::same_directory);
     hide(FrameTable::same_other_pins);
-    assert(after_core.frames.metas.len() == before_core.frames.metas.len()
-        && after_core.frames.frame(lease.frame).slot == before_core.frames.frame(lease.frame).slot)
-        by {
+    assert(after_core.frames_spec().metas_spec().len()
+        == before_core.frames_spec().metas_spec().len() && after_core.frames_spec().frame(
+        lease.frame,
+    ).slot == before_core.frames_spec().frame(lease.frame).slot) by {
         reveal(FrameTable::same_directory);
     }
     assert(after_pool.slots[lease.mw_slot as int] == before_pool.slots[lease.mw_slot as int]);
     if !lease.is_unpinned() {
         if touched_frame != Some(lease.frame) {
-            assert(after_core.frames.meta(lease.frame).active_remote_leases
-                == before_core.frames.meta(lease.frame).active_remote_leases
-                && after_core.frames.frame(lease.frame).remote_shares == before_core.frames.frame(
-                lease.frame,
-            ).remote_shares) by {
+            assert(after_core.frames_spec().meta(lease.frame).active_fenced_leases
+                == before_core.frames_spec().meta(lease.frame).active_fenced_leases
+                && after_core.frames_spec().frame(lease.frame).fenced_shares
+                == before_core.frames_spec().frame(lease.frame).fenced_shares) by {
                 reveal(FrameTable::same_directory);
                 reveal(FrameTable::same_other_pins);
             }
         } else {
-            assert(after_core.frames.frame(lease.frame).matches_lease(
-                lease.share@,
-                lease.mw_slot,
-                lease.generation,
-            )) by {
-                broadcast use vstd::map::group_map_lemmas;
-
-            }
-            assert(after_core.frames.meta(lease.frame).active_remote_leases > 0) by {
-                lemma_frame_remote_share_implies_nonzero(after_core, lease.frame, lease.share@);
+            assert(after_core.frames_spec().meta(lease.frame).active_fenced_leases > 0) by {
+                lemma_frame_fenced_share_implies_nonzero(after_core, lease.frame, lease.share@);
             }
         }
     }
 }
 
-/// Pure helper: if a published/well-formed frame contains `share` in `remote_shares`,
-/// then `meta.active_remote_leases > 0`.
-pub(in crate::backends) proof fn lemma_frame_remote_share_implies_nonzero(
+/// A recorded fenced share contributes to the active lease count.
+pub(in crate::backends) proof fn lemma_frame_fenced_share_implies_nonzero(
     core: &CacheCore,
     f: FrameId,
     share: TransferShare,
 )
     requires
         core.well_formed(),
-        f.0 < core.frames.metas.len(),
-        core.frames.frame(f).remote_shares.contains_key(share),
+        f.0 < core.frames_spec().metas_spec().len(),
+        core.frames_spec().frame(f).has_fenced_share(share),
     ensures
-        core.frames.meta(f).active_remote_leases > 0,
+        core.frames_spec().meta(f).active_fenced_leases > 0,
 {
-    assert(core.frames.valid_frame(f, core.kernel_view()));
-    assert(core.frames.frame(f).authority(core.frames.meta(f), core.instance_id()));
-    broadcast use vstd::map::group_map_lemmas;
-
-    assert(core.frames.frame(f).remote_shares.len() >= 1);
+    assert(core.frames_spec().valid_frame(f, core.kernel_view()));
+    assert(core.frames_spec().frame(f).authority(core.frames_spec().meta(f), core.instance_id()));
+    vstd::set::lemma_set_contains_len(core.frames_spec().frame(f).fenced_shares, share);
 }
 
 /// Push one newly valid `ActiveRemoteLease` (whose `mw_slot` was disjoint from
-/// all prior leases) after `pin_remote_lease` + `post_bind`.
+/// all prior leases) after `pin_fenced_lease` + `post_bind`.
 pub(super) proof fn lemma_rdma_leases_push<'a>(
     before: Seq<ActiveRemoteLease>,
     after: Seq<ActiveRemoteLease>,
@@ -358,18 +315,13 @@ pub(super) proof fn lemma_rdma_leases_push<'a>(
         forall|j: int|
             0 <= j < after_pool.slots.len() && j != new_lease.mw_slot as int ==> (
             #[trigger] after_pool.slots[j]) == before_pool.slots[j],
-        after_core.frames.same_directory(&before_core.frames),
-        after_core.frames.same_other_pins(&before_core.frames, Some(new_lease.frame)),
-        !before_core.frames.frame(new_lease.frame).remote_shares.contains_key(new_lease.share@),
-        after_core.frames.frame(new_lease.frame).remote_shares.contains_key(new_lease.share@),
-        forall|s: TransferShare|
-            s != new_lease.share@ && #[trigger] before_core.frames.frame(
-                new_lease.frame,
-            ).remote_shares.contains_key(s) ==> after_core.frames.frame(
-                new_lease.frame,
-            ).remote_shares.contains_key(s) && after_core.frames.frame(
-                new_lease.frame,
-            ).remote_shares[s] == before_core.frames.frame(new_lease.frame).remote_shares[s],
+        after_core.frames_spec().same_directory(&before_core.frames_spec()),
+        after_core.frames_spec().same_other_pins(&before_core.frames_spec(), Some(new_lease.frame)),
+        !before_core.frames_spec().frame(new_lease.frame).has_fenced_share(new_lease.share@),
+        after_core.frames_spec().frame(new_lease.frame).fenced_shares
+            == before_core.frames_spec().frame(new_lease.frame).fenced_shares.insert(
+            new_lease.share@,
+        ),
     ensures
         rdma_leases_valid(after, after_pool, qp, after_core),
 {
@@ -378,14 +330,25 @@ pub(super) proof fn lemma_rdma_leases_push<'a>(
     hide(complete_receipts);
     hide(ActiveRemoteLease::valid);
     reveal(rdma_leases_disjoint);
+    reveal(rdma_pinned_shares_disjoint);
     reveal(rdma_leases_valid);
     let n = before.len();
-    assert forall|i: int, j: int| 0 <= i < j < after.len() implies (#[trigger] after[i]).mw_slot
-        != (#[trigger] after[j]).mw_slot by {
+    assert forall|i: int, j: int| 0 <= i < j < after.len() implies {
+        &&& (#[trigger] after[i]).mw_slot != (#[trigger] after[j]).mw_slot
+        &&& !after[i].is_unpinned() && !after[j].is_unpinned() && after[i].frame == after[j].frame
+            ==> after[i].share@ != after[j].share@
+    } by {
         if j < n {
             assert(after[i] == before[i] && after[j] == before[j]);
         } else {
             assert(after[i] == before[i] && after[j] == new_lease);
+            if !before[i].is_unpinned() && before[i].frame == new_lease.frame {
+                assert(before_core.frames_spec().frame(new_lease.frame).has_fenced_share(
+                    before[i].share@,
+                )) by {
+                    reveal(ActiveRemoteLease::valid);
+                }
+            }
         }
     }
     assert forall|i: int| 0 <= i < after.len() implies (#[trigger] after[i]).valid(
@@ -396,12 +359,12 @@ pub(super) proof fn lemma_rdma_leases_push<'a>(
         if i < n {
             assert(after[i] == before[i]);
             if before[i].frame == new_lease.frame && !before[i].is_unpinned() {
-                assert(before[i].share@ != new_lease.share@) by {
+                assert(after_core.frames_spec().frame(new_lease.frame).has_fenced_share(
+                    before[i].share@,
+                )) by {
                     reveal(ActiveRemoteLease::valid);
-                    assert(before[i].valid(before_pool, qp, before_core));
-                    assert(before_core.frames.frame(new_lease.frame).remote_shares.contains_key(
-                        before[i].share@,
-                    ));
+                    broadcast use vstd::set::group_set_lemmas;
+
                 }
             }
             lemma_rdma_one_lease_preserved(
@@ -414,8 +377,6 @@ pub(super) proof fn lemma_rdma_leases_push<'a>(
                 after_core,
                 Some(new_lease.mw_slot),
                 Some(new_lease.frame),
-                None,
-                Some(new_lease.share@),
             );
         }
     }
@@ -439,6 +400,9 @@ pub(super) proof fn lemma_rdma_leases_update_in_place<'a>(
         0 <= idx < before.len(),
         after.len() == before.len(),
         after[idx].mw_slot == before[idx].mw_slot,
+        after[idx].frame == before[idx].frame,
+        after[idx].share@ == before[idx].share@,
+        !after[idx].is_unpinned() ==> !before[idx].is_unpinned(),
         after[idx].valid(after_pool, qp, after_core),
         forall|j: int| 0 <= j < before.len() && j != idx ==> (#[trigger] after[j]) == before[j],
         before_core.well_formed(),
@@ -448,19 +412,18 @@ pub(super) proof fn lemma_rdma_leases_update_in_place<'a>(
         forall|j: int|
             0 <= j < after_pool.slots.len() && j != before[idx].mw_slot as int ==> (
             #[trigger] after_pool.slots[j]) == before_pool.slots[j],
-        after_core.frames.same_directory(&before_core.frames),
-        after_core.frames.same_other_pins(&before_core.frames, Some(before[idx].frame)),
+        after_core.frames_spec().same_directory(&before_core.frames_spec()),
+        after_core.frames_spec().same_other_pins(
+            &before_core.frames_spec(),
+            Some(before[idx].frame),
+        ),
         match removed_share {
-            None => after_core.frames == before_core.frames,
+            None => after_core.frames_spec() == before_core.frames_spec(),
             Some(rs) => {
                 &&& rs == before[idx].share@
-                &&& before_core.frames.frame(before[idx].frame).matches_lease(
-                    rs,
-                    before[idx].mw_slot,
-                    before[idx].generation,
-                )
-                &&& after_core.frames.frame(before[idx].frame).remote_shares
-                    == before_core.frames.frame(before[idx].frame).remote_shares.remove(rs)
+                &&& !before[idx].is_unpinned()
+                &&& after_core.frames_spec().frame(before[idx].frame).fenced_shares
+                    == before_core.frames_spec().frame(before[idx].frame).fenced_shares.remove(rs)
             },
         },
     ensures
@@ -471,10 +434,14 @@ pub(super) proof fn lemma_rdma_leases_update_in_place<'a>(
     hide(complete_receipts);
     hide(ActiveRemoteLease::valid);
     reveal(rdma_leases_disjoint);
+    reveal(rdma_pinned_shares_disjoint);
     reveal(rdma_leases_valid);
     let slot_i = before[idx].mw_slot;
-    assert forall|i: int, j: int| 0 <= i < j < after.len() implies (#[trigger] after[i]).mw_slot
-        != (#[trigger] after[j]).mw_slot by {
+    assert forall|i: int, j: int| 0 <= i < j < after.len() implies {
+        &&& (#[trigger] after[i]).mw_slot != (#[trigger] after[j]).mw_slot
+        &&& !after[i].is_unpinned() && !after[j].is_unpinned() && after[i].frame == after[j].frame
+            ==> after[i].share@ != after[j].share@
+    } by {
         assert(after[i].mw_slot == before[i].mw_slot);
         assert(after[j].mw_slot == before[j].mw_slot);
     }
@@ -486,17 +453,13 @@ pub(super) proof fn lemma_rdma_leases_update_in_place<'a>(
         if i != idx {
             assert(after[i] == before[i]);
             assert(before[i].mw_slot != slot_i);
-            if let Some(rs) = removed_share {
-                if before[i].frame == before[idx].frame && !before[i].is_unpinned() {
-                    assert(rs != before[i].share@) by {
-                        reveal(ActiveRemoteLease::valid);
-                        assert(before[i].valid(before_pool, qp, before_core));
-                        assert(before_core.frames.frame(before[idx].frame).matches_lease(
-                            before[i].share@,
-                            before[i].mw_slot,
-                            before[i].generation,
-                        ));
-                    }
+            if before[i].frame == before[idx].frame && !before[i].is_unpinned() {
+                assert(after_core.frames_spec().frame(before[idx].frame).has_fenced_share(
+                    before[i].share@,
+                )) by {
+                    reveal(ActiveRemoteLease::valid);
+                    broadcast use vstd::set::group_set_lemmas;
+
                 }
             }
             lemma_rdma_one_lease_preserved(
@@ -509,8 +472,6 @@ pub(super) proof fn lemma_rdma_leases_update_in_place<'a>(
                 after_core,
                 Some(slot_i),
                 Some(before[idx].frame),
-                removed_share,
-                None,
             );
         }
     }
@@ -548,19 +509,18 @@ pub(super) proof fn lemma_rdma_leases_swap_remove<'a>(
         forall|j: int|
             0 <= j < after_pool.slots.len() && j != before[idx].mw_slot as int ==> (
             #[trigger] after_pool.slots[j]) == before_pool.slots[j],
-        after_core.frames.same_directory(&before_core.frames),
-        after_core.frames.same_other_pins(&before_core.frames, Some(before[idx].frame)),
+        after_core.frames_spec().same_directory(&before_core.frames_spec()),
+        after_core.frames_spec().same_other_pins(
+            &before_core.frames_spec(),
+            Some(before[idx].frame),
+        ),
         match removed_share {
-            None => after_core.frames == before_core.frames,
+            None => after_core.frames_spec() == before_core.frames_spec(),
             Some(rs) => {
                 &&& rs == before[idx].share@
-                &&& before_core.frames.frame(before[idx].frame).matches_lease(
-                    rs,
-                    before[idx].mw_slot,
-                    before[idx].generation,
-                )
-                &&& after_core.frames.frame(before[idx].frame).remote_shares
-                    == before_core.frames.frame(before[idx].frame).remote_shares.remove(rs)
+                &&& !before[idx].is_unpinned()
+                &&& after_core.frames_spec().frame(before[idx].frame).fenced_shares
+                    == before_core.frames_spec().frame(before[idx].frame).fenced_shares.remove(rs)
             },
         },
     ensures
@@ -571,11 +531,15 @@ pub(super) proof fn lemma_rdma_leases_swap_remove<'a>(
     hide(complete_receipts);
     hide(ActiveRemoteLease::valid);
     reveal(rdma_leases_disjoint);
+    reveal(rdma_pinned_shares_disjoint);
     reveal(rdma_leases_valid);
     let last = before.len() - 1;
     let slot_i = before[idx].mw_slot;
-    assert forall|i: int, j: int| 0 <= i < j < after.len() implies (#[trigger] after[i]).mw_slot
-        != (#[trigger] after[j]).mw_slot by {
+    assert forall|i: int, j: int| 0 <= i < j < after.len() implies {
+        &&& (#[trigger] after[i]).mw_slot != (#[trigger] after[j]).mw_slot
+        &&& !after[i].is_unpinned() && !after[j].is_unpinned() && after[i].frame == after[j].frame
+            ==> after[i].share@ != after[j].share@
+    } by {
         let bi = if i == idx {
             last
         } else {
@@ -613,17 +577,13 @@ pub(super) proof fn lemma_rdma_leases_swap_remove<'a>(
                 assert(before[idx].mw_slot != before[bi].mw_slot);
             }
         }
-        if let Some(rs) = removed_share {
-            if before[bi].frame == before[idx].frame && !before[bi].is_unpinned() {
-                assert(rs != before[bi].share@) by {
-                    reveal(ActiveRemoteLease::valid);
-                    assert(before[bi].valid(before_pool, before_qp, before_core));
-                    assert(before_core.frames.frame(before[idx].frame).matches_lease(
-                        before[bi].share@,
-                        before[bi].mw_slot,
-                        before[bi].generation,
-                    ));
-                }
+        if before[bi].frame == before[idx].frame && !before[bi].is_unpinned() {
+            assert(after_core.frames_spec().frame(before[idx].frame).has_fenced_share(
+                before[bi].share@,
+            )) by {
+                reveal(ActiveRemoteLease::valid);
+                broadcast use vstd::set::group_set_lemmas;
+
             }
         }
         lemma_rdma_one_lease_preserved(
@@ -636,8 +596,6 @@ pub(super) proof fn lemma_rdma_leases_swap_remove<'a>(
             after_core,
             Some(slot_i),
             Some(before[idx].frame),
-            removed_share,
-            None,
         );
     }
 }
@@ -714,7 +672,7 @@ pub(super) proof fn lemma_rdma_leases_after_qp_state_change<'a>(
     }
 }
 
-/// Preserve `RegisteredSlab` invariants when `core.frames` is unchanged or has
+/// Preserve `RegisteredSlab` invariants when `core.frames_spec()` is unchanged or has
 /// `same_directory`.
 pub(super) proof fn lemma_rdma_slabs_same_directory<'a>(
     host_mr: &Option<RegisteredSlab<'a>>,
@@ -726,10 +684,10 @@ pub(super) proof fn lemma_rdma_slabs_same_directory<'a>(
     requires
         before_core.well_formed(),
         after_core.well_formed(),
-        after_core.node_id == before_core.node_id,
+        after_core.node_id_spec() == before_core.node_id_spec(),
         after_core.instance_id() == before_core.instance_id(),
-        after_core.tiers == before_core.tiers,
-        after_core.frames.same_directory(&before_core.frames),
+        after_core.tiers_spec() == before_core.tiers_spec(),
+        after_core.frames_spec().same_directory(&before_core.frames_spec()),
         host_mr matches Some(s) ==> s.well_formed(before_core, pd_id),
         gpu_mr matches Some(s) ==> s.well_formed(before_core, pd_id),
     ensures
@@ -784,9 +742,9 @@ pub(super) proof fn lemma_rdma_leases_same_pool_slots<'a>(
     }
 }
 
-/// Preserve `rdma_leases_valid` when only `core.timelines` and `core.ledger`
+/// Preserve `rdma_leases_valid` when only `core.timelines_spec()` and `core.ledger`
 /// advance (e.g., `poll_cq`, `record_data_submission`, `record_data_batch`) and
-/// `core.frames` is completely unchanged.
+/// `core.frames_spec()` is completely unchanged.
 pub(super) proof fn lemma_rdma_leases_same_frames<'a>(
     leases: Seq<ActiveRemoteLease>,
     pool: &WindowPool<'a>,
@@ -797,7 +755,7 @@ pub(super) proof fn lemma_rdma_leases_same_frames<'a>(
     requires
         rdma_leases_valid(leases, pool, qp, before_core),
         after_core.instance_id() == before_core.instance_id(),
-        after_core.frames == before_core.frames,
+        after_core.frames_spec() == before_core.frames_spec(),
     ensures
         rdma_leases_valid(leases, pool, qp, after_core),
 {
@@ -863,7 +821,7 @@ pub(super) proof fn lemma_rdma_leases_swap_remove_preserves(
     }
 }
 
-/// Preserve all 4 RDMA slab invariants (owned + shared) when `core.frames` has `same_directory`.
+/// Preserve all 4 RDMA slab invariants (owned + shared) when `core.frames_spec()` has `same_directory`.
 pub(super) proof fn lemma_rdma_all_slabs_same_directory<'a>(
     host_mr: &Option<RegisteredSlab<'a>>,
     gpu_mr: &Option<RegisteredSlab<'a>>,
@@ -876,10 +834,10 @@ pub(super) proof fn lemma_rdma_all_slabs_same_directory<'a>(
     requires
         before_core.well_formed(),
         after_core.well_formed(),
-        after_core.node_id == before_core.node_id,
+        after_core.node_id_spec() == before_core.node_id_spec(),
         after_core.instance_id() == before_core.instance_id(),
-        after_core.tiers == before_core.tiers,
-        after_core.frames.same_directory(&before_core.frames),
+        after_core.tiers_spec() == before_core.tiers_spec(),
+        after_core.frames_spec().same_directory(&before_core.frames_spec()),
         host_mr matches Some(s) ==> s.well_formed(before_core, pd_id),
         gpu_mr matches Some(s) ==> s.well_formed(before_core, pd_id),
         shared_host_mr matches Some(s) ==> s.well_formed_shared(before_core, pd_id),
@@ -923,19 +881,19 @@ pub(super) proof fn lemma_completed_pulls_after_step(
     completed_pulls: [Option<(u64, Result<(), i32>)>; BITMAP_SLOTS],
     before_table: &TimelineTable,
     after_table: &TimelineTable,
-    t: u8,
+    t: TimelineId,
     observer: NodeId,
     before_ledger: &KnowledgeLedger,
     after_ledger: &KnowledgeLedger,
 )
     requires
         completed_pulls_wf(completed_pulls, before_table, t, observer, before_ledger),
-        t < before_table.count,
-        after_table.count == before_table.count,
-        after_table.next_seq[t as int] >= before_table.next_seq[t as int],
+        t < before_table.count_spec(),
+        after_table.count_spec() == before_table.count_spec(),
+        after_table.next_seq_spec()[t as int] >= before_table.next_seq_spec()[t as int],
         forall|s: u64|
-            before_table.issued(t, s) ==> #[trigger] after_table.events@[(t, s)]
-                == before_table.events@[(t, s)],
+            before_table.issued(t, s) ==> #[trigger] after_table.events_spec()@[(t, s)]
+                == before_table.events_spec()@[(t, s)],
         before_ledger.knows.set().subset_of(after_ledger.knows.set()),
         before_ledger.succeeded.dom().subset_of(after_ledger.succeeded.dom()),
     ensures
@@ -948,15 +906,15 @@ pub(super) proof fn lemma_completed_pulls_after_step(
         Some((seq, st)) => {
             &&& ((seq as int) % (BITMAP_CAPACITY as int)) == i
             &&& after_table.issued(t, seq)
-            &&& after_ledger.knows.set().contains((observer, after_table.events@[(t, seq)]))
+            &&& after_ledger.knows.set().contains((observer, after_table.events_spec()@[(t, seq)]))
             &&& (st.is_ok() ==> after_ledger.succeeded.dom().contains(
-                after_table.events@[(t, seq)],
+                after_table.events_spec()@[(t, seq)],
             ))
         },
     } by {
         if let Some((seq, st)) = completed_pulls[i] {
             assert(before_table.issued(t, seq));
-            assert(after_table.events@[(t, seq)] == before_table.events@[(t, seq)]);
+            assert(after_table.events_spec()@[(t, seq)] == before_table.events_spec()@[(t, seq)]);
         }
     }
 }
@@ -1520,8 +1478,8 @@ pub(super) proof fn lemma_swap_remove_foreign_shares_same_pins(
             } else {
                 before_leases[j]
             },
-        after_core.frames.metas.len() == before_core.frames.metas.len(),
-        after_core.frames.preserves_remote_leases(&before_core.frames),
+        after_core.frames_spec().metas_spec().len() == before_core.frames_spec().metas_spec().len(),
+        after_core.frames_spec().preserves_fenced_leases(&before_core.frames_spec()),
     ensures
         peer_foreign_shares_preserved(before_core, after_core, before_leases, after_leases),
 {
@@ -1549,8 +1507,8 @@ pub(super) proof fn lemma_foreign_shares_identical_pins(
     leases: Seq<ActiveRemoteLease>,
 )
     requires
-        after_core.frames.metas.len() == before_core.frames.metas.len(),
-        after_core.frames.preserves_remote_leases(&before_core.frames),
+        after_core.frames_spec().metas_spec().len() == before_core.frames_spec().metas_spec().len(),
+        after_core.frames_spec().preserves_fenced_leases(&before_core.frames_spec()),
     ensures
         peer_foreign_shares_preserved(before_core, after_core, leases, leases),
 {
@@ -1573,7 +1531,7 @@ pub(super) proof fn lemma_swap_remove_foreign_shares_after_unpin(
     requires
         0 <= idx < before_leases.len(),
         !before_leases[idx].is_unpinned(),
-        before_leases[idx].frame.0 < before_core.frames.metas.len(),
+        before_leases[idx].frame.0 < before_core.frames_spec().metas_spec().len(),
         after_leases.len() == before_leases.len() - 1,
         forall|j: int|
             0 <= j < after_leases.len() ==> (#[trigger] after_leases[j]) == if j == idx {
@@ -1581,11 +1539,15 @@ pub(super) proof fn lemma_swap_remove_foreign_shares_after_unpin(
             } else {
                 before_leases[j]
             },
-        after_core.frames.metas.len() == before_core.frames.metas.len(),
-        after_core.frames.same_other_pins(&before_core.frames, Some(before_leases[idx].frame)),
-        after_core.frames.frame(before_leases[idx].frame).remote_shares == before_core.frames.frame(
-            before_leases[idx].frame,
-        ).remote_shares.remove(before_leases[idx].share@),
+        after_core.frames_spec().metas_spec().len() == before_core.frames_spec().metas_spec().len(),
+        after_core.frames_spec().same_other_pins(
+            &before_core.frames_spec(),
+            Some(before_leases[idx].frame),
+        ),
+        after_core.frames_spec().frame(before_leases[idx].frame).fenced_shares
+            == before_core.frames_spec().frame(before_leases[idx].frame).fenced_shares.remove(
+            before_leases[idx].share@,
+        ),
     ensures
         peer_foreign_shares_preserved(before_core, after_core, before_leases, after_leases),
 {

@@ -15,12 +15,12 @@ pub(super) open spec fn cuda_backend_pre_park_wf<'a>(
     &&& b.gpu_buffer.well_formed()
     &&& b.gpu_buffer.instance_id() == core.instance_id()
     &&& b.gpu_buffer.node() == core.node()
-    &&& b.gpu_buffer.space() is GpuAlloc
-    &&& b.gpu_buffer.space()->GpuAlloc_device == b.device
+    &&& b.gpu_buffer.space().is_gpu()
+    &&& b.gpu_buffer.space().gpu_device() == b.device
     &&& b.gpu_buffer.num_slots() == b.gpu_num_frames as usize
-    &&& b.gpu_buffer.slot_len() == core.frames.tier_frame_size(b.gpu_tier)
-    &&& b.gpu_tier.valid(core.tiers.len())
-    &&& core.tiers[b.gpu_tier.index() as int].kind == TierKind::GpuVram
+    &&& b.gpu_buffer.slot_len() == core.frames_spec().tier_frame_size(b.gpu_tier)
+    &&& b.gpu_tier.valid(core.tiers_spec().len())
+    &&& core.tiers_spec()[b.gpu_tier.index() as int].kind == TierKind::GpuVram
     &&& b.gpu_sync_points.len() == b.gpu_num_frames as usize
     &&& slab_bound_to_core(
         core,
@@ -31,12 +31,13 @@ pub(super) open spec fn cuda_backend_pre_park_wf<'a>(
     )
     &&& match b.pinned_host {
         None => true,
-        Some(h) => h.well_formed(core) && h.tier != b.gpu_tier && core.frames.tier_frame_size(
-            h.tier,
-        ) == core.frames.tier_frame_size(b.gpu_tier),
+        Some(h) => h.well_formed(core) && h.tier != b.gpu_tier
+            && core.frames_spec().tier_frame_size(h.tier) == core.frames_spec().tier_frame_size(
+            b.gpu_tier,
+        ),
     }
     &&& b.timeline.device == b.device
-    &&& b.timeline.well_formed(&core.timelines, core.node(), &core.ledger@)
+    &&& b.timeline.well_formed(&core.timelines_spec(), core.node(), &core.ledger_spec()@)
     &&& cuda_puts_valid(b.active_gpu_puts@, before_core, tl)
 }
 
@@ -63,68 +64,77 @@ pub(super) open spec fn put_gpu_committed_ready<'a>(
     &&& b.timeline.timeline_id == after_begin_self.timeline.timeline_id
     &&& b.timeline.device == after_begin_self.timeline.device
     &&& b.timeline.stream.source().source() == after_begin_self.timeline.stream.source().source()
-    &&& core.node_id == after_begin_core.node_id && after_begin_core.node_id == before_core.node_id
+    &&& core.node_id_spec() == after_begin_core.node_id_spec() && after_begin_core.node_id_spec()
+        == before_core.node_id_spec()
     &&& core.instance_id() == after_begin_core.instance_id() && after_begin_core.instance_id()
         == before_core.instance_id()
-    &&& core.tiers == after_begin_core.tiers && after_begin_core.tiers == before_core.tiers
-    &&& core.spec == after_begin_core.spec && after_begin_core.spec == before_core.spec
-    &&& core.next_version_seq == after_begin_core.next_version_seq
-        && after_begin_core.next_version_seq == before_core.next_version_seq + 1
-    &&& core.version_seq_limit == after_begin_core.version_seq_limit
-        && after_begin_core.version_seq_limit == before_core.version_seq_limit
-    &&& core.version_registry == after_begin_core.version_registry
-        && after_begin_core.version_registry == before_core.version_registry
-    &&& core.frames == after_begin_core.frames
-    &&& after_begin_core.frames.same_directory(&before_core.frames)
-    &&& core.frames.same_directory(&before_core.frames)
-    &&& core.frames.preserves_initializing(&before_core.frames, Some(handle.frame))
-    &&& core.timelines.count == before_core.timelines.count
-    &&& b.timeline.timeline_id < before_core.timelines.count
-    &&& core.timelines.next_seq[b.timeline.timeline_id as int]
-        >= before_core.timelines.next_seq[b.timeline.timeline_id as int]
+    &&& core.tiers_spec() == after_begin_core.tiers_spec() && after_begin_core.tiers_spec()
+        == before_core.tiers_spec()
+    &&& core.spec_spec() == after_begin_core.spec_spec() && after_begin_core.spec_spec()
+        == before_core.spec_spec()
+    &&& core.next_version_seq_spec() == after_begin_core.next_version_seq_spec()
+        && after_begin_core.next_version_seq_spec() == before_core.next_version_seq_spec() + 1
+    &&& core.version_seq_limit_spec() == after_begin_core.version_seq_limit_spec()
+        && after_begin_core.version_seq_limit_spec() == before_core.version_seq_limit_spec()
+    &&& core.version_registry_spec() == after_begin_core.version_registry_spec()
+        && after_begin_core.version_registry_spec() == before_core.version_registry_spec()
+    &&& core.frames_spec() == after_begin_core.frames_spec()
+    &&& after_begin_core.frames_spec().same_directory(&before_core.frames_spec())
+    &&& core.frames_spec().same_directory(&before_core.frames_spec())
+    &&& core.frames_spec().preserves_initializing(&before_core.frames_spec(), Some(handle.frame))
+    &&& core.timelines_spec().count_spec() == before_core.timelines_spec().count_spec()
+    &&& b.timeline.timeline_id < before_core.timelines_spec().count_spec()
+    &&& core.timelines_spec().next_seq_spec()[b.timeline.timeline_id as int]
+        >= before_core.timelines_spec().next_seq_spec()[b.timeline.timeline_id as int]
     &&& cuda_timeline_events_preserved(
-        before_core.timelines.events@,
-        core.timelines.events@,
+        before_core.timelines_spec().events_spec()@,
+        core.timelines_spec().events_spec()@,
         b.timeline.timeline_id,
-        before_core.timelines.next_seq[b.timeline.timeline_id as int],
+        before_core.timelines_spec().next_seq_spec()[b.timeline.timeline_id as int],
     )
-    &&& cuda_ledger_writes_only(before_core.ledger@, core.ledger@, Some(handle.slot@.loc))
-    &&& before_core.frames.meta(handle.frame).state != STATE_INITIALIZING
-    &&& handle.frame.0 < core.frames.metas.len()
-    &&& core.frames.meta(handle.frame).state == STATE_INITIALIZING
-    &&& !core.frames.meta(handle.frame).queued()
-    &&& core.frames.frame(handle.frame).token is None
-    &&& core.frames.frame(handle.frame).tier == handle.tier
-    &&& core.frames.frame(handle.frame).slot == handle.slot@
-    &&& core.frames.frame(handle.frame).bound_key == Some(handle.key)
-    &&& core.frames.frame(handle.frame).bound_version == Some(handle.version)
+    &&& cuda_ledger_writes_only(
+        before_core.ledger_spec()@,
+        core.ledger_spec()@,
+        Some(handle.slot@.loc),
+    )
+    &&& before_core.frames_spec().meta(handle.frame).state != STATE_INITIALIZING
+    &&& handle.frame.0 < core.frames_spec().metas_spec().len()
+    &&& core.frames_spec().meta(handle.frame).state == STATE_INITIALIZING
+    &&& !core.frames_spec().meta(handle.frame).queued()
+    &&& core.frames_spec().frame(handle.frame).token is None
+    &&& core.frames_spec().frame(handle.frame).tier == handle.tier
+    &&& core.frames_spec().frame(handle.frame).slot == handle.slot@
+    &&& core.frames_spec().frame(handle.frame).bound_key == Some(handle.key)
+    &&& core.frames_spec().frame(handle.frame).bound_version == Some(handle.version)
     &&& handle.version.well_formed() && handle.version != VersionId::NONE
-    &&& handle.version.origin_node == before_core.node_id
-    &&& handle.version.seq == before_core.next_version_seq
-    &&& !core.frames.versions@.contains_key(handle.version)
+    &&& handle.version.origin_node == before_core.node_id_spec()
+    &&& handle.version.seq == before_core.next_version_seq_spec()
+    &&& !core.frames_spec().versions_spec()@.contains_key(handle.version)
     &&& handle.slot@.is_full()
-    &&& handle.slot@.slot_len == core.frames.tier_frame_size(b.gpu_tier)
+    &&& handle.slot@.slot_len == core.frames_spec().tier_frame_size(b.gpu_tier)
     &&& slot_is_owned(dst_tok, core.instance_id(), handle.slot@.loc)
     &&& slot_frontier(dst_tok).readers.is_empty()
     &&& slot_frontier(dst_tok).readers.subset_of(core.citations())
     &&& (slot_frontier(dst_tok).last_writer matches Some(w) ==> (core.citations().contains(w)
-        || core.timelines.ticket_covers(ticket, w)))
+        || core.timelines_spec().ticket_covers(ticket, w)))
     &&& ticket != Ticket::NONE
     &&& ticket.timeline_id() == b.timeline.timeline_id
-    &&& core.timelines.issued(b.timeline.timeline_id, ticket.sequence())
-    &&& core.timelines.events@.contains_key((b.timeline.timeline_id, ticket.sequence()))
-    &&& core.timelines.valid_ticket(ticket)
+    &&& core.timelines_spec().issued(b.timeline.timeline_id, ticket.sequence())
+    &&& core.timelines_spec().events_spec()@.contains_key(
+        (b.timeline.timeline_id, ticket.sequence()),
+    )
+    &&& core.timelines_spec().valid_ticket(ticket)
     &&& put_proof.certificate.slot == handle.slot@
-    &&& put_proof.certificate.bytes.len() == core.frames.tier_frame_size(b.gpu_tier)
-    &&& put_proof.certificate.writer == core.timelines.events@[(
+    &&& put_proof.certificate.bytes.len() == core.frames_spec().tier_frame_size(b.gpu_tier)
+    &&& put_proof.certificate.writer == core.timelines_spec().events_spec()@[(
         b.timeline.timeline_id,
         ticket.sequence(),
     )]
     &&& slot_frontier(dst_tok).last_writer == Some(put_proof.certificate.writer)
-    &&& put_proof.pending(core.ledger@, core.node())
+    &&& put_proof.pending(core.ledger_spec()@, core.node())
     &&& cuda_put_events_covered(
         put_proof.events,
-        core.timelines.events@,
+        core.timelines_spec().events_spec()@,
         b.timeline.timeline_id,
         ticket.sequence(),
     )
@@ -151,77 +161,89 @@ impl<'a> CudaBackend<'a> {
             old(core).well_formed(),
             before_core.well_formed(),
             cuda_backend_pre_park_wf(old(self), old(core), &before_core),
-            old(core).node_id == before_core.node_id,
+            old(core).node_id_spec() == before_core.node_id_spec(),
             old(core).instance_id() == before_core.instance_id(),
-            old(core).tiers == before_core.tiers,
-            old(core).spec == before_core.spec,
-            old(core).next_version_seq >= before_core.next_version_seq,
-            old(core).version_seq_limit == before_core.version_seq_limit,
-            old(core).timelines.count == before_core.timelines.count,
-            old(core).timelines.next_seq[old(self).timeline.timeline_id as int]
-                >= before_core.timelines.next_seq[old(self).timeline.timeline_id as int],
+            old(core).tiers_spec() == before_core.tiers_spec(),
+            old(core).spec_spec() == before_core.spec_spec(),
+            old(core).next_version_seq_spec() >= before_core.next_version_seq_spec(),
+            old(core).version_seq_limit_spec() == before_core.version_seq_limit_spec(),
+            old(core).timelines_spec().count_spec() == before_core.timelines_spec().count_spec(),
+            old(core).timelines_spec().next_seq_spec()[old(self).timeline.timeline_id as int]
+                >= before_core.timelines_spec().next_seq_spec()[old(
+                self,
+            ).timeline.timeline_id as int],
             cuda_timeline_events_preserved(
-                before_core.timelines.events@,
-                old(core).timelines.events@,
+                before_core.timelines_spec().events_spec()@,
+                old(core).timelines_spec().events_spec()@,
                 old(self).timeline.timeline_id,
-                before_core.timelines.next_seq[old(self).timeline.timeline_id as int],
+                before_core.timelines_spec().next_seq_spec()[old(self).timeline.timeline_id as int],
             ),
-            cuda_ledger_writes_only(before_core.ledger@, old(core).ledger@, Some(handle.slot@.loc)),
-            old(core).frames.same_directory(&before_core.frames),
-            old(core).frames.preserves_initializing(&before_core.frames, Some(handle.frame)),
-            before_core.frames.meta(handle.frame).state != STATE_INITIALIZING,
-            handle.frame.0 < old(core).frames.metas.len(),
-            old(core).frames.meta(handle.frame).state == STATE_INITIALIZING,
-            !old(core).frames.meta(handle.frame).queued(),
-            old(core).frames.frame(handle.frame).token is None,
-            old(core).frames.frame(handle.frame).tier == handle.tier,
-            old(core).frames.frame(handle.frame).slot == handle.slot@,
-            old(core).frames.frame(handle.frame).bound_key == Some(handle.key),
-            old(core).frames.frame(handle.frame).bound_version == Some(handle.version),
+            cuda_ledger_writes_only(
+                before_core.ledger_spec()@,
+                old(core).ledger_spec()@,
+                Some(handle.slot@.loc),
+            ),
+            old(core).frames_spec().same_directory(&before_core.frames_spec()),
+            old(core).frames_spec().preserves_initializing(
+                &before_core.frames_spec(),
+                Some(handle.frame),
+            ),
+            before_core.frames_spec().meta(handle.frame).state != STATE_INITIALIZING,
+            handle.frame.0 < old(core).frames_spec().metas_spec().len(),
+            old(core).frames_spec().meta(handle.frame).state == STATE_INITIALIZING,
+            !old(core).frames_spec().meta(handle.frame).queued(),
+            old(core).frames_spec().frame(handle.frame).token is None,
+            old(core).frames_spec().frame(handle.frame).tier == handle.tier,
+            old(core).frames_spec().frame(handle.frame).slot == handle.slot@,
+            old(core).frames_spec().frame(handle.frame).bound_key == Some(handle.key),
+            old(core).frames_spec().frame(handle.frame).bound_version == Some(handle.version),
             handle.version.well_formed() && handle.version != VersionId::NONE,
-            handle.version.origin_node != old(core).node_id || handle.version.seq < old(
+            handle.version.origin_node != old(core).node_id_spec() || handle.version.seq < old(
                 core,
-            ).next_version_seq || handle.version.seq >= old(core).version_seq_limit,
+            ).next_version_seq_spec() || handle.version.seq >= old(core).version_seq_limit_spec(),
             handle.slot@.is_full(),
-            handle.slot@.slot_len == old(core).frames.tier_frame_size(old(self).gpu_tier),
+            handle.slot@.slot_len == old(core).frames_spec().tier_frame_size(old(self).gpu_tier),
             slot_is_owned(dst_tok, old(core).instance_id(), handle.slot@.loc),
             slot_frontier(dst_tok).readers.is_empty(),
             slot_frontier(dst_tok).readers.subset_of(old(core).citations()),
             slot_frontier(dst_tok).last_writer matches Some(w) ==> old(core).citations().contains(w)
-                || old(core).timelines.ticket_covers(ticket, w),
+                || old(core).timelines_spec().ticket_covers(ticket, w),
             ticket != Ticket::NONE,
             ticket.timeline_id() == old(self).timeline.timeline_id,
-            old(core).timelines.issued(old(self).timeline.timeline_id, ticket.sequence()),
-            old(core).timelines.valid_ticket(ticket),
-            !only_if_current ==> !old(core).frames.versions@.contains_key(handle.version)
-                && handle.version.origin_node == before_core.node_id && handle.version.seq
-                == before_core.next_version_seq && handle.version.seq
-                < before_core.version_seq_limit,
-            only_if_current ==> old(core).frames.versions@.contains_key(handle.version) && old(
-                core,
-            ).frames.versions@[handle.version] == put_proof.certificate.bytes,
+            old(core).timelines_spec().issued(old(self).timeline.timeline_id, ticket.sequence()),
+            old(core).timelines_spec().valid_ticket(ticket),
+            !only_if_current ==> !old(core).frames_spec().versions_spec()@.contains_key(
+                handle.version,
+            ) && handle.version.origin_node == before_core.node_id_spec() && handle.version.seq
+                == before_core.next_version_seq_spec() && handle.version.seq
+                < before_core.version_seq_limit_spec(),
+            only_if_current ==> old(core).frames_spec().versions_spec()@.contains_key(
+                handle.version,
+            ) && old(core).frames_spec().versions_spec()@[handle.version]
+                == put_proof.certificate.bytes,
             put_proof.certificate.slot == handle.slot@,
-            put_proof.certificate.bytes.len() == old(core).frames.tier_frame_size(
+            put_proof.certificate.bytes.len() == old(core).frames_spec().tier_frame_size(
                 old(self).gpu_tier,
             ),
-            put_proof.certificate.writer == old(core).timelines.events@[(
+            put_proof.certificate.writer == old(core).timelines_spec().events_spec()@[(
                 old(self).timeline.timeline_id,
                 ticket.sequence(),
             )],
             slot_frontier(dst_tok).last_writer == Some(put_proof.certificate.writer),
-            put_proof.pending(old(core).ledger@, old(core).node()),
+            put_proof.pending(old(core).ledger_spec()@, old(core).node()),
             cuda_put_events_covered(
                 put_proof.events,
-                old(core).timelines.events@,
+                old(core).timelines_spec().events_spec()@,
                 old(self).timeline.timeline_id,
                 ticket.sequence(),
             ),
             core_transition(
                 &before_core,
                 old(core),
-                Some(old(self).timeline.timeline_id),
-                Some(old(self).timeline.stream.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(old(self).timeline.timeline_id),
+                    Some(old(self).timeline.stream.source().source()),
+                ),
             ),
         ensures
             final(core).well_formed(),
@@ -233,18 +255,19 @@ impl<'a> CudaBackend<'a> {
             final(self).same_pinned_layout(old(self)),
             final(self).owns_pinned_host(handle.frame) == old(self).owns_pinned_host(handle.frame),
             final(self).timeline.timeline_id == old(self).timeline.timeline_id,
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).spec == old(core).spec,
-            final(core).next_version_seq == old(core).next_version_seq,
-            final(core).version_registry == old(core).version_registry,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
             core_transition(
                 &before_core,
                 final(core),
-                Some(old(self).timeline.timeline_id),
-                Some(old(self).timeline.stream.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(old(self).timeline.timeline_id),
+                    Some(old(self).timeline.stream.source().source()),
+                ),
             ),
             match r {
                 Ok(sync_point) => final(self).active_gpu_puts@ == old(self).active_gpu_puts@.push(
@@ -312,12 +335,19 @@ impl<'a> CudaBackend<'a> {
             lemma_core_wf_facts(&before_core);
             lemma_core_wf_facts(core);
             lemma_cuda_slabs_same_directory(self, &after_copy_core, core);
-            assert(core.frames.same_directory(&before_core.frames) && core.frames.versions@
-                == after_copy_core.frames.versions@ && before_core.frames.metas.len()
-                == core.frames.metas.len() && before_core.frames.frame(h_frame).slot == h_slot) by {
+            assert(core.frames_spec().same_directory(&before_core.frames_spec())
+                && core.frames_spec().versions_spec()@
+                == after_copy_core.frames_spec().versions_spec()@
+                && before_core.frames_spec().metas_spec().len()
+                == core.frames_spec().metas_spec().len() && before_core.frames_spec().frame(
+                h_frame,
+            ).slot == h_slot) by {
                 reveal(FrameTable::same_directory);
             }
-            assert(core.frames.preserves_initializing(&before_core.frames, Some(h_frame))) by {
+            assert(core.frames_spec().preserves_initializing(
+                &before_core.frames_spec(),
+                Some(h_frame),
+            )) by {
                 reveal(FrameTable::same_directory);
                 reveal(FrameTable::preserves_initializing);
             }
@@ -332,9 +362,10 @@ impl<'a> CudaBackend<'a> {
             assert(core_transition(
                 &before_core,
                 core,
-                Some(self.timeline.timeline_id),
-                Some(self.timeline.stream.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(self.timeline.timeline_id),
+                    Some(self.timeline.stream.source().source()),
+                ),
             )) by {
                 lemma_core_transition_step_no_event(
                     &before_core,
@@ -363,47 +394,60 @@ impl<'a> CudaBackend<'a> {
             old(core).well_formed(),
             before_core.well_formed(),
             cuda_backend_pre_park_wf(old(self), old(core), &before_core),
-            old(core).node_id == before_core.node_id,
+            old(core).node_id_spec() == before_core.node_id_spec(),
             old(core).instance_id() == before_core.instance_id(),
-            old(core).tiers == before_core.tiers,
-            old(core).spec == before_core.spec,
-            old(core).next_version_seq >= before_core.next_version_seq,
-            old(core).version_seq_limit == before_core.version_seq_limit,
-            old(core).timelines.count == before_core.timelines.count,
-            old(core).timelines.next_seq[old(self).timeline.timeline_id as int]
-                >= before_core.timelines.next_seq[old(self).timeline.timeline_id as int],
+            old(core).tiers_spec() == before_core.tiers_spec(),
+            old(core).spec_spec() == before_core.spec_spec(),
+            old(core).next_version_seq_spec() >= before_core.next_version_seq_spec(),
+            old(core).version_seq_limit_spec() == before_core.version_seq_limit_spec(),
+            old(core).timelines_spec().count_spec() == before_core.timelines_spec().count_spec(),
+            old(core).timelines_spec().next_seq_spec()[old(self).timeline.timeline_id as int]
+                >= before_core.timelines_spec().next_seq_spec()[old(
+                self,
+            ).timeline.timeline_id as int],
             cuda_timeline_events_preserved(
-                before_core.timelines.events@,
-                old(core).timelines.events@,
+                before_core.timelines_spec().events_spec()@,
+                old(core).timelines_spec().events_spec()@,
                 old(self).timeline.timeline_id,
-                before_core.timelines.next_seq[old(self).timeline.timeline_id as int],
+                before_core.timelines_spec().next_seq_spec()[old(self).timeline.timeline_id as int],
             ),
-            cuda_ledger_writes_only(before_core.ledger@, old(core).ledger@, Some(handle.slot@.loc)),
-            old(core).frames.same_directory(&before_core.frames),
-            old(core).frames.preserves_initializing(&before_core.frames, Some(handle.frame)),
-            before_core.frames.meta(handle.frame).state != STATE_INITIALIZING,
-            handle.frame.0 < old(core).frames.metas.len(),
-            old(core).frames.meta(handle.frame).state == STATE_INITIALIZING,
-            !old(core).frames.meta(handle.frame).queued(),
-            old(core).frames.frame(handle.frame).token is None,
-            old(core).frames.frame(handle.frame).tier == handle.tier,
-            old(core).frames.frame(handle.frame).slot == handle.slot@,
-            old(core).frames.frame(handle.frame).bound_key == Some(handle.key),
-            old(core).frames.frame(handle.frame).bound_version == Some(handle.version),
+            cuda_ledger_writes_only(
+                before_core.ledger_spec()@,
+                old(core).ledger_spec()@,
+                Some(handle.slot@.loc),
+            ),
+            old(core).frames_spec().same_directory(&before_core.frames_spec()),
+            old(core).frames_spec().preserves_initializing(
+                &before_core.frames_spec(),
+                Some(handle.frame),
+            ),
+            before_core.frames_spec().meta(handle.frame).state != STATE_INITIALIZING,
+            handle.frame.0 < old(core).frames_spec().metas_spec().len(),
+            old(core).frames_spec().meta(handle.frame).state == STATE_INITIALIZING,
+            !old(core).frames_spec().meta(handle.frame).queued(),
+            old(core).frames_spec().frame(handle.frame).token is None,
+            old(core).frames_spec().frame(handle.frame).tier == handle.tier,
+            old(core).frames_spec().frame(handle.frame).slot == handle.slot@,
+            old(core).frames_spec().frame(handle.frame).bound_key == Some(handle.key),
+            old(core).frames_spec().frame(handle.frame).bound_version == Some(handle.version),
             slot_is_owned(dst_tok, old(core).instance_id(), handle.slot@.loc),
             slot_frontier(dst_tok).readers.subset_of(old(core).citations()),
             slot_frontier(dst_tok).last_writer matches Some(w) ==> old(core).citations().contains(w)
-                || old(core).timelines.ticket_covers(last_ticket, w),
+                || old(core).timelines_spec().ticket_covers(last_ticket, w),
             last_ticket != Ticket::NONE,
             last_ticket.timeline_id() == old(self).timeline.timeline_id,
-            old(core).timelines.issued(old(self).timeline.timeline_id, last_ticket.sequence()),
-            old(core).timelines.valid_ticket(last_ticket),
+            old(core).timelines_spec().issued(
+                old(self).timeline.timeline_id,
+                last_ticket.sequence(),
+            ),
+            old(core).timelines_spec().valid_ticket(last_ticket),
             core_transition(
                 &before_core,
                 old(core),
-                Some(old(self).timeline.timeline_id),
-                Some(old(self).timeline.stream.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(old(self).timeline.timeline_id),
+                    Some(old(self).timeline.stream.source().source()),
+                ),
             ),
         ensures
             final(core).well_formed(),
@@ -414,18 +458,19 @@ impl<'a> CudaBackend<'a> {
             final(self).gpu_num_frames == old(self).gpu_num_frames,
             final(self).pinned_host == old(self).pinned_host,
             final(self).timeline.timeline_id == old(self).timeline.timeline_id,
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).spec == old(core).spec,
-            final(core).next_version_seq == old(core).next_version_seq,
-            final(core).version_registry == old(core).version_registry,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
             core_transition(
                 &before_core,
                 final(core),
-                Some(old(self).timeline.timeline_id),
-                Some(old(self).timeline.stream.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(old(self).timeline.timeline_id),
+                    Some(old(self).timeline.stream.source().source()),
+                ),
             ),
             final(self).active_gpu_puts@ == old(self).active_gpu_puts@.push(
                 final(self).active_gpu_puts@.last(),
@@ -456,11 +501,17 @@ impl<'a> CudaBackend<'a> {
         proof {
             lemma_cuda_slabs_same_directory(self, &before_park_core, core);
             lemma_cuda_timeline_preserved(&self.timeline, &before_park_core, core);
-            assert(core.frames.same_directory(&before_core.frames) && before_core.frames.metas.len()
-                == core.frames.metas.len() && before_core.frames.frame(h_frame).slot == h_slot) by {
+            assert(core.frames_spec().same_directory(&before_core.frames_spec())
+                && before_core.frames_spec().metas_spec().len()
+                == core.frames_spec().metas_spec().len() && before_core.frames_spec().frame(
+                h_frame,
+            ).slot == h_slot) by {
                 reveal(FrameTable::same_directory);
             }
-            assert(core.frames.preserves_initializing(&before_core.frames, Some(h_frame))) by {
+            assert(core.frames_spec().preserves_initializing(
+                &before_core.frames_spec(),
+                Some(h_frame),
+            )) by {
                 reveal(FrameTable::same_directory);
                 reveal(FrameTable::preserves_initializing);
             }
@@ -496,32 +547,33 @@ impl<'a> CudaBackend<'a> {
             old(core).well_formed(),
             before_core.well_formed(),
             cuda_backend_pre_park_wf(old(self), old(core), &before_core),
-            old(core).node_id == before_core.node_id,
+            old(core).node_id_spec() == before_core.node_id_spec(),
             old(core).instance_id() == before_core.instance_id(),
-            old(core).tiers == before_core.tiers,
-            old(core).spec == before_core.spec,
-            old(core).next_version_seq >= before_core.next_version_seq,
-            old(core).version_seq_limit == before_core.version_seq_limit,
-            old(core).timelines == before_core.timelines,
-            old(core).ledger == before_core.ledger,
-            old(core).frames.same_directory(&before_core.frames),
-            old(core).frames.preserves_initializing(&before_core.frames, None),
-            handle.frame.0 < before_core.frames.metas.len(),
-            before_core.frames.meta(handle.frame).state != STATE_INITIALIZING,
-            handle.frame.0 < old(core).frames.metas.len(),
-            old(core).frames.meta(handle.frame).state == STATE_INITIALIZING,
-            !old(core).frames.meta(handle.frame).queued(),
-            old(core).frames.frame(handle.frame).token is None,
-            old(core).frames.frame(handle.frame).tier == handle.tier,
-            old(core).frames.frame(handle.frame).slot == handle.slot@,
+            old(core).tiers_spec() == before_core.tiers_spec(),
+            old(core).spec_spec() == before_core.spec_spec(),
+            old(core).next_version_seq_spec() >= before_core.next_version_seq_spec(),
+            old(core).version_seq_limit_spec() == before_core.version_seq_limit_spec(),
+            old(core).timelines_spec() == before_core.timelines_spec(),
+            old(core).ledger_spec() == before_core.ledger_spec(),
+            old(core).frames_spec().same_directory(&before_core.frames_spec()),
+            old(core).frames_spec().preserves_initializing(&before_core.frames_spec(), None),
+            handle.frame.0 < before_core.frames_spec().metas_spec().len(),
+            before_core.frames_spec().meta(handle.frame).state != STATE_INITIALIZING,
+            handle.frame.0 < old(core).frames_spec().metas_spec().len(),
+            old(core).frames_spec().meta(handle.frame).state == STATE_INITIALIZING,
+            !old(core).frames_spec().meta(handle.frame).queued(),
+            old(core).frames_spec().frame(handle.frame).token is None,
+            old(core).frames_spec().frame(handle.frame).tier == handle.tier,
+            old(core).frames_spec().frame(handle.frame).slot == handle.slot@,
             slot_is_owned(dst_tok, old(core).instance_id(), handle.slot@.loc),
             write_admitted(slot_frontier(dst_tok), old(core).citations()),
             core_transition(
                 &before_core,
                 old(core),
-                Some(old(self).timeline.timeline_id),
-                Some(old(self).timeline.stream.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(old(self).timeline.timeline_id),
+                    Some(old(self).timeline.stream.source().source()),
+                ),
             ),
         ensures
             final(core).well_formed(),
@@ -533,18 +585,19 @@ impl<'a> CudaBackend<'a> {
             final(self).pinned_host == old(self).pinned_host,
             final(self).active_gpu_puts == old(self).active_gpu_puts,
             final(self).timeline.timeline_id == old(self).timeline.timeline_id,
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).spec == old(core).spec,
-            final(core).next_version_seq == old(core).next_version_seq,
-            final(core).version_registry == old(core).version_registry,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
             core_transition(
                 &before_core,
                 final(core),
-                Some(old(self).timeline.timeline_id),
-                Some(old(self).timeline.stream.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(old(self).timeline.timeline_id),
+                    Some(old(self).timeline.stream.source().source()),
+                ),
             ),
     {
         hide(CacheCore::well_formed);
@@ -558,19 +611,22 @@ impl<'a> CudaBackend<'a> {
         core.abort_write(handle, Tracked(dst_tok));
         proof {
             lemma_cuda_slabs_same_directory(self, &after_begin_core, core);
-            assert(core.frames.same_directory(&before_core.frames)) by {
+            assert(core.frames_spec().same_directory(&before_core.frames_spec())) by {
                 reveal(FrameTable::same_directory);
             }
-            assert(core.frames.preserves_initializing(&before_core.frames, Some(handle.frame))) by {
+            assert(core.frames_spec().preserves_initializing(
+                &before_core.frames_spec(),
+                Some(handle.frame),
+            )) by {
                 reveal(FrameTable::same_directory);
                 reveal(FrameTable::preserves_initializing);
             }
             lemma_cuda_events_preserved_same(
-                core.timelines.events@,
+                core.timelines_spec().events_spec()@,
                 self.timeline.timeline_id,
-                before_core.timelines.next_seq[self.timeline.timeline_id as int],
+                before_core.timelines_spec().next_seq_spec()[self.timeline.timeline_id as int],
             );
-            lemma_cuda_ledger_writes_only_same(core.ledger@, None);
+            lemma_cuda_ledger_writes_only_same(core.ledger_spec()@, None);
             lemma_cuda_puts_after_disjoint_step(
                 self.active_gpu_puts@,
                 &before_core,
@@ -642,16 +698,17 @@ impl<'a> CudaBackend<'a> {
             after_begin_core.well_formed(),
             cuda_backend_pre_park_wf(&after_begin_self, &after_begin_core, &before_core),
             old(self).timeline.well_formed(
-                &old(core).timelines,
+                &old(core).timelines_spec(),
                 old(core).node(),
-                &old(core).ledger@,
+                &old(core).ledger_spec()@,
             ),
             core_transition(
                 &before_core,
                 old(core),
-                Some(after_begin_self.timeline.timeline_id),
-                Some(after_begin_self.timeline.stream.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(after_begin_self.timeline.timeline_id),
+                    Some(after_begin_self.timeline.stream.source().source()),
+                ),
             ),
             put_gpu_committed_ready(
                 old(self),
@@ -673,25 +730,27 @@ impl<'a> CudaBackend<'a> {
             final(self).gpu_num_frames == after_begin_self.gpu_num_frames,
             final(self).same_pinned_layout(&after_begin_self),
             final(self).timeline.timeline_id == after_begin_self.timeline.timeline_id,
-            final(core).node_id == after_begin_core.node_id,
+            final(core).node_id_spec() == after_begin_core.node_id_spec(),
             final(core).instance_id() == after_begin_core.instance_id(),
-            final(core).tiers == after_begin_core.tiers,
-            final(core).spec == after_begin_core.spec,
-            final(core).version_registry == before_core.version_registry,
+            final(core).tiers_spec() == after_begin_core.tiers_spec(),
+            final(core).spec_spec() == after_begin_core.spec_spec(),
+            final(core).version_registry_spec() == before_core.version_registry_spec(),
             core_transition(
                 &before_core,
                 final(core),
-                Some(after_begin_self.timeline.timeline_id),
-                Some(after_begin_self.timeline.stream.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(after_begin_self.timeline.timeline_id),
+                    Some(after_begin_self.timeline.stream.source().source()),
+                ),
             ),
             match r {
                 Ok((version, frame, t, _)) => {
                     &&& t != Ticket::NONE
                     &&& t.timeline_id() == after_begin_self.timeline.timeline_id
-                    &&& version.origin_node == before_core.node_id
-                    &&& version.seq == before_core.next_version_seq
-                    &&& final(core).next_version_seq == before_core.next_version_seq + 1
+                    &&& version.origin_node == before_core.node_id_spec()
+                    &&& version.seq == before_core.next_version_seq_spec()
+                    &&& final(core).next_version_seq_spec() == before_core.next_version_seq_spec()
+                        + 1
                     &&& ((handle.tier == after_begin_self.gpu_tier && final(self).owns_gpu(frame))
                         || final(self).owns_pinned_host(frame))
                     &&& final(self).active_gpu_puts@ == after_begin_self.active_gpu_puts@.push(

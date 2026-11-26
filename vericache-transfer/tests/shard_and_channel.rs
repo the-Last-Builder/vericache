@@ -6,12 +6,13 @@ use std::process::Command;
 use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 use transfer::context::*;
-use transfer::rdma::{QueuePairEndpoint, RemoteCapability};
+#[cfg(verus_only)]
+use transfer::domain::SPACE_HOST;
 #[cfg_attr(not(verus_only), allow(unused_imports))]
 use transfer::transport::Statement;
 use transfer::transport::{
     ByteTransport, Channel, ChannelAttachment, ChannelError, EndpointOrFrame, GrantTag,
-    ReceivedFrame,
+    QueuePairEndpoint, ReceivedFrame, RemoteCapability,
 };
 use vstd::prelude::*;
 
@@ -147,8 +148,9 @@ fn split_four_from_node_context(ctx: NodeContext) -> (
 }
 
 fn exercise_shard_tokens(shard: &mut ShardSources, seq: u64) -> Tracked<VersionBinding> {
-    let tracked _slot = shard.alloc.borrow_mut().allocate_slot(None);
-    let tracked _ev_src = shard.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked alloc = shard.alloc.borrow_mut();
+    let tracked _slot = alloc.allocate_slot_in(alloc.space_for(SPACE_HOST, 0));
+    let tracked _ev_src = shard.events.borrow_mut().mint(EventSourceKind::host());
     let tracked _share = shard.shares.borrow_mut().allocate();
     let tracked ver_tok = shard.versions.borrow_mut().take_seq(seq);
     let _key = (shard.node, seq);

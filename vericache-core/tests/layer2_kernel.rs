@@ -74,7 +74,7 @@ fn run_custom_tier_and_frame_table_lifecycle(_src: &mut Sources) {
         rdma_capable: false,
     };
     let mut core = CacheCore::new(0, FRAME_SIZE, Vec::new(), 4, Tracked(_src.instance.borrow()));
-    let tracked host_source = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_source = _src.events.borrow_mut().mint(EventSourceKind::host());
     let mut host_ctx = host::HostContext::new(Tracked(host_source));
     let tl = core.register_timeline(TimelineKind::Custom(77)).unwrap();
 
@@ -89,14 +89,14 @@ fn run_custom_tier_and_frame_table_lifecycle(_src: &mut Sources) {
     let ghost slots = Seq::new(2nat, |i: int| slab.slot_ref(i as nat));
     let (tier_id, first) = core.register_tier(custom_desc, Ghost(slots), 2, tokens).unwrap();
     assert!(tier_id == TierId(0) && first == FrameId(0));
-    assert!(core.frames.ready_queue[0].len() == 2);
+    assert!(core.tier_ready_count(TierId(0)).unwrap() == 2);
 
     // Reserve then abort returns the frame directly to the ready queue.
     let k_abort = ObjectKey([10, 11, 12, 13]);
     let (h_abort, tok_abort) = core.begin_write(tier_id, k_abort).unwrap();
-    assert!(core.frames.ready_queue[0].len() == 1);
+    assert!(core.tier_ready_count(TierId(0)).unwrap() == 1);
     core.abort_write(h_abort, tok_abort);
-    assert!(core.frames.ready_queue[0].len() == 2);
+    assert!(core.tier_ready_count(TierId(0)).unwrap() == 2);
 
     // Reserve, write, publish, lookup, evict, and reclaim.
     let key = ObjectKey([1, 2, 3, 4]);
@@ -109,8 +109,8 @@ fn run_custom_tier_and_frame_table_lifecycle(_src: &mut Sources) {
         &slice,
         &data,
         Tracked(&mut tok),
-        Tracked(&core.ledger.borrow().submitted),
-        Tracked(&core.ledger.borrow().knows),
+        Tracked(&core.ledger().borrow().submitted),
+        Tracked(&core.ledger().borrow().knows),
         Ghost(core.citations()),
     );
     let ticket = core.issue_ticket(tl, Tracked(comp.submitted)).unwrap();
@@ -124,27 +124,27 @@ fn run_custom_tier_and_frame_table_lifecycle(_src: &mut Sources) {
         Ghost(
             ValueCertificate {
                 slot: slice.slot_ref(),
-                writer: core.timelines.events@[(tl, ticket.sequence())],
+                writer: core.timeline_event(tl, ticket.sequence()),
                 bytes: data@,
                 proof: ValueProof::HostWrite,
             },
         ),
     );
-    assert!(core.frames.metas[frame.0 as usize].state == STATE_PUBLISHED);
+    assert!(core.frame_state(frame).unwrap() == STATE_PUBLISHED);
     assert!(core.lookup_tier(key, tier_id) == Some((frame, ver)));
 
     core.evict_frame(frame).unwrap();
-    assert!(core.frames.metas[frame.0 as usize].state == STATE_DRAINING);
+    assert!(core.frame_state(frame).unwrap() == STATE_DRAINING);
     assert!(core.lookup_tier(key, tier_id).is_none());
     let reclaimed = core.reclaim_draining(tier_id, 4);
     assert!(reclaimed == 1);
-    assert!(core.frames.metas[frame.0 as usize].state == STATE_EMPTY);
-    assert!(core.frames.ready_queue[0].len() == 2);
+    assert!(core.frame_state(frame).unwrap() == STATE_EMPTY);
+    assert!(core.tier_ready_count(TierId(0)).unwrap() == 2);
 }
 
 fn run_inline_read_compaction_and_overflow_fallback(_src: &mut Sources) {
     let mut core = CacheCore::new(0, FRAME_SIZE, Vec::new(), 8, Tracked(_src.instance.borrow()));
-    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let mut host = HostBackend::new(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -159,7 +159,7 @@ fn run_inline_read_compaction_and_overflow_fallback(_src: &mut Sources) {
     let mut ctxs = Vec::new();
     for _ in 0..5 {
         let tl = core.register_timeline(TimelineKind::Host).unwrap();
-        let tracked ev_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+        let tracked ev_src = _src.events.borrow_mut().mint(EventSourceKind::host());
         tls.push(tl);
         ctxs.push(host::HostContext::new(Tracked(ev_src)));
     }
@@ -172,6 +172,7 @@ fn run_inline_read_compaction_and_overflow_fallback(_src: &mut Sources) {
         key,
         &data,
     ).unwrap();
+    assert!(core.frame_overflow_sequences(frame).unwrap().is_empty());
 
     // Perform 5 reads on 5 distinct timelines WITHOUT marking them complete first.
     let mut tickets = Vec::new();
@@ -192,8 +193,8 @@ fn run_inline_read_compaction_and_overflow_fallback(_src: &mut Sources) {
             &slice,
             &mut out,
             Tracked(&mut perm),
-            Tracked(&core.ledger.borrow().submitted),
-            Tracked(&core.ledger.borrow().knows),
+            Tracked(&core.ledger().borrow().submitted),
+            Tracked(&core.ledger().borrow().knows),
             Ghost(core.citations()),
         );
         assert!(out == data);
@@ -207,15 +208,42 @@ fn run_inline_read_compaction_and_overflow_fallback(_src: &mut Sources) {
         ).unwrap();
         tickets.push(t);
         knows_list.push(Tracked(comp.knows));
+        if idx < 4 {
+            assert!(core.frame_overflow_sequences(frame).unwrap().is_empty());
+        }
     }
 
     // 5 distinct active timelines must have triggered FLAG_READ_OVERFLOW.
-    assert!((core.frames.metas[frame.0 as usize].flags & FLAG_READ_OVERFLOW) != 0);
+    assert!((core.frame_meta(frame).unwrap().flags & FLAG_READ_OVERFLOW) != 0);
+    let old_count = core.timeline_count();
+    assert!(core.frame_overflow_sequences(frame).unwrap().len() == old_count);
+
+    // Register a new read timeline after promotion and cross the old 8-bit boundary.
+    while core.timeline_count() <= u8::MAX as usize {
+        core.register_timeline(TimelineKind::Custom(0)).unwrap();
+    }
+    let late_tl = core.register_timeline(TimelineKind::Host).unwrap();
+    assert!(late_tl > u8::MAX as TimelineId);
+    assert!(core.frame_overflow_sequences(frame).unwrap().len() == old_count);
+    let mut late_ctx = host::HostContext::new(
+        Tracked(_src.events.borrow_mut().mint(EventSourceKind::host())),
+    );
+    let (late_ticket, Tracked(late_knows)) = perform_host_read_on_tl(
+        &mut core,
+        &host,
+        Tracked(_src.shares.borrow_mut()),
+        Tracked(_src.instance.borrow()),
+        &mut late_ctx,
+        late_tl,
+        frame,
+        &data,
+    );
+    assert!(core.frame_overflow_sequences(frame).unwrap()[late_tl as usize] == late_ticket.seq());
 
     core.evict_frame(frame).unwrap();
     // Cannot reclaim while any read timeline is still unconfirmed.
     assert!(core.reclaim_draining(host.tier_id(), 4) == 0);
-    assert!(core.frames.metas[frame.0 as usize].state == STATE_DRAINING);
+    assert!(core.frame_state(frame).unwrap() == STATE_DRAINING);
 
     // Confirm first 4 timelines; the 5th is still pending so reclamation remains blocked.
     for idx in 0..4usize {
@@ -224,18 +252,22 @@ fn run_inline_read_compaction_and_overflow_fallback(_src: &mut Sources) {
     }
     assert!(core.reclaim_draining(host.tier_id(), 4) == 0);
 
-    // Confirm the 5th timeline; now draining frame reclaims cleanly and resets overflow flag.
     let Tracked(k4) = knows_list[4];
     core.mark_timeline_complete(tls[4], tickets[4].seq(), Tracked(k4));
+    assert!(core.reclaim_draining(host.tier_id(), 4) == 0);
+
+    // The late read also blocks reclamation, and reclaim releases the overflow allocation.
+    core.mark_timeline_complete(late_tl, late_ticket.seq(), Tracked(late_knows));
     assert!(core.reclaim_draining(host.tier_id(), 4) == 1);
-    assert!(core.frames.metas[frame.0 as usize].state == STATE_EMPTY);
-    assert!((core.frames.metas[frame.0 as usize].flags & FLAG_READ_OVERFLOW) == 0);
+    assert!(core.frame_state(frame).unwrap() == STATE_EMPTY);
+    assert!((core.frame_meta(frame).unwrap().flags & FLAG_READ_OVERFLOW) == 0);
+    assert!(core.frame_overflow_sequences(frame).unwrap().is_empty());
 }
 
-fn run_concurrent_local_and_remote_leases_overflow_and_eviction(_src: &mut Sources) {
+fn run_concurrent_local_and_fenced_leases_overflow_and_eviction(_src: &mut Sources) {
     // Cap max_local_leases at 2 so we test lease table overflow explicitly.
     let mut core = CacheCore::new(0, FRAME_SIZE, Vec::new(), 2, Tracked(_src.instance.borrow()));
-    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let mut host = HostBackend::new(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -278,51 +310,61 @@ fn run_concurrent_local_and_remote_leases_overflow_and_eviction(_src: &mut Sourc
     );
     assert!(extra_lease.is_err());
 
-    // Remote lease still succeeds independently of the local lease table.
-    let (rv, _rc, Tracked(rcap)) = core.pin_remote_lease(
+    // Two fenced pins can share the frame even when the local lease table is full.
+    let (rv, _rc, Tracked(rcap)) = core.pin_fenced_lease(
         frame,
-        0,
-        1,
         Tracked(_src.shares.borrow_mut()),
         Tracked(_src.instance.borrow()),
     ).unwrap();
-    assert!(rv == ver);
-    assert!(core.frames.metas[frame.0 as usize].active_local_reads == 2);
-    assert!(core.frames.metas[frame.0 as usize].active_remote_leases == 1);
+    let (rv2, _rc2, Tracked(rcap2)) = core.pin_fenced_lease(
+        frame,
+        Tracked(_src.shares.borrow_mut()),
+        Tracked(_src.instance.borrow()),
+    ).unwrap();
+    assert!(rv == ver && rv2 == ver);
+    assert!(core.frame_meta(frame).unwrap().active_local_reads == 2);
+    assert!(core.frame_meta(frame).unwrap().active_fenced_leases == 2);
 
     // Evicting while leased transitions to Draining, hides from catalog, and blocks reclamation.
     core.evict_frame(frame).unwrap();
     assert!(core.lookup_tier(key, host.tier_id()).is_none());
     assert!(core.reclaim_draining(host.tier_id(), 4) == 0);
 
-    // Release local lease #2 first (out of order), still blocked by local #1 and remote lease.
+    // Release local lease #2 first (out of order).
     core.release_local_lease(l2, cap2, Ticket::NONE, Tracked(_src.instance.borrow())).unwrap();
     assert!(core.reclaim_draining(host.tier_id(), 4) == 0);
 
-    // Release remote lease cooperatively; still blocked by local #1.
+    // Returning the first fenced share leaves the second pin in place.
     let tracked returned = rcap.return_share();
-    core.unpin_remote_lease(
+    core.unpin_fenced_lease(
         frame,
-        0,
-        1,
         Tracked(returned),
         Ticket::NONE,
         Tracked(_src.instance.borrow()),
     ).unwrap();
-    assert!(core.frames.metas[frame.0 as usize].active_remote_leases == 0);
+    assert!(core.frame_meta(frame).unwrap().active_fenced_leases == 1);
     assert!(core.reclaim_draining(host.tier_id(), 4) == 0);
 
-    // Release local lease #1; now frame reclaims cleanly and is reusable.
+    // The final fenced pin still blocks reclamation after both local releases.
     core.release_local_lease(l1, cap1, Ticket::NONE, Tracked(_src.instance.borrow())).unwrap();
+    assert!(core.reclaim_draining(host.tier_id(), 4) == 0);
+    let tracked returned = rcap2.return_share();
+    core.unpin_fenced_lease(
+        frame,
+        Tracked(returned),
+        Ticket::NONE,
+        Tracked(_src.instance.borrow()),
+    ).unwrap();
+    assert!(core.frame_meta(frame).unwrap().active_fenced_leases == 0);
     assert!(core.reclaim_draining(host.tier_id(), 4) == 1);
-    assert!(core.frames.metas[frame.0 as usize].state == STATE_EMPTY);
+    assert!(core.frame_state(frame).unwrap() == STATE_EMPTY);
 }
 
 fn run_host_backend_put_read_and_copy_tier(_src: &mut Sources) {
     let mut core = CacheCore::new(0, FRAME_SIZE, Vec::new(), 4, Tracked(_src.instance.borrow()));
-    let tracked src0 = _src.events.borrow_mut().mint(EventSourceKind::Host);
-    let tracked src1 = _src.events.borrow_mut().mint(EventSourceKind::Host);
-    let tracked src_shared = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked src0 = _src.events.borrow_mut().mint(EventSourceKind::host());
+    let tracked src1 = _src.events.borrow_mut().mint(EventSourceKind::host());
+    let tracked src_shared = _src.events.borrow_mut().mint(EventSourceKind::host());
 
     let mut host0 = HostBackend::new(
         &mut core,
@@ -398,7 +440,7 @@ fn run_host_backend_put_read_and_copy_tier(_src: &mut Sources) {
 
 fn run_nvme_backend_io_uring_round_trip(_src: &mut Sources) {
     let mut core = CacheCore::new(0, FRAME_SIZE, Vec::new(), 4, Tracked(_src.instance.borrow()));
-    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let mut host = HostBackend::new(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -408,10 +450,10 @@ fn run_nvme_backend_io_uring_round_trip(_src: &mut Sources) {
         4096,
     ).unwrap();
 
-    let tracked ring_src = _src.events.borrow_mut().mint(EventSourceKind::IoUring);
+    let tracked ring_src = _src.events.borrow_mut().mint(EventSourceKind::io_uring());
     let mut nvme = match NvmeBackend::new(
         &mut core,
-        &host.ctx,
+        host.context(),
         Tracked(_src.instance.borrow()),
         Tracked(_src.allocations.borrow_mut()),
         Tracked(ring_src),
@@ -456,7 +498,7 @@ fn run_nvme_backend_io_uring_round_trip(_src: &mut Sources) {
         vericache_core::backends::nvme::NvmeProgress::empty(),
     ).unwrap();
     assert!(prog.completed == 1 && prog.failed == 0);
-    assert!(core.timelines.is_retired(t_down));
+    assert!(core.is_ticket_retired(t_down));
     assert!(core.lookup_tier(key, nvme.tier_id()) == Some((nvme_f, ver)));
 
     // Evict DRAM replica, reclaim it, overwrite DRAM with different key, then evict again.
@@ -484,11 +526,11 @@ fn run_nvme_backend_io_uring_round_trip(_src: &mut Sources) {
     let sub_up = nvme.submit(Ghost(&core)).unwrap();
     assert!(sub_up == 1);
     let mut total_completed = 0usize;
-    while !core.timelines.is_retired(t_up) {
+    while !core.is_ticket_retired(t_up) {
         let p = nvme.poll_completions(&mut core, Tracked(_src.instance.borrow())).unwrap();
         total_completed += p.completed;
         assert!(p.failed == 0);
-        if !core.timelines.is_retired(t_up) {
+        if !core.is_ticket_retired(t_up) {
             std::thread::yield_now();
         }
     }
@@ -515,7 +557,7 @@ fn run_cuda_wait_event_not_ready_before_poll(_src: &mut Sources) {
     }
     let dev: DeviceId = 0;
     let mut core = CacheCore::new(0, FRAME_SIZE, Vec::new(), 4, Tracked(_src.instance.borrow()));
-    let tracked s_src = _src.events.borrow_mut().mint(EventSourceKind::CudaStream);
+    let tracked s_src = _src.events.borrow_mut().mint(EventSourceKind::cuda_stream());
     let mut tl = CudaTimeline::new(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -546,7 +588,7 @@ fn run_cuda_backend_ordered_handoff_and_section_5_3_hazard(_src: &mut Sources) {
     }
     let dev: DeviceId = 0;
     let mut core = CacheCore::new(0, FRAME_SIZE, Vec::new(), 4, Tracked(_src.instance.borrow()));
-    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let host = HostBackend::new(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -555,9 +597,9 @@ fn run_cuda_backend_ordered_handoff_and_section_5_3_hazard(_src: &mut Sources) {
         2,
         4096,
     ).unwrap();
-    let tracked host_op_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_op_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let mut host_op_ctx = host::HostContext::new(Tracked(host_op_src));
-    let tracked gpu_src = _src.events.borrow_mut().mint(EventSourceKind::CudaStream);
+    let tracked gpu_src = _src.events.borrow_mut().mint(EventSourceKind::cuda_stream());
     let mut gpu = CudaBackend::new(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -571,7 +613,7 @@ fn run_cuda_backend_ordered_handoff_and_section_5_3_hazard(_src: &mut Sources) {
     gpu.attach_pinned_host(&core, &host).unwrap();
 
     // Create a second independent caller CUDA stream + timeline for Ordered Handoff.
-    let tracked caller_src = _src.events.borrow_mut().mint(EventSourceKind::CudaStream);
+    let tracked caller_src = _src.events.borrow_mut().mint(EventSourceKind::cuda_stream());
     let mut caller_stream = cuda::CudaStream::new(dev, Tracked(caller_src)).unwrap();
     let caller_tl = core.register_timeline(TimelineKind::CudaStream { device: dev }).unwrap();
 
@@ -608,7 +650,7 @@ fn run_cuda_backend_ordered_handoff_and_section_5_3_hazard(_src: &mut Sources) {
     // §5.3 hazard: immediately evict `dram_f` BEFORE confirming `caller_stream`'s read ticket!
     // The frame MUST remain Draining and MUST NOT be reclaimed until caller_tl confirms `t_read`.
     core.evict_frame(dram_f).unwrap();
-    assert!(core.frames.metas[dram_f.0 as usize].state == STATE_DRAINING);
+    assert!(core.frame_state(dram_f).unwrap() == STATE_DRAINING);
     assert!(core.reclaim_draining(host.tier_id(), 4) == 0);
 
     // Synchronize caller stream and advance caller_tl confirmation watermark.
@@ -620,7 +662,7 @@ fn run_cuda_backend_ordered_handoff_and_section_5_3_hazard(_src: &mut Sources) {
 
     // Now reclamation succeeds safely!
     assert!(core.reclaim_draining(host.tier_id(), 4) == 1);
-    assert!(core.frames.metas[dram_f.0 as usize].state == STATE_EMPTY);
+    assert!(core.frame_state(dram_f).unwrap() == STATE_EMPTY);
 
     // Copy dev_buf back into a fresh host slab via put_gpu -> pinned_host + synchronize + read
     // to verify exact end-to-end byte integrity on real GPU hardware.
@@ -659,9 +701,9 @@ fn run_cuda_backend_ordered_handoff_and_section_5_3_hazard(_src: &mut Sources) {
     let _ = caller_stream.destroy();
 }
 
-fn run_remote_lease_and_fenced_revocation_contract(_src: &mut Sources) {
+fn run_fenced_revocation_contract(_src: &mut Sources) {
     let mut core = CacheCore::new(0, FRAME_SIZE, Vec::new(), 4, Tracked(_src.instance.borrow()));
-    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let mut host = HostBackend::new(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -680,32 +722,27 @@ fn run_remote_lease_and_fenced_revocation_contract(_src: &mut Sources) {
         &data,
     ).unwrap();
 
-    let (rv, _rc, Tracked(_rcap)) = core.pin_remote_lease(
+    let ghost unused_share = _src.shares@.next_share();
+    let stale = core.begin_fenced_revocation(frame, Ghost(unused_share));
+    assert!(stale.is_err());
+
+    let (rv, _rc, Tracked(_rcap)) = core.pin_fenced_lease(
         frame,
-        3,
-        9,
         Tracked(_src.shares.borrow_mut()),
         Tracked(_src.instance.borrow()),
     ).unwrap();
     assert!(rv == ver);
-    assert!(core.frames.metas[frame.0 as usize].active_remote_leases == 1);
+    assert!(core.frame_meta(frame).unwrap().active_fenced_leases == 1);
 
     // Evict while remotely pinned; reclamation is blocked until fenced revocation completes.
     core.evict_frame(frame).unwrap();
     assert!(core.reclaim_draining(host.tier_id(), 4) == 0);
 
-    // Wrong (mw_slot, generation) is rejected cleanly.
+    // Beginning the fence extracts the lent token while the frame stays pinned.
     let ghost share = _rcap.share();
-    let bad_rev = core.begin_fenced_revocation(frame, 3, 10, Ghost(share));
-    assert!(bad_rev.is_err());
-
-    // Begin fenced revocation with matching (mw_slot, generation), returning the lent SlotToken.
-    // The frame stays pinned (`active_remote_leases == 1`) until `finish_fenced_revocation` runs
-    // after the hardware fence completes.
-    let pending = core.begin_fenced_revocation(frame, 3, 9, Ghost(share)).unwrap();
-    assert!(pending.frame == frame && pending.slot == 3 && pending.generation == 9);
-    assert!(core.frames.metas[frame.0 as usize].active_remote_leases == 1);
-    assert!(core.reclaim_draining(host.tier_id(), 4) == 0);
+    let pending = core.begin_fenced_revocation(frame, Ghost(share)).unwrap();
+    assert!(pending.frame == frame);
+    assert!(core.frame_meta(frame).unwrap().active_fenced_leases == 1);
 }
 
 fn run_cuda_one_slot_ring_readiness_bidirectional(_src: &mut Sources) {
@@ -717,7 +754,7 @@ fn run_cuda_one_slot_ring_readiness_bidirectional(_src: &mut Sources) {
     }
     let dev: DeviceId = 0;
     let mut core = CacheCore::new(0, FRAME_SIZE, Vec::new(), 4, Tracked(_src.instance.borrow()));
-    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let host = HostBackend::new(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -726,9 +763,9 @@ fn run_cuda_one_slot_ring_readiness_bidirectional(_src: &mut Sources) {
         2,
         4096,
     ).unwrap();
-    let tracked host_op_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_op_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let mut host_op_ctx = host::HostContext::new(Tracked(host_op_src));
-    let tracked gpu_src = _src.events.borrow_mut().mint(EventSourceKind::CudaStream);
+    let tracked gpu_src = _src.events.borrow_mut().mint(EventSourceKind::cuda_stream());
     // 2 resident GPU frames sharing a 1-entry CUDA event ring!
     let mut gpu = CudaBackend::new(
         &mut core,
@@ -741,7 +778,7 @@ fn run_cuda_one_slot_ring_readiness_bidirectional(_src: &mut Sources) {
         false,
     ).unwrap();
 
-    let tracked caller_src = _src.events.borrow_mut().mint(EventSourceKind::CudaStream);
+    let tracked caller_src = _src.events.borrow_mut().mint(EventSourceKind::cuda_stream());
     let mut caller_stream = cuda::CudaStream::new(dev, Tracked(caller_src)).unwrap();
     let caller_tl = core.register_timeline(TimelineKind::CudaStream { device: dev }).unwrap();
 
@@ -873,11 +910,11 @@ fn run_rdma_lease_handle_swap_remove_regression(
     t: TcpTransport,
 ) {
     let dev0 = rdma::DeviceContext::open(dev_idx, 0).unwrap();
-    let tracked pd0_tok = _src.events.borrow_mut().mint(EventSourceKind::RdmaQueuePair);
+    let tracked pd0_tok = _src.events.borrow_mut().mint(EventSourceKind::rdma_qp());
     let pd0 = rdma::ProtectionDomain::new(&dev0, Tracked(pd0_tok)).unwrap();
-    let tracked cq0_tok = _src.events.borrow_mut().mint(EventSourceKind::RdmaQueuePair);
+    let tracked cq0_tok = _src.events.borrow_mut().mint(EventSourceKind::rdma_qp());
     let cq0 = rdma::CompletionQueue::new(&dev0, 32, Tracked(cq0_tok)).unwrap();
-    let tracked qp0_tok = _src.events.borrow_mut().mint(EventSourceKind::RdmaQueuePair);
+    let tracked qp0_tok = _src.events.borrow_mut().mint(EventSourceKind::rdma_qp());
     let uqp0 = rdma::UnconnectedQueuePair::new(
         &pd0,
         &cq0,
@@ -899,8 +936,8 @@ fn run_rdma_lease_handle_swap_remove_regression(
         },
     };
 
-    let tracked mw0_tok = _src.events.borrow_mut().mint(EventSourceKind::RdmaQueuePair);
-    let tracked mw1_tok = _src.events.borrow_mut().mint(EventSourceKind::RdmaQueuePair);
+    let tracked mw0_tok = _src.events.borrow_mut().mint(EventSourceKind::rdma_qp());
+    let tracked mw1_tok = _src.events.borrow_mut().mint(EventSourceKind::rdma_qp());
     let w0 = rdma::alloc_window(&pd0, Tracked(mw0_tok)).unwrap();
     let w1 = rdma::alloc_window(&pd0, Tracked(mw1_tok)).unwrap();
     let mut windows = Vec::new();
@@ -908,7 +945,7 @@ fn run_rdma_lease_handle_swap_remove_regression(
     windows.push(w1);
 
     let mut core = CacheCore::new(0, FRAME_SIZE, Vec::new(), 4, Tracked(_src.instance.borrow()));
-    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let mut host = HostBackend::new(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -939,10 +976,10 @@ fn run_rdma_lease_handle_swap_remove_regression(
     rdma.register_host_slab(
         &core,
         &pd0,
-        &host.buffer,
-        host.tier,
-        host.first_frame,
-        host.num_frames,
+        host.buffer(),
+        host.tier_id(),
+        host.first_frame(),
+        host.num_frames(),
         rdma::AccessFlags { local_write: true, mw_bind: true },
     ).unwrap();
 
@@ -983,6 +1020,9 @@ fn run_rdma_lease_handle_swap_remove_regression(
     }
     assert!(bound0 && bound1);
 
+    let mut revoke_ctx = host::HostContext::new(
+        Tracked(_src.events.borrow_mut().mint(EventSourceKind::host())),
+    );
     // Revoke `h0` (slot index 0 in `active_leases`), which `swap_remove`s index 0
     // and shifts `h1` down to vector index 0.
     let inv0 = rdma.begin_fenced_invalidate(&core, h0).unwrap();
@@ -995,7 +1035,7 @@ fn run_rdma_lease_handle_swap_remove_regression(
             ) if wr_id == inv0 => {
                 let _ = rdma.finish_fenced_revoke_with_invalidate(
                     &mut core,
-                    &mut host.ctx,
+                    &mut revoke_ctx,
                     h0,
                     witness,
                     Tracked(_src.instance.borrow()),
@@ -1017,7 +1057,7 @@ fn run_rdma_lease_handle_swap_remove_regression(
 
     // Acknowledge quarantine and replenish the vacant slot (`h0.mw_slot`), bumping its generation.
     rdma.acknowledge_quarantined_window(&core, h0.mw_slot as u32).unwrap();
-    let tracked replenish_tok = _src.events.borrow_mut().mint(EventSourceKind::RdmaQueuePair);
+    let tracked replenish_tok = _src.events.borrow_mut().mint(EventSourceKind::rdma_qp());
     rdma.replenish_window(&core, h0.mw_slot as u32, &pd0, Tracked(replenish_tok)).unwrap();
 
     // Re-bind `f0`, reusing `h0.mw_slot` with bumped `generation`; stale `h0` must still fail.
@@ -1059,7 +1099,7 @@ fn run_rdma_lease_handle_swap_remove_regression(
             ) if wr_id == inv1 => {
                 let _ = rdma.finish_fenced_revoke_with_invalidate(
                     &mut core,
-                    &mut host.ctx,
+                    &mut revoke_ctx,
                     h1,
                     witness,
                     Tracked(_src.instance.borrow()),
@@ -1083,7 +1123,7 @@ fn run_rdma_lease_handle_swap_remove_regression(
             ) if wr_id == inv2 => {
                 let _ = rdma.finish_fenced_revoke_with_invalidate(
                     &mut core,
-                    &mut host.ctx,
+                    &mut revoke_ctx,
                     h2,
                     witness,
                     Tracked(_src.instance.borrow()),
@@ -1103,11 +1143,11 @@ fn run_rdma_lease_handle_swap_remove_regression(
 fn run_rdma_lease_peer_inner(dev_idx: u32, gid_idx: u8, t: TcpTransport) {
     let (Tracked(instance), _, Tracked(mut events1), _) = NodeContext::bootstrap(1).into_sources();
     let dev1 = rdma::DeviceContext::open(dev_idx, 1).unwrap();
-    let tracked pd1_tok = events1.mint(EventSourceKind::RdmaQueuePair);
+    let tracked pd1_tok = events1.mint(EventSourceKind::rdma_qp());
     let pd1 = rdma::ProtectionDomain::new(&dev1, Tracked(pd1_tok)).unwrap();
-    let tracked cq1_tok = events1.mint(EventSourceKind::RdmaQueuePair);
+    let tracked cq1_tok = events1.mint(EventSourceKind::rdma_qp());
     let cq1 = rdma::CompletionQueue::new(&dev1, 32, Tracked(cq1_tok)).unwrap();
-    let tracked qp1_tok = events1.mint(EventSourceKind::RdmaQueuePair);
+    let tracked qp1_tok = events1.mint(EventSourceKind::rdma_qp());
     let uqp1 = rdma::UnconnectedQueuePair::new(
         &pd1,
         &cq1,
@@ -1134,7 +1174,7 @@ fn perform_host_read_on_tl(
     shares: Tracked<&mut ShareSource>,
     instance: Tracked<&TransferInstance>,
     ctx: &mut host::HostContext,
-    tl: u8,
+    tl: TimelineId,
     frame: FrameId,
     expected: &Vec<u8>,
 ) -> (Ticket, Tracked<Knows>) {
@@ -1153,8 +1193,8 @@ fn perform_host_read_on_tl(
         &slice,
         &mut out,
         Tracked(&mut perm),
-        Tracked(&core.ledger.borrow().submitted),
-        Tracked(&core.ledger.borrow().knows),
+        Tracked(&core.ledger().borrow().submitted),
+        Tracked(&core.ledger().borrow().knows),
         Ghost(core.citations()),
     );
     assert!(out == *expected);
@@ -1166,7 +1206,7 @@ fn perform_host_read_on_tl(
 
 fn run_reclamation_liveness_under_continuous_hot_overflow(_src: &mut Sources) {
     let mut core = CacheCore::new(0, FRAME_SIZE, Vec::new(), 8, Tracked(_src.instance.borrow()));
-    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let mut host = HostBackend::new(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -1176,12 +1216,12 @@ fn run_reclamation_liveness_under_continuous_hot_overflow(_src: &mut Sources) {
         4096,
     ).unwrap();
 
-    let mut tls: Vec<u8> = Vec::new();
+    let mut tls: Vec<TimelineId> = Vec::new();
     let mut ctxs: Vec<host::HostContext> = Vec::new();
     let mut idx = 0usize;
     while idx < 5 {
         let tl = core.register_timeline(TimelineKind::Host).unwrap();
-        let tracked ev_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+        let tracked ev_src = _src.events.borrow_mut().mint(EventSourceKind::host());
         tls.push(tl);
         ctxs.push(host::HostContext::new(Tracked(ev_src)));
         idx += 1;
@@ -1222,9 +1262,9 @@ fn run_reclamation_liveness_under_continuous_hot_overflow(_src: &mut Sources) {
         knows_a.push(knows);
         ctx_idx += 1;
     }
-    assert!((core.frames.metas[frame_a.0 as usize].flags & FLAG_READ_OVERFLOW) != 0);
+    assert!((core.frame_meta(frame_a).unwrap().flags & FLAG_READ_OVERFLOW) != 0);
     core.evict_frame(frame_a).unwrap();
-    assert!(core.frames.metas[frame_a.0 as usize].state == STATE_DRAINING);
+    assert!(core.frame_state(frame_a).unwrap() == STATE_DRAINING);
 
     // Hot frame_b continues overflowing across ALL 5 timelines with newer unconfirmed reads.
     let mut tickets_b: Vec<Ticket> = Vec::new();
@@ -1247,7 +1287,7 @@ fn run_reclamation_liveness_under_continuous_hot_overflow(_src: &mut Sources) {
         knows_b.push(knows);
         idx_b += 1;
     }
-    assert!((core.frames.metas[frame_b.0 as usize].flags & FLAG_READ_OVERFLOW) != 0);
+    assert!((core.frame_meta(frame_b).unwrap().flags & FLAG_READ_OVERFLOW) != 0);
 
     // Confirm only frame_a's earlier reads; frame_a MUST reclaim immediately while frame_b's
     // newer reads on all 5 timelines remain unconfirmed!
@@ -1255,17 +1295,17 @@ fn run_reclamation_liveness_under_continuous_hot_overflow(_src: &mut Sources) {
     while c_idx < 5 {
         let Tracked(k) = knows_a.remove(0);
         core.mark_timeline_complete(tls[c_idx], tickets_a[c_idx].seq(), Tracked(k));
-        assert!(core.timelines.confirmed_seq[tls[c_idx] as usize] < tickets_b[c_idx].seq());
+        assert!(core.timelines().confirmed_sequence(tls[c_idx]).unwrap() < tickets_b[c_idx].seq());
         c_idx += 1;
     }
     assert!(core.reclaim_draining(host.tier_id(), 4) == 1);
-    assert!(core.frames.metas[frame_a.0 as usize].state == STATE_EMPTY);
-    assert!((core.frames.metas[frame_a.0 as usize].flags & FLAG_READ_OVERFLOW) == 0);
+    assert!(core.frame_state(frame_a).unwrap() == STATE_EMPTY);
+    assert!((core.frame_meta(frame_a).unwrap().flags & FLAG_READ_OVERFLOW) == 0);
 
     // Evicting frame_b now stays blocked while its newer reads are unconfirmed, then succeeds once confirmed.
     core.evict_frame(frame_b).unwrap();
     assert!(core.reclaim_draining(host.tier_id(), 4) == 0);
-    assert!(core.frames.metas[frame_b.0 as usize].state == STATE_DRAINING);
+    assert!(core.frame_state(frame_b).unwrap() == STATE_DRAINING);
 
     let mut d_idx = 0usize;
     while d_idx < 5 {
@@ -1274,12 +1314,12 @@ fn run_reclamation_liveness_under_continuous_hot_overflow(_src: &mut Sources) {
         d_idx += 1;
     }
     assert!(core.reclaim_draining(host.tier_id(), 4) == 1);
-    assert!(core.frames.metas[frame_b.0 as usize].state == STATE_EMPTY);
+    assert!(core.frame_state(frame_b).unwrap() == STATE_EMPTY);
 }
 
 fn run_multi_size_class_host_tiers_and_copy_hop_rejection(_src: &mut Sources) {
     let mut core = CacheCore::new(0, 4096, Vec::new(), 4, Tracked(_src.instance.borrow()));
-    let tracked s0 = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked s0 = _src.events.borrow_mut().mint(EventSourceKind::host());
     let mut host0 = HostBackend::new_with_frame_size(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -1289,7 +1329,7 @@ fn run_multi_size_class_host_tiers_and_copy_hop_rejection(_src: &mut Sources) {
         4096,
         4096,
     ).unwrap();
-    let tracked s1 = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked s1 = _src.events.borrow_mut().mint(EventSourceKind::host());
     let mut host1 = HostBackend::new_with_frame_size(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -1299,7 +1339,7 @@ fn run_multi_size_class_host_tiers_and_copy_hop_rejection(_src: &mut Sources) {
         4096,
         16384,
     ).unwrap();
-    let tracked s2 = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked s2 = _src.events.borrow_mut().mint(EventSourceKind::host());
     let host2 = HostBackend::new_with_frame_size(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -1310,9 +1350,9 @@ fn run_multi_size_class_host_tiers_and_copy_hop_rejection(_src: &mut Sources) {
         4096,
     ).unwrap();
 
-    assert!(core.tier_frame_size(host0.tier_id()) == 4096);
-    assert!(core.tier_frame_size(host1.tier_id()) == 16384);
-    assert!(core.tier_frame_size(host2.tier_id()) == 4096);
+    assert!(core.tier_frame_size(host0.tier_id()).unwrap() == 4096);
+    assert!(core.tier_frame_size(host1.tier_id()).unwrap() == 16384);
+    assert!(core.tier_frame_size(host2.tier_id()).unwrap() == 4096);
 
     let data_4k = vec![0xA7u8; 4096];
     let data_16k = vec![0x5Eu8; 16384];
@@ -1365,7 +1405,7 @@ fn run_multi_size_class_host_tiers_and_copy_hop_rejection(_src: &mut Sources) {
     assert!(got_v1 == v1 && out_16k == data_16k);
 
     // Cross-size copy hop MUST be rejected without pinning or leaking leases.
-    let leases_before = core.free_lease_slots.len();
+    let leases_before = core.free_lease_count();
     match core.begin_copy_hop(
         f0,
         host1.tier_id(),
@@ -1375,7 +1415,7 @@ fn run_multi_size_class_host_tiers_and_copy_hop_rejection(_src: &mut Sources) {
         Err(CoreError::InvalidArgument) => {},
         _ => assert!(false),
     }
-    assert!(core.free_lease_slots.len() == leases_before);
+    assert!(core.free_lease_count() == leases_before);
 
     // Matching-size copy hop succeeds and aborts cleanly.
     let (hop, Tracked(cap), Tracked(tok)) = core.begin_copy_hop(
@@ -1391,7 +1431,7 @@ fn run_multi_size_class_host_tiers_and_copy_hop_rejection(_src: &mut Sources) {
         Tracked(tok),
         Tracked(_src.instance.borrow()),
     );
-    assert!(core.free_lease_slots.len() == leases_before);
+    assert!(core.free_lease_count() == leases_before);
 
     core.evict_frame(f0).unwrap();
     core.evict_frame(f1).unwrap();
@@ -1404,7 +1444,7 @@ fn run_nvme_backend_explicit_path_and_size(_src: &mut Sources, path: &str) -> Re
     CoreError,
 > {
     let mut core = CacheCore::new(0, FRAME_SIZE, Vec::new(), 4, Tracked(_src.instance.borrow()));
-    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let host = HostBackend::new(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -1413,10 +1453,10 @@ fn run_nvme_backend_explicit_path_and_size(_src: &mut Sources, path: &str) -> Re
         1,
         4096,
     ).unwrap();
-    let tracked ring_src = _src.events.borrow_mut().mint(EventSourceKind::IoUring);
+    let tracked ring_src = _src.events.borrow_mut().mint(EventSourceKind::io_uring());
     let nvme = NvmeBackend::new_with_path(
         &mut core,
-        &host.ctx,
+        host.context(),
         Tracked(_src.instance.borrow()),
         Tracked(_src.allocations.borrow_mut()),
         Tracked(ring_src),
@@ -1426,7 +1466,7 @@ fn run_nvme_backend_explicit_path_and_size(_src: &mut Sources, path: &str) -> Re
         true,
         8192,
     )?;
-    Ok(core.tier_frame_size(nvme.tier_id()))
+    Ok(core.tier_frame_size(nvme.tier_id()).unwrap())
 }
 
 } // verus!
@@ -1576,9 +1616,9 @@ fn inline_read_compaction_and_overflow_fallback() {
 }
 
 #[test]
-fn concurrent_local_and_remote_leases_overflow_and_eviction() {
+fn concurrent_local_and_fenced_leases_overflow_and_eviction() {
     let mut src = sources();
-    run_concurrent_local_and_remote_leases_overflow_and_eviction(&mut src);
+    run_concurrent_local_and_fenced_leases_overflow_and_eviction(&mut src);
 }
 
 #[test]
@@ -1606,9 +1646,9 @@ fn cuda_backend_ordered_handoff_and_section_5_3_hazard() {
 }
 
 #[test]
-fn remote_lease_and_fenced_revocation_contract() {
+fn fenced_revocation_contract() {
     let mut src = sources();
-    run_remote_lease_and_fenced_revocation_contract(&mut src);
+    run_fenced_revocation_contract(&mut src);
 }
 
 #[test]

@@ -262,7 +262,7 @@ pub(super) fn raw_enable_sync_memops(buf: &CudaBuffer) -> Result<(), CudaError>
             set(
                 (&sync_val as *const u32).cast(),
                 CU_POINTER_ATTRIBUTE_SYNC_MEMOPS,
-                buf.memory.ptr.addr() as u64,
+                buf.memory.allocation.raw_parts().0.addr() as u64,
             )
         },
     )
@@ -270,9 +270,14 @@ pub(super) fn raw_enable_sync_memops(buf: &CudaBuffer) -> Result<(), CudaError>
 
 /// Coverage: a fresh live device allocation on the selected GPU, zero-initialized.
 #[verifier::external_body]
-pub(super) fn raw_alloc_device(device: DeviceId, len: usize) -> (r: Result<*mut u8, CudaError>)
+pub(super) fn raw_alloc_device(device: DeviceId, len: usize) -> (r: Result<
+    DmaAllocation,
+    CudaError,
+>)
     ensures
-        r matches Ok(ptr) ==> ptr.addr() != 0 && ptr.addr() + len <= usize::MAX,
+        r matches Ok(a) ==> a.well_formed() && a.total_len() == len && a.device_spec() == Some(
+            device,
+        ),
 {
     set_device(device)?;
     let mut ptr = ptr::null_mut();
@@ -282,30 +287,29 @@ pub(super) fn raw_alloc_device(device: DeviceId, len: usize) -> (r: Result<*mut 
         let _ = unsafe { cudaFree(ptr) };
         return Err(e);
     }
-    Ok(ptr.cast())
+    Ok(unsafe { DmaAllocation::from_live_allocation(ptr.cast(), len, Some(device)) })
 }
 
 /// Coverage: a fresh page-locked allocation, initialized for CPU byte reads.
 #[verifier::external_body]
-pub(super) fn raw_alloc_host(len: usize) -> (r: Result<*mut u8, CudaError>)
+pub(super) fn raw_alloc_host(len: usize) -> (r: Result<DmaAllocation, CudaError>)
     ensures
-        r matches Ok(ptr) ==> ptr.addr() != 0 && ptr.addr() + len <= usize::MAX,
+        r matches Ok(a) ==> a.well_formed() && a.total_len() == len && a.device_spec().is_none(),
 {
     let mut ptr = ptr::null_mut();
     status(unsafe { cudaHostAlloc(&mut ptr, len.max(1), 0) })?;
     unsafe {
         ptr.cast::<u8>().write_bytes(0, len);
     }
-    Ok(ptr.cast())
+    Ok(unsafe { DmaAllocation::from_live_allocation(ptr.cast(), len, None) })
 }
 
 /// Coverage: pin the existing CPU byte range in place.
 #[verifier::external_body]
-pub(super) fn raw_host_register(buffer: &HostBuffer) -> Result<RawHostRegGuard, CudaError>
+pub(super) fn raw_host_register(ptr: *mut u8, len: usize) -> Result<RawHostRegGuard, CudaError>
     requires
-        buffer.well_formed(),
+        ptr.addr() + len <= usize::MAX,
 {
-    let (ptr, len) = buffer.raw_parts();
     if len == 0 {
         return Err(CudaError::INVALID_VALUE);
     }
@@ -363,20 +367,65 @@ pub(super) fn raw_stream_wait_event(stream: &CudaStream, event: &CudaEvent) -> R
 
 /// Observation: only success establishes host visibility of the recorded work.
 #[verifier::external_body]
-pub(super) fn raw_event_query(event: &CudaEvent) -> Result<bool, CudaError> {
+pub(super) fn raw_event_query(event: &CudaEvent) -> (r: Result<
+    Option<Tracked<ObservedEvents>>,
+    CudaError,
+>)
+    requires
+        event.well_formed(),
+    ensures
+        r matches Ok(Some(evidence)) ==> evidence@.observed(
+            event.infos().instance_id(),
+            event.observer(),
+            event.recorded(),
+        ),
+{
     set_device(event.device)?;
     match unsafe { cudaEventQuery(event.raw.as_ptr().cast()) } {
-        0 => Ok(true),
-        ERROR_NOT_READY => Ok(false),
+        0 => Ok(
+            Some(
+                unsafe {
+                    ObservedEvents::from_completion(
+                        Ghost(event.infos().instance_id()),
+                        Ghost(event.observer()),
+                        Ghost(event.recorded()),
+                        Ghost(ISet::empty()),
+                    )
+                },
+            ),
+        ),
+        ERROR_NOT_READY => Ok(None),
         code => Err(CudaError(code)),
     }
 }
 
 /// Observation: success establishes host visibility of all preceding stream work.
 #[verifier::external_body]
-pub(super) fn raw_stream_synchronize(stream: &CudaStream) -> Result<(), CudaError> {
+pub(super) fn raw_stream_synchronize(stream: &CudaStream) -> (r: Result<
+    Tracked<ObservedEvents>,
+    CudaError,
+>)
+    requires
+        stream.well_formed(),
+    ensures
+        r matches Ok(evidence) ==> evidence@.observed(
+            stream.source().id(),
+            stream.source().node(),
+            stream.tail(),
+        ),
+{
     set_device(stream.device)?;
-    status(unsafe { cudaStreamSynchronize(stream.raw.as_ptr().cast()) })
+    status(unsafe { cudaStreamSynchronize(stream.raw.as_ptr().cast()) })?;
+    Ok(
+        unsafe {
+            ObservedEvents::from_completion(
+                Ghost(stream.source().id()),
+                Ghost(stream.source().node()),
+                Ghost(stream.tail()),
+                Ghost(ISet::empty()),
+            )
+        },
+    )
 }
 
 /// Enable the stream GPU to access the remote allocation when the topology
@@ -456,22 +505,22 @@ pub(super) fn raw_free_device(buf: &CudaBuffer) -> (r: Result<Tracked<CompletedA
     requires
         buf.well_formed(),
     ensures
-        r matches Ok(w) ==> w@.access == reclaim_slab_access(
+        r matches Ok(w) ==> w@.access() == reclaim_slab_access(
             buf.node(),
             buf.space(),
             buf.num_slots() as nat,
-        ) && w@.effect == havoc_effect(),
+        ) && w@.effect() == havoc_effect(),
 {
     let CudaPointerKind::Device(device) = buf.memory.kind else { unreachable!() };
     set_device(device)?;
-    status(unsafe { cudaFree(buf.memory.ptr.cast()) })?;
+    status(unsafe { cudaFree(buf.memory.allocation.raw_parts().0.cast()) })?;
     Ok(
-        Tracked(
-            CompletedAccess {
-                access: reclaim_slab_access(buf.node(), buf.space(), buf.num_slots() as nat),
-                effect: havoc_effect(),
-            },
-        ),
+        unsafe {
+            CompletedAccess::from_completed_access(
+                Ghost(reclaim_slab_access(buf.node(), buf.space(), buf.num_slots() as nat)),
+                Ghost(havoc_effect()),
+            )
+        },
     )
 }
 
@@ -484,20 +533,20 @@ pub(super) fn raw_free_host(buf: &CudaHostBuffer) -> (r: Result<
     requires
         buf.well_formed(),
     ensures
-        r matches Ok(w) ==> w@.access == reclaim_slab_access(
+        r matches Ok(w) ==> w@.access() == reclaim_slab_access(
             buf.node(),
             buf.space(),
             buf.num_slots() as nat,
-        ) && w@.effect == havoc_effect(),
+        ) && w@.effect() == havoc_effect(),
 {
-    status(unsafe { cudaFreeHost(buf.memory.ptr.cast()) })?;
+    status(unsafe { cudaFreeHost(buf.memory.allocation.raw_parts().0.cast()) })?;
     Ok(
-        Tracked(
-            CompletedAccess {
-                access: reclaim_slab_access(buf.node(), buf.space(), buf.num_slots() as nat),
-                effect: havoc_effect(),
-            },
-        ),
+        unsafe {
+            CompletedAccess::from_completed_access(
+                Ghost(reclaim_slab_access(buf.node(), buf.space(), buf.num_slots() as nat)),
+                Ghost(havoc_effect()),
+            )
+        },
     )
 }
 
@@ -510,11 +559,11 @@ pub(super) fn raw_host_unregister(buf: &CudaHostRegistration<'_>) -> (r: Result<
     requires
         buf.well_formed(),
     ensures
-        r matches Ok(w) ==> w@.access == dereg_slab_access(
+        r matches Ok(w) ==> w@.access() == dereg_slab_access(
             buf.node(),
             buf.space(),
             buf.num_slots() as nat,
-        ) && w@.effect == (if buf.num_slots() == 1 {
+        ) && w@.effect() == (if buf.num_slots() == 1 {
             identity_effect(buf.slot_loc(0))
         } else {
             identity_effect_slab()
@@ -522,16 +571,18 @@ pub(super) fn raw_host_unregister(buf: &CudaHostRegistration<'_>) -> (r: Result<
 {
     status(unsafe { cudaHostUnregister(buf.guard.as_ptr().cast()) })?;
     Ok(
-        Tracked(
-            CompletedAccess {
-                access: dereg_slab_access(buf.node(), buf.space(), buf.num_slots() as nat),
-                effect: if buf.num_slots() == 1 {
-                    identity_effect(buf.slot_loc(0))
-                } else {
-                    identity_effect_slab()
-                },
-            },
-        ),
+        unsafe {
+            CompletedAccess::from_completed_access(
+                Ghost(dereg_slab_access(buf.node(), buf.space(), buf.num_slots() as nat)),
+                Ghost(
+                    if buf.num_slots() == 1 {
+                        identity_effect(buf.slot_loc(0))
+                    } else {
+                        identity_effect_slab()
+                    },
+                ),
+            )
+        },
     )
 }
 

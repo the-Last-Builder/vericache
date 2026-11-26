@@ -1,6 +1,5 @@
 //! Coverage of file and buffer ranges, CQE observation and full-length copy behavior.
 use super::*;
-use crate::host::CompletedAccess;
 use std::ffi::{c_char, CString};
 use std::ptr;
 
@@ -137,8 +136,8 @@ pub(super) fn close(file: NvmeFile) -> (r: Tracked<CompletedAccess>)
     requires
         file.well_formed(),
     ensures
-        r@.access == reclaim_slab_access(file.node(), file.space(), file.num_slots() as nat),
-        r@.effect == havoc_effect(),
+        r@.access() == reclaim_slab_access(file.node(), file.space(), file.num_slots() as nat),
+        r@.effect() == havoc_effect(),
 {
     let fd = file.fd.into_fd();
     if fd >= 0 {
@@ -146,12 +145,12 @@ pub(super) fn close(file: NvmeFile) -> (r: Tracked<CompletedAccess>)
             linux_close(fd);
         }
     }
-    Tracked(
-        CompletedAccess {
-            access: reclaim_slab_access(file.node(), file.space(), file.num_slots() as nat),
-            effect: havoc_effect(),
-        },
-    )
+    unsafe {
+        CompletedAccess::from_completed_access(
+            Ghost(reclaim_slab_access(file.node(), file.space(), file.num_slots() as nat)),
+            Ghost(havoc_effect()),
+        )
+    }
 }
 
 #[verifier::external_body]
@@ -240,20 +239,39 @@ pub(super) fn submit(ring: &IoUring) -> (r: Result<usize, NvmeError>)
 /// Observation: the DMA identified by this CQE has terminated. Behavior:
 /// its signed result gives the transferred byte count or a negative errno.
 #[verifier::external_body]
-pub(super) fn poll(ring: &IoUring) -> (r: Option<(u64, u32, i32)>)
+pub(super) fn poll(ring: &IoUring) -> (r: Option<(u64, u32, i32, Tracked<ObservedEvents>)>)
     requires
         ring.well_formed(),
     ensures
-        r matches Some((id, len, _)) ==> ring.pending().contains_key(id) && !ring.staged().contains(
-            id,
-        ) && ring.pending()[id].expected_len == len,
+        r matches Some((id, len, res, evidence)) ==> {
+            let event = ring.pending()[id].event;
+            &&& ring.pending().contains_key(id) && !ring.staged().contains(id)
+            &&& ring.pending()[id].expected_len == len
+            &&& evidence@.observed(ring.instance_id(), ring.node(), ISet::empty().insert(event))
+            &&& res == len as i32 ==> evidence@.succeeded(ring.instance_id(), event)
+        },
 {
     let (mut id, mut len, mut res) = (0, 0, 0);
     let found = unsafe { vc_uring_poll(ring.raw.as_ptr(), &mut id, &mut len, &mut res) };
     if found == 0 {
         None
     } else {
-        Some((id, len, res))
+        let ghost event = ring.pending()[id].event;
+        let ghost completed = ISet::empty().insert(event);
+        let ghost successful = if res == len as i32 {
+            completed
+        } else {
+            ISet::empty()
+        };
+        let evidence = unsafe {
+            ObservedEvents::from_completion(
+                Ghost(ring.instance_id()),
+                Ghost(ring.node()),
+                Ghost(completed),
+                Ghost(successful),
+            )
+        };
+        Some((id, len, res, evidence))
     }
 }
 

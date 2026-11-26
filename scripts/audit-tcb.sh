@@ -5,6 +5,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 fail=0
+verified_crates=(
+  vericache-foundation
+  vericache-transfer-core
+  vericache-transfer
+  vericache-kernel
+  vericache-core
+)
 
 check_exact_list() {
   local label="$1"
@@ -19,16 +26,16 @@ check_exact_list() {
 
 # 1. Exact FFI Rust file inventory across all workspace crates
 actual_ffi="$(
-  find vericache-foundation vericache-transfer vericache-core \
+  find "${verified_crates[@]}" \
     -type f -name '*ffi*.rs' | LC_ALL=C sort
 )"
 expected_ffi="$(cat <<'EOF' | LC_ALL=C sort
-vericache-transfer/src/context/ffi.rs
+vericache-transfer-core/src/context/ffi.rs
 vericache-transfer/src/cuda/ffi.rs
 vericache-transfer/src/host/ffi.rs
 vericache-transfer/src/nvme/ffi.rs
 vericache-transfer/src/rdma/ffi.rs
-vericache-transfer/src/transport/ffi.rs
+vericache-transfer-core/src/transport/ffi.rs
 EOF
 )"
 check_exact_list "ffi-rust-files" "$actual_ffi" "$expected_ffi"
@@ -68,34 +75,7 @@ EOF
 )"
 check_exact_list "build-rs-c-sources" "$actual_build_c" "$expected_build_c"
 
-# 5. Audit exclusion globs in Justfiles may not be widened beyond the 6 ffi.rs files
-actual_globs="$(
-  python3 - <<'PY'
-import pathlib, re
-expected_glob = "'!src/{context,host,cuda,rdma,nvme,transport}/ffi.rs'"
-bad = []
-for jf in ["Justfile", "vericache-foundation/Justfile", "vericache-transfer/Justfile", "vericache-core/Justfile"]:
-    txt = pathlib.Path(jf).read_text()
-    for i, line in enumerate(txt.splitlines(), 1):
-        if "--globs" in line:
-            if jf != "vericache-transfer/Justfile":
-                bad.append(f"{jf}:{i}: unexpected --globs outside vericache-transfer/Justfile: {line.strip()}")
-            else:
-                globs = re.findall(r"--globs\s+(\S+)", line)
-                for g in globs:
-                    if g != expected_glob:
-                        bad.append(f"{jf}:{i}: unexpected glob {g} (expected {expected_glob})")
-if bad:
-    print("\n".join(bad))
-PY
-)"
-if [[ -n "$actual_globs" ]]; then
-  echo "TCB AUDIT FAILED [justfile-globs]:" >&2
-  echo "$actual_globs" >&2
-  fail=1
-fi
-
-# 6. No Cargo.toml in the workspace may configure a custom `build = ...` script
+# 5. No Cargo.toml in the workspace may configure a custom `build = ...` script
 actual_custom_build="$(
   python3 - <<'PY'
 import pathlib, re
@@ -117,50 +97,60 @@ if [[ -n "$actual_custom_build" ]]; then
   fail=1
 fi
 
-# 7. Every crate Justfile must retain all expected ast-grep scan invocations
+# 6. Require the exact AST scans, including the only allowed exclusion globs.
 actual_just_scans="$(
-  python3 - <<'PY'
+  python3 - "${verified_crates[@]}" <<'PY'
+import difflib
 import pathlib
+import re
+import sys
 
-expected = {
-    "vericache-foundation/Justfile": [
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-assume-admit-truncate.yml src",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-external-escape.yml src",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-external-body.yml src",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-unsafe.yml src",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-unverified-code.yml src",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-panicking-stubs.yml src",
+scan = "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/"
+security_rules = (
+    "no-assume-admit-truncate",
+    "no-external-escape",
+    "no-external-body",
+    "no-unsafe",
+    "no-unverified-code",
+    "no-panicking-stubs",
+)
+source_only = {"no-unverified-code", "no-panicking-stubs"}
+exclude_ffi = {"no-external-body", "no-unsafe", "no-unverified-code"}
+ffi_globs = {
+    "vericache-transfer-core": "'!src/{context,transport}/ffi.rs'",
+    "vericache-transfer": "'!src/{host,cuda,nvme,rdma}/ffi.rs'",
+}
+drivers = ("host", "cuda", "nvme", "rdma")
+architecture = {
+    "vericache-transfer": [
+        f"no-transfer-{driver}-dep.yml " + " ".join(f"src/{other}" for other in drivers if other != driver)
+        for driver in drivers
     ],
-    "vericache-transfer/Justfile": [
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-assume-admit-truncate.yml src tests",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-external-escape.yml src tests",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-external-body.yml --globs '!src/{context,host,cuda,rdma,nvme,transport}/ffi.rs' src tests",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-unsafe.yml --globs '!src/{context,host,cuda,rdma,nvme,transport}/ffi.rs' src tests",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-unverified-code.yml --globs '!src/{context,host,cuda,rdma,nvme,transport}/ffi.rs' src",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-panicking-stubs.yml src",
-    ],
-    "vericache-core/Justfile": [
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-assume-admit-truncate.yml src tests",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-external-escape.yml src tests",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-external-body.yml src tests",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-unsafe.yml src tests",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-unverified-code.yml src",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-panicking-stubs.yml src",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-hardware-import-in-core.yml src/spec.rs src/provenance src/timeline src/frame src/catalog src/kernel",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-cuda-dep.yml src/backends/host src/backends/nvme",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-nvme-dep.yml src/backends/host src/backends/cuda src/backends/rdma",
-        "ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-remote-dep.yml src/backends/host src/backends/cuda src/backends/nvme",
+    "vericache-kernel": ["no-hardware-import-in-core.yml src"],
+    "vericache-core": [
+        "no-cuda-dep.yml src/backends/host src/backends/nvme src/engine",
+        "no-nvme-dep.yml src/backends/host src/backends/cuda src/backends/rdma",
+        "no-remote-dep.yml src/backends/host src/backends/cuda src/backends/nvme",
     ],
 }
 
-missing = []
-for jf, lines in expected.items():
-    present = {line.strip() for line in pathlib.Path(jf).read_text().splitlines()}
-    for req in lines:
-        if req not in present:
-            missing.append(f"{jf}: missing required scan: {req}")
-if missing:
-    print("\n".join(missing))
+for crate in ("", *sys.argv[1:]):
+    justfile = pathlib.Path(crate, "Justfile")
+    actual = []
+    for line in justfile.read_text().splitlines():
+        line = line.strip()
+        if not line.startswith("#") and re.search(r"\bast-grep\s+scan\b|--globs\b", line):
+            actual.append(line)
+
+    expected = []
+    if crate:
+        for rule in security_rules:
+            glob = f" --globs {ffi_globs[crate]}" if crate in ffi_globs and rule in exclude_ffi else ""
+            targets = "src tests" if crate in {"vericache-transfer", "vericache-core"} and rule not in source_only else "src"
+            expected.append(f"{scan}{rule}.yml{glob} {targets}")
+        expected.extend(scan + rule for rule in architecture.get(crate, ()))
+    if actual != expected:
+        print("\n".join(difflib.unified_diff(expected, actual, "required scans", str(justfile), lineterm="")))
 PY
 )"
 if [[ -n "$actual_just_scans" ]]; then

@@ -10,7 +10,7 @@ pub(super) proof fn lemma_scatter_piece_pre_enqueue(
     core: &CacheCore,
     before_core: &CacheCore,
     stream: transfer::cuda::CudaStream,
-    tl: u8,
+    tl: TimelineId,
     dst_frame: FrameId,
     dst_slot: SlotRef,
     srcs: Seq<CudaSlice<'_>>,
@@ -36,18 +36,18 @@ pub(super) proof fn lemma_scatter_piece_pre_enqueue(
         core.well_formed(),
         before_core.well_formed(),
         stream.well_formed(),
-        stream.infos().map().submap_of(core.ledger@.submitted.map()),
+        stream.infos().map().submap_of(core.ledger_spec()@.submitted.map()),
         stream.tail().subset_of(stream.infos().dom()),
-        core.node_id == before_core.node_id,
-        dst_frame.0 < core.frames.metas.len(),
-        core.frames.meta(dst_frame).state == STATE_INITIALIZING,
-        core.frames.frame(dst_frame).slot == dst_slot,
-        core.ledger@.knows == before_core.ledger@.knows,
+        core.node_id_spec() == before_core.node_id_spec(),
+        dst_frame.0 < core.frames_spec().metas_spec().len(),
+        core.frames_spec().meta(dst_frame).state == STATE_INITIALIZING,
+        core.frames_spec().frame(dst_frame).slot == dst_slot,
+        core.ledger_spec()@.knows == before_core.ledger_spec()@.knows,
         cuda_scatter_pieces_wf(
-            before_core.ledger@,
-            core.ledger@,
+            before_core.ledger_spec()@,
+            core.ledger_spec()@,
             core.node(),
-            &core.timelines,
+            &core.timelines_spec(),
             tl,
             dst_slot,
             srcs,
@@ -59,7 +59,7 @@ pub(super) proof fn lemma_scatter_piece_pre_enqueue(
             i,
         ),
         cuda_scatter_srcs_valid(
-            before_core.ledger@,
+            before_core.ledger_spec()@,
             core.instance_id(),
             core.node(),
             dst_slot.loc,
@@ -84,14 +84,14 @@ pub(super) proof fn lemma_scatter_piece_pre_enqueue(
         read_admitted(
             src_frontier,
             foundation::tracked::closure_from(
-                core.ledger@.submitted.map(),
+                core.ledger_spec()@.submitted.map(),
                 stream.tail().union(core.citations()),
             ),
         ),
         write_admitted(
             dst_frontier,
             foundation::tracked::closure_from(
-                core.ledger@.submitted.map(),
+                core.ledger_spec()@.submitted.map(),
                 stream.tail().union(core.citations()),
             ),
         ),
@@ -103,7 +103,7 @@ pub(super) proof fn lemma_scatter_piece_pre_enqueue(
     lemma_core_wf_facts(core);
     lemma_scatter_offsets_bounded(srcs, offsets, dst_slot.slot_len as usize, i + 1);
     lemma_cuda_scatter_src_at(
-        before_core.ledger@,
+        before_core.ledger_spec()@,
         core.instance_id(),
         core.node(),
         dst_slot.loc,
@@ -121,10 +121,10 @@ pub(super) proof fn lemma_scatter_piece_pre_enqueue(
         assert(stream.tail().contains(pieces[i - 1].writer));
         assert(before_core.node() == core.node());
         lemma_cuda_scatter_citations_monotone(
-            before_core.ledger@,
-            core.ledger@,
+            before_core.ledger_spec()@,
+            core.ledger_spec()@,
             core.node(),
-            &core.timelines,
+            &core.timelines_spec(),
             tl,
             dst_slot,
             srcs,
@@ -137,7 +137,7 @@ pub(super) proof fn lemma_scatter_piece_pre_enqueue(
         );
         assert(before_core.citations().subset_of(core.citations()));
         lemma_iset_subset_closure_union(
-            core.ledger@.submitted.map(),
+            core.ledger_spec()@.submitted.map(),
             stream.tail(),
             core.citations(),
             before_core.citations(),
@@ -151,7 +151,7 @@ pub(super) proof fn lemma_scatter_piece_post_enqueue(
     before_core: &CacheCore,
     before_step_core: &CacheCore,
     core: &CacheCore,
-    tl: u8,
+    tl: TimelineId,
     dst_slot: SlotRef,
     srcs: Seq<CudaSlice<'_>>,
     src_certs: Seq<ValueCertificate>,
@@ -168,27 +168,26 @@ pub(super) proof fn lemma_scatter_piece_post_enqueue(
         0 <= i < srcs.len(),
         i < src_certs.len(),
         i + 1 < offsets.len(),
-        before_step_core.timelines.next_seq[tl as int] >= before_core.timelines.next_seq[tl as int],
+        before_step_core.timelines_spec().next_seq_spec()[tl as int]
+            >= before_core.timelines_spec().next_seq_spec()[tl as int],
         ticket != Ticket::NONE,
         ticket.timeline_id() == tl,
-        ticket.sequence() == before_step_core.timelines.next_seq[tl as int],
+        ticket.sequence() == before_step_core.timelines_spec().next_seq_spec()[tl as int],
         1 <= ticket.sequence(),
-        core.timelines.events@ == before_step_core.timelines.events@.insert(
-            (tl, ticket.sequence()),
-            ev,
-        ),
-        core.timelines.events@[(tl, ticket.sequence())] == ev,
+        core.timelines_spec().events_spec()@
+            == before_step_core.timelines_spec().events_spec()@.insert((tl, ticket.sequence()), ev),
+        core.timelines_spec().events_spec()@[(tl, ticket.sequence())] == ev,
         cuda_timeline_events_preserved(
-            before_core.timelines.events@,
-            before_step_core.timelines.events@,
+            before_core.timelines_spec().events_spec()@,
+            before_step_core.timelines_spec().events_spec()@,
             tl,
-            before_core.timelines.next_seq[tl as int],
+            before_core.timelines_spec().next_seq_spec()[tl as int],
         ),
         cuda_scatter_pieces_wf(
-            before_core.ledger@,
-            before_step_core.ledger@,
+            before_core.ledger_spec()@,
+            before_step_core.ledger_spec()@,
             core.node(),
-            &before_step_core.timelines,
+            &before_step_core.timelines_spec(),
             tl,
             dst_slot,
             srcs,
@@ -199,30 +198,36 @@ pub(super) proof fn lemma_scatter_piece_post_enqueue(
             last_ticket,
             i,
         ),
-        before_step_core.ledger@.knows == before_core.ledger@.knows,
-        core.ledger@.knows == before_step_core.ledger@.knows,
-        before_step_core.ledger@.submitted.map().submap_of(core.ledger@.submitted.map()),
-        core.ledger@.submitted.map() == before_step_core.ledger@.submitted.map().insert(
+        before_step_core.ledger_spec()@.knows == before_core.ledger_spec()@.knows,
+        core.ledger_spec()@.knows == before_step_core.ledger_spec()@.knows,
+        before_step_core.ledger_spec()@.submitted.map().submap_of(
+            core.ledger_spec()@.submitted.map(),
+        ),
+        core.ledger_spec()@.submitted.map()
+            == before_step_core.ledger_spec()@.submitted.map().insert(
             ev,
-            core.ledger@.submitted.map()[ev],
+            core.ledger_spec()@.submitted.map()[ev],
         ),
-        !before_step_core.ledger@.submitted.dom().contains(ev),
+        !before_step_core.ledger_spec()@.submitted.dom().contains(ev),
         ev.source.succeeds_on_observe(),
-        core.ledger@.submitted.map()[ev].access == copy_access(
+        core.ledger_spec()@.submitted.map()[ev].access == copy_access(
             srcs[i].slot_ref(),
             dst_slot.sub_slice(offsets[i] as u64, srcs[i].slot_ref().sub_len),
         ),
-        core.ledger@.submitted.map()[ev].effect == copy_effect(
+        core.ledger_spec()@.submitted.map()[ev].effect == copy_effect(
             srcs[i].slot_ref(),
             dst_slot.sub_slice(offsets[i] as u64, srcs[i].slot_ref().sub_len),
         ),
-        core.ledger@.submitted.map()[ev].preds == foundation::tracked::closure_from(
-            before_step_core.ledger@.submitted.map(),
+        core.ledger_spec()@.submitted.map()[ev].preds == foundation::tracked::closure_from(
+            before_step_core.ledger_spec()@.submitted.map(),
             stream_tail.union(before_step_core.citations()),
         ),
-        core.ledger@.submitted.map()[ev].preds.subset_of(before_step_core.ledger@.submitted.dom()),
+        core.ledger_spec()@.submitted.map()[ev].preds.subset_of(
+            before_step_core.ledger_spec()@.submitted.dom(),
+        ),
         before_step_core.node() == core.node(),
-        i == 0 ==> before_step_core.ledger@.submitted.map() == before_core.ledger@.submitted.map(),
+        i == 0 ==> before_step_core.ledger_spec()@.submitted.map()
+            == before_core.ledger_spec()@.submitted.map(),
         i > 0 ==> stream_tail == ISet::empty().insert(pieces[i - 1].writer)
             && last_ticket.sequence() < ticket.sequence(),
         srcs[i].slot_ref().sub_len > 0,
@@ -230,12 +235,12 @@ pub(super) proof fn lemma_scatter_piece_post_enqueue(
         dst_slot.is_full(),
     ensures
         cuda_timeline_events_preserved(
-            before_core.timelines.events@,
-            core.timelines.events@,
+            before_core.timelines_spec().events_spec()@,
+            core.timelines_spec().events_spec()@,
             tl,
-            before_core.timelines.next_seq[tl as int],
+            before_core.timelines_spec().next_seq_spec()[tl as int],
         ),
-        core.timelines.ticket_covers(ticket, ev),
+        core.timelines_spec().ticket_covers(ticket, ev),
         ({
             let new_piece = GatherPiece {
                 source: src_certs[i],
@@ -244,10 +249,10 @@ pub(super) proof fn lemma_scatter_piece_post_enqueue(
                 writer: ev,
             };
             cuda_scatter_pieces_wf(
-                before_core.ledger@,
-                core.ledger@,
+                before_core.ledger_spec()@,
+                core.ledger_spec()@,
                 core.node(),
-                &core.timelines,
+                &core.timelines_spec(),
                 tl,
                 dst_slot,
                 srcs,
@@ -261,22 +266,22 @@ pub(super) proof fn lemma_scatter_piece_post_enqueue(
         }),
 {
     lemma_cuda_events_preserved_step(
-        before_core.timelines.events@,
-        before_step_core.timelines.events@,
-        core.timelines.events@,
+        before_core.timelines_spec().events_spec()@,
+        before_step_core.timelines_spec().events_spec()@,
+        core.timelines_spec().events_spec()@,
         tl,
-        before_core.timelines.next_seq[tl as int],
+        before_core.timelines_spec().next_seq_spec()[tl as int],
         tl,
         ticket.sequence(),
         ev,
     );
     lemma_cuda_scatter_pieces_step(
-        before_core.ledger@,
-        before_step_core.ledger@,
-        core.ledger@,
+        before_core.ledger_spec()@,
+        before_step_core.ledger_spec()@,
+        core.ledger_spec()@,
         core.node(),
-        &before_step_core.timelines,
-        &core.timelines,
+        &before_step_core.timelines_spec(),
+        &core.timelines_spec(),
         tl,
         dst_slot,
         srcs,
@@ -290,7 +295,7 @@ pub(super) proof fn lemma_scatter_piece_post_enqueue(
         ticket,
         stream_tail,
     );
-    lemma_cuda_ticket_covers_exact(&core.timelines, ticket, ev);
+    lemma_cuda_ticket_covers_exact(&core.timelines_spec(), ticket, ev);
 }
 
 } // verus!

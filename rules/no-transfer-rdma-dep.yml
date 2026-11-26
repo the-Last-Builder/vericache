@@ -1,0 +1,14 @@
+id: no-transfer-rdma-dep
+language: verus
+severity: error
+message: "Transfer drivers must use shared capabilities instead of the rdma driver."
+rule:
+  any:
+    - kind: use_declaration
+      regex: '(?s)\b(crate|super|transfer)\s*::\s*(rdma\b|\{.*\brdma\b)'
+    - any:
+        - kind: scoped_identifier
+        - kind: scoped_type_identifier
+      regex: '(?:^|::)\s*(?:crate|super|transfer)\s*::\s*rdma\b'
+    - kind: use_declaration
+      regex: '\buse\s+(?:crate|transfer)(?:\s+as\b|\s*::\s*\*)|\buse\s+(?:super\s*::\s*){2,}\*'

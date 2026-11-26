@@ -91,7 +91,9 @@ name = "vericache-core"
 version = "0.1.0"
 dependencies = [
  "vericache-foundation",
+ "vericache-kernel",
  "vericache-transfer",
+ "vericache-transfer-core",
  "vstd",
 ]
 
@@ -104,7 +106,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "vericache-kernel"
+version = "0.1.0"
+dependencies = [
+ "vericache-foundation",
+ "vericache-transfer-core",
+ "vstd",
+]
+
+[[package]]
 name = "vericache-transfer"
+version = "0.1.0"
+dependencies = [
+ "vericache-foundation",
+ "vericache-transfer-core",
+ "vstd",
+]
+
+[[package]]
+name = "vericache-transfer-core"
 version = "0.1.0"
 dependencies = [
  "vericache-foundation",

@@ -161,7 +161,7 @@ fn ensure_donor_resident(
     if lru.is_full() {
         if let Some((_vk, vf)) = lru.pop_lru() {
             engine.evict_frame(vf).expect("donor evict lru");
-            let r = engine.reclaim_draining(host_tier, 8);
+            let r = engine.reclaim_draining(host_tier, 8).unwrap();
             assert!(r >= 1, "donor reclaim failed");
         }
     }
@@ -228,7 +228,7 @@ fn run_donor_inner(
         );
         let key = key_from_hash_id(hid);
         let req_id = match engine
-            .poll_peer_event(Tracked(caps.instance.borrow()))
+            .poll_peer_event_from(0, Tracked(caps.instance.borrow()))
             .expect("donor poll FetchRequest")
         {
             DistributedEvent::Control(ControlPayload::FetchRequest { request_id, key: k }) => {
@@ -239,8 +239,7 @@ fn run_donor_inner(
         };
 
         let grant_tag = match engine
-            .serve_fetch_request(
-                host_tier,
+            .serve_fetch_request_for_peer(0, host_tier,
                 req_id,
                 key,
                 Tracked(caps.shares.borrow_mut()),
@@ -255,14 +254,14 @@ fn run_donor_inner(
         if revoke_flags[op_idx] {
             // Option-A unilateral donor revocation: LOCAL_INV + ibv_dealloc_mw -> Quarantined + RevokeNotice.
             let mw_slot = engine
-                .revoke_lease_unilateral(grant_tag, Tracked(caps.instance.borrow()))
+                .revoke_peer_lease_unilateral(0, grant_tag, Tracked(caps.instance.borrow()))
                 .expect("donor revoke_lease_unilateral");
 
             // Immediately evict, reclaim, and overwrite that frame with a conflicting hot key to
             // prove fenced hardware revocation prevents ANY torn/stale read!
             if let Some(evicted_f) = lru.remove(&key) {
                 engine.evict_frame(evicted_f).expect("evict revoked frame");
-                let r = engine.reclaim_draining(host_tier, 8);
+                let r = engine.reclaim_draining(host_tier, 8).unwrap();
                 assert!(r == 1, "revoked frame must reclaim immediately after LOCAL_INV");
                 let conflict_hid = hid.wrapping_add(0xDEAD_BEEF);
                 let ver = version_counter;
@@ -277,7 +276,7 @@ fn run_donor_inner(
 
             // Drain initiator's post-abort ReadRelease.
             match engine
-                .poll_peer_event(Tracked(caps.instance.borrow()))
+                .poll_peer_event_from(0, Tracked(caps.instance.borrow()))
                 .expect("donor poll post-abort ReadRelease")
             {
                 DistributedEvent::ReadReleased { tag, was_active, .. } => {
@@ -288,13 +287,13 @@ fn run_donor_inner(
             }
 
             // Option-A QP recovery: Error -> Reset -> Reconnect -> Replenish MW.
-            let _err_w = engine.enter_qp_error().expect("donor enter_qp_error");
+            let _err_w = engine.enter_peer_qp_error(0).expect("donor enter_qp_error");
             psn_counter = (psn_counter + 7) & 0x00ff_ffff;
             engine
-                .reset_and_reconnect(psn_counter, Tracked(caps.instance.borrow()))
+                .reset_and_reconnect_peer(0, psn_counter, Tracked(caps.instance.borrow()))
                 .expect("donor reset_and_reconnect");
             engine
-                .replenish_window(mw_slot, &pd, caps.mint_rdma())
+                .replenish_peer_window(0, mw_slot, &pd, caps.mint_rdma())
                 .expect("donor replenish_window");
 
             // Re-populate `hid` and serve the clean retry fetch!
@@ -308,7 +307,7 @@ fn run_donor_inner(
                 hid,
             );
             let retry_req_id = match engine
-                .poll_peer_event(Tracked(caps.instance.borrow()))
+                .poll_peer_event_from(0, Tracked(caps.instance.borrow()))
                 .expect("donor poll retry FetchRequest")
             {
                 DistributedEvent::Control(ControlPayload::FetchRequest { request_id, key: k }) => {
@@ -318,8 +317,7 @@ fn run_donor_inner(
                 _ => panic!("donor expected retry FetchRequest"),
             };
             let retry_tag = match engine
-                .serve_fetch_request(
-                    host_tier,
+                .serve_fetch_request_for_peer(0, host_tier,
                     retry_req_id,
                     key,
                     Tracked(caps.shares.borrow_mut()),
@@ -331,7 +329,7 @@ fn run_donor_inner(
                 ServeOutcome::Miss => panic!("donor missed retry key"),
             };
             match engine
-                .poll_peer_event(Tracked(caps.instance.borrow()))
+                .poll_peer_event_from(0, Tracked(caps.instance.borrow()))
                 .expect("donor poll retry ReadRelease")
             {
                 DistributedEvent::ReadReleased { tag, was_active, .. } => {
@@ -343,7 +341,7 @@ fn run_donor_inner(
         } else {
             // Normal cooperative release.
             match engine
-                .poll_peer_event(Tracked(caps.instance.borrow()))
+                .poll_peer_event_from(0, Tracked(caps.instance.borrow()))
                 .expect("donor poll ReadRelease")
             {
                 DistributedEvent::ReadReleased { tag, was_active, .. } => {
@@ -427,29 +425,28 @@ fn run_initiator_inner(
             revoke_count += 1;
             total_wire_attempts += 1;
             let _req_id = engine
-                .send_fetch_request(key, Tracked(caps.instance.borrow()))
+                .send_fetch_request_to(0, key, Tracked(caps.instance.borrow()))
                 .expect("send_fetch_request");
             let grant = match engine
-                .poll_peer_event(Tracked(caps.instance.borrow()))
+                .poll_peer_event_from(0, Tracked(caps.instance.borrow()))
                 .expect("poll ReadGrant")
             {
                 DistributedEvent::ReadGrant(g) => g,
                 _ => panic!("expected ReadGrant"),
             };
             match engine
-                .poll_peer_event(Tracked(caps.instance.borrow()))
+                .poll_peer_event_from(0, Tracked(caps.instance.borrow()))
                 .expect("poll RevokeNotice")
             {
                 DistributedEvent::Control(ControlPayload::RevokeNotice { grant_tag }) => {
-                    assert!(grant_tag == grant.tag);
+                    assert!(grant_tag == grant.tag());
                 },
                 _ => panic!("expected RevokeNotice"),
             }
 
             // Attempt RDMA_READ against unilaterally revoked MW -> hardware IBV_WC_REM_ACCESS_ERR + abort_write!
             let t_recov = Instant::now();
-            let pull_res = engine.pull_with_grant(
-                key,
+            let pull_res = engine.pull_with_grant_from(0, key,
                 host_tier,
                 PullTarget::Host,
                 grant,
@@ -475,10 +472,10 @@ fn run_initiator_inner(
             );
 
             // Option-A QP recovery: Error -> Reset -> Reconnect.
-            let _err_w = engine.enter_qp_error().expect("init enter_qp_error");
+            let _err_w = engine.enter_peer_qp_error(0).expect("init enter_qp_error");
             psn_counter = (psn_counter + 7) & 0x00ff_ffff;
             engine
-                .reset_and_reconnect(psn_counter, Tracked(caps.instance.borrow()))
+                .reset_and_reconnect_peer(0, psn_counter, Tracked(caps.instance.borrow()))
                 .expect("init reset_and_reconnect");
             let recov_ns = t_recov.elapsed().as_nanos() as u64;
             recov_hist.record_ns(recov_ns);
@@ -486,8 +483,7 @@ fn run_initiator_inner(
             // Clean retry fetch over reconnected QP + full checksum verification.
             total_wire_attempts += 1;
             let FetchOutcome::Hit { frame, .. } = engine
-                .fetch_remote_frame(
-                    key,
+                .fetch_from_peer(0, key,
                     host_tier,
                     PullTarget::Host,
                     Tracked(caps.instance.borrow()),
@@ -511,12 +507,11 @@ fn run_initiator_inner(
                 valid_fetches += 1;
             }
             engine.evict_frame(frame).expect("evict retry frame");
-            assert!(engine.reclaim_draining(host_tier, 8) == 1);
+            assert!(engine.reclaim_draining(host_tier, 8).unwrap() == 1);
         } else {
             total_wire_attempts += 1;
             let FetchOutcome::Hit { frame, .. } = engine
-                .fetch_remote_frame(
-                    key,
+                .fetch_from_peer(0, key,
                     host_tier,
                     PullTarget::Host,
                     Tracked(caps.instance.borrow()),
@@ -540,7 +535,7 @@ fn run_initiator_inner(
                 valid_fetches += 1;
             }
             engine.evict_frame(frame).expect("evict frame");
-            assert!(engine.reclaim_draining(host_tier, 8) == 1);
+            assert!(engine.reclaim_draining(host_tier, 8).unwrap() == 1);
         }
 
         let op_ns = t_op.elapsed().as_nanos() as u64;

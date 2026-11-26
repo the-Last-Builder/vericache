@@ -151,17 +151,87 @@ static int post_signaled(struct ibv_qp *qp, struct ibv_send_wr *wr, enum work_ki
     return rc;
 }
 
+struct vc_bind_desc {
+    struct ibv_mw *mw;
+    struct ibv_mr *mr;
+    uint64_t addr, len, id;
+    uint32_t rkey;
+    int32_t write;
+};
+struct vc_inv_desc { uint64_t id; uint32_t rkey; };
+
+static struct ibv_send_wr bind_wr(const struct vc_bind_desc *d) {
+    return (struct ibv_send_wr){.wr_id = d->id, .opcode = IBV_WR_BIND_MW,
+        .send_flags = IBV_SEND_SIGNALED, .bind_mw = {.mw = d->mw, .rkey = d->rkey,
+        .bind_info = {.mr = d->mr, .addr = d->addr, .length = d->len,
+        .mw_access_flags = IBV_ACCESS_REMOTE_READ | (d->write ? IBV_ACCESS_REMOTE_WRITE : 0)}}};
+}
+
+static struct ibv_send_wr invalidate_wr(const struct vc_inv_desc *d) {
+    return (struct ibv_send_wr){.wr_id = d->id, .opcode = IBV_WR_LOCAL_INV,
+        .send_flags = IBV_SEND_SIGNALED, .invalidate_rkey = d->rkey};
+}
+
 int vc_bind(struct ibv_qp *qp, struct ibv_mw *mw, struct ibv_mr *mr, uint64_t addr,
             uint64_t len, uint32_t rkey, int write, uint64_t id) {
-    struct ibv_send_wr wr = {.wr_id = id, .opcode = IBV_WR_BIND_MW,
-        .send_flags = IBV_SEND_SIGNALED, .bind_mw = {.mw = mw, .rkey = rkey,
-        .bind_info = {.mr = mr, .addr = addr, .length = len, .mw_access_flags = IBV_ACCESS_REMOTE_READ | (write ? IBV_ACCESS_REMOTE_WRITE : 0)}}};
+    struct vc_bind_desc d = {.mw = mw, .mr = mr, .addr = addr, .len = len,
+                             .id = id, .rkey = rkey, .write = write};
+    struct ibv_send_wr wr = bind_wr(&d);
     return post_signaled(qp, &wr, BIND_WINDOW);
 }
 int vc_invalidate(struct ibv_qp *qp, uint32_t rkey, uint64_t id) {
-    struct ibv_send_wr wr = {.wr_id = id, .opcode = IBV_WR_LOCAL_INV,
-        .send_flags = IBV_SEND_SIGNALED, .invalidate_rkey = rkey};
+    struct vc_inv_desc d = {.id = id, .rkey = rkey};
+    struct ibv_send_wr wr = invalidate_wr(&d);
     return post_signaled(qp, &wr, LOCAL_INVALIDATE);
+}
+
+static int post_wr_list(struct ibv_qp *qp, struct ibv_send_wr *wrs, size_t count,
+                        size_t *posted_out) {
+    struct ibv_send_wr *bad = NULL;
+    int rc = ibv_post_send(qp, wrs, &bad);
+    if (!rc) {
+        *posted_out = count;
+    } else {
+        // verbs reports the first unposted WR on failure.
+        uintptr_t offset = (uintptr_t)bad - (uintptr_t)wrs;
+        if (offset % sizeof(*wrs) || offset / sizeof(*wrs) >= count) abort();
+        *posted_out = offset / sizeof(*wrs);
+    }
+    return rc;
+}
+
+static int post_control_batch(struct ibv_qp *qp, const void *descs, size_t count,
+                               enum work_kind kind, size_t *posted_out) {
+    struct ibv_send_wr local[32];
+    *posted_out = 0;
+    if (!count) return 0;
+    struct ibv_send_wr *wrs = count <= 32 ? local : calloc(count, sizeof(*wrs));
+    if (!wrs) return ENOMEM;
+    size_t packed = 0;
+    int rc = 0;
+    while (packed < count) {
+        wrs[packed] = kind == BIND_WINDOW
+            ? bind_wr(&((const struct vc_bind_desc *)descs)[packed])
+            : invalidate_wr(&((const struct vc_inv_desc *)descs)[packed]);
+        rc = pack_wr_id(&wrs[packed].wr_id, kind);
+        if (rc) break;
+        ++packed;
+        if (packed < count) wrs[packed - 1].next = &wrs[packed];
+    }
+    if (!rc) rc = post_wr_list(qp, wrs, count, posted_out);
+    for (size_t i = *posted_out; i < packed; ++i) release_cookie(wrs[i].wr_id);
+    if (wrs != local) free(wrs);
+    return rc;
+}
+
+int vc_bind_batch(struct ibv_qp *qp, const struct vc_bind_desc *descs, size_t count,
+                  size_t *posted_out) {
+    return post_control_batch(qp, descs, count, BIND_WINDOW, posted_out);
+}
+
+int vc_invalidate_batch(struct ibv_qp *qp, const struct vc_inv_desc *descs, size_t count,
+                        size_t *posted_out) {
+    return post_control_batch(qp, descs, count, LOCAL_INVALIDATE, posted_out);
 }
 struct vc_sge { uint64_t addr; uint32_t len, lkey; };
 struct vc_wr_desc {
@@ -204,7 +274,7 @@ int vc_transfer(struct ibv_qp *qp, uint64_t local, uint32_t len, uint32_t lkey,
 
 int vc_post_batch(struct ibv_qp *qp, const struct vc_wr_desc *reqs, size_t count,
                   const struct vc_sge *sges, size_t total_sges, size_t *posted_out) {
-    struct ibv_send_wr local_wrs[32], *bad = NULL;
+    struct ibv_send_wr local_wrs[32];
     struct ibv_sge local_sges[64];
     *posted_out = 0;
     if (!count) return 0;
@@ -225,14 +295,7 @@ int vc_post_batch(struct ibv_qp *qp, const struct vc_wr_desc *reqs, size_t count
         offset += d->num_sge;
     }
     if (offset != total_sges) { rc = EINVAL; goto cleanup; }
-    rc = ibv_post_send(qp, wrs, &bad);
-    if (!rc) *posted_out = count;
-    else if ((uintptr_t)bad >= (uintptr_t)wrs
-             && (uintptr_t)bad < (uintptr_t)(wrs + count)
-             && (((uintptr_t)bad - (uintptr_t)wrs) % sizeof(*wrs) == 0))
-        *posted_out = (size_t)(bad - wrs);
-    else
-        *posted_out = packed;
+    rc = post_wr_list(qp, wrs, count, posted_out);
 cleanup:
     for (size_t i = *posted_out; i < packed; ++i) release_cookie(wrs[i].wr_id);
     if (native != local_sges) free(native);

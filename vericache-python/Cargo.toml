@@ -10,6 +10,10 @@ description = "Zero-external-dependency C ABI / Python binding and vLLM v1 KVCon
 name = "vericache_python"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["cuda"]
+cuda = ["vericache/cuda", "vericache-core/cuda"]
+
 [dependencies]
-vericache = { path = "../vericache" }
-vericache-core = { path = "../vericache-core" }
+vericache = { path = "../vericache", default-features = false, features = ["nvme", "rdma"] }
+vericache-core = { path = "../vericache-core", default-features = false, features = ["nvme", "rdma"] }

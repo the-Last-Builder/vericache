@@ -18,67 +18,66 @@ pub(super) open spec fn put_gpu_enqueue_ready<'a>(
     src_cert: ValueCertificate,
 ) -> bool {
     &&& instance.id() == core.instance_id()
-    &&& core.node_id == before_core.node_id
+    &&& core.node_id_spec() == before_core.node_id_spec()
     &&& core.instance_id() == before_core.instance_id()
-    &&& core.tiers == before_core.tiers
-    &&& core.spec == before_core.spec
-    &&& core.next_version_seq == before_core.next_version_seq + 1
-    &&& core.version_seq_limit == before_core.version_seq_limit
-    &&& core.version_registry == before_core.version_registry
-    &&& core.timelines == before_core.timelines
-    &&& core.ledger == before_core.ledger
-    &&& core.frames.same_directory(&before_core.frames)
-    &&& core.frames.preserves_initializing(&before_core.frames, None)
-    &&& handle.frame.0 < before_core.frames.metas.len()
-    &&& before_core.frames.meta(handle.frame).state != STATE_INITIALIZING
-    &&& handle.frame.0 < core.frames.metas.len()
-    &&& core.frames.meta(handle.frame).state == STATE_INITIALIZING
-    &&& !core.frames.meta(handle.frame).queued()
-    &&& core.frames.frame(handle.frame).token is None
-    &&& core.frames.frame(handle.frame).tier == handle.tier
-    &&& core.frames.frame(handle.frame).slot == handle.slot@
-    &&& core.frames.frame(handle.frame).bound_key == Some(handle.key)
-    &&& core.frames.frame(handle.frame).bound_version == Some(handle.version)
+    &&& core.tiers_spec() == before_core.tiers_spec()
+    &&& core.spec_spec() == before_core.spec_spec()
+    &&& core.next_version_seq_spec() == before_core.next_version_seq_spec() + 1
+    &&& core.version_seq_limit_spec() == before_core.version_seq_limit_spec()
+    &&& core.version_registry_spec() == before_core.version_registry_spec()
+    &&& core.timelines_spec() == before_core.timelines_spec()
+    &&& core.ledger_spec() == before_core.ledger_spec()
+    &&& core.frames_spec().same_directory(&before_core.frames_spec())
+    &&& core.frames_spec().preserves_initializing(&before_core.frames_spec(), None)
+    &&& handle.frame.0 < before_core.frames_spec().metas_spec().len()
+    &&& before_core.frames_spec().meta(handle.frame).state != STATE_INITIALIZING
+    &&& handle.frame.0 < core.frames_spec().metas_spec().len()
+    &&& core.frames_spec().meta(handle.frame).state == STATE_INITIALIZING
+    &&& !core.frames_spec().meta(handle.frame).queued()
+    &&& core.frames_spec().frame(handle.frame).token is None
+    &&& core.frames_spec().frame(handle.frame).tier == handle.tier
+    &&& core.frames_spec().frame(handle.frame).slot == handle.slot@
+    &&& core.frames_spec().frame(handle.frame).bound_key == Some(handle.key)
+    &&& core.frames_spec().frame(handle.frame).bound_version == Some(handle.version)
     &&& handle.version.well_formed() && handle.version != VersionId::NONE
-    &&& handle.version.origin_node == before_core.node_id
-    &&& handle.version.seq == before_core.next_version_seq
-    &&& !before_core.frames.versions@.contains_key(handle.version)
+    &&& handle.version.origin_node == before_core.node_id_spec()
+    &&& handle.version.seq == before_core.next_version_seq_spec()
+    &&& !before_core.frames_spec().versions_spec()@.contains_key(handle.version)
     &&& handle.slot@.is_full()
     &&& handle.slot@.well_formed()
-    &&& handle.slot@.slot_len == core.frames.tier_frame_size(b.gpu_tier)
+    &&& handle.slot@.slot_len == core.frames_spec().tier_frame_size(b.gpu_tier)
     &&& handle.slot@.loc.node == core.node()
     &&& src.well_formed()
     &&& src.instance_id() == core.instance_id()
     &&& src.slot_ref().loc.node == core.node()
-    &&& src.slot_ref().sub_len == core.frames.tier_frame_size(b.gpu_tier)
+    &&& src.slot_ref().sub_len == core.frames_spec().tier_frame_size(b.gpu_tier)
     &&& src.slot_ref().loc != handle.slot@.loc
-    &&& src_perm.valid_local(core.instance_id(), src.slot_ref().loc)
-    &&& (src.slot_ref().loc.space is GpuAlloc && src.slot_ref().loc.space->GpuAlloc_device
-        != b.device ==> (src_perm.frontier().last_writer matches Some(w) ==> !(
-    w.source is RdmaQueuePair)))
+    &&& src_perm.valid_cooperative(core.instance_id(), src.slot_ref().loc)
+    &&& (src.slot_ref().loc.space.is_gpu() && src.slot_ref().loc.space.gpu_device() != b.device
+        ==> (src_perm.frontier().last_writer matches Some(w) ==> !(w.source.is_rdma_qp())))
     &&& slot_is_owned(dst_tok, core.instance_id(), handle.slot@.loc)
     &&& write_admitted(slot_frontier(dst_tok), core.citations())
     &&& read_admitted(
         src_perm.frontier(),
         closure_from(
-            core.ledger@.submitted.map(),
+            core.ledger_spec()@.submitted.map(),
             b.timeline.stream.tail().union(core.citations()),
         ),
     )
     &&& write_admitted(
         slot_frontier(dst_tok),
         closure_from(
-            core.ledger@.submitted.map(),
+            core.ledger_spec()@.submitted.map(),
             b.timeline.stream.tail().union(core.citations()),
         ),
     )
-    &&& replica_valid(core.ledger@, core.node(), src_cert)
+    &&& replica_valid(core.ledger_spec()@, core.node(), src_cert)
     &&& source_slice_valid(src_cert, src.slot_ref())
     &&& src_cert.slot == src.slot_ref()
     &&& src_cert.bytes.len() == src.slot_ref().sub_len
     &&& core.disjoint_from_published(ISet::empty().insert(handle.slot@.loc))
-    &&& b.gpu_buffer.space() is GpuAlloc
-    &&& b.gpu_buffer.space()->GpuAlloc_device == b.device
+    &&& b.gpu_buffer.space().is_gpu()
+    &&& b.gpu_buffer.space().gpu_device() == b.device
     &&& (is_gpu ==> b.gpu_tier == handle.tier && b.owns_gpu(handle.frame) && b.gpu_buffer.slot_ref(
         (handle.frame.0 - b.gpu_first_frame.0) as nat,
     ) == handle.slot@)
@@ -108,9 +107,10 @@ impl<'a> CudaBackend<'a> {
             core_transition(
                 &before_core,
                 old(core),
-                Some(old(self).timeline.timeline_id),
-                Some(old(self).timeline.stream.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(old(self).timeline.timeline_id),
+                    Some(old(self).timeline.stream.source().source()),
+                ),
             ),
             put_gpu_enqueue_ready(
                 old(self),
@@ -136,17 +136,18 @@ impl<'a> CudaBackend<'a> {
                     &&& final(self).same_pinned_layout(old(self))
                     &&& final(self).active_gpu_puts == old(self).active_gpu_puts
                     &&& final(self).timeline.timeline_id == old(self).timeline.timeline_id
-                    &&& final(core).node_id == old(core).node_id
+                    &&& final(core).node_id_spec() == old(core).node_id_spec()
                     &&& final(core).instance_id() == old(core).instance_id()
-                    &&& final(core).tiers == old(core).tiers
-                    &&& final(core).spec == old(core).spec
-                    &&& final(core).version_registry == before_core.version_registry
+                    &&& final(core).tiers_spec() == old(core).tiers_spec()
+                    &&& final(core).spec_spec() == old(core).spec_spec()
+                    &&& final(core).version_registry_spec() == before_core.version_registry_spec()
                     &&& core_transition(
                         &before_core,
                         final(core),
-                        Some(old(self).timeline.timeline_id),
-                        Some(old(self).timeline.stream.source().source()),
-                        FrameTouchMode::PreserveAllInit,
+                        CoreFootprint::preserve_all(
+                            Some(old(self).timeline.timeline_id),
+                            Some(old(self).timeline.stream.source().source()),
+                        ),
                     )
                 },
                 Ok((ticket, h_out, tok, put_proof)) => {
@@ -154,16 +155,17 @@ impl<'a> CudaBackend<'a> {
                     &&& put_proof@.certificate.bytes == src_cert.bytes
                     &&& final(core).well_formed()
                     &&& final(self).timeline.well_formed(
-                        &final(core).timelines,
+                        &final(core).timelines_spec(),
                         final(core).node(),
-                        &final(core).ledger@,
+                        &final(core).ledger_spec()@,
                     )
                     &&& core_transition(
                         &before_core,
                         final(core),
-                        Some(old(self).timeline.timeline_id),
-                        Some(old(self).timeline.stream.source().source()),
-                        FrameTouchMode::PreserveAllInit,
+                        CoreFootprint::preserve_all(
+                            Some(old(self).timeline.timeline_id),
+                            Some(old(self).timeline.stream.source().source()),
+                        ),
                     )
                     &&& put_gpu_committed_ready(
                         final(self),
@@ -199,18 +201,19 @@ impl<'a> CudaBackend<'a> {
             assert(self.gpu_buffer.well_formed() && self.gpu_buffer.instance_id()
                 == core.instance_id() && self.gpu_buffer.node() == core.node()
                 && self.gpu_buffer.num_slots() == self.gpu_num_frames as usize
-                && self.gpu_buffer.slot_len() == core.frames.tier_frame_size(self.gpu_tier) && (
-            self.pinned_host matches Some(h) ==> h.well_formed(core) && core.frames.tier_frame_size(
-                h.tier,
-            ) == core.frames.tier_frame_size(self.gpu_tier)) && self.timeline.well_formed(
-                &core.timelines,
+                && self.gpu_buffer.slot_len() == core.frames_spec().tier_frame_size(self.gpu_tier)
+                && (self.pinned_host matches Some(h) ==> h.well_formed(core)
+                && core.frames_spec().tier_frame_size(h.tier) == core.frames_spec().tier_frame_size(
+                self.gpu_tier,
+            )) && self.timeline.well_formed(
+                &core.timelines_spec(),
                 core.node(),
-                &core.ledger@,
+                &core.ledger_spec()@,
             )) by {
                 reveal(cuda_backend_pre_park_wf);
             }
             lemma_core_wf_facts(core);
-            assert(!core.frames.versions@.contains_key(handle.version)) by {
+            assert(!core.frames_spec().versions_spec()@.contains_key(handle.version)) by {
                 reveal(FrameTable::same_directory);
             }
         }

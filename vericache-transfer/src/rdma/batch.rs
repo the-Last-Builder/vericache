@@ -761,4 +761,389 @@ pub fn post_send_batch_gdr(
     (BatchPostOutcome { posted, error }, Tracked(pending))
 }
 
+/// The destination remains sealed for GPU writes until a completion flush.
+pub tracked enum BatchReadDestination {
+    Owned(SlotToken),
+    PendingGdr(PendingGdrSlot),
+}
+
+pub tracked struct BatchReadBuffers {
+    pub tracked remote: ReadPerm,
+    pub tracked destination: BatchReadDestination,
+}
+
+impl BatchReadBuffers {
+    pub open spec fn admitted(
+        self,
+        q: &QueuePair,
+        cq: CompletionQueue,
+        r: TransferRequest,
+        infos: SubmittedMap,
+        knows: Knows,
+        cited: ISet<TransferEvent>,
+    ) -> bool {
+        &&& r.read && !r.fence && r.locals@.len() == 1
+        &&& self.destination matches BatchReadDestination::Owned(dst)
+        &&& q.read_transfer_admitted(
+            cq,
+            q.source().id(),
+            r.locals@[0],
+            r.remote,
+            r.wr_id,
+            false,
+            self.remote,
+            dst,
+            infos,
+            knows,
+            cited,
+        )
+    }
+
+    pub open spec fn completed_post(
+        self,
+        before: Self,
+        gpu: bool,
+        id: InstanceId,
+        loc: SlotLoc,
+        ev: TransferEvent,
+    ) -> bool {
+        let fr = Frontier { last_writer: Some(ev), readers: ISet::empty() };
+        &&& self.remote.advanced_read(before.remote, ev)
+        &&& if gpu {
+            self.destination matches BatchReadDestination::PendingGdr(p) && p.well_formed()
+                && p.loc() == loc && p.instance_id() == id && p.writer() == ev && p.frontier() == fr
+        } else {
+            self.destination matches BatchReadDestination::Owned(t) && slot_owned(t, id, loc, fr)
+        }
+    }
+}
+
+pub open spec fn read_batch_pending(
+    initial: CompletionQueue,
+    after: CompletionQueue,
+    base: u64,
+    posted: Seq<PostedBatchItem>,
+) -> bool {
+    forall|w: u64| #[trigger]
+        after.in_flight().contains_key(w) <==> initial.in_flight().contains_key(w) || base <= w
+            < base + posted.len()
+}
+
+pub open spec fn read_batch_items(
+    initial: CompletionQueue,
+    after: CompletionQueue,
+    base: u64,
+    posted: Seq<PostedBatchItem>,
+) -> bool {
+    &&& initial.in_flight().submap_of(after.in_flight())
+    &&& read_batch_pending(initial, after, base, posted)
+    &&& forall|i: int|
+        0 <= i < posted.len() ==> {
+            let item = #[trigger] posted[i];
+            let wr = (base + i) as u64;
+            &&& item.wr_id == wr
+            &&& after.in_flight().contains_key(wr)
+            &&& after.in_flight()[wr].kind == (PendingKind::DataTransfer { event: item.event@ })
+        }
+}
+
+pub open spec fn read_batch_qp_frame(q: &QueuePair, prior: &QueuePair) -> bool {
+    &&& q.ready() && q.state() is ReadyToSend
+    &&& q.source().well_formed()
+    &&& q.source().source() == prior.source().source()
+    &&& q.source().node() == prior.source().node()
+    &&& q.source().id() == prior.source().id()
+    &&& q.cq_id() == prior.cq_id()
+    &&& q.pd_id() == prior.pd_id()
+    &&& q.peer() == prior.peer()
+    &&& q.configuration() == prior.configuration()
+    &&& q.effective_max_rd_atomic() == prior.effective_max_rd_atomic()
+}
+
+proof fn lemma_single_read_sge(
+    q: &QueuePair,
+    r: TransferRequest,
+    cq: CompletionQueue,
+    toks: BatchReadBuffers,
+    infos: SubmittedMap,
+    knows: Knows,
+    cited: ISet<TransferEvent>,
+)
+    requires
+        toks.admitted(q, cq, r, infos, knows, cited),
+    ensures
+        q.valid_sges(q.source().id(), r.locals@, r.remote, true),
+        sge_transfer_access(true, r.locals@, r.remote.slot_ref()) == copy_access(
+            r.remote.slot_ref(),
+            r.locals@[0].slot_ref(),
+        ),
+        sge_copy_effect(true, r.locals@, r.remote.slot_ref()) == copy_effect(
+            r.remote.slot_ref(),
+            r.locals@[0].slot_ref(),
+        ),
+{
+    let locals = r.locals@;
+    let src = r.remote.slot_ref();
+    let dst = locals[0].slot_ref();
+    reveal(QueuePair::valid_sges);
+    r.remote.lemma_nonempty();
+    reveal_with_fuel(sge_total_len, 2);
+    assert(sge_total_len(locals, 1) == dst.sub_len);
+    assert(src.sub_slice(0, dst.sub_len) == src);
+    assert(sge_locs(locals) =~= ISet::empty().insert(dst.loc));
+    assert(sge_partial_locs(locals) =~= if dst.is_full() {
+        ISet::empty()
+    } else {
+        ISet::empty().insert(dst.loc)
+    });
+    assert(sges_distinct_locs(locals));
+    assert forall|i: int| 0 <= i < locals.len() implies {
+        let l = #[trigger] locals[i];
+        &&& l.well_formed()
+        &&& 0 < l.slot_ref().sub_len <= MAX_RDMA_MSG_LEN
+        &&& l.registration().pd_id() == q.pd_id()
+        &&& l.registration().instance_id() == q.source().id()
+        &&& l.slot_ref().loc.node == q.source().node()
+        &&& l.registration().access().local_write
+    } by {
+        assert(i == 0);
+        assert(src.sub_len > 0);
+    }
+    assert(sge_transfer_access(true, locals, src).reads =~= copy_access(src, dst).reads);
+    assert(sge_copy_effect(true, locals, src) =~= copy_effect(src, dst));
+}
+
+/// Single-SGE, unfenced READs over the same native send-batch path. The
+/// per-request read permissions allow separately granted shares of one slot.
+/// The unposted suffix retains its input permissions and destination tokens.
+#[verifier::rlimit(80)]
+pub fn post_send_batch_reads(
+    qp: &mut QueuePair,
+    cq: &mut CompletionQueue,
+    Tracked(instance): Tracked<&TransferInstance>,
+    requests: &[TransferRequest],
+    base: u64,
+    gpu: bool,
+    Tracked(buffers): Tracked<&mut Map<usize, BatchReadBuffers>>,
+    Tracked(infos): Tracked<&mut SubmittedMap>,
+    Tracked(knows): Tracked<&Knows>,
+    Ghost(cited): Ghost<ISet<TransferEvent>>,
+) -> (out: BatchPostOutcome)
+    requires
+        old(qp).ready(),
+        old(qp).state() is ReadyToSend,
+        old(qp).source().well_formed(),
+        old(qp).source().id() == instance.id(),
+        old(cq).well_formed(),
+        old(cq).id() == old(qp).cq_id(),
+        old(cq).observer() == old(qp).source().node(),
+        old(cq).infos().instance_id() == instance.id(),
+        old(cq).pending().len() + requests.len() <= old(cq).capacity(),
+        old(infos).instance_id() == instance.id(),
+        base + requests.len() <= u64::MAX,
+        forall|i: int|
+            0 <= i < requests.len() ==> {
+                let r = #[trigger] requests@[i];
+                &&& r.wr_id == base + i
+                &&& old(buffers).contains_key(i as usize)
+                &&& old(buffers)[i as usize].admitted(
+                    old(qp),
+                    *old(cq),
+                    r,
+                    *old(infos),
+                    *knows,
+                    cited,
+                )
+                &&& r.locals@[0].registration().gpu_device_spec().is_some() == gpu
+            },
+    ensures
+        out.posted.len() <= requests.len(),
+        out.error.is_none() ==> out.posted.len() == requests.len(),
+        read_batch_qp_frame(final(qp), old(qp)),
+        final(cq).same_queue(*old(cq)),
+        final(cq).well_formed(),
+        read_batch_items(*old(cq), *final(cq), base, out.posted@),
+        *final(infos) == *old(infos),
+        final(infos).instance_id() == instance.id(),
+        final(buffers).dom() == old(buffers).dom(),
+        forall|i: int|
+            0 <= i < out.posted.len() ==> {
+                let item = #[trigger] out.posted[i];
+                let r = requests@[i];
+                let loc = r.locals@[0].slot_ref().loc;
+                &&& item.event@ == item.submitted@.key()
+                &&& item.event@.observer == old(qp).source().node()
+                &&& item.submitted@.instance_id() == instance.id()
+                &&& item.submitted@.value() == (EventInfo {
+                    access: copy_access(r.remote.slot_ref(), r.locals@[0].slot_ref()),
+                    effect: copy_effect(r.remote.slot_ref(), r.locals@[0].slot_ref()),
+                    read_guards: old(buffers)[i as usize].remote.read_guards(),
+                    preds: closure_from(old(infos).map(), cited),
+                })
+                &&& final(buffers)[i as usize].completed_post(
+                    old(buffers)[i as usize],
+                    gpu,
+                    instance.id(),
+                    loc,
+                    item.event@,
+                )
+            },
+        forall|i: usize| #[trigger]
+            old(buffers).contains_key(i) && i >= out.posted.len() ==> final(buffers)[i] == old(
+                buffers,
+            )[i],
+{
+    hide(QueuePair::valid_sges);
+    hide(sge_transfer_access);
+    hide(sge_copy_effect);
+    assert forall|i: int| 0 <= i < requests.len() implies {
+        let r = #[trigger] requests@[i];
+        qp.valid_sges(instance.id(), r.locals@, r.remote, r.read)
+    } by {
+        lemma_single_read_sge(qp, requests@[i], *cq, buffers[i as usize], *infos, *knows, cited);
+    }
+    let (count, error, Tracked(mut prefix)) = ffi::post_batch(qp, requests);
+    let mut posted = Vec::with_capacity(count);
+    let mut i = 0;
+    while i < count
+        invariant
+            i == posted.len() <= count <= requests.len(),
+            read_batch_qp_frame(qp, old(qp)),
+            cq.well_formed(),
+            cq.same_queue(*old(cq)),
+            cq.pending().len() == old(cq).pending().len() + i,
+            read_batch_items(*old(cq), *cq, base, posted@),
+            old(cq).pending().len() + requests.len() <= old(cq).capacity(),
+            base + requests.len() <= u64::MAX,
+            prefix.descriptors() == requests@.take(count as int),
+            prefix.cursor() == i,
+            *infos == *old(infos),
+            infos.instance_id() == instance.id(),
+            old(qp).source().id() == instance.id(),
+            buffers.dom() == old(buffers).dom(),
+            forall|j: int|
+                0 <= j < requests.len() ==> {
+                    let r = #[trigger] requests@[j];
+                    &&& r.wr_id == base + j
+                    &&& old(buffers).contains_key(j as usize)
+                    &&& old(buffers)[j as usize].admitted(
+                        old(qp),
+                        *old(cq),
+                        r,
+                        *old(infos),
+                        *knows,
+                        cited,
+                    )
+                    &&& r.locals@[0].registration().gpu_device_spec().is_some() == gpu
+                },
+            forall|j: int|
+                0 <= j < i ==> {
+                    let item = #[trigger] posted[j];
+                    let r = requests@[j];
+                    let loc = r.locals@[0].slot_ref().loc;
+                    &&& item.event@ == item.submitted@.key()
+                    &&& item.event@.observer == old(qp).source().node()
+                    &&& item.submitted@.instance_id() == instance.id()
+                    &&& item.submitted@.value() == (EventInfo {
+                        access: copy_access(r.remote.slot_ref(), r.locals@[0].slot_ref()),
+                        effect: copy_effect(r.remote.slot_ref(), r.locals@[0].slot_ref()),
+                        read_guards: old(buffers)[j as usize].remote.read_guards(),
+                        preds: closure_from(old(infos).map(), cited),
+                    })
+                    &&& buffers[j as usize].completed_post(
+                        old(buffers)[j as usize],
+                        gpu,
+                        instance.id(),
+                        loc,
+                        item.event@,
+                    )
+                },
+            forall|j: usize| #[trigger]
+                old(buffers).contains_key(j) && i <= j ==> buffers[j] == old(buffers)[j],
+        decreases count - i,
+    {
+        let r = &requests[i];
+        let ghost before_cq = *cq;
+        let ghost before = *qp;
+        let ghost prior = posted@;
+        let ghost prefix_buffers = *buffers;
+        assert(prefix.descriptors()[i as int] == *r);
+        let tracked b = buffers.tracked_remove(i);
+        let tracked mut perm = b.remote;
+        let tracked mut dst = match b.destination {
+            BatchReadDestination::Owned(tok) => tok,
+            _ => {
+                assert(false);
+                proof_from_false()
+            },
+        };
+        let tracked work = prefix.work(i as int, qp.reads());
+        proof {
+            lemma_single_read_sge(old(qp), *r, *old(cq), b, *old(infos), *knows, cited);
+            assert(!cq.pending().contains_key(r.wr_id));
+            assert(cq.pending().len() < cq.capacity());
+            assert(ISet::empty().union(cited) =~= cited);
+            assert(before.transfer_ordered(false, *infos, cited) == old(qp).transfer_ordered(
+                false,
+                *old(infos),
+                cited,
+            ));
+        }
+        let (ev, sub) = submit_transfer_2(
+            qp,
+            cq,
+            Tracked(instance),
+            Tracked(work),
+            r.wr_id,
+            false,
+            true,
+            Tracked(&mut perm),
+            Tracked(&mut dst),
+            Tracked(infos),
+            Tracked(knows),
+            Ghost(cited),
+        );
+        proof {
+            let tracked destination = if gpu {
+                BatchReadDestination::PendingGdr(PendingGdrSlot { writer: ev@, token: dst })
+            } else {
+                BatchReadDestination::Owned(dst)
+            };
+            buffers.tracked_insert(i, BatchReadBuffers { remote: perm, destination });
+        }
+        posted.push(PostedBatchItem { wr_id: r.wr_id, event: ev, submitted: sub });
+        proof {
+            assert forall|w: u64| #[trigger] old(cq).pending().contains_key(w) implies {
+                &&& cq.pending().contains_key(w)
+                &&& cq.pending()[w] == old(cq).pending()[w]
+            } by {
+                assert(before_cq.pending().contains_key(w));
+                assert(w != r.wr_id);
+            }
+            assert(old(cq).pending().submap_of(cq.pending()));
+            assert forall|w: u64| #[trigger]
+                cq.pending().contains_key(w) <==> old(cq).pending().contains_key(w) || base <= w
+                    < base + posted.len() by {
+                assert(read_batch_pending(*old(cq), before_cq, base, prior));
+            }
+            assert forall|j: int| 0 <= j < posted.len() implies {
+                let item = #[trigger] posted[j];
+                let wr = (base + j) as u64;
+                &&& item.wr_id == wr
+                &&& cq.pending().contains_key(wr)
+                &&& cq.pending()[wr].kind == (PendingKind::DataTransfer { event: item.event@ })
+            } by {
+                if j < i {
+                    assert(posted[j] == prior[j]);
+                }
+            }
+            assert forall|j: int| 0 <= j < i implies (#[trigger] posted[j]) == prior[j]
+                && buffers[j as usize] == prefix_buffers[j as usize] by {}
+            assert(read_batch_items(*old(cq), *cq, base, posted@));
+        }
+        i += 1;
+    }
+    BatchPostOutcome { posted, error }
+}
+
 } // verus!

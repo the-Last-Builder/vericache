@@ -48,8 +48,8 @@ impl Fixture {
         let tracked mut events = supplies.1.borrow_mut().split();
         let tracked names = supplies.2.borrow_mut().split();
         drop(supplies);
-        let host = HostContext::new(Tracked(events.mint(EventSourceKind::Host)));
-        let ring = IoUring::new(Tracked(events.mint(EventSourceKind::IoUring)), depth).map_err(
+        let host = HostContext::new(Tracked(events.mint(EventSourceKind::host())));
+        let ring = IoUring::new(Tracked(events.mint(EventSourceKind::io_uring())), depth).map_err(
             |(err, _)| err,
         ).expect("io_uring_setup");
         assert!(ring.sq_capacity_val() >= depth as usize);
@@ -405,7 +405,7 @@ impl Fixture {
         let tracked fresh = self.names.borrow_mut().allocate();
         let tracked (Tracked(lent), Tracked(cap)) = self.instance.borrow().lend_slot(tok, fresh);
         proof {
-            self.shares.borrow_mut().tracked_insert(_file.slot_loc(0), cap.into_local());
+            self.shares.borrow_mut().tracked_insert(_file.slot_loc(0), cap.into_cooperative());
         }
         Tracked(lent)
     }
@@ -444,7 +444,7 @@ impl FileOnlyFixture {
         let tracked allocations = supplies.0.borrow_mut().split();
         let tracked mut events = supplies.1.borrow_mut().split();
         drop(supplies);
-        let host = HostContext::new(Tracked(events.mint(EventSourceKind::Host)));
+        let host = HostContext::new(Tracked(events.mint(EventSourceKind::host())));
         Self {
             instance,
             host,

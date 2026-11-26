@@ -217,7 +217,7 @@ pub(super) open spec fn cuda_scatter_pieces_wf(
     curr_ledger: KnowledgeLedger,
     node: NodeId,
     timelines: &TimelineTable,
-    tl: u8,
+    tl: TimelineId,
     dst: SlotRef,
     srcs: Seq<CudaSlice<'_>>,
     src_certs: Seq<ValueCertificate>,
@@ -243,7 +243,7 @@ pub(super) open spec fn cuda_scatter_pieces_wf(
             &&& piece.source_slot == srcs[p].slot_ref()
             &&& piece.dst_offset == offsets[p] as u64
             &&& 1 <= piece_seqs[p] <= last_ticket.sequence()
-            &&& timelines.events@[(tl, piece_seqs[p])] == piece.writer
+            &&& timelines.events_spec()@[(tl, piece_seqs[p])] == piece.writer
             &&& piece.writer.source.succeeds_on_observe()
             &&& curr_ledger.submitted.dom().contains(piece.writer)
             &&& !before_ledger.submitted.dom().contains(piece.writer)
@@ -275,7 +275,7 @@ pub(super) proof fn lemma_cuda_scatter_pieces_init(
     before_ledger: KnowledgeLedger,
     node: NodeId,
     timelines: &TimelineTable,
-    tl: u8,
+    tl: TimelineId,
     dst: SlotRef,
     srcs: Seq<CudaSlice<'_>>,
     src_certs: Seq<ValueCertificate>,
@@ -310,7 +310,7 @@ pub(super) proof fn lemma_cuda_scatter_pieces_step(
     node: NodeId,
     step_timelines: &TimelineTable,
     after_timelines: &TimelineTable,
-    tl: u8,
+    tl: TimelineId,
     dst: SlotRef,
     srcs: Seq<CudaSlice<'_>>,
     src_certs: Seq<ValueCertificate>,
@@ -367,7 +367,10 @@ pub(super) proof fn lemma_cuda_scatter_pieces_step(
         i == 0 ==> step_ledger.submitted.map() == before_ledger.submitted.map(),
         i > 0 ==> stream_tail == ISet::empty().insert(pieces[i - 1].writer)
             && last_ticket.sequence() < ticket.sequence(),
-        after_timelines.events@ == step_timelines.events@.insert((tl, ticket.sequence()), ev),
+        after_timelines.events_spec()@ == step_timelines.events_spec()@.insert(
+            (tl, ticket.sequence()),
+            ev,
+        ),
         1 <= ticket.sequence(),
         i > 0 ==> ticket.sequence() > last_ticket.sequence(),
         srcs[i].slot_ref().sub_len > 0,
@@ -448,7 +451,7 @@ pub(super) proof fn lemma_cuda_scatter_pieces_step(
         &&& piece.source_slot == srcs[p].slot_ref()
         &&& piece.dst_offset == offsets[p] as u64
         &&& 1 <= next_seqs[p] <= ticket.sequence()
-        &&& after_timelines.events@[(tl, next_seqs[p])] == piece.writer
+        &&& after_timelines.events_spec()@[(tl, next_seqs[p])] == piece.writer
         &&& piece.writer.source.succeeds_on_observe()
         &&& after_ledger.submitted.dom().contains(piece.writer)
         &&& !before_ledger.submitted.dom().contains(piece.writer)
@@ -542,8 +545,8 @@ pub(super) proof fn lemma_cuda_scatter_src_at(
 
 proof fn lemma_cuda_event_at_prefix_intro(
     ev: TransferEvent,
-    ev_map: Map<(u8, u64), TransferEvent>,
-    tl: u8,
+    ev_map: Map<(TimelineId, u64), TransferEvent>,
+    tl: TimelineId,
     s: u64,
     q: u64,
 )
@@ -562,7 +565,7 @@ pub(super) proof fn lemma_cuda_scatter_build_proof_opaque(
     staged: KnowledgeLedger,
     node: NodeId,
     timelines: &TimelineTable,
-    tl: u8,
+    tl: TimelineId,
     srcs: Seq<CudaSlice<'_>>,
     src_certs: Seq<ValueCertificate>,
     pieces: Seq<GatherPiece>,
@@ -616,7 +619,7 @@ pub(super) proof fn lemma_cuda_scatter_build_proof_opaque(
         p.certificate.bytes == bytes,
         p.events.len() == pieces.len(),
         p.pending(staged, node),
-        cuda_put_events_covered(p.events, timelines.events@, tl, last_ticket.sequence()),
+        cuda_put_events_covered(p.events, timelines.events_spec()@, tl, last_ticket.sequence()),
 {
     hide(replica_valid);
     hide(complete_receipts);
@@ -656,18 +659,18 @@ pub(super) proof fn lemma_cuda_scatter_build_proof_opaque(
     let p = gather_put_proof(pieces, dst, bytes);
     assert forall|k: int| 0 <= k < p.events.len() implies cuda_event_at_prefix(
         #[trigger] p.events[k],
-        timelines.events@,
+        timelines.events_spec()@,
         tl,
         last_ticket.sequence(),
     ) by {
         assert(p.events[k] == pieces[k].writer);
         let q = piece_seqs[k];
         assert(1 <= q <= last_ticket.sequence());
-        assert(timelines.events@[(tl, q)] == p.events[k]);
+        assert(timelines.events_spec()@[(tl, q)] == p.events[k]);
         assert(p.events[k].source.succeeds_on_observe());
         lemma_cuda_event_at_prefix_intro(
             p.events[k],
-            timelines.events@,
+            timelines.events_spec()@,
             tl,
             last_ticket.sequence(),
             q,
@@ -682,7 +685,7 @@ pub(super) proof fn lemma_cuda_scatter_writes_only(
     curr_ledger: KnowledgeLedger,
     node: NodeId,
     timelines: &TimelineTable,
-    tl: u8,
+    tl: TimelineId,
     dst: SlotRef,
     srcs: Seq<CudaSlice<'_>>,
     src_certs: Seq<ValueCertificate>,
@@ -726,19 +729,21 @@ pub(super) proof fn lemma_cuda_scatter_writes_only(
 pub(super) open spec fn cuda_readers_covered(
     readers: ISet<TransferEvent>,
     core: &CacheCore,
-    dst_timeline: u8,
+    dst_timeline: TimelineId,
     last_ticket: Ticket,
 ) -> bool {
     forall|e: TransferEvent| #[trigger]
         readers.contains(e) ==> core.citations().contains(e) || exists|s: u64|
-            1 <= s <= last_ticket.sequence() && #[trigger] core.timelines.events@[(dst_timeline, s)]
-                == e
+            1 <= s <= last_ticket.sequence() && #[trigger] core.timelines_spec().events_spec()@[(
+                dst_timeline,
+                s,
+            )] == e
 }
 
 pub(super) proof fn lemma_cuda_readers_covered_empty(
     readers: ISet<TransferEvent>,
     core: &CacheCore,
-    dst_timeline: u8,
+    dst_timeline: TimelineId,
     last_ticket: Ticket,
 )
     requires
@@ -756,7 +761,7 @@ pub(super) proof fn lemma_cuda_readers_covered_step(
     after_readers: ISet<TransferEvent>,
     before_core: &CacheCore,
     after_core: &CacheCore,
-    dst_timeline: u8,
+    dst_timeline: TimelineId,
     prev_ticket: Ticket,
     new_ticket: Ticket,
     ev: TransferEvent,
@@ -767,10 +772,13 @@ pub(super) proof fn lemma_cuda_readers_covered_step(
         first ==> before_readers.is_empty(),
         !first ==> cuda_readers_covered(before_readers, before_core, dst_timeline, prev_ticket)
             && prev_ticket.sequence() < new_ticket.sequence(),
-        before_core.ledger@.submitted.map().submap_of(after_core.ledger@.submitted.map()),
-        after_core.ledger@.knows == before_core.ledger@.knows,
-        after_core.node_id == before_core.node_id,
-        after_core.timelines.events@ == before_core.timelines.events@.insert(
+        before_core.ledger_spec()@.submitted.map().submap_of(
+            after_core.ledger_spec()@.submitted.map(),
+        ),
+        after_core.ledger_spec()@.knows == before_core.ledger_spec()@.knows,
+        after_core.node_id_spec() == before_core.node_id_spec(),
+        after_core.timelines_spec().events_spec()@
+            == before_core.timelines_spec().events_spec()@.insert(
             (dst_timeline, new_ticket.sequence()),
             ev,
         ),
@@ -788,25 +796,23 @@ pub(super) proof fn lemma_cuda_readers_covered_step(
     assert(before_core.citations().subset_of(after_core.citations()));
     assert forall|e: TransferEvent| #[trigger]
         after_readers.contains(e) implies after_core.citations().contains(e) || exists|s: u64|
-        1 <= s <= new_ticket.sequence() && #[trigger] after_core.timelines.events@[(
+        1 <= s <= new_ticket.sequence() && #[trigger] after_core.timelines_spec().events_spec()@[(
             dst_timeline,
             s,
         )] == e by {
         if e == ev {
             let s = new_ticket.sequence();
             assert(1 <= s <= new_ticket.sequence());
-            assert(after_core.timelines.events@[(dst_timeline, s)] == ev);
+            assert(after_core.timelines_spec().events_spec()@[(dst_timeline, s)] == ev);
         } else {
             assert(!first);
             assert(before_readers.contains(e));
             if !before_core.citations().contains(e) {
                 let s = choose|s: u64|
-                    1 <= s <= prev_ticket.sequence() && before_core.timelines.events@[(
-                        dst_timeline,
-                        s,
-                    )] == e;
+                    1 <= s <= prev_ticket.sequence()
+                        && before_core.timelines_spec().events_spec()@[(dst_timeline, s)] == e;
                 assert(s < new_ticket.sequence());
-                assert(after_core.timelines.events@[(dst_timeline, s)] == e);
+                assert(after_core.timelines_spec().events_spec()@[(dst_timeline, s)] == e);
             }
         }
     }
@@ -820,15 +826,15 @@ pub(super) proof fn lemma_cuda_readers_covered_to_returned(
 )
     requires
         core.well_formed(),
-        frame.0 < core.frames.metas.len(),
+        frame.0 < core.frames_spec().metas_spec().len(),
         cap.well_formed(),
         cap.instance_id() == core.instance_id(),
-        cap.loc() == core.frames.frame(frame).slot.loc,
+        cap.loc() == core.frames_spec().frame(frame).slot.loc,
         last_ticket != Ticket::NONE,
-        core.timelines.valid_ticket(last_ticket),
+        core.timelines_spec().valid_ticket(last_ticket),
         cuda_readers_covered(cap.frontier().readers, core, last_ticket.timeline_id(), last_ticket),
     ensures
-        core.frames.returned_reads(frame, cap, last_ticket, core.kernel_view()),
+        core.frames_spec().returned_reads(frame, cap, last_ticket, core.kernel_view()),
 {
     reveal(cuda_readers_covered);
     lemma_returned_reads_by_ticket(core, frame, cap, last_ticket);
@@ -839,7 +845,7 @@ pub(super) proof fn lemma_cuda_scatter_citations_monotone(
     curr_ledger: KnowledgeLedger,
     node: NodeId,
     timelines: &TimelineTable,
-    tl: u8,
+    tl: TimelineId,
     dst: SlotRef,
     srcs: Seq<CudaSlice<'_>>,
     src_certs: Seq<ValueCertificate>,

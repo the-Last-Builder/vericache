@@ -84,7 +84,7 @@ impl OwnedHostShard {
         );
         let host_static: &'static HostBackend = box_host_as_static(&host);
         let eng_ctx = HostContext::new(caps.mint_host());
-        let engine = LocalEngine::new(core, host_static, eng_ctx, None, None);
+        let engine = LocalEngine::new(core, host_static, eng_ctx, None, None).expect("assemble local engine");
         Self {
             caps,
             host,
@@ -125,7 +125,7 @@ impl OwnedHostShard {
             if let Some((_vic_key, vic_frame)) = self.lru.pop_lru() {
                 let eng = self.engine.as_mut().unwrap();
                 eng.evict_frame(vic_frame).expect("evict lru victim");
-                let reclaimed = eng.reclaim_draining(host_tier, 8);
+                let reclaimed = eng.reclaim_draining(host_tier, 8).unwrap();
                 assert!(reclaimed >= 1, "expected lru victim reclaim");
             }
         }

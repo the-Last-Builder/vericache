@@ -47,8 +47,8 @@ proof fn nvme_write_read_round_trip(
     requires
         history::reachable(h),
         valid_run(h, run),
-        host.loc.space is HostAlloc,
-        file.loc.space is NvmeFile,
+        host.loc.space.is_host(),
+        file.loc.space.is_nvme(),
         completed_copy(written, h, run, host, file),
         completed_copy(read, h, run, file, host),
         value_at_start(run, written->Data_event@, host.loc).len() == host.slot_len,
@@ -92,69 +92,6 @@ proof fn nvme_write_read_round_trip(
     copy_effect_full(host, file, w_in, w_out);
     assert(r_in[l] == w_out[l]);
     copy_effect_full(file, host, r_in, r_out);
-}
-
-/// Recover a failed read's destination using the receipt returned by poll or wait.
-fn nvme_failed_io_recovery(
-    Ghost(before): Ghost<IoUring>,
-    ring: &IoUring,
-    completion: Completed,
-    cpu: &mut HostContext,
-    Tracked(instance): Tracked<&TransferInstance>,
-    buf: host::HostBuffer,
-    replacement: &[u8],
-    Tracked(tok): Tracked<SlotToken>,
-) -> (reclaimed: Tracked<host::Completion>)
-    requires
-        completion is DataFailed,
-        completion.describes(before, *ring),
-        before.instance_id() == instance.id(),
-        old(cpu).ready(instance.id(), before.node()),
-        buf.well_formed(),
-        buf.num_slots() == 1,
-        buf.instance_id() == instance.id(),
-        buf.node() == before.node(),
-        buf.slot_len() == replacement.len(),
-        before.pending()[completion->DataFailed_user_data].access.writes == ISet::empty().insert(
-            buf.slot_loc(0),
-        ),
-        slot_owned(
-            tok,
-            instance.id(),
-            buf.slot_loc(0),
-            Frontier { last_writer: Some(completion->DataFailed_event@), readers: ISet::empty() },
-        ),
-    ensures
-        final(cpu).source@.next_seq() == old(cpu).source@.next_seq() + 2,
-        reclaimed@.submitted.value().access == reclaim_access(buf.slot_loc(0)),
-        reclaimed@.knows.set().contains((buf.node(), reclaimed@.submitted.key())),
-{
-    let Completed::DataFailed { event, submitted, knows, .. } = completion else { unreachable!() };
-    let tracked mut tok = tok;
-    let tracked mut infos = SubmittedMap::empty(instance.id());
-    proof {
-        infos.insert(submitted.get());
-    }
-    let Tracked(written) = host::write_slice(
-        cpu,
-        Tracked(instance),
-        &buf.as_slice(),
-        replacement,
-        Tracked(&mut tok),
-        Tracked(&infos),
-        Tracked(knows.borrow()),
-        Ghost(ISet::empty().insert(event@)),
-    );
-    let tracked infos = written.infos();
-    host::free(
-        cpu,
-        Tracked(instance),
-        buf,
-        Tracked(tok),
-        Tracked(&infos),
-        Tracked(&written.knows),
-        Ghost(ISet::empty().insert(written.submitted.key())),
-    )
 }
 
 } // verus!

@@ -2,7 +2,7 @@
 name = "vericache-core"
 version.workspace = true
 edition.workspace = true
-description = "Verus-verified backend-agnostic cache kernel, pluggable hardware backends, and composable service contract for VeriCache."
+description = "Verified hardware backends and composable cache engines for VeriCache."
 
 [package.metadata.verus]
 verify = true
@@ -10,10 +10,34 @@ verify = true
 [lib]
 name = "vericache_core"
 
+[features]
+default = ["cuda", "nvme", "rdma"]
+cuda = ["transfer/cuda"]
+nvme = ["transfer/nvme"]
+rdma = ["transfer/rdma"]
+
 [dependencies]
 foundation.workspace = true
+transfer_core.workspace = true
 transfer.workspace = true
+vericache_kernel.workspace = true
 vstd.workspace = true
 
 [lints]
 workspace = true
+
+[[test]]
+name = "distributed_e2e"
+required-features = ["cuda", "nvme", "rdma"]
+
+[[test]]
+name = "layer2_kernel"
+required-features = ["cuda", "nvme", "rdma"]
+
+[[test]]
+name = "production_stress_e2e"
+required-features = ["cuda", "rdma"]
+
+[[test]]
+name = "rdma_batch_protocol"
+required-features = ["rdma"]

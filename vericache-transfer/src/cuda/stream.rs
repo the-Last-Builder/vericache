@@ -1,13 +1,41 @@
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 verus! {
 
 broadcast use {vstd::imap::group_imap_lemmas, vstd::iset::group_iset_lemmas};
 
+exec static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_stream_id() -> Result<u64, CudaError> {
+    let mut attempt = 0usize;
+    while attempt < 64
+        invariant
+            attempt <= 64,
+        decreases 64 - attempt,
+    {
+        let id = NEXT_STREAM_ID.load(Ordering::Relaxed);
+        if id == u64::MAX {
+            break;
+        }
+        if NEXT_STREAM_ID.compare_exchange(
+            id,
+            id + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ).is_ok() {
+            return Ok(id);
+        }
+        attempt += 1;
+    }
+    Err(CudaError(1))
+}
+
 #[cfg_attr(not(verus_only), allow(dead_code))]
 pub struct CudaStream {
     pub(super) raw: ffi::RawStreamGuard,
     pub(super) device: DeviceId,
+    runtime_id: u64,
     source: Tracked<EventSourceToken>,
     tail: Ghost<ISet<TransferEvent>>,
     tail_infos: Tracked<SubmittedMap>,
@@ -31,8 +59,20 @@ impl CudaStream {
         self.device
     }
 
+    pub fn device_id(&self) -> (device: DeviceId)
+        ensures
+            device == self.device(),
+    {
+        self.device
+    }
+
+    /// Process-local identity that survives moves and CUDA handle reuse.
+    pub fn runtime_id(&self) -> u64 {
+        self.runtime_id
+    }
+
     pub closed spec fn well_formed(&self) -> bool {
-        &&& self.source@.well_formed() && self.source@.source() is CudaStream
+        &&& self.source@.well_formed() && self.source@.source().is_cuda_stream()
         &&& self.source@.id() == self.tail_infos@.instance_id()
         &&& self.tail@.subset_of(self.tail_infos@.dom())
         &&& valid_receipts(self.receipts@, self.tail_infos@)
@@ -65,17 +105,19 @@ impl CudaStream {
     >)
         requires
             source.well_formed(),
-            source.source() is CudaStream,
+            source.source().is_cuda_stream(),
             source.next_seq() == 0,
         ensures
             r matches Ok(s) ==> s.well_formed() && s.source() == source && s.device() == device
                 && s.tail() == ISet::empty() && s.infos().map() == IMap::empty(),
     {
+        let runtime_id = allocate_stream_id()?;
         let raw = ffi::raw_stream_create(device)?;
         Ok(
             Self {
                 raw,
                 device,
+                runtime_id,
                 source: Tracked(source),
                 tail: Ghost(ISet::empty()),
                 tail_infos: Tracked(SubmittedMap::empty(source.id())),
@@ -237,14 +279,16 @@ pub fn event_query(event: &CudaEvent, Tracked(instance): Tracked<&TransferInstan
         r matches Ok(EventStatus::Ready(k)) ==> k@.instance_id() == instance.id() && k@.set()
             == knowledge_of(event.observer(), closure_from(event.infos().map(), event.recorded())),
 {
-    if ffi::raw_event_query(event)? {
+    if let Some(observed) = ffi::raw_event_query(event)? {
+        let Tracked(evidence) = observed;
         Ok(
             EventStatus::Ready(
                 Tracked(
-                    instance.observe(
+                    instance.observe_completed(
                         event.observer@,
                         event.recorded@,
                         event.recorded_infos.borrow(),
+                        &evidence,
                     ),
                 ),
             ),
@@ -265,8 +309,17 @@ pub fn stream_synchronize(stream: &CudaStream, Tracked(instance): Tracked<&Trans
             closure_from(stream.infos().map(), stream.tail()),
         ),
 {
-    ffi::raw_stream_synchronize(stream)?;
-    Ok(Tracked(instance.observe(stream.source@.node(), stream.tail@, stream.tail_infos.borrow())))
+    let Tracked(evidence) = ffi::raw_stream_synchronize(stream)?;
+    Ok(
+        Tracked(
+            instance.observe_completed(
+                stream.source@.node(),
+                stream.tail@,
+                stream.tail_infos.borrow(),
+                &evidence,
+            ),
+        ),
+    )
 }
 
 #[cfg_attr(not(verus_only), allow(dead_code))]
@@ -317,13 +370,11 @@ pub fn memcpy_async(
         src.slot_ref().loc.node == old(stream).source().node(),
         dst.slot_ref().loc.node == src.slot_ref().loc.node,
         src.slot_ref().loc != dst.slot_ref().loc,
-        old(src_perm).valid_local(instance.id(), src.slot_ref().loc),
+        old(src_perm).valid_cooperative(instance.id(), src.slot_ref().loc),
         slot_is_owned(*old(dst_tok), instance.id(), dst.slot_ref().loc),
-        src.slot_ref().loc.space is GpuAlloc && dst.slot_ref().loc.space is GpuAlloc
-            && src.slot_ref().loc.space->GpuAlloc_device
-            != dst.slot_ref().loc.space->GpuAlloc_device ==> (old(
-            src_perm,
-        ).frontier().last_writer matches Some(w) ==> !(w.source is RdmaQueuePair)),
+        src.slot_ref().loc.space.is_gpu() && dst.slot_ref().loc.space.is_gpu()
+            && src.slot_ref().loc.space.gpu_device() != dst.slot_ref().loc.space.gpu_device() ==> (
+        old(src_perm).frontier().last_writer matches Some(w) ==> !(w.source.is_rdma_qp())),
         copy_admitted(
             *old(stream),
             *old(src_perm),

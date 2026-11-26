@@ -1,147 +1,231 @@
-//! Verified composable 4-tier N-peer distributed engine (`DistributedEngine<'a, T>`),
-//! unifying `CacheCore`, `HostBackend`, `CudaAttachment<'a>` (`None`, `Borrowed`, or
-//! `Owned` with async `pending_gpu_bindings`), optional `NvmeBackend` (`io_uring`
+//! Verified composable 4-tier N-peer distributed engine (`DistributedEngine<'a, T, D>`),
+//! unifying `CacheCore`, `HostBackend`, `DeviceAttachment<'a, D>` (`None`, `Borrowed`, or
+//! `Owned` with async `pending_device_bindings`), optional `NvmeBackend` (`io_uring`
 //! `O_DIRECT`), and `peers: Vec<PeerSession<'a, T>>` with shared or per-peer MRs,
 //! full-duplex single-QP CQ routing, cooperative-first MW revocation, and Option-A
 //! QP error/reset/reconnect recovery.
-use super::{GpuLease, HostLease};
+use super::nvme_storage::nvme_tier;
 #[cfg(verus_only)]
-use crate::backends::compose::*;
-#[cfg(verus_only)]
-use crate::backends::cuda::{
-    caller_stream_valid, cuda_puts_bindings_covered, lemma_cuda_puts_bindings_empty,
-    lemma_cuda_puts_bindings_push_abort, lemma_cuda_puts_bindings_push_publish, PendingGpuAction,
+use super::nvme_storage::{
+    lemma_preserve_nvme, nvme_compatible, nvme_pending_untouched, nvme_tier_spec,
+    nvme_timeline_distinct, nvme_untouched, nvme_well_formed,
 };
-use crate::backends::cuda::{CudaBackend, CudaPollReport};
+use super::{is_caller_device_timeline, GpuLease, HostLease, NvmeStorage};
+#[cfg(verus_only)]
+use crate::backends::device::device_puts_untouched;
+#[cfg(verus_only)]
+use crate::backends::host::lemma_core_transition_preserves_host;
 use crate::backends::host::HostBackend;
-use crate::backends::nvme::{NvmeBackend, NvmeProgress};
+#[cfg(all(feature = "nvme", verus_only))]
+use crate::backends::nvme::NvmeBackend;
+#[cfg(feature = "nvme")]
+use crate::backends::nvme::NvmeProgress;
 use crate::backends::rdma::peer::{
-    FetchOutcome, PeerMessage, PeerProgress, PeerSession, ServeOutcome,
+    FetchBatchPulls, FetchOutcome, PeerMessage, PeerProgress, PeerSession, PendingInboundGrant,
+    ServeOutcome,
 };
 use crate::backends::rdma::protocol::{ControlPayload, ReadGrantMeta, ReadReleaseMeta};
 use crate::backends::rdma::pull::PullTarget;
-use crate::backends::*;
+use crate::backends::rdma::rdma_error;
+#[cfg(verus_only)]
+use crate::backends::rdma::{
+    leases_free_of_share, lemma_core_transition_preserves_peer_session, lemma_foreign_shares_trans,
+    lemma_peer_core_step_trans_retire_new_init, lemma_peer_leases_disjoint_sym,
+    lemma_peer_step_footprint_with_pins, lemma_peer_step_preserves_sibling_session, peer_core_step,
+    peer_core_step_except, peer_foreign_shares_preserved, peer_leases_disjoint,
+    peer_step_with_pins,
+};
+use crate::backends::{DeviceAttachment, DeviceBackend, DeviceSlice, DeviceStream};
 #[cfg(verus_only)]
 use crate::frame::*;
 use crate::kernel::*;
 use crate::provenance::ValueCertificate;
 #[cfg(verus_only)]
-use crate::provenance::{complete_receipts, replica_valid, source_slice_valid};
+use crate::provenance::{complete_receipts, replica_valid, revoked_submap, source_slice_valid};
 use crate::spec::*;
+#[cfg(feature = "nvme")]
 use crate::timeline::BITMAP_CAPACITY;
 #[cfg(verus_only)]
 use foundation::tracked::{knowledge_of, Frontier};
 use transfer::context::*;
-use transfer::cuda::{CudaSlice, CudaStream};
 use transfer::domain::TransferEvent;
 #[cfg(verus_only)]
 use transfer::domain::{EventSource, NodeId};
-use transfer::host::HostContext;
-#[cfg(verus_only)]
+#[cfg(all(feature = "nvme", verus_only))]
 use transfer::nvme::DIRECT_IO_ALIGNMENT;
 use transfer::rdma;
 #[cfg(verus_only)]
 use transfer::transport::GrantKind;
 use transfer::transport::{ByteTransport, ChannelError, GrantTag, Statement};
+#[cfg(verus_only)]
+use transfer_core::memory::RdmaRegisterableSlab;
+#[cfg(verus_only)]
+use vericache_kernel::compose::*;
+use vericache_kernel::spi::*;
 use vstd::prelude::*;
+
+#[cfg(feature = "cuda")]
+pub use super::CudaAttachment;
+pub use super::DistributedEngine;
 
 verus! {
 
-/// GPU backend attachment mode for `DistributedEngine<'a, T>`:
-/// - `None`: Host/NVMe/RDMA-only engine without a local GPU tier.
-/// - `Borrowed(&'a CudaBackend<'a>)`: shared immutable borrow (compatible with
-///   concurrent GPUDirect RDMA MRs borrowing `&'a c.gpu_buffer` when idle).
-/// - `Owned(CudaBackend<'a>)`: owned mutable backend supporting non-blocking
-///   `submit_put_gpu_async` + `poll_gpu_completions` alongside shared RDMA MRs.
-pub enum CudaAttachment<'a> {
-    None,
-    Borrowed(&'a CudaBackend<'a>),
-    Owned(CudaBackend<'a>),
+/// Exclusive reservation for a direct write into an initializing Host DRAM frame.
+#[must_use = "commit or abort the reservation on its issuing engine after draining all writes"]
+pub struct HostWriteReservation {
+    pub(crate) core_id: Option<u64>,
+    pub(crate) handle: WriteHandle,
+    pub(crate) token: Tracked<SlotToken>,
+    #[cfg_attr(not(verus_only), allow(dead_code))]
+    pub(crate) version_name: Tracked<VersionUnused>,
+    pub(crate) host_addr: usize,
+    pub(crate) frame_size: usize,
 }
 
-impl<'a> CudaAttachment<'a> {
-    pub open spec fn spec_ref(&self) -> Option<CudaBackend<'a>> {
-        match *self {
-            CudaAttachment::None => None,
-            CudaAttachment::Borrowed(c) => Some(*c),
-            CudaAttachment::Owned(c) => Some(c),
-        }
+impl HostWriteReservation {
+    pub open(crate) spec fn handle_spec(&self) -> WriteHandle {
+        self.handle
     }
 
-    pub open spec fn same_config(&self, other: &Self) -> bool {
-        match (*self, *other) {
-            (CudaAttachment::None, CudaAttachment::None) => true,
-            (CudaAttachment::Borrowed(a), CudaAttachment::Borrowed(b)) => a == b,
-            (CudaAttachment::Owned(a), CudaAttachment::Owned(b)) => {
-                &&& a.device == b.device
-                &&& a.gpu_tier == b.gpu_tier
-                &&& a.gpu_first_frame == b.gpu_first_frame
-                &&& a.gpu_num_frames == b.gpu_num_frames
-                &&& a.same_pinned_layout(&b)
-                &&& a.timeline.timeline_id == b.timeline.timeline_id
-            },
-            _ => false,
-        }
+    pub open(crate) spec fn host_addr_spec(&self) -> usize {
+        self.host_addr
     }
 
-    pub fn from_option_borrowed(opt: Option<&'a CudaBackend<'a>>) -> (r: Self)
+    pub open(crate) spec fn frame_size_spec(&self) -> usize {
+        self.frame_size
+    }
+
+    #[inline]
+    pub fn frame(&self) -> (r: FrameId)
         ensures
-            match opt {
-                None => r is None && r.spec_ref() is None,
-                Some(c) => r == CudaAttachment::Borrowed(c) && r.spec_ref() == Some(*c),
-            },
+            r == self.handle_spec().frame,
     {
-        match opt {
-            None => CudaAttachment::None,
-            Some(c) => CudaAttachment::Borrowed(c),
-        }
+        self.handle.frame
     }
 
-    pub fn as_ref(&self) -> (r: Option<&CudaBackend<'a>>)
+    /// Address of the reserved frame, pinned when the host slab is registered with a device.
+    #[inline]
+    pub fn host_addr(&self) -> (r: usize)
         ensures
-            match (self, r) {
-                (CudaAttachment::None, None) => self.spec_ref() is None,
-                (CudaAttachment::Borrowed(c), Some(rc)) => rc == *c && self.spec_ref() == Some(*rc),
-                (CudaAttachment::Owned(c), Some(rc)) => rc == c && self.spec_ref() == Some(*rc),
-                _ => false,
-            },
+            r == self.host_addr_spec(),
     {
-        match self {
-            CudaAttachment::None => None,
-            CudaAttachment::Borrowed(c) => Some(*c),
-            CudaAttachment::Owned(c) => Some(c),
-        }
+        self.host_addr
     }
 
-    pub fn take(&mut self) -> (r: Self)
+    #[inline]
+    pub fn frame_size(&self) -> (r: usize)
         ensures
-            r == *old(self),
-            *final(self) is None,
+            r == self.frame_size_spec(),
     {
-        let mut out = CudaAttachment::None;
-        core::mem::swap(self, &mut out);
-        out
+        self.frame_size
+    }
+
+    pub open(crate) spec fn issued_by<'a, T: ByteTransport, D: DeviceBackend<'a>>(
+        &self,
+        engine: &DistributedEngine<'a, T, D>,
+    ) -> bool {
+        self.core_id == engine.core.runtime_id()
+    }
+
+    pub open(crate) spec fn valid_for<'a, T: ByteTransport, D: DeviceBackend<'a>>(
+        &self,
+        engine: &DistributedEngine<'a, T, D>,
+    ) -> bool {
+        let c = engine.core;
+        let f = self.handle.frame;
+        let v = self.handle.version;
+        &&& self.issued_by(engine)
+        &&& engine.host.owns(f)
+        &&& self.handle.tier == engine.host.tier
+        &&& f.0 < c.frames_spec().metas_spec().len()
+        &&& c.frames_spec().meta(f).state == STATE_INITIALIZING
+        &&& !c.frames_spec().meta(f).queued()
+        &&& c.frames_spec().frame(f).token is None
+        &&& c.frames_spec().frame(f).slot == self.handle.slot@
+        &&& c.frames_spec().frame(f).tier == self.handle.tier
+        &&& c.frames_spec().frame(f).bound_key == Some(self.handle.key)
+        &&& c.frames_spec().frame(f).bound_version == Some(v)
+        &&& v.origin_node == c.node_id_spec() && v.seq < c.next_version_seq_spec()
+        &&& self.version_name@.instance_id() == cluster_version_instance_id()
+        &&& self.version_name@.element() == (v.origin_node as NodeId, v.seq)
+        &&& slot_is_owned(self.token@, c.instance_id(), self.handle.slot@.loc)
+        &&& write_admitted(slot_frontier(self.token@), c.citations())
+        &&& self.host_addr == engine.host.buffer.address() + (f.0 - engine.host.first_frame.0)
+            * engine.host.buffer.slot_len()
+        &&& self.frame_size == c.frames_spec().tier_frame_size(self.handle.tier)
     }
 }
 
 /// Pending `READ_GRANT` received from a remote donor, ready to execute a
 /// local Host or GPUDirect RDMA pull via `DistributedEngine::pull_with_grant_from`
-/// (or `pull_with_grant` for peer `0`).
 pub struct PendingReadGrant {
-    pub tag: GrantTag,
-    pub meta: ReadGrantMeta,
-    pub cap: rdma::RemoteCapability,
-    pub share: Tracked<ShareCap>,
-    pub statement: Tracked<Statement>,
-    pub cert: Ghost<ValueCertificate>,
-    pub revoked: Tracked<RevokedMap>,
-    pub version_binding: Tracked<Option<VersionBinding>>,
+    pub(crate) core_id: Option<u64>,
+    pub(crate) peer_timeline: TimelineId,
+    pub(crate) connection_epoch: u64,
+    pub(crate) tag: GrantTag,
+    pub(crate) meta: ReadGrantMeta,
+    pub(crate) cap: rdma::RemoteCapability,
+    pub(crate) share: Tracked<ShareCap>,
+    pub(crate) statement: Tracked<Statement>,
+    pub(crate) cert: Ghost<ValueCertificate>,
+    pub(crate) revoked: Tracked<RevokedMap>,
+    pub(crate) version_binding: Tracked<Option<VersionBinding>>,
 }
 
 impl PendingReadGrant {
-    pub open spec fn valid_for_peer<T: ByteTransport>(
+    pub fn tag(&self) -> (tag: GrantTag)
+        ensures
+            tag == self.tag_spec(),
+    {
+        self.tag
+    }
+
+    pub fn meta(&self) -> (meta: ReadGrantMeta)
+        ensures
+            meta == self.meta_spec(),
+    {
+        self.meta
+    }
+
+    pub open(crate) spec fn tag_spec(&self) -> GrantTag {
+        self.tag
+    }
+
+    pub open(crate) spec fn meta_spec(&self) -> ReadGrantMeta {
+        self.meta
+    }
+
+    pub(crate) fn matches_connection<T: ByteTransport>(&self, peer: &PeerSession<'_, T>) -> bool {
+        self.core_id == peer.rdma.core_id && self.peer_timeline == peer.rdma.timeline_id
+            && self.connection_epoch == peer.reconnect_epoch
+    }
+
+    pub(crate) fn into_pending(self) -> (grant: PendingInboundGrant)
+        ensures
+            grant.tag == self.tag,
+            grant.meta == self.meta,
+            grant.cap == self.cap,
+            grant.share == self.share,
+            grant.statement == self.statement,
+            grant.cert == self.cert,
+            grant.revoked == self.revoked,
+            grant.version_binding == self.version_binding,
+    {
+        PendingInboundGrant {
+            tag: self.tag,
+            meta: self.meta,
+            cap: self.cap,
+            share: self.share,
+            statement: self.statement,
+            cert: self.cert,
+            revoked: self.revoked,
+            version_binding: self.version_binding,
+        }
+    }
+
+    pub open(crate) spec fn valid_for_peer<'a, T: ByteTransport, D: DeviceBackend<'a>>(
         &self,
-        engine: &DistributedEngine<'_, T>,
+        engine: &DistributedEngine<'a, T, D>,
         peer_idx: int,
     ) -> bool {
         &&& 0 <= peer_idx < engine.peers@.len()
@@ -162,7 +246,7 @@ impl PendingReadGrant {
         &&& self.cap.slot_ref() == self.cert@.slot
         &&& self.cert@.slot.is_full()
         &&& self.cert@.bytes.len() == self.meta.frame_size
-        &&& self.share@.is_rdma_bound()
+        &&& self.share@.is_fenced()
         &&& self.share@.instance_id() == engine.core.instance_id()
         &&& self.share@.loc() == self.cap.slot_ref().loc
         &&& self.share@.frontier().last_writer == Some(self.cert@.writer)
@@ -182,13 +266,9 @@ impl PendingReadGrant {
             self.meta.version.seq,
         ) && b.value() == self.cert@.bytes)
     }
-
-    pub open spec fn valid<T: ByteTransport>(&self, engine: &DistributedEngine<'_, T>) -> bool {
-        self.valid_for_peer(engine, 0)
-    }
 }
 
-/// High-level event returned by `DistributedEngine::poll_peer_event` / `poll_peer_event_from`.
+/// High-level event returned by `DistributedEngine::poll_peer_event_from`.
 pub enum DistributedEvent {
     Control(ControlPayload),
     ReadGrant(PendingReadGrant),
@@ -198,24 +278,11 @@ pub enum DistributedEvent {
     Unexpected,
 }
 
-/// Verified composable 4-tier N-peer distributed KV-cache engine unifying
-/// `CacheCore`, `HostBackend`, `CudaAttachment<'a>`, optional `NvmeBackend`,
-/// and `peers: Vec<PeerSession<'a, T>>`.
-pub struct DistributedEngine<'a, T: ByteTransport> {
-    pub core: CacheCore,
-    pub host: &'a HostBackend,
-    pub host_ctx: HostContext,
-    pub cuda: CudaAttachment<'a>,
-    pub pending_gpu_bindings: Tracked<Map<VersionId, VersionBinding>>,
-    pub nvme: Option<NvmeBackend>,
-    pub peers: Vec<PeerSession<'a, T>>,
-}
-
-pub open spec fn peer_session_compatible<'a, T: ByteTransport>(
+pub open(crate) spec fn peer_session_compatible<'a, T: ByteTransport, D: DeviceBackend<'a>>(
     core: &CacheCore,
     host: &HostBackend,
-    cuda: &CudaAttachment<'a>,
-    nvme: &Option<NvmeBackend>,
+    device: &DeviceAttachment<'a, D>,
+    nvme: &NvmeStorage,
     p: &PeerSession<'a, T>,
 ) -> bool {
     &&& p.well_formed(core)
@@ -224,13 +291,13 @@ pub open spec fn peer_session_compatible<'a, T: ByteTransport>(
     &&& p.rdma.qp.peer() == p.rdma.peer_node
     &&& p.rdma.qp.pd_id() == p.rdma.window_pool.pd()
     &&& p.rdma.qp.source().well_formed()
-    &&& p.rdma.qp.source().source() is RdmaQueuePair
+    &&& p.rdma.qp.source().source().is_rdma_qp()
     &&& p.rdma.qp.source().node() != p.rdma.peer_node
-    &&& (cuda.spec_ref() matches Some(c) ==> c.timeline.timeline_id != p.rdma.timeline_id)
-    &&& (*nvme matches Some(n) ==> n.timeline != p.rdma.timeline_id)
+    &&& (device.spec_ref() matches Some(c) ==> c.timeline_id_spec() != p.rdma.timeline_id)
+    &&& nvme_timeline_distinct(nvme, p.rdma.timeline_id)
 }
 
-pub open spec fn peers_pairwise_disjoint<'a, T: ByteTransport>(
+pub open(crate) spec fn peers_pairwise_disjoint<'a, T: ByteTransport>(
     peers: Seq<PeerSession<'a, T>>,
 ) -> bool {
     forall|p: int, q: int|
@@ -243,310 +310,246 @@ pub open spec fn peers_pairwise_disjoint<'a, T: ByteTransport>(
         }
 }
 
-impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
-    pub open spec fn well_formed(&self) -> bool {
+impl<'a, T: ByteTransport, D: DeviceBackend<'a>> DistributedEngine<'a, T, D> {
+    pub open(crate) spec fn pending_device_bindings_spec(&self) -> Tracked<
+        Map<VersionId, VersionBinding>,
+    > {
+        self.pending_device_bindings
+    }
+
+    pub open(crate) spec fn host_ctx_spec(&self) -> SyncContext {
+        self.host_ctx
+    }
+
+    pub open(crate) spec fn core_spec(&self) -> CacheCore {
+        self.core
+    }
+
+    pub open(crate) spec fn peers_spec(&self) -> Vec<PeerSession<'a, T>> {
+        self.peers
+    }
+
+    pub open(crate) spec fn device_spec(&self) -> DeviceAttachment<'a, D> {
+        self.device
+    }
+
+    pub open(crate) spec fn nvme_spec(&self) -> NvmeStorage {
+        self.nvme
+    }
+
+    pub open(crate) spec fn host_spec(&self) -> &'a HostBackend {
+        self.host
+    }
+
+    pub open(crate) spec fn device_attachment_valid(
+        core: &CacheCore,
+        host: &HostBackend,
+        attachment: &DeviceAttachment<'a, D>,
+        bindings: Map<VersionId, VersionBinding>,
+    ) -> bool {
+        &&& match *attachment {
+            DeviceAttachment::None => true,
+            DeviceAttachment::Borrowed(c) => c.active_put_count_spec() == 0,
+            DeviceAttachment::Owned(c) => c.pending_put_bindings_covered(bindings),
+        }
+        &&& attachment.spec_ref() matches Some(c) ==> {
+            &&& c.well_formed(core)
+            &&& c.timeline_id_spec() != host.timeline
+            &&& c.pinned_host_layout_spec() matches Some((tier, first, count)) ==> tier == host.tier
+                && first == host.first_frame && count == host.num_frames
+        }
+    }
+
+    pub open(crate) spec fn well_formed(&self) -> bool {
         &&& self.core.well_formed()
         &&& self.core.all_versions_bound()
         &&& self.host.well_formed(&self.core)
         &&& self.host_ctx.ready(self.core.instance_id(), self.core.node())
-        &&& source_fresh_for_ledger(self.host_ctx.source@, self.core.ledger@)
+        &&& source_fresh_for_ledger(self.host_ctx.source@, self.core.ledger_spec()@)
         &&& self.host_ctx.source@.source() != self.host.ctx.source@.source()
-        &&& match self.cuda {
-            CudaAttachment::None => true,
-            CudaAttachment::Borrowed(c) => {
-                &&& c.well_formed(&self.core)
-                &&& c.active_gpu_puts@.len() == 0
-                &&& c.timeline.timeline_id != self.host.timeline
-                &&& c.pinned_host matches Some(h) ==> h.tier == self.host.tier && h.first_frame
-                    == self.host.first_frame && h.num_frames == self.host.num_frames
-            },
-            CudaAttachment::Owned(c) => {
-                &&& c.well_formed(&self.core)
-                &&& cuda_puts_bindings_covered(c.active_gpu_puts@, self.pending_gpu_bindings@)
-                &&& c.timeline.timeline_id != self.host.timeline
-                &&& c.pinned_host matches Some(h) ==> h.tier == self.host.tier && h.first_frame
-                    == self.host.first_frame && h.num_frames == self.host.num_frames
-            },
-        }
-        &&& match self.nvme {
-            None => true,
-            Some(n) => {
-                &&& n.well_formed(&self.core)
-                &&& self.host.buffer.align() % (DIRECT_IO_ALIGNMENT as usize) == 0
-                &&& n.timeline != self.host.timeline
-                &&& (self.cuda.spec_ref() matches Some(c) ==> n.timeline != c.timeline.timeline_id)
-            },
-        }
+        &&& Self::device_attachment_valid(
+            &self.core,
+            self.host,
+            &self.device,
+            self.pending_device_bindings@,
+        )
+        &&& nvme_compatible(&self.nvme, &self.core, self.host, self.device.spec_ref())
         &&& forall|i: int|
             #![trigger self.peers@[i]]
             0 <= i < self.peers@.len() ==> peer_session_compatible(
                 &self.core,
                 self.host,
-                &self.cuda,
+                &self.device,
                 &self.nvme,
                 &self.peers@[i],
             )
         &&& peers_pairwise_disjoint(self.peers@)
     }
 
-    /// Assemble a single-peer `DistributedEngine` from an already-initialized `CacheCore`,
-    /// shared `HostBackend`, dedicated `HostContext`, optional borrowed `CudaBackend`,
-    /// and `PeerSession<'a, T>` (with `nvme: None`).
-    pub fn new(
-        core: CacheCore,
-        host: &'a HostBackend,
-        host_ctx: HostContext,
-        cuda: Option<&'a CudaBackend<'a>>,
-        peer: PeerSession<'a, T>,
-    ) -> (engine: Self)
-        requires
-            core.well_formed(),
-            core.all_versions_bound(),
-            host.well_formed(&core),
-            host_ctx.ready(core.instance_id(), core.node()),
-            source_fresh_for_ledger(host_ctx.source@, core.ledger@),
-            host_ctx.source@.source() != host.ctx.source@.source(),
-            peer.well_formed(&core),
-            peer.rdma.timeline_id != host.timeline,
-            peer.rdma.peer_node != core.node(),
-            peer.rdma.qp.peer() == peer.rdma.peer_node,
-            peer.rdma.qp.pd_id() == peer.rdma.window_pool.pd(),
-            peer.rdma.qp.source().well_formed(),
-            peer.rdma.qp.source().source() is RdmaQueuePair,
-            peer.rdma.qp.source().node() != peer.rdma.peer_node,
-            cuda matches Some(c) ==> {
-                &&& c.well_formed(&core)
-                &&& c.active_gpu_puts@.len() == 0
-                &&& c.timeline.timeline_id != host.timeline
-                &&& c.timeline.timeline_id != peer.rdma.timeline_id
-                &&& c.pinned_host matches Some(h) ==> h.tier == host.tier && h.first_frame
-                    == host.first_frame && h.num_frames == host.num_frames
-            },
-        ensures
-            engine.well_formed(),
-            engine.core == core,
-            engine.host == host,
-            engine.cuda.spec_ref() == match cuda {
-                None => None,
-                Some(c) => Some(*c),
-            },
-            engine.nvme is None,
-            engine.peers@.len() == 1,
-            engine.peers@[0] == peer,
-    {
-        let cuda_att = CudaAttachment::from_option_borrowed(cuda);
-        let mut peers: Vec<PeerSession<'a, T>> = Vec::with_capacity(1);
-        peers.push(peer);
-        Self {
-            core,
-            host,
-            host_ctx,
-            cuda: cuda_att,
-            pending_gpu_bindings: Tracked(Map::tracked_empty()),
-            nvme: None,
-            peers,
-        }
-    }
-
-    /// Assemble a 4-tier single-peer `DistributedEngine` spanning GPU HBM, Pinned Host DRAM,
-    /// optional Local NVMe (`io_uring` `O_DIRECT`), and Peer RDMA / GDR.
-    pub fn new_with_nvme(
-        core: CacheCore,
-        host: &'a HostBackend,
-        host_ctx: HostContext,
-        cuda: Option<&'a CudaBackend<'a>>,
-        peer: PeerSession<'a, T>,
-        nvme: Option<NvmeBackend>,
-    ) -> (engine: Self)
-        requires
-            core.well_formed(),
-            core.all_versions_bound(),
-            host.well_formed(&core),
-            host_ctx.ready(core.instance_id(), core.node()),
-            source_fresh_for_ledger(host_ctx.source@, core.ledger@),
-            host_ctx.source@.source() != host.ctx.source@.source(),
-            peer.well_formed(&core),
-            peer.rdma.timeline_id != host.timeline,
-            peer.rdma.peer_node != core.node(),
-            peer.rdma.qp.peer() == peer.rdma.peer_node,
-            peer.rdma.qp.pd_id() == peer.rdma.window_pool.pd(),
-            peer.rdma.qp.source().well_formed(),
-            peer.rdma.qp.source().source() is RdmaQueuePair,
-            peer.rdma.qp.source().node() != peer.rdma.peer_node,
-            cuda matches Some(c) ==> {
-                &&& c.well_formed(&core)
-                &&& c.active_gpu_puts@.len() == 0
-                &&& c.timeline.timeline_id != host.timeline
-                &&& c.timeline.timeline_id != peer.rdma.timeline_id
-                &&& c.pinned_host matches Some(h) ==> h.tier == host.tier && h.first_frame
-                    == host.first_frame && h.num_frames == host.num_frames
-            },
-            nvme matches Some(n) ==> {
-                &&& n.well_formed(&core)
-                &&& host.buffer.align() % (DIRECT_IO_ALIGNMENT as usize) == 0
-                &&& n.timeline != host.timeline
-                &&& n.timeline != peer.rdma.timeline_id
-                &&& (cuda matches Some(c) ==> n.timeline != c.timeline.timeline_id)
-            },
-        ensures
-            engine.well_formed(),
-            engine.core == core,
-            engine.host == host,
-            engine.cuda.spec_ref() == match cuda {
-                None => None,
-                Some(c) => Some(*c),
-            },
-            engine.nvme == nvme,
-            engine.peers@.len() == 1,
-            engine.peers@[0] == peer,
-    {
-        let cuda_att = CudaAttachment::from_option_borrowed(cuda);
-        let mut peers: Vec<PeerSession<'a, T>> = Vec::with_capacity(1);
-        peers.push(peer);
-        Self {
-            core,
-            host,
-            host_ctx,
-            cuda: cuda_att,
-            pending_gpu_bindings: Tracked(Map::tracked_empty()),
-            nvme,
-            peers,
-        }
-    }
-
     /// Assemble an N-peer `DistributedEngine` supporting shared MRs (`attach_shared_host_slab` /
-    /// `attach_shared_gpu_slab`) and `CudaAttachment::{None, Borrowed, Owned}`.
+    /// `attach_shared_gpu_slab`) and `DeviceAttachment::{None, Borrowed, Owned}`.
     pub fn new_multi_peer(
         core: CacheCore,
         host: &'a HostBackend,
-        host_ctx: HostContext,
-        cuda: CudaAttachment<'a>,
-        nvme: Option<NvmeBackend>,
+        host_ctx: SyncContext,
+        device: DeviceAttachment<'a, D>,
+        nvme: NvmeStorage,
         peers: Vec<PeerSession<'a, T>>,
-    ) -> (engine: Self)
+    ) -> (r: BackendResult<Self>)
         requires
             core.well_formed(),
             core.all_versions_bound(),
             host.well_formed(&core),
             host_ctx.ready(core.instance_id(), core.node()),
-            source_fresh_for_ledger(host_ctx.source@, core.ledger@),
-            host_ctx.source@.source() != host.ctx.source@.source(),
-            cuda.spec_ref() matches Some(c) ==> {
+            source_fresh_for_ledger(host_ctx.source@, core.ledger_spec()@),
+            host_ctx.source@.source() != host.ctx_spec().source@.source(),
+            device.spec_ref() matches Some(c) ==> {
                 &&& c.well_formed(&core)
-                &&& c.active_gpu_puts@.len() == 0
-                &&& c.timeline.timeline_id != host.timeline
-                &&& c.pinned_host matches Some(h) ==> h.tier == host.tier && h.first_frame
-                    == host.first_frame && h.num_frames == host.num_frames
+                &&& c.active_put_count_spec() == 0
+                &&& c.timeline_id_spec() != host.timeline_spec()
+                &&& c.pinned_host_layout_spec() matches Some((tier, first, count)) ==> tier
+                    == host.tier_spec() && first == host.first_frame_spec() && count
+                    == host.num_frames_spec()
             },
-            nvme matches Some(n) ==> {
-                &&& n.well_formed(&core)
-                &&& host.buffer.align() % (DIRECT_IO_ALIGNMENT as usize) == 0
-                &&& n.timeline != host.timeline
-                &&& (cuda.spec_ref() matches Some(c) ==> n.timeline != c.timeline.timeline_id)
-            },
+            nvme_compatible(&nvme, &core, host, device.spec_ref()),
             forall|i: int|
                 #![trigger peers@[i]]
                 0 <= i < peers@.len() ==> peer_session_compatible(
                     &core,
                     host,
-                    &cuda,
+                    &device,
                     &nvme,
                     &peers@[i],
                 ),
             peers_pairwise_disjoint(peers@),
         ensures
-            engine.well_formed(),
-            engine.core == core,
-            engine.host == host,
-            engine.cuda == cuda,
-            engine.nvme == nvme,
-            engine.peers == peers,
+            r matches Ok(engine) ==> {
+                &&& engine.well_formed()
+                &&& engine.core_spec() == core
+                &&& engine.host_spec() == host
+                &&& engine.device_spec() == device
+                &&& engine.nvme_spec() == nvme
+                &&& engine.peers_spec() == peers
+            },
     {
         let tracked bindings = Map::tracked_empty();
         proof {
-            if let CudaAttachment::Owned(ref c) = cuda {
-                lemma_cuda_puts_bindings_empty(c.active_gpu_puts@, bindings);
+            if let DeviceAttachment::Owned(ref c) = device {
+                c.lemma_pending_put_model();
+                c.lemma_pending_put_bindings(bindings);
             }
         }
-        Self { core, host, host_ctx, cuda, pending_gpu_bindings: Tracked(bindings), nvme, peers }
+        let engine = Self {
+            core,
+            host,
+            host_ctx,
+            device,
+            pending_device_bindings: Tracked(bindings),
+            nvme,
+            peers,
+            caller_device_streams: Vec::new(),
+        };
+        if !engine.valid_configuration() {
+            return Err(CoreError::InvalidArgument);
+        }
+        Ok(engine)
     }
 
-    /// Assemble an N-peer `DistributedEngine` taking ownership of `CudaBackend<'a>`
+    /// Assemble an N-peer `DistributedEngine` taking ownership of a device backend
     /// for async `submit_put_gpu_async` + `poll_gpu_completions`.
     pub fn new_with_owned_cuda(
         core: CacheCore,
         host: &'a HostBackend,
-        host_ctx: HostContext,
-        cuda: CudaBackend<'a>,
-        nvme: Option<NvmeBackend>,
+        host_ctx: SyncContext,
+        device: D,
+        nvme: NvmeStorage,
         peers: Vec<PeerSession<'a, T>>,
-    ) -> (engine: Self)
+    ) -> (r: BackendResult<Self>)
         requires
             core.well_formed(),
             core.all_versions_bound(),
             host.well_formed(&core),
             host_ctx.ready(core.instance_id(), core.node()),
-            source_fresh_for_ledger(host_ctx.source@, core.ledger@),
-            host_ctx.source@.source() != host.ctx.source@.source(),
-            cuda.well_formed(&core),
-            cuda.active_gpu_puts@.len() == 0,
-            cuda.timeline.timeline_id != host.timeline,
-            cuda.pinned_host matches Some(h) ==> h.tier == host.tier && h.first_frame
-                == host.first_frame && h.num_frames == host.num_frames,
-            nvme matches Some(n) ==> {
-                &&& n.well_formed(&core)
-                &&& host.buffer.align() % (DIRECT_IO_ALIGNMENT as usize) == 0
-                &&& n.timeline != host.timeline
-                &&& n.timeline != cuda.timeline.timeline_id
-            },
+            source_fresh_for_ledger(host_ctx.source@, core.ledger_spec()@),
+            host_ctx.source@.source() != host.ctx_spec().source@.source(),
+            device.well_formed(&core),
+            device.active_put_count_spec() == 0,
+            device.timeline_id_spec() != host.timeline_spec(),
+            device.pinned_host_layout_spec() matches Some((tier, first, count)) ==> tier
+                == host.tier_spec() && first == host.first_frame_spec() && count
+                == host.num_frames_spec(),
+            nvme_compatible(&nvme, &core, host, Some(device)),
             forall|i: int|
                 #![trigger peers@[i]]
                 0 <= i < peers@.len() ==> peer_session_compatible(
                     &core,
                     host,
-                    &CudaAttachment::Owned(cuda),
+                    &DeviceAttachment::Owned(device),
                     &nvme,
                     &peers@[i],
                 ),
             peers_pairwise_disjoint(peers@),
         ensures
-            engine.well_formed(),
-            engine.core == core,
-            engine.host == host,
-            engine.cuda == CudaAttachment::Owned(cuda),
-            engine.nvme == nvme,
-            engine.peers == peers,
+            r matches Ok(engine) ==> {
+                &&& engine.well_formed()
+                &&& engine.core_spec() == core
+                &&& engine.host_spec() == host
+                &&& engine.device_spec() == DeviceAttachment::Owned(device)
+                &&& engine.nvme_spec() == nvme
+                &&& engine.peers_spec() == peers
+            },
     {
-        Self::new_multi_peer(core, host, host_ctx, CudaAttachment::Owned(cuda), nvme, peers)
+        Self::new_multi_peer(core, host, host_ctx, DeviceAttachment::Owned(device), nvme, peers)
     }
 
     /// Attach an additional freshly-connected `PeerSession<'a, T>` (`active_leases@.len() == 0`)
     /// with distinct `timeline_id` and `peer_node`.
-    pub fn add_peer(&mut self, peer: PeerSession<'a, T>)
+    pub fn add_peer(&mut self, peer: PeerSession<'a, T>) -> (r: BackendResult<()>)
         requires
             old(self).well_formed(),
             peer_session_compatible(
-                &old(self).core,
-                old(self).host,
-                &old(self).cuda,
-                &old(self).nvme,
+                &old(self).core_spec(),
+                old(self).host_spec(),
+                &old(self).device_spec(),
+                &old(self).nvme_spec(),
                 &peer,
             ),
-            peer.rdma.active_leases@.len() == 0,
-            forall|i: int|
-                0 <= i < old(self).peers@.len() ==> {
-                    let existing = #[trigger] old(self).peers@[i];
-                    &&& existing.rdma.timeline_id != peer.rdma.timeline_id
-                    &&& existing.rdma.peer_node != peer.rdma.peer_node
-                },
         ensures
             final(self).well_formed(),
-            final(self).core == old(self).core,
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@ == old(self).peers@.push(peer),
+            final(self).core_spec() == old(self).core_spec(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            r.is_ok() ==> final(self).peers_spec()@ == old(self).peers_spec()@.push(peer),
+            r.is_err() ==> *final(self) == *old(self),
     {
+        if !self.matches_peer(&peer) {
+            return Err(CoreError::InvalidArgument);
+        }
+        if !peer.rdma.active_leases.is_empty() {
+            return Err(CoreError::WouldConflict);
+        }
+        let mut i = 0;
+        while i < self.peers.len()
+            invariant
+                *self == *old(self),
+                self.well_formed(),
+                i <= self.peers@.len(),
+                forall|j: int|
+                    0 <= j < i ==> {
+                        let existing = #[trigger] self.peers@[j];
+                        &&& existing.rdma.timeline_id != peer.rdma.timeline_id
+                        &&& existing.rdma.peer_node != peer.rdma.peer_node
+                    },
+            decreases self.peers@.len() - i,
+        {
+            let existing = &self.peers[i];
+            if existing.rdma.timeline_id == peer.rdma.timeline_id || existing.rdma.peer_node
+                == peer.rdma.peer_node {
+                return Err(CoreError::WouldConflict);
+            }
+            i += 1;
+        }
         let ghost before_peers = self.peers@;
         self.peers.push(peer);
         proof {
@@ -566,11 +569,100 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Detach a peer after its remote leases have been drained.
+    /// Peers after the removed index shift down by one. Timeline IDs stay registered.
+    pub fn remove_peer(&mut self, peer_idx: usize) -> (r: Result<PeerSession<'a, T>, CoreError>)
+        requires
+            old(self).well_formed(),
+        ensures
+            final(self).well_formed(),
+            peers_pairwise_disjoint(final(self).peers_spec()@),
+            final(self).core_spec() == old(self).core_spec(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).host_ctx_spec() == old(self).host_ctx_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).pending_device_bindings_spec() == old(self).pending_device_bindings_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            match r {
+                Ok(peer) => {
+                    &&& peer_idx < old(self).peers_spec()@.len()
+                    &&& peer == old(self).peers_spec()@[peer_idx as int]
+                    &&& peer.rdma_spec().active_leases_spec()@.len() == 0
+                    &&& final(self).peers_spec()@ == old(self).peers_spec()@.remove(peer_idx as int)
+                    &&& peer_session_compatible(
+                        &final(self).core_spec(),
+                        final(self).host_spec(),
+                        &final(self).device_spec(),
+                        &final(self).nvme_spec(),
+                        &peer,
+                    )
+                },
+                Err(CoreError::InvalidArgument) => peer_idx >= old(self).peers_spec()@.len()
+                    && *final(self) == *old(self),
+                Err(CoreError::WouldConflict) => peer_idx < old(self).peers_spec()@.len()
+                    && *final(self) == *old(self),
+                Err(_) => false,
+            },
+    {
+        hide(CacheCore::well_formed);
+        if peer_idx >= self.peers.len() {
+            return Err(CoreError::InvalidArgument);
+        }
+        let peer = &self.peers[peer_idx];
+        if !peer.rdma.active_leases.is_empty() || peer.rdma.cq.in_flight_count() != 0
+            || !peer.pending_inbound_grants.is_empty() {
+            return Err(CoreError::WouldConflict);
+        }
+        let ghost before_peers = self.peers@;
+        let removed = self.peers.remove(peer_idx);
+        proof {
+            assert forall|i: int|
+                #![trigger self.peers@[i]]
+                0 <= i < self.peers@.len() implies peer_session_compatible(
+                &self.core,
+                self.host,
+                &self.device,
+                &self.nvme,
+                &self.peers@[i],
+            ) by {
+                let prior = if i < peer_idx {
+                    i
+                } else {
+                    i + 1
+                };
+                assert(self.peers@[i] == before_peers[prior]);
+            }
+            assert forall|p: int, q: int| 0 <= p < q < self.peers@.len() implies {
+                let a = #[trigger] self.peers@[p];
+                let b = #[trigger] self.peers@[q];
+                &&& a.rdma.timeline_id != b.rdma.timeline_id
+                &&& a.rdma.peer_node != b.rdma.peer_node
+                &&& peer_leases_disjoint(a.rdma.active_leases@, b.rdma.active_leases@)
+            } by {
+                let old_p = if p < peer_idx {
+                    p
+                } else {
+                    p + 1
+                };
+                let old_q = if q < peer_idx {
+                    q
+                } else {
+                    q + 1
+                };
+                assert(0 <= old_p < old_q < before_peers.len());
+                assert(self.peers@[p] == before_peers[old_p]);
+                assert(self.peers@[q] == before_peers[old_q]);
+            }
+        }
+        Ok(removed)
     }
 
     pub fn peer_count(&self) -> (n: usize)
         ensures
-            n == self.peers@.len(),
+            n == self.peers_spec()@.len(),
     {
         self.peers.len()
     }
@@ -578,10 +670,12 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     pub fn find_peer_index(&self, peer_node: u64) -> (r: Option<usize>)
         ensures
             match r {
-                Some(idx) => (idx as int) < self.peers@.len()
-                    && self.peers@[idx as int].rdma.peer_node == peer_node as NodeId,
+                Some(idx) => (idx as int) < self.peers_spec()@.len()
+                    && self.peers_spec()@[idx as int].rdma_spec().peer_node_spec()
+                    == peer_node as NodeId,
                 None => forall|i: int|
-                    0 <= i < self.peers@.len() ==> (#[trigger] self.peers@[i]).rdma.peer_node
+                    0 <= i < self.peers_spec()@.len() ==> (
+                    #[trigger] self.peers_spec()@[i]).rdma_spec().peer_node_spec()
                         != peer_node as NodeId,
             },
     {
@@ -604,48 +698,55 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
 
     pub fn host_tier(&self) -> (t: TierId)
         ensures
-            t == self.host.tier,
+            t == self.host_spec().tier_spec(),
     {
         self.host.tier_id()
     }
 
     pub fn gpu_tier(&self) -> (t: Option<TierId>)
         ensures
-            t == match self.cuda.spec_ref() {
-                Some(c) => Some(c.gpu_tier),
+            t == match self.device_spec().spec_ref() {
+                Some(c) => Some(c.device_tier_spec()),
                 None => None,
             },
     {
-        match self.cuda.as_ref() {
-            Some(c) => Some(c.gpu_tier_id()),
-            None => None,
-        }
+        self.device_tier()
+    }
+
+    pub fn device_tier(&self) -> (t: Option<TierId>)
+        ensures
+            t == match self.device_spec().spec_ref() {
+                Some(c) => Some(c.device_tier_spec()),
+                None => None,
+            },
+    {
+        self.device.device_tier_id()
     }
 
     pub fn nvme_tier(&self) -> (t: Option<TierId>)
         ensures
-            t == match self.nvme {
-                Some(n) => Some(n.tier),
-                None => None,
-            },
+            t == nvme_tier_spec(&self.nvme_spec()),
     {
-        match &self.nvme {
-            Some(n) => Some(n.tier_id()),
-            None => None,
-        }
+        nvme_tier(&self.nvme)
     }
 
-    pub fn gpu_frame_slice(&self, frame: FrameId) -> (s: Option<CudaSlice<'_>>)
+    pub fn gpu_frame_slice(&self, frame: FrameId) -> (s: Option<D::Slice<'_>>)
         requires
             self.well_formed(),
     {
-        match self.cuda.as_ref() {
+        self.device_frame_slice(frame)
+    }
+
+    pub fn device_frame_slice(&self, frame: FrameId) -> (s: Option<D::Slice<'_>>)
+        requires
+            self.well_formed(),
+    {
+        match self.device.as_ref() {
             Some(c) => {
-                if c.owns_gpu_frame(frame) {
-                    Some(c.gpu_frame_slice(frame))
-                } else {
-                    None
+                proof {
+                    c.lemma_device_layout(&self.core);
                 }
+                c.device_frame_slice(frame)
             },
             None => None,
         }
@@ -656,12 +757,12 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             self.well_formed(),
         ensures
             r matches Some((f, version)) ==> {
-                &&& tier.valid(self.core.tiers.len())
-                &&& f.0 < self.core.frames.metas.len()
-                &&& self.core.frames.meta(f).state == STATE_PUBLISHED
-                &&& self.core.frames.frame(f).tier == tier
-                &&& self.core.frames.frame(f).bound_key == Some(key)
-                &&& self.core.frames.frame(f).bound_version == Some(version)
+                &&& tier.valid(self.core_spec().tiers_spec().len())
+                &&& f.0 < self.core_spec().frames_spec().metas_spec().len()
+                &&& self.core_spec().frames_spec().meta(f).state == STATE_PUBLISHED
+                &&& self.core_spec().frames_spec().frame(f).tier == tier
+                &&& self.core_spec().frames_spec().frame(f).bound_key == Some(key)
+                &&& self.core_spec().frames_spec().frame(f).bound_version == Some(version)
             },
     {
         self.core.lookup_tier(key, tier)
@@ -674,133 +775,78 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             self.well_formed(),
         ensures
             r matches Some((f, tier, version)) ==> {
-                &&& tier.valid(self.core.tiers.len())
-                &&& f.0 < self.core.frames.metas.len()
-                &&& self.core.frames.meta(f).state == STATE_PUBLISHED
-                &&& self.core.frames.frame(f).tier == tier
-                &&& self.core.frames.frame(f).bound_key == Some(key)
-                &&& self.core.frames.frame(f).bound_version == Some(version)
+                &&& tier.valid(self.core_spec().tiers_spec().len())
+                &&& f.0 < self.core_spec().frames_spec().metas_spec().len()
+                &&& self.core_spec().frames_spec().meta(f).state == STATE_PUBLISHED
+                &&& self.core_spec().frames_spec().frame(f).tier == tier
+                &&& self.core_spec().frames_spec().frame(f).bound_key == Some(key)
+                &&& self.core_spec().frames_spec().frame(f).bound_version == Some(version)
             },
     {
         self.core.lookup_best(key, priority)
     }
 
-    proof fn lemma_preserve_siblings(
+    pub(super) proof fn lemma_preserve_siblings(
         before: &CacheCore,
         after: &CacheCore,
-        touched_timeline: Option<u8>,
-        allowed_source: Option<EventSource>,
-        mode: FrameTouchMode,
+        fp: CoreFootprint,
         host: &HostBackend,
-        host_ctx: &HostContext,
-        cuda: &CudaAttachment<'a>,
-        nvme: &Option<NvmeBackend>,
+        host_ctx: &SyncContext,
+        device: &DeviceAttachment<'a, D>,
+        nvme: &NvmeStorage,
         peers: Seq<PeerSession<'a, T>>,
     )
         requires
             before.well_formed(),
             after.well_formed(),
-            core_transition(before, after, touched_timeline, allowed_source, mode),
+            core_transition(before, after, fp),
             host.well_formed(before),
-            touched_timeline != Some(host.timeline),
-            allowed_source != Some(host.ctx.source@.source()),
+            !fp.touched_timelines.contains(host.timeline),
+            fp.excludes_source(host.ctx.source@.source()),
             host_ctx.ready(before.instance_id(), before.node()),
-            source_fresh_for_ledger(host_ctx.source@, before.ledger@),
-            allowed_source != Some(host_ctx.source@.source()),
+            source_fresh_for_ledger(host_ctx.source@, before.ledger_spec()@),
+            fp.excludes_source(host_ctx.source@.source()),
+            fp.touched_fenced_shares.is_empty(),
             forall|i: int|
                 0 <= i < peers.len() ==> {
                     &&& (#[trigger] peers[i]).well_formed(before)
-                    &&& touched_timeline != Some(peers[i].rdma.timeline_id)
+                    &&& !fp.touched_timelines.contains(peers[i].rdma.timeline_id)
                 },
-            cuda.spec_ref() matches Some(c) ==> {
+            device.spec_ref() matches Some(c) ==> {
                 &&& c.well_formed(before)
-                &&& touched_timeline != Some(c.timeline.timeline_id)
-                &&& allowed_source != Some(c.timeline.stream.source().source())
-                &&& (mode is PreserveAllInit || mode is PreserveParkedInit)
+                &&& !fp.touched_timelines.contains(c.timeline_id_spec())
+                &&& fp.excludes_source(c.event_source_spec())
+                &&& device_puts_untouched(c.pending_puts_spec(), before, fp)
             },
-            nvme matches Some(n) ==> {
-                &&& n.well_formed(before)
-                &&& touched_timeline != Some(n.timeline)
-                &&& allowed_source != Some(n.ring.source().source())
-                &&& (mode is PreserveAllInit || mode is PreserveUnparkedInit)
-            },
+            nvme_well_formed(nvme, before),
+            nvme_untouched(nvme, before, fp),
         ensures
             host.well_formed(after),
             host_ctx.ready(after.instance_id(), after.node()),
-            source_fresh_for_ledger(host_ctx.source@, after.ledger@),
+            source_fresh_for_ledger(host_ctx.source@, after.ledger_spec()@),
             forall|i: int| 0 <= i < peers.len() ==> (#[trigger] peers[i]).well_formed(after),
-            cuda.spec_ref() matches Some(c) ==> c.well_formed(after),
-            nvme matches Some(n) ==> n.well_formed(after),
+            device.spec_ref() matches Some(c) ==> c.well_formed(after),
+            nvme_well_formed(nvme, after),
     {
         hide(CacheCore::well_formed);
-        lemma_core_transition_preserves_host(
-            before,
-            after,
-            touched_timeline,
-            allowed_source,
-            mode,
-            host,
-        );
-        lemma_core_transition_preserves_source(
-            before,
-            after,
-            touched_timeline,
-            allowed_source,
-            mode,
-            host_ctx.source@,
-        );
+        lemma_core_transition_preserves_host(before, after, fp, host);
+        lemma_core_transition_preserves_source(before, after, fp, host_ctx.source@);
         assert forall|i: int| 0 <= i < peers.len() implies (#[trigger] peers[i]).well_formed(
             after,
         ) by {
-            lemma_core_transition_preserves_peer_session(
-                before,
-                after,
-                touched_timeline,
-                allowed_source,
-                mode,
-                &peers[i],
-            );
+            lemma_core_transition_preserves_peer_session(before, after, fp, &peers[i]);
         }
-        match cuda {
-            CudaAttachment::None => {},
-            CudaAttachment::Borrowed(c) => {
-                lemma_core_transition_preserves_cuda(
-                    before,
-                    after,
-                    touched_timeline,
-                    allowed_source,
-                    mode,
-                    *c,
-                );
-            },
-            CudaAttachment::Owned(c) => {
-                lemma_core_transition_preserves_cuda(
-                    before,
-                    after,
-                    touched_timeline,
-                    allowed_source,
-                    mode,
-                    c,
-                );
-            },
+        if let Some(ref c) = device.spec_ref() {
+            c.preserve_across_core_transition(before, after, fp);
         }
-        if let Some(ref n) = *nvme {
-            lemma_core_transition_preserves_nvme(
-                before,
-                after,
-                touched_timeline,
-                allowed_source,
-                mode,
-                n,
-            );
-        }
+        lemma_preserve_nvme(before, after, fp, nvme);
     }
 
-    /// Re-establish `self.host`, `self.host_ctx`, `self.cuda` (both `Borrowed` and
+    /// Re-establish `self.host`, `self.host_ctx`, `self.device` (both `Borrowed` and
     /// `Owned` with parked async puts), `self.nvme`, and all sibling `self.peers[j]`
     /// (`j != peer_idx`) after `self.peers[peer_idx]` steps with `peer_core_step`
     /// and `peer_foreign_shares_preserved`.
-    fn restore_after_peer_step(
+    pub(super) fn restore_after_peer_step(
         &mut self,
         peer_idx: usize,
         Ghost(before): Ghost<CacheCore>,
@@ -823,7 +869,7 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 0 <= j < before_peers.len() ==> peer_session_compatible(
                     &before,
                     old(self).host,
-                    &old(self).cuda,
+                    &old(self).device,
                     &old(self).nvme,
                     &before_peers[j],
                 ),
@@ -838,7 +884,7 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 self,
             ).peers@[peer_idx as int].rdma.window_pool.pd(),
             old(self).peers@[peer_idx as int].rdma.qp.source().well_formed(),
-            old(self).peers@[peer_idx as int].rdma.qp.source().source() is RdmaQueuePair,
+            old(self).peers@[peer_idx as int].rdma.qp.source().source().is_rdma_qp(),
             peer_core_step(
                 &before,
                 &old(self).core,
@@ -853,85 +899,66 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             old(self).host.well_formed(&before),
             old(self).host_ctx.ready(old(self).core.instance_id(), old(self).core.node()),
             old(self).host_ctx.source@.source() != old(self).host.ctx.source@.source(),
-            match old(self).cuda {
-                CudaAttachment::None => true,
-                CudaAttachment::Borrowed(c) => {
-                    &&& c.well_formed(&before)
-                    &&& c.active_gpu_puts@.len() == 0
-                    &&& c.timeline.timeline_id != old(self).host.timeline
-                    &&& c.pinned_host matches Some(h) ==> h.tier == old(self).host.tier
-                        && h.first_frame == old(self).host.first_frame && h.num_frames == old(
-                        self,
-                    ).host.num_frames
-                },
-                CudaAttachment::Owned(c) => {
-                    &&& c.well_formed(&before)
-                    &&& cuda_puts_bindings_covered(
-                        c.active_gpu_puts@,
-                        old(self).pending_gpu_bindings@,
-                    )
-                    &&& c.timeline.timeline_id != old(self).host.timeline
-                    &&& c.pinned_host matches Some(h) ==> h.tier == old(self).host.tier
-                        && h.first_frame == old(self).host.first_frame && h.num_frames == old(
-                        self,
-                    ).host.num_frames
-                },
-            },
-            match old(self).nvme {
-                None => true,
-                Some(n) => {
-                    &&& n.well_formed(&before)
-                    &&& old(self).host.buffer.align() % (DIRECT_IO_ALIGNMENT as usize) == 0
-                    &&& n.timeline != old(self).host.timeline
-                    &&& (old(self).cuda.spec_ref() matches Some(c) ==> n.timeline
-                        != c.timeline.timeline_id)
-                },
-            },
+            Self::device_attachment_valid(
+                &before,
+                old(self).host,
+                &old(self).device,
+                old(self).pending_device_bindings@,
+            ),
+            nvme_compatible(&old(self).nvme, &before, old(self).host, old(self).device.spec_ref()),
         ensures
             final(self).well_formed(),
             final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
+            final(self).device == old(self).device,
             final(self).nvme == old(self).nvme,
             final(self).peers == old(self).peers,
-            final(self).core.node_id == old(self).core.node_id,
+            final(self).core.node_id_spec() == old(self).core.node_id_spec(),
             final(self).core.instance_id() == old(self).core.instance_id(),
-            final(self).core.tiers == old(self).core.tiers,
-            final(self).core.spec == old(self).core.spec,
-            final(self).core.frames == old(self).core.frames,
-            final(self).core.timelines == old(self).core.timelines,
-            final(self).core.ledger == old(self).core.ledger,
+            final(self).core.tiers_spec() == old(self).core.tiers_spec(),
+            final(self).core.spec_spec() == old(self).core.spec_spec(),
+            final(self).core.frames_spec() == old(self).core.frames_spec(),
+            final(self).core.timelines_spec() == old(self).core.timelines_spec(),
+            final(self).core.ledger_spec() == old(self).core.ledger_spec(),
     {
         hide(CacheCore::well_formed);
         let ghost rdma_tl = self.peers@[peer_idx as int].rdma.timeline_id;
         let ghost before_leases = before_peers[peer_idx as int].rdma.active_leases@;
         let ghost after_leases = self.peers@[peer_idx as int].rdma.active_leases@;
+        let ghost fp = peer_step_with_pins(rdma_tl, None, before_leases);
         proof {
             reveal(peer_core_step_except);
+            reveal(core_transition);
             lemma_core_wf_facts(&self.core);
             lemma_core_wf_facts(&before);
             assert(before_peers[peer_idx as int].well_formed(&before));
-            assert(self.core.timelines.kinds == before.timelines.kinds);
+            assert(self.core.timelines_spec().kinds_spec() == before.timelines_spec().kinds_spec());
             assert(self.peers@[peer_idx as int].rdma.peer_node
                 == before_peers[peer_idx as int].rdma.peer_node);
             self.host.ctx.source.borrow().lemma_all_future_unsubmitted(
                 instance,
-                &self.core.ledger.borrow().submitted,
+                &self.core.borrow_ledger().submitted,
             );
             self.host_ctx.source.borrow().lemma_all_future_unsubmitted(
                 instance,
-                &self.core.ledger.borrow().submitted,
+                &self.core.borrow_ledger().submitted,
             );
-            lemma_peer_core_step_preserves_host(&before, &self.core, rdma_tl, self.host);
-            if let Some(ref n) = self.nvme {
-                assert(peer_session_compatible(
-                    &before,
-                    self.host,
-                    &self.cuda,
-                    &self.nvme,
-                    &before_peers[peer_idx as int],
-                ));
-                lemma_peer_core_step_preserves_nvme(&before, &self.core, rdma_tl, n);
-            }
+            lemma_peer_step_footprint_with_pins(
+                &before,
+                &self.core,
+                rdma_tl,
+                None,
+                before_leases,
+                after_leases,
+            );
+            lemma_core_transition_preserves_host(&before, &self.core, fp, self.host);
+            assert(peer_session_compatible(
+                &before,
+                self.host,
+                &self.device,
+                &self.nvme,
+                &before_peers[peer_idx as int],
+            ));
+            lemma_preserve_nvme(&before, &self.core, fp, &self.nvme);
             assert forall|j: int| 0 <= j < self.peers@.len() && j != peer_idx as int implies {
                 &&& (#[trigger] self.peers@[j]).well_formed(&self.core)
                 &&& peer_leases_disjoint(self.peers@[j].rdma.active_leases@, after_leases)
@@ -941,7 +968,7 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 assert(peer_session_compatible(
                     &before,
                     self.host,
-                    &self.cuda,
+                    &self.device,
                     &self.nvme,
                     &before_peers[j],
                 ));
@@ -994,7 +1021,7 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 0 <= i < self.peers@.len() implies peer_session_compatible(
                 &self.core,
                 self.host,
-                &self.cuda,
+                &self.device,
                 &self.nvme,
                 &self.peers@[i],
             ) by {
@@ -1002,7 +1029,7 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                     assert(peer_session_compatible(
                         &before,
                         self.host,
-                        &self.cuda,
+                        &self.device,
                         &self.nvme,
                         &before_peers[peer_idx as int],
                     ));
@@ -1011,7 +1038,7 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                     assert(peer_session_compatible(
                         &before,
                         self.host,
-                        &self.cuda,
+                        &self.device,
                         &self.nvme,
                         &before_peers[i],
                     ));
@@ -1019,76 +1046,488 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 }
             }
         }
-        match &self.cuda {
-            CudaAttachment::None => {},
-            CudaAttachment::Borrowed(c) => {
-                c.timeline.stream.lemma_source_fresh(
+        match &self.device {
+            DeviceAttachment::None => {},
+            DeviceAttachment::Borrowed(c) => {
+                proof {
+                    c.lemma_device_layout(&before);
+                }
+                c.stream().lemma_source_fresh(
                     Tracked(instance),
-                    Tracked(&self.core.ledger.borrow().submitted),
+                    Tracked(&self.core.borrow_ledger().submitted),
                 );
                 proof {
                     assert(peer_session_compatible(
                         &before,
                         self.host,
-                        &self.cuda,
+                        &self.device,
                         &self.nvme,
                         &before_peers[peer_idx as int],
                     ));
-                    lemma_peer_core_step_preserves_idle_cuda(&before, &self.core, rdma_tl, *c);
+                    c.preserve_idle_across_core_transition(&before, &self.core, fp);
                 }
             },
-            CudaAttachment::Owned(c) => {
-                let ghost puts = c.active_gpu_puts@;
-                let ghost ctl = c.timeline.timeline_id;
-                c.timeline.stream.lemma_source_fresh(
+            DeviceAttachment::Owned(c) => {
+                proof {
+                    c.lemma_device_layout(&before);
+                }
+                c.stream().lemma_source_fresh(
                     Tracked(instance),
-                    Tracked(&self.core.ledger.borrow().submitted),
+                    Tracked(&self.core.borrow_ledger().submitted),
                 );
                 proof {
                     assert(peer_session_compatible(
                         &before,
                         self.host,
-                        &self.cuda,
+                        &self.device,
                         &self.nvme,
                         &before_peers[peer_idx as int],
                     ));
                     reveal(peer_core_step_except);
+                    reveal(core_transition);
                     reveal(FrameTable::same_layout);
                     reveal(FrameTable::preserves_initializing);
-                    assert(self.core.frames.consistent(self.core.kernel_view())) by {
+                    assert(self.core.frames_spec().consistent(self.core.kernel_view())) by {
                         reveal(CacheCore::well_formed);
                     }
                     lemma_core_wf_facts(&before);
                     assert forall|f: FrameId|
-                        f.0 < before.frames.metas.len() && (#[trigger] before.frames.meta(f)).state
-                            == STATE_INITIALIZING implies self.core.frames.ghosts@.contains_key(
-                        f.0 as nat,
-                    ) && self.core.frames.ghosts@[f.0 as nat] == before.frames.frame(f) by {
-                        assert(f.0 < self.core.frames.metas.len());
-                        assert(self.core.frames.frame(f) == before.frames.frame(f));
+                        f.0 < before.frames_spec().metas_spec().len() && (
+                        #[trigger] before.frames_spec().meta(f)).state
+                            == STATE_INITIALIZING implies self.core.frames_spec().ghosts_spec()@.contains_key(
+                    f.0 as nat) && self.core.frames_spec().ghosts_spec()@[f.0 as nat]
+                        == before.frames_spec().frame(f) by {
+                        assert(f.0 < self.core.frames_spec().metas_spec().len());
+                        assert(self.core.frames_spec().frame(f) == before.frames_spec().frame(f));
                     }
                     let ghost pre_core = self.core;
-                    lemma_prove_cuda_puts_dest_preserved(
-                        &before,
-                        self.core.frames.ghosts.borrow_mut(),
-                        self.core.ledger.borrow(),
-                        instance,
-                        puts,
-                        ctl,
-                        puts.len(),
-                    );
+                    let tracked (frame_ghosts, ledger) = self.core.borrow_frame_ghosts_and_ledger();
+                    c.prove_pending_destinations_preserved(&before, frame_ghosts, ledger, instance);
                     assert(self.core == pre_core);
-                    lemma_peer_core_step_preserves_cuda(
+                    c.preserve_across_core_transition_with_bindings(
                         &before,
                         &self.core,
-                        self.core.version_registry.borrow(),
-                        self.pending_gpu_bindings.borrow(),
-                        rdma_tl,
-                        c,
+                        self.core.borrow_version_registry(),
+                        self.pending_device_bindings.borrow(),
+                        fp,
                     );
                 }
             },
         }
+    }
+
+    /// Reserve a ready Host DRAM frame for an external full-frame write.
+    /// The address is valid until this reservation is committed or aborted.
+    pub fn begin_host_write(&mut self, key: ObjectKey) -> (r: Result<
+        HostWriteReservation,
+        CoreError,
+    >)
+        requires
+            old(self).well_formed(),
+        ensures
+            final(self).well_formed(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).core_spec().spec_spec() == old(self).core_spec().spec_spec(),
+            final(self).core_spec().frames_spec().preserves_initializing(
+                &old(self).core_spec().frames_spec(),
+                None,
+            ),
+            r matches Ok(res) ==> res.valid_for(final(self)) && res.handle_spec().key == key,
+            r is Err ==> *final(self) == *old(self),
+    {
+        hide(CacheCore::well_formed);
+        proof {
+            lemma_core_wf_facts(&self.core);
+        }
+        if self.core.timelines().next_sequences()[self.host.timeline as usize] > MAX_TICKET_SEQ {
+            return Err(CoreError::SequenceExhausted);
+        }
+        let ghost before = self.core;
+        let (handle, token) = self.core.begin_write(self.host.tier, key)?;
+        let tracked version_name;
+        proof {
+            // Take the binding authority now so later writes may commit in either order.
+            reveal(CacheCore::well_formed);
+            version_name = self.core.reserve_version_name(handle.version);
+        }
+        proof {
+            lemma_core_wf_facts(&self.core);
+            lemma_core_transition_no_event(&before, &self.core, None, None);
+            Self::lemma_preserve_siblings(
+                &before,
+                &self.core,
+                CoreFootprint::preserve_all(None, None),
+                self.host,
+                &self.host_ctx,
+                &self.device,
+                &self.nvme,
+                self.peers@,
+            );
+            lemma_slab_owns_tier_frame(
+                &self.core,
+                self.host.tier,
+                self.host.first_frame,
+                self.host.num_frames,
+                self.host.buffer.space(),
+                handle.frame,
+            );
+            assert(self.core.all_versions_bound()) by {
+                reveal(FrameTable::same_directory);
+            }
+        }
+        let slice = self.host.frame_slice(handle.frame);
+        Ok(
+            HostWriteReservation {
+                core_id: self.core.runtime_id(),
+                handle,
+                token,
+                version_name: Tracked(version_name),
+                host_addr: slice.addr(),
+                frame_size: slice.len(),
+            },
+        )
+    }
+
+    /// Publish the bytes written directly to the reserved frame and bind the new version.
+    /// The caller must fill the entire frame, synchronize all writes to it, and relinquish
+    /// the address before committing. A sequence exhaustion error returns the frame to
+    /// the ready queue.
+    pub fn commit_host_write(
+        &mut self,
+        Tracked(instance): Tracked<&TransferInstance>,
+        reservation: HostWriteReservation,
+    ) -> (r: Result<(VersionId, FrameId), CoreError>)
+        requires
+            old(self).well_formed(),
+            instance.id() == old(self).core_spec().instance_id(),
+            reservation.issued_by(old(self)) ==> reservation.valid_for(old(self)),
+        ensures
+            final(self).well_formed(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).core_spec().frames_spec().preserves_initializing(
+                &old(self).core_spec().frames_spec(),
+                Some(reservation.handle_spec().frame),
+            ),
+            r matches Ok((version, frame)) ==> {
+                let cert = final(self).core_spec().frames_spec().frame(frame).cert.unwrap();
+                &&& frame == reservation.handle_spec().frame
+                &&& version == reservation.handle_spec().version
+                &&& final(self).core_spec().frames_spec().meta(frame).state == STATE_PUBLISHED
+                &&& final(self).core_spec().frames_spec().frame(frame).cert is Some
+                &&& final(self).core_spec().has_version_binding(version)
+                &&& final(self).core_spec().spec_spec()@.versions == old(
+                    self,
+                ).core_spec().spec_spec()@.versions.insert(version, cert.bytes)
+                &&& final(self).core_spec().spec_spec()@.catalog == old(
+                    self,
+                ).core_spec().spec_spec()@.catalog.insert(reservation.handle_spec().key, version)
+            },
+            r is Err ==> final(self).core_spec().spec_spec() == old(self).core_spec().spec_spec(),
+    {
+        hide(CacheCore::well_formed);
+        if reservation.core_id != self.core.runtime_id() {
+            return Err(CoreError::InvalidArgument);
+        }
+        proof {
+            lemma_core_wf_facts(&self.core);
+        }
+        if self.core.timelines().next_sequences()[self.host.timeline as usize] > MAX_TICKET_SEQ {
+            self.abort_host_write(reservation);
+            return Err(CoreError::SequenceExhausted);
+        }
+        let ghost before = *self;
+        let handle = reservation.handle;
+        let Tracked(mut tok) = reservation.token;
+        let frame = handle.frame;
+        let version = handle.version;
+        proof {
+            Self::lemma_reserved_version_unbound(
+                &before,
+                version,
+                self.core.borrow_version_registry().tracked_borrow(),
+                self.pending_device_bindings.borrow(),
+                reservation.version_name.borrow(),
+            );
+        }
+        let (ticket, cert) = self.host.write_and_certify_host_slot_with(
+            &mut self.host_ctx,
+            &mut self.core,
+            Tracked(instance),
+            frame,
+            handle.slot,
+            Tracked(&mut tok),
+            None,
+        );
+        let ghost after_write = self.core;
+        self.core.finish_write(handle, Tracked(tok), ticket, cert);
+        proof {
+            lemma_core_wf_facts(&self.core);
+            assert(self.core.version_registry_spec()@->Some_0.instance.id()
+                == cluster_version_instance_id()) by {
+                reveal(CacheCore::well_formed);
+            }
+            assert(self.core.frames_spec().versions_spec()@.contains_key(version));
+        }
+        let tracked binding = self.core.borrow_version_registry().tracked_borrow().instance.bind(
+            (version.origin_node as NodeId, version.seq),
+            cert@.bytes,
+            reservation.version_name.get(),
+        );
+        self.core.register_version_binding(version, Tracked(binding));
+        proof {
+            let source = before.host_ctx.source@.source();
+            let fp = CoreFootprint::finish_write(self.host.timeline, source, frame, version);
+            lemma_core_wf_facts(&self.core);
+            lemma_core_frames_separated(&before.core);
+            lemma_slab_bound_same_layout(
+                &after_write,
+                &self.core,
+                self.host.tier,
+                self.host.first_frame,
+                self.host.num_frames,
+                self.host.buffer.space(),
+            );
+            assert(core_transition(&before.core, &self.core, fp)) by {
+                broadcast use {
+                    vstd::map::group_map_lemmas,
+                    vstd::imap::group_imap_lemmas,
+                    vstd::iset::group_iset_lemmas,
+                };
+
+                reveal(core_transition);
+                assert(self.core.instance_id() == before.core.instance_id());
+                assert(self.core.frames_spec().same_layout(&before.core.frames_spec()));
+                assert(self.core.frames_spec().preserves_fenced_leases(&before.core.frames_spec()));
+                assert(self.core.frames_spec().preserves_initializing(
+                    &before.core.frames_spec(),
+                    Some(frame),
+                ));
+                assert(fenced_shares_preserved(&before.core, &self.core, fp.touched_fenced_shares));
+                assert forall|t: TimelineId|
+                    t < before.core.timelines_spec().count_spec() && !fp.touched_timelines.contains(
+                        t,
+                    ) implies (#[trigger] self.core.timelines_spec().next_seq_spec()[t as int])
+                    == before.core.timelines_spec().next_seq_spec()[t as int]
+                    && self.core.timelines_spec().confirmed_seq_spec()[t as int]
+                    == before.core.timelines_spec().confirmed_seq_spec()[t as int] by {
+                    assert(t != self.host.timeline);
+                    assert(after_write.timelines_spec().next_seq_spec()[t as int]
+                        == before.core.timelines_spec().next_seq_spec()[t as int]);
+                }
+                assert forall|t: TimelineId, s: u64|
+                    t < before.core.timelines_spec().count_spec() && t != self.host.timeline && 1
+                        <= s
+                        < before.core.timelines_spec().next_seq_spec()[t as int] implies #[trigger] self.core.timelines_spec().events_spec()@[(
+                t, s)] == before.core.timelines_spec().events_spec()@[(t, s)] by {
+                    assert(after_write.timelines_spec().next_seq_spec()[t as int]
+                        == before.core.timelines_spec().next_seq_spec()[t as int]);
+                }
+                assert(self.core.frames_spec().versions_spec()@
+                    == before.core.frames_spec().versions_spec()@.insert(version, cert@.bytes));
+                assert(before.core.frames_spec().versions_spec()@.submap_of(
+                    self.core.frames_spec().versions_spec()@,
+                ));
+                assert forall|v: VersionId| #[trigger]
+                    self.core.frames_spec().versions_spec()@.contains_key(v)
+                        && !before.core.frames_spec().versions_spec()@.contains_key(
+                        v,
+                    ) implies fp.versions.allows(&before.core, v) by {
+                    assert(v == version);
+                }
+                assert(revoked_submap(
+                    before.core.ledger_spec()@.revoked,
+                    self.core.ledger_spec()@.revoked,
+                ));
+                assert forall|f: FrameId|
+                    f != frame && f.0
+                        < before.core.frames_spec().metas_spec().len() implies cert@.slot.loc != (
+                #[trigger] before.core.frames_spec().frame(f)).slot.loc by {
+                    if f.0 < frame.0 {
+                        assert(before.core.frames_spec().frame(f).slot.loc
+                            != before.core.frames_spec().frame(frame).slot.loc);
+                    } else {
+                        assert(before.core.frames_spec().frame(frame).slot.loc
+                            != before.core.frames_spec().frame(f).slot.loc);
+                    }
+                }
+                assert forall|e: TransferEvent| #[trigger]
+                    self.core.ledger_spec()@.submitted.dom().contains(e)
+                        && !before.core.ledger_spec()@.submitted.dom().contains(e) implies e.source
+                    == source && forall|f: FrameId|
+                    f != frame && f.0 < before.core.frames_spec().metas_spec().len() && (
+                    #[trigger] before.core.frames_spec().meta(f)).state == STATE_INITIALIZING
+                        ==> !self.core.ledger_spec()@.submitted.map()[e].access.writes.contains(
+                        before.core.frames_spec().frame(f).slot.loc,
+                    ) by {
+                    assert(e == cert@.writer);
+                }
+            }
+            Self::lemma_host_transition_preserves_siblings(&before, &self.core, fp);
+            assert(self.core.all_versions_bound()) by {
+                assert forall|v: VersionId| #[trigger]
+                    self.core.frames_spec().versions_spec()@.contains_key(
+                        v,
+                    ) implies self.core.has_version_binding(v) by {
+                    if v != version {
+                        assert(before.core.frames_spec().versions_spec()@.contains_key(v));
+                    }
+                }
+            }
+        }
+        Ok((version, frame))
+    }
+
+    /// Return an unpublished host frame to the ready queue. The caller must
+    /// drain any outstanding writes to the frame before aborting.
+    pub fn abort_host_write(&mut self, reservation: HostWriteReservation)
+        requires
+            old(self).well_formed(),
+            reservation.issued_by(old(self)) ==> reservation.valid_for(old(self)),
+        ensures
+            final(self).well_formed(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).core_spec().spec_spec() == old(self).core_spec().spec_spec(),
+            final(self).core_spec().frames_spec().preserves_initializing(
+                &old(self).core_spec().frames_spec(),
+                Some(reservation.handle_spec().frame),
+            ),
+            reservation.issued_by(old(self)) ==> {
+                let meta = final(self).core_spec().frames_spec().meta(
+                    reservation.handle_spec().frame,
+                );
+                &&& meta.state == STATE_EMPTY
+                &&& meta.queued()
+            },
+    {
+        hide(CacheCore::well_formed);
+        if reservation.core_id != self.core.runtime_id() {
+            return;
+        }
+        let ghost before = *self;
+        let ghost fp = CoreFootprint::finish_write(
+            self.host.timeline,
+            before.host_ctx.source@.source(),
+            reservation.handle.frame,
+            reservation.handle.version,
+        );
+        proof {
+            Self::lemma_reserved_version_unbound(
+                &before,
+                reservation.handle.version,
+                self.core.borrow_version_registry().tracked_borrow(),
+                self.pending_device_bindings.borrow(),
+                reservation.version_name.borrow(),
+            );
+        }
+        self.core.abort_write(reservation.handle, reservation.token);
+        proof {
+            lemma_core_wf_facts(&self.core);
+            lemma_slab_bound_same_layout(
+                &before.core,
+                &self.core,
+                self.host.tier,
+                self.host.first_frame,
+                self.host.num_frames,
+                self.host.buffer.space(),
+            );
+            assert(core_transition(&before.core, &self.core, fp)) by {
+                reveal(core_transition);
+                reveal(FrameTable::same_directory);
+            }
+            Self::lemma_host_transition_preserves_siblings(&before, &self.core, fp);
+            assert(self.core.all_versions_bound()) by {
+                reveal(FrameTable::same_directory);
+            }
+        }
+    }
+
+    proof fn lemma_reserved_version_unbound(
+        before: &Self,
+        version: VersionId,
+        tracked registry: &VersionRegistry,
+        tracked pending: &Map<VersionId, VersionBinding>,
+        tracked name: &VersionUnused,
+    )
+        requires
+            before.well_formed(),
+            before.core.version_registry_spec()@ == Some(*registry),
+            before.pending_device_bindings@ == *pending,
+            name.instance_id() == cluster_version_instance_id(),
+            name.element() == (version.origin_node as NodeId, version.seq),
+        ensures
+            !before.core.frames_spec().versions_spec()@.contains_key(version),
+            before.device.spec_ref() matches Some(c) ==> (forall|i: int|
+                0 <= i < c.pending_puts_spec().len() ==> !(
+                #[trigger] c.pending_puts_spec()[i]).publishes_version(version)),
+    {
+        assert(registry.instance.id() == cluster_version_instance_id());
+        if before.core.frames_spec().versions_spec()@.contains_key(version) {
+            registry.instance.unused_key_differs_from_binding(
+                name,
+                registry.bindings.tracked_borrow(version),
+            );
+        }
+        if pending.contains_key(version) && pending[version].instance_id() == registry.instance.id()
+            && pending[version].key() == name.element() {
+            registry.instance.unused_key_differs_from_binding(
+                name,
+                pending.tracked_borrow(version),
+            );
+        }
+        if let Some(ref c) = before.device.spec_ref() {
+            c.lemma_pending_put_model();
+            c.lemma_pending_put_bindings(*pending);
+            let puts = c.pending_puts_spec();
+            assert forall|i: int| 0 <= i < puts.len() implies !(
+            #[trigger] puts[i]).publishes_version(version) by {
+                if puts[i].publishes_version(version) {
+                    assert(before.device is Owned);
+                    c.lemma_pending_put_valid(&before.core, i);
+                    assert(puts[i].binding_covered(*pending));
+                }
+            }
+        }
+    }
+
+    proof fn lemma_host_transition_preserves_siblings(
+        before: &Self,
+        after: &CacheCore,
+        fp: CoreFootprint,
+    )
+        requires
+            before.well_formed(),
+            after.well_formed(),
+            core_transition(&before.core, after, fp),
+            fp.touched_timelines == optional_set(Some(before.host.timeline)),
+            fp.allowed_sources == Some(optional_set(Some(before.host_ctx.source@.source()))),
+            fp.touched_fenced_shares.is_empty(),
+            before.device.spec_ref() matches Some(c) ==> device_puts_untouched(
+                c.pending_puts_spec(),
+                &before.core,
+                fp,
+            ),
+            nvme_pending_untouched(&before.nvme, &before.core, fp),
+        ensures
+            forall|i: int|
+                0 <= i < before.peers@.len() ==> (#[trigger] before.peers@[i]).well_formed(after),
+            before.device.spec_ref() matches Some(c) ==> c.well_formed(after),
+            nvme_well_formed(&before.nvme, after),
+    {
+        hide(CacheCore::well_formed);
+        assert forall|i: int| 0 <= i < before.peers@.len() implies (
+        #[trigger] before.peers@[i]).well_formed(after) by {
+            lemma_core_transition_preserves_peer_session(
+                &before.core,
+                after,
+                fp,
+                &before.peers@[i],
+            );
+        }
+        if let Some(ref c) = before.device.spec_ref() {
+            c.lemma_device_layout(&before.core);
+            c.preserve_across_core_transition(&before.core, after, fp);
+        }
+        lemma_preserve_nvme(&before.core, after, fp, &before.nvme);
     }
 
     /// Synchronously publish `data` into Host DRAM and bind its cluster-wide
@@ -1101,29 +1540,33 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: BackendResult<(VersionId, FrameId)>)
         requires
             old(self).well_formed(),
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers == old(self).peers,
-            final(self).core.node_id == old(self).core.node_id,
-            final(self).core.instance_id() == old(self).core.instance_id(),
-            final(self).core.tiers == old(self).core.tiers,
-            old(self).core.spec@.versions_monotonic(final(self).core.spec@),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            final(self).core_spec().tiers_spec() == old(self).core_spec().tiers_spec(),
+            old(self).core_spec().spec_spec()@.versions_monotonic(
+                final(self).core_spec().spec_spec()@,
+            ),
             r matches Ok((ver, frame)) ==> {
-                &&& final(self).host.owns(frame)
-                &&& final(self).core.spec@.versions == old(self).core.spec@.versions.insert(
-                    ver,
-                    data@,
-                )
-                &&& final(self).core.spec@.catalog == old(self).core.spec@.catalog.insert(key, ver)
-                &&& final(self).core.frames.meta(frame).state == STATE_PUBLISHED
+                &&& final(self).host_spec().owns(frame)
+                &&& final(self).core_spec().spec_spec()@.versions == old(
+                    self,
+                ).core_spec().spec_spec()@.versions.insert(ver, data@)
+                &&& final(self).core_spec().spec_spec()@.catalog == old(
+                    self,
+                ).core_spec().spec_spec()@.catalog.insert(key, ver)
+                &&& final(self).core_spec().frames_spec().meta(frame).state == STATE_PUBLISHED
             },
     {
         hide(CacheCore::well_formed);
-        let ghost before = self.core;
+        let ghost before_engine = *self;
+        let ghost before = before_engine.core;
         let res = self.host.put_host_with(
             &mut self.host_ctx,
             &mut self.core,
@@ -1134,62 +1577,20 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         proof {
             lemma_core_wf_facts(&before);
             lemma_core_wf_facts(&self.core);
-            assert forall|i: int| 0 <= i < self.peers@.len() implies (
-            #[trigger] self.peers@[i]).well_formed(&self.core) by {
-                assert(peer_session_compatible(
-                    &before,
-                    self.host,
-                    &self.cuda,
-                    &self.nvme,
-                    &self.peers@[i],
-                ));
-                lemma_core_transition_preserves_peer_session(
-                    &before,
-                    &self.core,
-                    Some(self.host.timeline),
-                    Some(old(self).host_ctx.source@.source()),
-                    FrameTouchMode::PreserveAllInit,
-                    &self.peers@[i],
-                );
-            }
-            match &self.cuda {
-                CudaAttachment::None => {},
-                CudaAttachment::Borrowed(c) => {
-                    lemma_core_transition_preserves_cuda(
-                        &before,
-                        &self.core,
-                        Some(self.host.timeline),
-                        Some(old(self).host_ctx.source@.source()),
-                        FrameTouchMode::PreserveAllInit,
-                        *c,
-                    );
-                },
-                CudaAttachment::Owned(c) => {
-                    lemma_core_transition_preserves_cuda(
-                        &before,
-                        &self.core,
-                        Some(self.host.timeline),
-                        Some(old(self).host_ctx.source@.source()),
-                        FrameTouchMode::PreserveAllInit,
-                        c,
-                    );
-                },
-            }
-            if let Some(ref n) = self.nvme {
-                lemma_core_transition_preserves_nvme(
-                    &before,
-                    &self.core,
-                    Some(self.host.timeline),
-                    Some(old(self).host_ctx.source@.source()),
-                    FrameTouchMode::PreserveAllInit,
-                    n,
-                );
-            }
+            Self::lemma_host_transition_preserves_siblings(
+                &before_engine,
+                &self.core,
+                CoreFootprint::preserve_all(
+                    Some(before_engine.host.timeline),
+                    Some(before_engine.host_ctx.source@.source()),
+                ),
+            );
         }
         match res {
             Err(e) => {
                 proof {
-                    assert(self.core.frames.versions@ == before.frames.versions@) by {
+                    assert(self.core.frames_spec().versions_spec()@
+                        == before.frames_spec().versions_spec()@) by {
                         reveal(CacheCore::well_formed);
                     }
                     assert(self.core.all_versions_bound());
@@ -1199,11 +1600,11 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             Ok((ver, frame)) => {
                 let ghost before_bind = self.core;
                 proof {
-                    assert(before.version_registry@->Some_0.source.min_seq()
-                        <= before.next_version_seq as nat) by {
+                    assert(before.version_registry_spec()@->Some_0.source.min_seq()
+                        <= before.next_version_seq_spec() as nat) by {
                         reveal(CacheCore::well_formed);
                     }
-                    assert(self.core.frames.versions@.contains_key(ver)) by {
+                    assert(self.core.frames_spec().versions_spec()@.contains_key(ver)) by {
                         reveal(CacheCore::well_formed);
                     }
                 }
@@ -1214,9 +1615,7 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                     assert(core_transition(
                         &before_bind,
                         &self.core,
-                        None,
-                        None,
-                        FrameTouchMode::PreserveAllInit,
+                        CoreFootprint::preserve_all(None, None),
                     )) by {
                         reveal(core_transition);
                         reveal(FrameTable::same_layout);
@@ -1225,22 +1624,20 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                     Self::lemma_preserve_siblings(
                         &before_bind,
                         &self.core,
-                        None,
-                        None,
-                        FrameTouchMode::PreserveAllInit,
+                        CoreFootprint::preserve_all(None, None),
                         self.host,
                         &self.host_ctx,
-                        &self.cuda,
+                        &self.device,
                         &self.nvme,
                         self.peers@,
                     );
                     assert(self.core.all_versions_bound()) by {
                         assert forall|v: VersionId| #[trigger]
-                            self.core.frames.versions@.contains_key(
+                            self.core.frames_spec().versions_spec()@.contains_key(
                                 v,
                             ) implies self.core.has_version_binding(v) by {
                             if v != ver {
-                                assert(before.frames.versions@.contains_key(v)) by {
+                                assert(before.frames_spec().versions_spec()@.contains_key(v)) by {
                                     reveal(CacheCore::well_formed);
                                 }
                                 assert(before.has_version_binding(v));
@@ -1254,100 +1651,125 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         }
     }
 
-    /// Synchronously publish a GPU-VRAM frame from caller's `CudaSlice` (`src`)
+    /// Synchronously publish a GPU-VRAM frame from caller's device slice (`src`)
     /// using caller's idle `src_stream` / `src_timeline`, and bind its cluster-wide
-    /// `VersionBinding`. Works with both `CudaAttachment::Borrowed` and `Owned`.
+    /// `VersionBinding`. Works with both `DeviceAttachment::Borrowed` and `Owned`.
     pub fn put_gpu_sync(
         &mut self,
         Tracked(instance): Tracked<&TransferInstance>,
-        src_stream: &mut CudaStream,
-        src_timeline: u8,
+        src_stream: &mut D::Stream,
+        src_timeline: TimelineId,
         key: ObjectKey,
-        src: &CudaSlice,
+        src: &D::Slice<'_>,
         Tracked(src_perm): Tracked<&mut ReadPerm>,
         Ghost(src_cert): Ghost<ValueCertificate>,
     ) -> (r: BackendResult<(VersionId, FrameId)>)
         requires
             old(self).well_formed(),
-            old(self).cuda.spec_ref() matches Some(c) && {
-                &&& caller_stream_valid(
-                    *old(src_stream),
-                    &old(self).core,
-                    src_timeline,
-                    c.timeline.stream,
-                )
-                &&& src_timeline != old(self).host.timeline
-                &&& src_timeline != c.timeline.timeline_id
+            old(self).device_spec().spec_ref() matches Some(c) && {
+                &&& c.caller_stream_valid(*old(src_stream), &old(self).core_spec(), src_timeline)
+                &&& src_timeline != old(self).host_spec().timeline_spec()
+                &&& src_timeline != c.timeline_id_spec()
                 &&& forall|i: int|
-                    0 <= i < old(self).peers@.len() ==> src_timeline != (#[trigger] old(
+                    0 <= i < old(self).peers_spec()@.len() ==> src_timeline != (#[trigger] old(
                         self,
-                    ).peers@[i]).rdma.timeline_id
-                &&& (old(self).nvme matches Some(n) ==> src_timeline != n.timeline)
-                &&& old(self).core.timelines.confirmed_seq[src_timeline as int] + 1 == old(
+                    ).peers_spec()@[i]).rdma_spec().timeline_id_spec()
+                &&& nvme_timeline_distinct(&old(self).nvme_spec(), src_timeline)
+                &&& old(self).core_spec().timelines_spec().confirmed_seq_spec()[src_timeline as int]
+                    + 1 == old(
                     self,
-                ).core.timelines.next_seq[src_timeline as int]
-                &&& old(src_stream).device() == c.device
-                &&& src.slot_ref().loc.space is GpuAlloc
-                    && src.slot_ref().loc.space->GpuAlloc_device != c.device ==> (old(
-                    src_perm,
-                ).frontier().last_writer matches Some(w) ==> !(w.source is RdmaQueuePair))
+                ).core_spec().timelines_spec().next_seq_spec()[src_timeline as int]
+                &&& old(src_stream).device_spec() == c.device_spec()
+                &&& src.slot_ref().loc.space.is_gpu() && src.slot_ref().loc.space.gpu_device()
+                    != c.device_spec() ==> (old(src_perm).frontier().last_writer matches Some(w)
+                    ==> !(w.source.is_rdma_qp()))
             },
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
             src.well_formed(),
-            src.instance_id() == old(self).core.instance_id(),
-            src.slot_ref().loc.node == old(self).core.node(),
-            old(self).cuda.spec_ref() matches Some(c) ==> src.slot_ref().sub_len == old(
+            src.instance_id() == old(self).core_spec().instance_id(),
+            src.slot_ref().loc.node == old(self).core_spec().node(),
+            old(self).device_spec().spec_ref() matches Some(c) ==> src.slot_ref().sub_len == old(
                 self,
-            ).core.frames.tier_frame_size(c.gpu_tier),
-            old(src_perm).valid_local(old(self).core.instance_id(), src.slot_ref().loc),
-            read_admitted(old(src_perm).frontier(), old(self).core.citations()),
-            replica_valid(old(self).core.ledger@, old(self).core.node(), src_cert),
+            ).core_spec().frames_spec().tier_frame_size(c.device_tier_spec()),
+            old(src_perm).valid_cooperative(
+                old(self).core_spec().instance_id(),
+                src.slot_ref().loc,
+            ),
+            read_admitted(old(src_perm).frontier(), old(self).core_spec().citations()),
+            replica_valid(
+                old(self).core_spec().ledger_spec()@,
+                old(self).core_spec().node(),
+                src_cert,
+            ),
             source_slice_valid(src_cert, src.slot_ref()),
             src_cert.slot == src.slot_ref(),
             src_cert.bytes.len() == src.slot_ref().sub_len,
             forall|f: FrameId|
-                f.0 < old(self).core.frames.metas.len() && (#[trigger] old(self).core.frames.meta(
-                    f,
-                )).state == STATE_EMPTY ==> src.slot_ref().loc != old(self).core.frames.frame(
-                    f,
-                ).slot.loc,
+                f.0 < old(self).core_spec().frames_spec().metas_spec().len() && (#[trigger] old(
+                    self,
+                ).core_spec().frames_spec().meta(f)).state == STATE_EMPTY ==> src.slot_ref().loc
+                    != old(self).core_spec().frames_spec().frame(f).slot.loc,
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers == old(self).peers,
-            final(self).core.node_id == old(self).core.node_id,
-            final(self).core.instance_id() == old(self).core.instance_id(),
-            final(self).core.tiers == old(self).core.tiers,
-            old(self).core.spec@.versions_monotonic(final(self).core.spec@),
-            final(self).cuda.spec_ref() matches Some(c) ==> caller_stream_valid(
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            final(self).core_spec().tiers_spec() == old(self).core_spec().tiers_spec(),
+            old(self).core_spec().spec_spec()@.versions_monotonic(
+                final(self).core_spec().spec_spec()@,
+            ),
+            final(self).device_spec().spec_ref() matches Some(c) ==> c.caller_stream_valid(
                 *final(src_stream),
-                &final(self).core,
+                &final(self).core_spec(),
                 src_timeline,
-                c.timeline.stream,
             ),
             r matches Ok((ver, frame)) ==> {
-                &&& final(self).cuda.spec_ref() matches Some(c) && c.owns_gpu(frame)
-                &&& final(self).core.timelines.confirmed_seq[src_timeline as int] + 1
-                    == final(self).core.timelines.next_seq[src_timeline as int]
-                &&& final(self).core.spec@.versions == old(self).core.spec@.versions.insert(
-                    ver,
-                    src_cert.bytes,
-                )
-                &&& final(self).core.spec@.catalog == old(self).core.spec@.catalog.insert(key, ver)
-                &&& final(self).core.frames.meta(frame).state == STATE_PUBLISHED
+                &&& final(self).device_spec().spec_ref() matches Some(c) && c.owns_device(frame)
+                &&& final(self).core_spec().timelines_spec().confirmed_seq_spec()[src_timeline as int]
+                    + 1
+                    == final(self).core_spec().timelines_spec().next_seq_spec()[src_timeline as int]
+                &&& final(self).core_spec().spec_spec()@.versions == old(
+                    self,
+                ).core_spec().spec_spec()@.versions.insert(ver, src_cert.bytes)
+                &&& final(self).core_spec().spec_spec()@.catalog == old(
+                    self,
+                ).core_spec().spec_spec()@.catalog.insert(key, ver)
+                &&& final(self).core_spec().frames_spec().meta(frame).state == STATE_PUBLISHED
             },
     {
         hide(CacheCore::well_formed);
         hide(replica_valid);
         hide(complete_receipts);
-        let Some(cuda) = self.cuda.as_ref() else {
+        let Some(device) = self.device.as_ref() else {
             return Err(CoreError::UnsupportedTier);
         };
+        if src_timeline == device.timeline_id() || !is_caller_device_timeline::<D>(
+            &self.core,
+            src_timeline,
+            src_stream,
+        ) || self.core.tier_frame_size(device.device_tier_id()) != Some(src.len()) {
+            return Err(CoreError::InvalidArgument);
+        }
+        if !self.core.timeline_is_idle(src_timeline) {
+            return Err(CoreError::WouldConflict);
+        }
+        if !super::boundary::bind_caller_device_stream(
+            &mut self.caller_device_streams,
+            src_timeline,
+            src_stream,
+        ) {
+            return Err(CoreError::InvalidArgument);
+        }
         let ghost before = self.core;
         let ghost src_source = src_stream.source().source();
-        let res = cuda.put_gpu_sync(
+        proof {
+            device.lemma_caller_stream_valid(*src_stream, &before, src_timeline);
+            src_stream.lemma_source_kind();
+        }
+        let res = device.put_device_sync(
             &mut self.core,
             Tracked(instance),
             src_stream,
@@ -1363,12 +1785,10 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                     Self::lemma_preserve_siblings(
                         &before,
                         &self.core,
-                        Some(src_timeline),
-                        Some(src_source),
-                        FrameTouchMode::PreserveAllInit,
+                        CoreFootprint::preserve_all(Some(src_timeline), Some(src_source)),
                         self.host,
                         &self.host_ctx,
-                        &self.cuda,
+                        &self.device,
                         &self.nvme,
                         self.peers@,
                     );
@@ -1379,52 +1799,59 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             Ok((ver, frame)) => {
                 let ghost before_bind = self.core;
                 proof {
-                    assert(before.version_registry@->Some_0.source.min_seq()
-                        <= before.next_version_seq as nat) by {
+                    assert(before.version_registry_spec()@->Some_0.source.min_seq()
+                        <= before.next_version_seq_spec() as nat) by {
                         reveal(CacheCore::well_formed);
                     }
                 }
                 self.core.bind_local_version(ver);
                 proof {
-                    assert(core_transition(
-                        &before,
-                        &self.core,
-                        Some(src_timeline),
-                        Some(src_source),
-                        FrameTouchMode::PreserveAllInit,
-                    )) by {
-                        assert(core_transition(
-                            &before,
-                            &before_bind,
-                            Some(src_timeline),
-                            Some(src_source),
-                            FrameTouchMode::PreserveAllInit,
-                        ));
-                        assert(self.core.frames == before_bind.frames);
-                        assert(self.core.timelines == before_bind.timelines);
-                        assert(self.core.ledger == before_bind.ledger);
-                        assert(self.core.active_leases == before_bind.active_leases);
+                    lemma_core_wf_facts(&before_bind);
+                    lemma_core_wf_facts(&self.core);
+                    let binding_fp = CoreFootprint::preserve_all(None, None);
+                    assert(core_transition(&before_bind, &self.core, binding_fp)) by {
                         reveal(core_transition);
+                        reveal(FrameTable::same_layout);
                     }
+                    device.preserve_caller_stream(
+                        &before_bind,
+                        &self.core,
+                        binding_fp,
+                        *src_stream,
+                        src_timeline,
+                    );
+                    assert(core_transition(
+                        &before_bind,
+                        &self.core,
+                        CoreFootprint::preserve_all(Some(src_timeline), Some(src_source)),
+                    )) by {
+                        reveal(core_transition);
+                        reveal(FrameTable::same_layout);
+                        reveal(FrameTable::preserves_initializing);
+                    }
+                    lemma_core_transition_trans_same(
+                        &before,
+                        &before_bind,
+                        &self.core,
+                        CoreFootprint::preserve_all(Some(src_timeline), Some(src_source)),
+                    );
                     Self::lemma_preserve_siblings(
                         &before,
                         &self.core,
-                        Some(src_timeline),
-                        Some(src_source),
-                        FrameTouchMode::PreserveAllInit,
+                        CoreFootprint::preserve_all(Some(src_timeline), Some(src_source)),
                         self.host,
                         &self.host_ctx,
-                        &self.cuda,
+                        &self.device,
                         &self.nvme,
                         self.peers@,
                     );
                     assert(self.core.all_versions_bound()) by {
                         assert forall|v: VersionId| #[trigger]
-                            self.core.frames.versions@.contains_key(
+                            self.core.frames_spec().versions_spec()@.contains_key(
                                 v,
                             ) implies self.core.has_version_binding(v) by {
                             if v != ver {
-                                assert(before.frames.versions@.contains_key(v));
+                                assert(before.frames_spec().versions_spec()@.contains_key(v));
                                 assert(before.has_version_binding(v));
                                 assert(before_bind.has_version_binding(v));
                             }
@@ -1436,76 +1863,99 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         }
     }
 
-    /// Asynchronously enqueue a GPU-VRAM or pinned-host write on `CudaAttachment::Owned`,
-    /// pre-binding its `VersionBinding` into `self.pending_gpu_bindings` so concurrent
+    /// Asynchronously enqueue a GPU-VRAM or pinned-host write on `DeviceAttachment::Owned`,
+    /// pre-binding its `VersionBinding` into `self.pending_device_bindings` so concurrent
     /// RDMA / NVMe / Host steps remain composable while the GPU copy is in flight.
     pub fn submit_put_gpu_async(
         &mut self,
         Tracked(instance): Tracked<&TransferInstance>,
         dst_tier: TierId,
         key: ObjectKey,
-        src: &CudaSlice,
+        src: &D::Slice<'_>,
         Tracked(src_perm): Tracked<&mut ReadPerm>,
         Ghost(src_cert): Ghost<ValueCertificate>,
     ) -> (r: BackendResult<(VersionId, FrameId, Ticket, SyncPoint)>)
         requires
             old(self).well_formed(),
-            old(self).cuda is Owned,
-            instance.id() == old(self).core.instance_id(),
+            old(self).device_spec() is Owned,
+            instance.id() == old(self).core_spec().instance_id(),
             src.well_formed(),
-            src.instance_id() == old(self).core.instance_id(),
-            src.slot_ref().loc.node == old(self).core.node(),
-            old(self).cuda.spec_ref() matches Some(c) ==> {
-                &&& src.slot_ref().sub_len == old(self).core.frames.tier_frame_size(c.gpu_tier)
-                &&& src.slot_ref().loc.space is GpuAlloc
-                    && src.slot_ref().loc.space->GpuAlloc_device != c.device ==> (old(
-                    src_perm,
-                ).frontier().last_writer matches Some(w) ==> !(w.source is RdmaQueuePair))
+            src.instance_id() == old(self).core_spec().instance_id(),
+            src.slot_ref().loc.node == old(self).core_spec().node(),
+            old(self).device_spec().spec_ref() matches Some(c) ==> {
+                &&& src.slot_ref().sub_len == old(self).core_spec().frames_spec().tier_frame_size(
+                    c.device_tier_spec(),
+                )
+                &&& src.slot_ref().loc.space.is_gpu() && src.slot_ref().loc.space.gpu_device()
+                    != c.device_spec() ==> (old(src_perm).frontier().last_writer matches Some(w)
+                    ==> !(w.source.is_rdma_qp()))
             },
-            old(src_perm).valid_local(old(self).core.instance_id(), src.slot_ref().loc),
-            read_admitted(old(src_perm).frontier(), old(self).core.citations()),
-            replica_valid(old(self).core.ledger@, old(self).core.node(), src_cert),
+            old(src_perm).valid_cooperative(
+                old(self).core_spec().instance_id(),
+                src.slot_ref().loc,
+            ),
+            read_admitted(old(src_perm).frontier(), old(self).core_spec().citations()),
+            replica_valid(
+                old(self).core_spec().ledger_spec()@,
+                old(self).core_spec().node(),
+                src_cert,
+            ),
             source_slice_valid(src_cert, src.slot_ref()),
             src_cert.slot == src.slot_ref(),
             src_cert.bytes.len() == src.slot_ref().sub_len,
             forall|f: FrameId|
-                f.0 < old(self).core.frames.metas.len() && (#[trigger] old(self).core.frames.meta(
-                    f,
-                )).state == STATE_EMPTY ==> src.slot_ref().loc != old(self).core.frames.frame(
-                    f,
-                ).slot.loc,
+                f.0 < old(self).core_spec().frames_spec().metas_spec().len() && (#[trigger] old(
+                    self,
+                ).core_spec().frames_spec().meta(f)).state == STATE_EMPTY ==> src.slot_ref().loc
+                    != old(self).core_spec().frames_spec().frame(f).slot.loc,
         ensures
             final(self).well_formed(),
-            final(self).cuda is Owned,
-            final(self).cuda.same_config(&old(self).cuda),
-            final(self).host == old(self).host,
-            final(self).nvme == old(self).nvme,
-            final(self).peers == old(self).peers,
-            final(self).core.node_id == old(self).core.node_id,
-            final(self).core.instance_id() == old(self).core.instance_id(),
-            final(self).core.tiers == old(self).core.tiers,
-            final(self).core.spec == old(self).core.spec,
+            final(self).device_spec() is Owned,
+            final(self).device_spec().same_config(&old(self).device_spec()),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            final(self).core_spec().tiers_spec() == old(self).core_spec().tiers_spec(),
+            final(self).core_spec().spec_spec() == old(self).core_spec().spec_spec(),
             r matches Ok((ver, frame, ticket, _)) ==> {
                 &&& ticket != Ticket::NONE
-                &&& final(self).cuda.spec_ref() matches Some(c) && ticket.timeline_id()
-                    == c.timeline.timeline_id && ((dst_tier == c.gpu_tier && c.owns_gpu(frame))
-                    || c.owns_pinned_host(frame))
+                &&& final(self).device_spec().spec_ref() matches Some(c) && ticket.timeline_id()
+                    == c.timeline_id_spec() && ((dst_tier == c.device_tier_spec() && c.owns_device(
+                    frame,
+                )) || c.owns_pinned_host(frame))
             },
     {
         hide(CacheCore::well_formed);
         hide(replica_valid);
         hide(complete_receipts);
-        let prev_att = self.cuda.take();
-        let CudaAttachment::Owned(mut cuda) = prev_att else {
-            self.cuda = prev_att;
+        proof {
+            if let DeviceAttachment::Owned(ref device) = self.device {
+                device.lemma_same_config(device);
+            }
+        }
+        if dst_tier.as_index() >= self.core.tier_count() {
+            return Err(CoreError::InvalidArgument);
+        }
+        let prev_att = self.device.take();
+        let DeviceAttachment::Owned(mut device) = prev_att else {
+            self.device = prev_att;
             return Err(CoreError::UnsupportedTier);
         };
+        if self.core.tier_frame_size(device.device_tier_id()) != Some(src.len()) {
+            self.device = DeviceAttachment::Owned(device);
+            return Err(CoreError::InvalidArgument);
+        }
         let ghost before = self.core;
-        let ghost before_puts = cuda.active_gpu_puts@;
-        let ghost before_bindings = self.pending_gpu_bindings@;
-        let ghost cuda_tl = cuda.timeline.timeline_id;
-        let ghost cuda_src = cuda.timeline.stream.source().source();
-        let res = cuda.put_gpu(
+        let ghost before_device = device;
+        let ghost before_bindings = self.pending_device_bindings@;
+        let ghost device_tl = device.timeline_id_spec();
+        let ghost fp = CoreFootprint::preserve_all(
+            Some(device_tl),
+            Some(device.event_source_spec()),
+        );
+        let res = device.put_device(
             &mut self.core,
             Tracked(instance),
             dst_tier,
@@ -1514,189 +1964,62 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             Tracked(src_perm),
             Ghost(src_cert),
         );
-        match res {
-            Err(e) => {
-                proof {
-                    if cuda.active_gpu_puts@.len() > before_puts.len() {
-                        lemma_cuda_puts_bindings_push_abort(
-                            before_puts,
-                            cuda.active_gpu_puts@,
-                            cuda.active_gpu_puts@.last(),
-                            before_bindings,
-                        );
-                    }
-                    let ghost none_cuda: CudaAttachment<'a> = CudaAttachment::None;
-                    assert forall|i: int| 0 <= i < self.peers@.len() implies (
-                    #[trigger] self.peers@[i]).rdma.timeline_id != cuda_tl by {
-                        assert(peer_session_compatible(
-                            &before,
-                            self.host,
-                            &CudaAttachment::Owned(cuda),
-                            &self.nvme,
-                            &self.peers@[i],
-                        ) || old(self).peers@[i].rdma.timeline_id != cuda_tl);
-                    }
-                    Self::lemma_preserve_siblings(
-                        &before,
-                        &self.core,
-                        Some(cuda_tl),
-                        Some(cuda_src),
-                        FrameTouchMode::PreserveAllInit,
-                        self.host,
-                        &self.host_ctx,
-                        &none_cuda,
-                        &self.nvme,
-                        self.peers@,
-                    );
-                    assert(self.core.frames.versions@ == before.frames.versions@) by {
-                        reveal(CacheCore::well_formed);
-                    }
-                    assert(self.core.all_versions_bound());
+        if let Ok((ver, _, _, _)) = res {
+            let ghost after_put = self.core;
+            proof {
+                lemma_core_wf_facts(&after_put);
+                assert(ver.seq < before.version_seq_limit_spec()) by {
+                    reveal(core_transition);
                 }
-                self.cuda = CudaAttachment::Owned(cuda);
-                Err(e)
-            },
-            Ok((ver, frame, ticket, sync_pt)) => {
-                let ghost after_put = self.core;
-                proof {
-                    assert(before.version_registry@->Some_0.source.min_seq()
-                        <= before.next_version_seq as nat) by {
-                        reveal(CacheCore::well_formed);
-                    }
-                    assert(self.core.has_version_registry());
+                assert(before.version_registry_spec()@->Some_0.source.min_seq()
+                    <= before.next_version_seq_spec() as nat) by {
+                    reveal(CacheCore::well_formed);
                 }
-                let Tracked(vb) = self.core.prebind_local_version(ver, Ghost(src_cert.bytes));
-                proof {
-                    self.pending_gpu_bindings.borrow_mut().tracked_insert(ver, vb);
-                    lemma_cuda_puts_bindings_push_publish(
-                        before_puts,
-                        cuda.active_gpu_puts@,
-                        cuda.active_gpu_puts@.last(),
-                        before_bindings,
-                        self.pending_gpu_bindings@,
-                        ver,
-                        vb,
-                        &after_put,
-                        cuda_tl,
-                    );
-                    assert(cuda.well_formed(&self.core)) by {
-                        reveal(slab_bound_to_core);
-                        assert(self.core.frames == after_put.frames);
-                        assert(self.core.timelines == after_put.timelines);
-                        assert(self.core.ledger == after_put.ledger);
-                        assert(self.core.tiers == after_put.tiers);
-                        assert(self.core.node_id == after_put.node_id);
-                        assert(self.core.next_version_seq == after_put.next_version_seq);
-                        assert(self.core.version_seq_limit == after_put.version_seq_limit);
-                        assert(self.core.instance_id() == after_put.instance_id()) by {
-                            reveal(CacheCore::well_formed);
-                        }
-                        reveal(crate::backends::cuda::cuda_puts_valid);
-                        assert forall|k: int| 0 <= k < cuda.active_gpu_puts@.len() implies (
-                        #[trigger] cuda.active_gpu_puts@[k]).valid(&self.core, cuda_tl) by {
-                            assert(cuda.active_gpu_puts@[k].valid(&after_put, cuda_tl));
-                        }
-                    }
-                    assert(core_transition(
-                        &before,
-                        &self.core,
-                        Some(cuda_tl),
-                        Some(cuda_src),
-                        FrameTouchMode::PreserveAllInit,
-                    )) by {
-                        assert(core_transition(
-                            &before,
-                            &after_put,
-                            Some(cuda_tl),
-                            Some(cuda_src),
-                            FrameTouchMode::PreserveAllInit,
-                        ));
-                        reveal(core_transition);
-                    }
-                    let ghost none_cuda: CudaAttachment<'a> = CudaAttachment::None;
-                    assert forall|i: int| 0 <= i < self.peers@.len() implies (
-                    #[trigger] self.peers@[i]).rdma.timeline_id != cuda_tl by {
-                        assert(peer_session_compatible(
-                            &before,
-                            self.host,
-                            &old(self).cuda,
-                            &self.nvme,
-                            &self.peers@[i],
-                        ));
-                    }
-                    Self::lemma_preserve_siblings(
-                        &before,
-                        &self.core,
-                        Some(cuda_tl),
-                        Some(cuda_src),
-                        FrameTouchMode::PreserveAllInit,
-                        self.host,
-                        &self.host_ctx,
-                        &none_cuda,
-                        &self.nvme,
-                        self.peers@,
-                    );
-                    assert(self.core.frames.versions@ == before.frames.versions@) by {
-                        assert(after_put.frames.versions@ == before.frames.versions@) by {
-                            reveal(CacheCore::well_formed);
-                        }
-                    }
-                    assert(self.core.all_versions_bound());
-                    lemma_core_wf_facts(&self.core);
+            }
+            let Tracked(binding) = self.core.prebind_local_version(ver, Ghost(src_cert.bytes));
+            proof {
+                self.pending_device_bindings.borrow_mut().tracked_insert(ver, binding);
+                let binding_fp = CoreFootprint::preserve_all(None, None);
+                lemma_core_wf_facts(&after_put);
+                lemma_core_wf_facts(&self.core);
+                assert(core_transition(&after_put, &self.core, binding_fp)) by {
+                    reveal(core_transition);
+                    reveal(FrameTable::same_layout);
                 }
-                self.cuda = CudaAttachment::Owned(cuda);
-                Ok((ver, frame, ticket, sync_pt))
-            },
+                device.preserve_across_core_transition(&after_put, &self.core, binding_fp);
+                assert(core_transition(&before, &self.core, fp)) by {
+                    reveal(core_transition);
+                }
+            }
         }
-    }
-
-    /// Non-blockingly poll ready CUDA timeline events and publish/abort completed
-    /// parked GPU writes on `CudaAttachment::Owned`, registering their pre-bound
-    /// `VersionBinding`s into `self.core.version_registry`.
-    pub fn poll_gpu_completions(&mut self, Tracked(instance): Tracked<&TransferInstance>) -> (r:
-        Result<CudaPollReport, (CoreError, CudaPollReport)>)
-        requires
-            old(self).well_formed(),
-            old(self).cuda is Owned,
-            instance.id() == old(self).core.instance_id(),
-        ensures
-            final(self).well_formed(),
-            final(self).cuda is Owned,
-            final(self).cuda.same_config(&old(self).cuda),
-            final(self).host == old(self).host,
-            final(self).nvme == old(self).nvme,
-            final(self).peers == old(self).peers,
-            final(self).core.node_id == old(self).core.node_id,
-            final(self).core.instance_id() == old(self).core.instance_id(),
-            final(self).core.tiers == old(self).core.tiers,
-            old(self).core.spec@.versions_monotonic(final(self).core.spec@),
-    {
-        hide(CacheCore::well_formed);
-        let prev_att = self.cuda.take();
-        let CudaAttachment::Owned(mut cuda) = prev_att else {
-            self.cuda = prev_att;
-            return Err(
-                (
-                    CoreError::UnsupportedTier,
-                    CudaPollReport { events_completed: 0, writes_published: 0, writes_aborted: 0 },
-                ),
-            );
-        };
-        let ghost before = self.core;
-        let ghost cuda_tl = cuda.timeline.timeline_id;
-        let res = cuda.poll_completions_with_bindings(
-            &mut self.core,
-            Tracked(instance),
-            Tracked(self.pending_gpu_bindings.borrow_mut()),
-        );
         proof {
-            let ghost none_cuda: CudaAttachment<'a> = CudaAttachment::None;
+            before_device.lemma_pending_put_bindings(before_bindings);
+            device.lemma_pending_put_bindings(self.pending_device_bindings@);
+            let before_puts = before_device.pending_puts_spec();
+            let puts = device.pending_puts_spec();
+            assert forall|i: int| 0 <= i < puts.len() implies (#[trigger] puts[i]).binding_covered(
+                self.pending_device_bindings@,
+            ) by {
+                if i < before_puts.len() {
+                    assert(puts[i] == before_puts[i]);
+                    assert(before_puts[i].binding_covered(before_bindings));
+                    if let Ok((ver, _, _, _)) = res {
+                        before_device.lemma_pending_put_valid(&before, i);
+                        assert(!puts[i].publishes_version(ver));
+                    }
+                } else {
+                    assert(i == before_puts.len());
+                    assert(puts[i] == puts.last());
+                }
+            }
+            before_device.lemma_device_layout(&before);
+            device.lemma_same_config(&before_device);
             assert forall|i: int| 0 <= i < self.peers@.len() implies (
-            #[trigger] self.peers@[i]).rdma.timeline_id != cuda_tl by {
+            #[trigger] self.peers@[i]).rdma.timeline_id != device_tl by {
                 assert(peer_session_compatible(
                     &before,
                     self.host,
-                    &old(self).cuda,
+                    &old(self).device,
                     &self.nvme,
                     &self.peers@[i],
                 ));
@@ -1704,17 +2027,84 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             Self::lemma_preserve_siblings(
                 &before,
                 &self.core,
-                Some(cuda_tl),
-                None,
-                FrameTouchMode::PreserveUnparkedInit,
+                fp,
                 self.host,
                 &self.host_ctx,
-                &none_cuda,
+                &self.device,
+                &self.nvme,
+                self.peers@,
+            );
+            lemma_core_wf_facts(&before);
+            lemma_core_wf_facts(&self.core);
+            assert(self.core.all_versions_bound());
+        }
+        self.device = DeviceAttachment::Owned(device);
+        res
+    }
+
+    /// Non-blockingly poll ready device timeline events and publish/abort completed
+    /// parked GPU writes on `DeviceAttachment::Owned`, registering their pre-bound
+    /// `VersionBinding`s into `self.core.version_registry_spec()`.
+    pub fn poll_gpu_completions(&mut self, Tracked(instance): Tracked<&TransferInstance>) -> (r:
+        Result<DevicePollReport, (CoreError, DevicePollReport)>)
+        requires
+            old(self).well_formed(),
+            old(self).device_spec() is Owned,
+            instance.id() == old(self).core_spec().instance_id(),
+        ensures
+            final(self).well_formed(),
+            final(self).device_spec() is Owned,
+            final(self).device_spec().same_config(&old(self).device_spec()),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            final(self).core_spec().tiers_spec() == old(self).core_spec().tiers_spec(),
+            old(self).core_spec().spec_spec()@.versions_monotonic(
+                final(self).core_spec().spec_spec()@,
+            ),
+    {
+        hide(CacheCore::well_formed);
+        let prev_att = self.device.take();
+        let DeviceAttachment::Owned(mut device) = prev_att else {
+            self.device = prev_att;
+            return Err((CoreError::UnsupportedTier, DevicePollReport::empty()));
+        };
+        let ghost before = self.core;
+        let ghost before_device = device;
+        let ghost device_tl = device.timeline_id_spec();
+        let ghost poll_fp = device.poll_footprint();
+        let res = device.poll_completions_with_bindings(
+            &mut self.core,
+            Tracked(instance),
+            Tracked(self.pending_device_bindings.borrow_mut()),
+        );
+        proof {
+            before_device.lemma_pending_put_model();
+            device.lemma_same_config(&before_device);
+            assert forall|i: int| 0 <= i < self.peers@.len() implies (
+            #[trigger] self.peers@[i]).rdma.timeline_id != device_tl by {
+                assert(peer_session_compatible(
+                    &before,
+                    self.host,
+                    &old(self).device,
+                    &self.nvme,
+                    &self.peers@[i],
+                ));
+            }
+            Self::lemma_preserve_siblings(
+                &before,
+                &self.core,
+                poll_fp,
+                self.host,
+                &self.host_ctx,
+                &self.device,
                 &self.nvme,
                 self.peers@,
             );
         }
-        self.cuda = CudaAttachment::Owned(cuda);
+        self.device = DeviceAttachment::Owned(device);
         res
     }
 
@@ -1728,23 +2118,24 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: BackendResult<Option<VersionId>>)
         requires
             old(self).well_formed(),
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers == old(self).peers,
-            final(self).core.spec == old(self).core.spec,
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().spec_spec() == old(self).core_spec().spec_spec(),
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
             final(dst)@.len() == old(dst)@.len(),
-            r matches Ok(Some(ver)) ==> final(self).core.spec@.catalog.contains_key(key)
-                && final(self).core.spec@.catalog[key] == ver,
+            r matches Ok(Some(ver)) ==> final(self).core_spec().spec_spec()@.catalog.contains_key(
+                key,
+            ) && final(self).core_spec().spec_spec()@.catalog[key] == ver,
     {
         hide(CacheCore::well_formed);
         let Some((frame, _ver)) = self.core.lookup_tier(key, self.host.tier) else {
@@ -1767,45 +2158,24 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 lemma_core_transition_preserves_peer_session(
                     &before,
                     &self.core,
-                    None,
-                    Some(old(self).host_ctx.source@.source()),
-                    FrameTouchMode::PreserveAllInit,
+                    CoreFootprint::preserve_all(None, Some(old(self).host_ctx.source@.source())),
                     &self.peers@[i],
                 );
             }
-            match &self.cuda {
-                CudaAttachment::None => {},
-                CudaAttachment::Borrowed(c) => {
-                    lemma_core_transition_preserves_cuda(
-                        &before,
-                        &self.core,
-                        None,
-                        Some(old(self).host_ctx.source@.source()),
-                        FrameTouchMode::PreserveAllInit,
-                        *c,
-                    );
-                },
-                CudaAttachment::Owned(c) => {
-                    lemma_core_transition_preserves_cuda(
-                        &before,
-                        &self.core,
-                        None,
-                        Some(old(self).host_ctx.source@.source()),
-                        FrameTouchMode::PreserveAllInit,
-                        c,
-                    );
-                },
-            }
-            if let Some(ref n) = self.nvme {
-                lemma_core_transition_preserves_nvme(
+            if let Some(ref c) = self.device.spec_ref() {
+                c.lemma_device_layout(&before);
+                c.preserve_across_core_transition(
                     &before,
                     &self.core,
-                    None,
-                    Some(old(self).host_ctx.source@.source()),
-                    FrameTouchMode::PreserveAllInit,
-                    n,
+                    CoreFootprint::preserve_all(None, Some(old(self).host_ctx.source@.source())),
                 );
             }
+            lemma_preserve_nvme(
+                &before,
+                &self.core,
+                CoreFootprint::preserve_all(None, Some(old(self).host_ctx.source@.source())),
+                &self.nvme,
+            );
             assert(self.core.all_versions_bound()) by {
                 reveal(FrameTable::same_directory);
             }
@@ -1816,91 +2186,102 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         }
     }
 
-    /// Asynchronously read a published GPU-VRAM object into caller's `CudaSlice`.
+    /// Asynchronously read a published GPU-VRAM object into caller's device slice.
     pub fn get_into_gpu(
         &mut self,
         Tracked(instance): Tracked<&TransferInstance>,
         Tracked(shares): Tracked<&mut ShareSource>,
         key: ObjectKey,
-        dst_stream: &mut CudaStream,
-        dst_timeline: u8,
-        dst: &CudaSlice,
+        dst_stream: &mut D::Stream,
+        dst_timeline: TimelineId,
+        dst: &D::Slice<'_>,
         Tracked(dst_tok): Tracked<&mut SlotToken>,
     ) -> (r: BackendResult<Option<(VersionId, Ticket, Ghost<TransferEvent>)>>)
         requires
             old(self).well_formed(),
-            old(self).cuda.spec_ref() matches Some(c) && {
-                &&& caller_stream_valid(
-                    *old(dst_stream),
-                    &old(self).core,
-                    dst_timeline,
-                    c.timeline.stream,
-                )
-                &&& dst_timeline != old(self).host.timeline
-                &&& dst_timeline != c.timeline.timeline_id
+            old(self).device_spec().spec_ref() matches Some(c) && {
+                &&& c.caller_stream_valid(*old(dst_stream), &old(self).core_spec(), dst_timeline)
+                &&& dst_timeline != old(self).host_spec().timeline_spec()
+                &&& dst_timeline != c.timeline_id_spec()
                 &&& forall|i: int|
-                    0 <= i < old(self).peers@.len() ==> dst_timeline != (#[trigger] old(
+                    0 <= i < old(self).peers_spec()@.len() ==> dst_timeline != (#[trigger] old(
                         self,
-                    ).peers@[i]).rdma.timeline_id
-                &&& (old(self).nvme matches Some(n) ==> dst_timeline != n.timeline)
-                &&& dst.slot_ref().loc.space is GpuAlloc
-                    ==> dst.slot_ref().loc.space->GpuAlloc_device == c.device
+                    ).peers_spec()@[i]).rdma_spec().timeline_id_spec()
+                &&& nvme_timeline_distinct(&old(self).nvme_spec(), dst_timeline)
+                &&& dst.slot_ref().loc.space.is_gpu() ==> dst.slot_ref().loc.space.gpu_device()
+                    == c.device_spec()
             },
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
             dst.well_formed(),
-            dst.instance_id() == old(self).core.instance_id(),
-            dst.slot_ref().loc.node == old(self).core.node(),
-            old(self).cuda.spec_ref() matches Some(c) ==> dst.slot_ref().sub_len == old(
+            dst.instance_id() == old(self).core_spec().instance_id(),
+            dst.slot_ref().loc.node == old(self).core_spec().node(),
+            old(self).device_spec().spec_ref() matches Some(c) ==> dst.slot_ref().sub_len == old(
                 self,
-            ).core.frames.tier_frame_size(c.gpu_tier),
-            slot_is_owned(*old(dst_tok), old(self).core.instance_id(), dst.slot_ref().loc),
-            write_admitted(slot_frontier(*old(dst_tok)), old(self).core.citations()),
-            old(self).core.disjoint_from_published(ISet::empty().insert(dst.slot_ref().loc)),
+            ).core_spec().frames_spec().tier_frame_size(c.device_tier_spec()),
+            slot_is_owned(*old(dst_tok), old(self).core_spec().instance_id(), dst.slot_ref().loc),
+            write_admitted(slot_frontier(*old(dst_tok)), old(self).core_spec().citations()),
+            old(self).core_spec().disjoint_from_published(ISet::empty().insert(dst.slot_ref().loc)),
             forall|f: FrameId|
-                f.0 < old(self).core.frames.metas.len() ==> dst.slot_ref().loc != (#[trigger] old(
-                    self,
-                ).core.frames.frame(f)).slot.loc,
+                f.0 < old(self).core_spec().frames_spec().metas_spec().len() ==> dst.slot_ref().loc
+                    != (#[trigger] old(self).core_spec().frames_spec().frame(f)).slot.loc,
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers == old(self).peers,
-            final(self).core.spec == old(self).core.spec,
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().spec_spec() == old(self).core_spec().spec_spec(),
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
-            final(self).cuda.spec_ref() matches Some(c) ==> caller_stream_valid(
+            final(self).device_spec().spec_ref() matches Some(c) ==> c.caller_stream_valid(
                 *final(dst_stream),
-                &final(self).core,
+                &final(self).core_spec(),
                 dst_timeline,
-                c.timeline.stream,
             ),
             r matches Ok(Some((version, ticket, ev))) ==> {
                 &&& ticket != Ticket::NONE
                 &&& ticket.timeline_id() == dst_timeline
-                &&& final(self).core.spec@.versions.contains_key(version)
+                &&& final(self).core_spec().spec_spec()@.versions.contains_key(version)
                 &&& slot_owned(
                     *final(dst_tok),
-                    old(self).core.instance_id(),
+                    old(self).core_spec().instance_id(),
                     dst.slot_ref().loc,
                     Frontier { last_writer: Some(ev@), readers: ISet::empty() },
                 )
             },
     {
         hide(CacheCore::well_formed);
-        let Some(cuda) = self.cuda.as_ref() else {
+        let Some(device) = self.device.as_ref() else {
             return Err(CoreError::UnsupportedTier);
         };
-        let Some((frame, _ver)) = self.core.lookup_tier(key, cuda.gpu_tier) else {
+        if dst_timeline == device.timeline_id() || !is_caller_device_timeline::<D>(
+            &self.core,
+            dst_timeline,
+            dst_stream,
+        ) || self.core.tier_frame_size(device.device_tier_id()) != Some(dst.len()) {
+            return Err(CoreError::InvalidArgument);
+        }
+        let Some((frame, _ver)) = self.core.lookup_tier(key, device.device_tier_id()) else {
             return Ok(None);
         };
+        if !super::boundary::bind_caller_device_stream(
+            &mut self.caller_device_streams,
+            dst_timeline,
+            dst_stream,
+        ) {
+            return Err(CoreError::InvalidArgument);
+        }
         let ghost before = self.core;
         let ghost src_ev = dst_stream.source().source();
-        let res = cuda.get_into_gpu(
+        proof {
+            device.lemma_caller_stream_valid(*dst_stream, &before, dst_timeline);
+            dst_stream.lemma_source_kind();
+        }
+        let res = device.get_into_device(
             &mut self.core,
             Tracked(instance),
             Tracked(shares),
@@ -1916,12 +2297,10 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             Self::lemma_preserve_siblings(
                 &before,
                 &self.core,
-                Some(dst_timeline),
-                Some(src_ev),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(Some(dst_timeline), Some(src_ev)),
                 self.host,
                 &self.host_ctx,
-                &self.cuda,
+                &self.device,
                 &self.nvme,
                 self.peers@,
             );
@@ -1934,46 +2313,42 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     }
 
     /// Evict a published frame (`Published -> Draining`), preserving sibling
-    /// Host/CUDA/NVMe/RDMA invariants.
+    /// host, device, NVMe, and RDMA invariants.
     pub fn evict_frame(&mut self, frame: FrameId) -> (r: BackendResult<()>)
         requires
             old(self).well_formed(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers == old(self).peers,
-            final(self).core.node_id == old(self).core.node_id,
-            final(self).core.instance_id() == old(self).core.instance_id(),
-            final(self).core.tiers == old(self).core.tiers,
-            old(self).core.spec@.versions_monotonic(final(self).core.spec@),
-            r.is_ok() ==> final(self).core.frames.meta(frame).state == STATE_DRAINING,
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            final(self).core_spec().tiers_spec() == old(self).core_spec().tiers_spec(),
+            old(self).core_spec().spec_spec()@.versions_monotonic(
+                final(self).core_spec().spec_spec()@,
+            ),
+            r.is_ok() ==> final(self).core_spec().frames_spec().meta(frame).state == STATE_DRAINING,
     {
         hide(CacheCore::well_formed);
+        self.core.check_published_frame(frame)?;
         let ghost before = self.core;
         let res = self.core.evict_frame(frame);
         proof {
             lemma_core_wf_facts(&before);
             lemma_core_wf_facts(&self.core);
-            assert(core_transition(
-                &before,
-                &self.core,
-                None,
-                None,
-                FrameTouchMode::PreserveAllInit,
-            )) by {
+            assert(core_transition(&before, &self.core, CoreFootprint::preserve_all(None, None)))
+                by {
                 reveal(core_transition);
             }
             Self::lemma_preserve_siblings(
                 &before,
                 &self.core,
-                None,
-                None,
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(None, None),
                 self.host,
                 &self.host_ctx,
-                &self.cuda,
+                &self.device,
                 &self.nvme,
                 self.peers@,
             );
@@ -1985,19 +2360,22 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     }
 
     /// Reclaim up to `budget` retired draining frames on `tier`.
-    pub fn reclaim_draining(&mut self, tier: TierId, budget: usize) -> (reclaimed: usize)
+    pub fn reclaim_draining(&mut self, tier: TierId, budget: usize) -> (r: BackendResult<usize>)
         requires
             old(self).well_formed(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers == old(self).peers,
-            final(self).core.spec == old(self).core.spec,
-            reclaimed <= budget,
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().spec_spec() == old(self).core_spec().spec_spec(),
+            r matches Ok(reclaimed) ==> reclaimed <= budget,
     {
         hide(CacheCore::well_formed);
+        if tier.as_index() >= self.core.tier_count() {
+            return Err(CoreError::InvalidArgument);
+        }
         let ghost before = self.core;
         let reclaimed = self.core.reclaim_draining(tier, budget);
         proof {
@@ -2005,12 +2383,10 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             Self::lemma_preserve_siblings(
                 &before,
                 &self.core,
-                None,
-                None,
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(None, None),
                 self.host,
                 &self.host_ctx,
-                &self.cuda,
+                &self.device,
                 &self.nvme,
                 self.peers@,
             );
@@ -2018,7 +2394,7 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 reveal(FrameTable::same_directory);
             }
         }
-        reclaimed
+        Ok(reclaimed)
     }
 
     /// Reclaim retired draining frames across every registered tier.
@@ -2027,11 +2403,11 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             old(self).well_formed(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers == old(self).peers,
-            final(self).core.spec == old(self).core.spec,
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().spec_spec() == old(self).core_spec().spec_spec(),
     {
         hide(CacheCore::well_formed);
         let ghost before = self.core;
@@ -2041,12 +2417,10 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             Self::lemma_preserve_siblings(
                 &before,
                 &self.core,
-                None,
-                None,
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(None, None),
                 self.host,
                 &self.host_ctx,
-                &self.cuda,
+                &self.device,
                 &self.nvme,
                 self.peers@,
             );
@@ -2065,24 +2439,32 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         peer_idx: usize,
         payload: ControlPayload,
         Tracked(instance): Tracked<&TransferInstance>,
-    ) -> (r: Result<(), ChannelError<T::Error>>)
+    ) -> (r: Result<(), CoreError>)
         requires
             old(self).well_formed(),
-            (peer_idx as int) < old(self).peers@.len(),
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
         ensures
             final(self).well_formed(),
-            final(self).core == old(self).core,
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).peers@[peer_idx as int].rdma == old(self).peers@[peer_idx as int].rdma,
+            final(self).core_spec() == old(self).core_spec(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec() == old(
+                self,
+            ).peers_spec()@[peer_idx as int].rdma_spec(),
             forall|j: int|
-                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
-                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
     {
-        self.peers[peer_idx].send_control(&self.core, payload, Tracked(instance))
+        if peer_idx >= self.peers.len() {
+            return Err(CoreError::InvalidArgument);
+        }
+        match self.peers[peer_idx].send_control(&self.core, payload, Tracked(instance)) {
+            Ok(value) => Ok(value),
+            Err(ChannelError::InvalidFrame) => Err(CoreError::InvalidArgument),
+            Err(_) => Err(rdma_error(rdma::RdmaError(-1))),
+        }
     }
 
     pub fn send_fetch_request_to(
@@ -2090,25 +2472,72 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         peer_idx: usize,
         key: ObjectKey,
         Tracked(instance): Tracked<&TransferInstance>,
-    ) -> (r: Result<u64, ChannelError<T::Error>>)
+    ) -> (r: Result<u64, CoreError>)
         requires
             old(self).well_formed(),
-            (peer_idx as int) < old(self).peers@.len(),
-            old(self).peers@[peer_idx as int].next_request_id < u64::MAX,
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
         ensures
             final(self).well_formed(),
-            final(self).core == old(self).core,
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).peers@[peer_idx as int].rdma == old(self).peers@[peer_idx as int].rdma,
+            final(self).core_spec() == old(self).core_spec(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec() == old(
+                self,
+            ).peers_spec()@[peer_idx as int].rdma_spec(),
             forall|j: int|
-                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
-                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
     {
-        self.peers[peer_idx].send_fetch_request(&self.core, key, Tracked(instance))
+        if peer_idx >= self.peers.len() {
+            return Err(CoreError::InvalidArgument);
+        }
+        if self.peers[peer_idx].next_request_id == u64::MAX {
+            return Err(CoreError::SequenceExhausted);
+        }
+        match self.peers[peer_idx].send_fetch_request(&self.core, key, Tracked(instance)) {
+            Ok(value) => Ok(value),
+            Err(ChannelError::InvalidFrame) => Err(CoreError::InvalidArgument),
+            Err(_) => Err(rdma_error(rdma::RdmaError(-1))),
+        }
+    }
+
+    pub fn send_fetch_batch_to(
+        &mut self,
+        peer_idx: usize,
+        keys: &[ObjectKey],
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<u64, CoreError>)
+        requires
+            old(self).well_formed(),
+            instance.id() == old(self).core_spec().instance_id(),
+        ensures
+            final(self).well_formed(),
+            final(self).core_spec() == old(self).core_spec(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec() == old(
+                self,
+            ).peers_spec()@[peer_idx as int].rdma_spec(),
+            r matches Ok(base) ==> base == old(
+                self,
+            ).peers_spec()@[peer_idx as int].next_request_id_spec() && base + keys.len()
+                <= u64::MAX,
+            forall|j: int|
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
+    {
+        if peer_idx >= self.peers.len() {
+            return Err(CoreError::InvalidArgument);
+        }
+        match self.peers[peer_idx].send_fetch_batch(&self.core, keys, Tracked(instance)) {
+            Ok(value) => Ok(value),
+            Err(ChannelError::InvalidFrame) => Err(CoreError::InvalidArgument),
+            Err(_) => Err(rdma_error(rdma::RdmaError(-1))),
+        }
     }
 
     pub fn serve_fetch_request_for_peer(
@@ -2122,33 +2551,39 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: Result<ServeOutcome, CoreError>)
         requires
             old(self).well_formed(),
-            (peer_idx as int) < old(self).peers@.len(),
-            old(self).peers@[peer_idx as int].rdma.qp.ready(),
-            old(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
-            old(self).peers@[peer_idx as int].next_grant_tag < u64::MAX,
-            instance.id() == old(self).core.instance_id(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().ready(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend,
+            old(self).peers_spec()@[peer_idx as int].next_grant_tag_spec() < u64::MAX,
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).core.node_id == old(self).core.node_id,
-            final(self).core.instance_id() == old(self).core.instance_id(),
-            final(self).peers@[peer_idx as int].rdma.qp == old(
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec() == old(
                 self,
-            ).peers@[peer_idx as int].rdma.qp,
+            ).peers_spec()@[peer_idx as int].rdma_spec().qp_spec(),
             forall|j: int|
-                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
-                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
     {
         hide(CacheCore::well_formed);
+        self.check_peer_ready(peer_idx)?;
+        if tier.as_index() >= self.core.tier_count() {
+            return Err(CoreError::InvalidArgument);
+        }
+        if self.peers[peer_idx].next_grant_tag == u64::MAX {
+            return Err(CoreError::SequenceExhausted);
+        }
         let ghost before = self.core;
         let ghost before_peers = self.peers@;
         let res = self.peers[peer_idx].serve_fetch_request(
@@ -2175,30 +2610,31 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: Result<DistributedEvent, CoreError>)
         requires
             old(self).well_formed(),
-            (peer_idx as int) < old(self).peers@.len(),
-            old(self).peers@[peer_idx as int].rdma.qp.ready(),
-            old(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
-            instance.id() == old(self).core.instance_id(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().ready(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend,
+            instance.id() == old(self).core_spec().instance_id(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).core.node_id == old(self).core.node_id,
-            final(self).core.instance_id() == old(self).core.instance_id(),
-            final(self).peers@[peer_idx as int].rdma.qp == old(
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec() == old(
                 self,
-            ).peers@[peer_idx as int].rdma.qp,
+            ).peers_spec()@[peer_idx as int].rdma_spec().qp_spec(),
             forall|j: int|
-                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
-                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
             r matches Ok(DistributedEvent::ReadGrant(ref g)) ==> g.valid_for_peer(
                 final(self),
                 peer_idx as int,
             ),
     {
         hide(CacheCore::well_formed);
+        self.check_peer_ready(peer_idx)?;
+
         let ghost before_peers = self.peers@;
         let msg = match self.peers[peer_idx].recv_message(&self.core, Tracked(instance)) {
             Ok(m) => m,
@@ -2218,6 +2654,9 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             } => Ok(
                 DistributedEvent::ReadGrant(
                     PendingReadGrant {
+                        core_id: self.peers[peer_idx].rdma.core_id,
+                        peer_timeline: self.peers[peer_idx].rdma.timeline_id,
+                        connection_epoch: self.peers[peer_idx].reconnect_epoch,
                         tag,
                         meta,
                         cap,
@@ -2267,43 +2706,60 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: Result<FetchOutcome, CoreError>)
         requires
             old(self).well_formed(),
-            (peer_idx as int) < old(self).peers@.len(),
             grant.valid_for_peer(old(self), peer_idx as int),
-            old(self).peers@[peer_idx as int].rdma.qp.ready(),
-            old(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
-            old(self).core.frames.tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
-            instance.id() == old(self).core.instance_id(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().ready(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend,
+            old(self).core_spec().frames_spec().tier_frame_size(dst_tier) as u64
+                <= rdma::MAX_RDMA_MSG_LEN,
+            instance.id() == old(self).core_spec().instance_id(),
             match target {
                 PullTarget::Host => old(
                     self,
-                ).peers@[peer_idx as int].rdma.effective_host_mr_spec() matches Some(s) && s.tier
-                    == dst_tier && s.mr.access().local_write && s.mr.gpu_device_spec().is_none(),
+                ).peers_spec()@[peer_idx as int].rdma_spec().effective_host_mr_spec() matches Some(
+                    s,
+                ) && s.tier_spec() == dst_tier && s.mr_spec().access().local_write
+                    && s.mr_spec().gpu_device_spec().is_none(),
                 PullTarget::GpuGdr => old(
                     self,
-                ).peers@[peer_idx as int].rdma.effective_gpu_mr_spec() matches Some(s) && s.tier
-                    == dst_tier && s.mr.access().local_write && s.mr.gpu_device_spec() is Some,
+                ).peers_spec()@[peer_idx as int].rdma_spec().effective_gpu_mr_spec() matches Some(s)
+                    && s.tier_spec() == dst_tier && s.mr_spec().access().local_write
+                    && s.mr_spec().gpu_device_spec() is Some,
             },
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).peers@[peer_idx as int].rdma.qp.ready(),
-            final(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().ready(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend,
             forall|j: int|
-                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
-                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
     {
         hide(CacheCore::well_formed);
+        self.check_peer_ready(peer_idx)?;
+        self.check_pull_target(peer_idx, dst_tier, target)?;
+        if !grant.matches_connection(&self.peers[peer_idx]) || grant.meta.key != key {
+            return Err(CoreError::InvalidArgument);
+        }
         if self.peers[peer_idx].rdma.qp.effective_max_rd_atomic_exec() == 0 {
             return Err(CoreError::InvalidArgument);
         }
-        if grant.meta.frame_size != self.core.tier_frame_size(dst_tier) as u64 {
+        if grant.meta.frame_size != self.core.registered_tier_frame_size(dst_tier) as u64 {
             return Err(CoreError::InvalidArgument);
         }
-        let PendingReadGrant { tag, meta, cap, share, statement, cert, revoked, version_binding } =
-            grant;
+        let PendingReadGrant {
+            tag,
+            meta,
+            cap,
+            share,
+            statement,
+            cert,
+            revoked,
+            version_binding,
+            ..
+        } = grant;
         let ghost before = self.core;
         let ghost before_peers = self.peers@;
         let ghost orig_share_frontier = share@.frontier();
@@ -2370,6 +2826,109 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         res
     }
 
+    /// Pull received grants from one peer in one doorbell. Use
+    /// `send_fetch_batch_to` to request them and correlate replies by request ID.
+    pub fn fetch_batch_from_peer(
+        &mut self,
+        peer_idx: usize,
+        dst_tier: TierId,
+        target: PullTarget,
+        grants: Vec<PendingReadGrant>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (res: Result<FetchBatchPulls, CoreError>)
+        requires
+            old(self).well_formed(),
+            peer_idx < old(self).peers_spec()@.len(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().ready(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend,
+            old(self).peers_spec()@[peer_idx as int].pull_tier_valid(dst_tier, target),
+            old(self).core_spec().frames_spec().tier_frame_size(dst_tier) as u64
+                <= rdma::MAX_RDMA_MSG_LEN,
+            instance.id() == old(self).core_spec().instance_id(),
+            forall|i: int|
+                0 <= i < grants.len() ==> (#[trigger] grants[i]).valid_for_peer(
+                    old(self),
+                    peer_idx as int,
+                ),
+            forall|i: int, j: int|
+                0 <= i < j < grants.len() ==> (#[trigger] grants[i]).tag_spec() != (
+                #[trigger] grants[j]).tag_spec(),
+        ensures
+            final(self).well_formed(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().ready(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend,
+            forall|j: int|
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
+            res matches Ok(r) ==> r.results.len() + r.pending.len() == grants.len(),
+    {
+        hide(CacheCore::well_formed);
+        self.check_peer_ready(peer_idx)?;
+        self.check_pull_target(peer_idx, dst_tier, target)?;
+
+        if self.peers[peer_idx].rdma.qp.effective_max_rd_atomic_exec() == 0 {
+            return Err(CoreError::InvalidArgument);
+        }
+        let count = grants.len();
+        let ghost original = grants@;
+        let mut input = grants.into_iter();
+        let mut pending: Vec<PendingInboundGrant> = Vec::with_capacity(count);
+        while pending.len() < count
+            invariant
+                *self == *old(self),
+                self.well_formed(),
+                peer_idx < self.peers@.len(),
+                self.peers@[peer_idx as int].rdma.qp.ready(),
+                self.peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
+                pending.len() <= count == original.len(),
+                vstd::std_specs::iter::IteratorSpec::remaining(&input) == original.skip(
+                    pending.len() as int,
+                ),
+                forall|i: int|
+                    0 <= i < pending.len() ==> {
+                        let g = #[trigger] pending[i];
+                        &&& g.tag == original[i].tag
+                        &&& g.valid(
+                            &self.core,
+                            &self.peers@[peer_idx as int].channel,
+                            self.peers@[peer_idx as int].rdma.peer_node,
+                        )
+                    },
+                forall|i: int|
+                    0 <= i < count ==> (#[trigger] original[i]).valid_for_peer(
+                        self,
+                        peer_idx as int,
+                    ),
+            decreases count - pending.len(),
+        {
+            let grant = input.next().unwrap();
+            if !grant.matches_connection(&self.peers[peer_idx]) {
+                return Err(CoreError::InvalidArgument);
+            }
+            pending.push(grant.into_pending());
+        }
+        let ghost before = self.core;
+        let ghost before_peers = self.peers@;
+        let r = self.peers[peer_idx].fetch_batch_from_grants(
+            &mut self.core,
+            dst_tier,
+            target,
+            pending,
+            Tracked(instance),
+        );
+        self.restore_after_peer_step(
+            peer_idx,
+            Ghost(before),
+            Ghost(before_peers),
+            Tracked(instance),
+        );
+        Ok(r)
+    }
+
     pub fn fetch_from_peer(
         &mut self,
         peer_idx: usize,
@@ -2380,35 +2939,43 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: Result<FetchOutcome, CoreError>)
         requires
             old(self).well_formed(),
-            (peer_idx as int) < old(self).peers@.len(),
-            old(self).peers@[peer_idx as int].rdma.qp.ready(),
-            old(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
-            old(self).peers@[peer_idx as int].next_request_id < u64::MAX,
-            old(self).core.frames.tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
-            instance.id() == old(self).core.instance_id(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().ready(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend,
+            old(self).peers_spec()@[peer_idx as int].next_request_id_spec() < u64::MAX,
+            old(self).core_spec().frames_spec().tier_frame_size(dst_tier) as u64
+                <= rdma::MAX_RDMA_MSG_LEN,
+            instance.id() == old(self).core_spec().instance_id(),
             match target {
                 PullTarget::Host => old(
                     self,
-                ).peers@[peer_idx as int].rdma.effective_host_mr_spec() matches Some(s) && s.tier
-                    == dst_tier && s.mr.access().local_write && s.mr.gpu_device_spec().is_none(),
+                ).peers_spec()@[peer_idx as int].rdma_spec().effective_host_mr_spec() matches Some(
+                    s,
+                ) && s.tier_spec() == dst_tier && s.mr_spec().access().local_write
+                    && s.mr_spec().gpu_device_spec().is_none(),
                 PullTarget::GpuGdr => old(
                     self,
-                ).peers@[peer_idx as int].rdma.effective_gpu_mr_spec() matches Some(s) && s.tier
-                    == dst_tier && s.mr.access().local_write && s.mr.gpu_device_spec() is Some,
+                ).peers_spec()@[peer_idx as int].rdma_spec().effective_gpu_mr_spec() matches Some(s)
+                    && s.tier_spec() == dst_tier && s.mr_spec().access().local_write
+                    && s.mr_spec().gpu_device_spec() is Some,
             },
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).peers@[peer_idx as int].rdma.qp.ready(),
-            final(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().ready(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend,
             forall|j: int|
-                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
-                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
     {
         hide(CacheCore::well_formed);
+        self.check_peer_ready(peer_idx)?;
+        self.check_pull_target(peer_idx, dst_tier, target)?;
+        if self.peers[peer_idx].next_request_id == u64::MAX {
+            return Err(CoreError::SequenceExhausted);
+        }
         if self.peers[peer_idx].rdma.qp.effective_max_rd_atomic_exec() == 0 {
             return Err(CoreError::InvalidArgument);
         }
@@ -2447,53 +3014,71 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: Result<FetchOutcome, CoreError>)
         requires
             old(self).well_formed(),
-            (peer_idx as int) < old(self).peers@.len(),
-            old(self).peers@[peer_idx as int].rdma.qp.ready(),
-            old(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
-            old(self).peers@[peer_idx as int].next_request_id < u64::MAX,
-            old(self).core.frames.tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
-            instance.id() == old(self).core.instance_id(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().ready(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend,
+            old(self).peers_spec()@[peer_idx as int].next_request_id_spec() < u64::MAX,
+            old(self).core_spec().frames_spec().tier_frame_size(dst_tier) as u64
+                <= rdma::MAX_RDMA_MSG_LEN,
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
-            pd matches Some(p) ==> p.id() == old(self).peers@[peer_idx as int].rdma.window_pool.pd()
-                && p.node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
+            pd matches Some(p) ==> p.id() == old(
+                self,
+            ).peers_spec()@[peer_idx as int].rdma_spec().window_pool_spec().pd() && p.node() == old(
+                self,
+            ).core_spec().node(),
             forall|k: int|
                 0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
                     tokens,
-                )@[k]@.source() is RdmaQueuePair && old(tokens)@[k]@.node() == old(
+                )@[k]@.source().is_rdma_qp() && old(tokens)@[k]@.node() == old(
                     self,
-                ).core.node(),
+                ).core_spec().node(),
             match target {
                 PullTarget::Host => old(
                     self,
-                ).peers@[peer_idx as int].rdma.effective_host_mr_spec() matches Some(s) && s.tier
-                    == dst_tier && s.mr.access().local_write && s.mr.gpu_device_spec().is_none(),
+                ).peers_spec()@[peer_idx as int].rdma_spec().effective_host_mr_spec() matches Some(
+                    s,
+                ) && s.tier_spec() == dst_tier && s.mr_spec().access().local_write
+                    && s.mr_spec().gpu_device_spec().is_none(),
                 PullTarget::GpuGdr => old(
                     self,
-                ).peers@[peer_idx as int].rdma.effective_gpu_mr_spec() matches Some(s) && s.tier
-                    == dst_tier && s.mr.access().local_write && s.mr.gpu_device_spec() is Some,
+                ).peers_spec()@[peer_idx as int].rdma_spec().effective_gpu_mr_spec() matches Some(s)
+                    && s.tier_spec() == dst_tier && s.mr_spec().access().local_write
+                    && s.mr_spec().gpu_device_spec() is Some,
             },
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).peers@[peer_idx as int].rdma.qp.ready(),
-            final(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().ready(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend,
             forall|j: int|
-                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
-                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
             forall|k: int|
                 0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
-                    && final(tokens)@[k]@.source() is RdmaQueuePair && final(tokens)@[k]@.node()
-                    == old(self).core.node(),
+                    && final(tokens)@[k]@.source().is_rdma_qp() && final(tokens)@[k]@.node() == old(
+                    self,
+                ).core_spec().node(),
     {
         hide(CacheCore::well_formed);
+        self.check_peer_ready(peer_idx)?;
+        if serve_tier.as_index() >= self.core.tier_count() {
+            return Err(CoreError::InvalidArgument);
+        }
+        self.check_pull_target(peer_idx, dst_tier, target)?;
+        if self.peers[peer_idx].next_request_id == u64::MAX {
+            return Err(CoreError::SequenceExhausted);
+        }
+        if let Some(pd) = pd {
+            self.check_peer_pd(peer_idx, pd)?;
+        }
         if self.peers[peer_idx].rdma.qp.effective_max_rd_atomic_exec() == 0 {
             return Err(CoreError::InvalidArgument);
         }
@@ -2530,44 +3115,54 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: Result<PeerProgress, CoreError>)
         requires
             old(self).well_formed(),
-            (peer_idx as int) < old(self).peers@.len(),
-            old(self).peers@[peer_idx as int].rdma.qp.ready(),
-            old(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
-            instance.id() == old(self).core.instance_id(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().ready(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend,
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
-            pd matches Some(p) ==> p.id() == old(self).peers@[peer_idx as int].rdma.window_pool.pd()
-                && p.node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
+            pd matches Some(p) ==> p.id() == old(
+                self,
+            ).peers_spec()@[peer_idx as int].rdma_spec().window_pool_spec().pd() && p.node() == old(
+                self,
+            ).core_spec().node(),
             forall|k: int|
                 0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
                     tokens,
-                )@[k]@.source() is RdmaQueuePair && old(tokens)@[k]@.node() == old(
+                )@[k]@.source().is_rdma_qp() && old(tokens)@[k]@.node() == old(
                     self,
-                ).core.node(),
+                ).core_spec().node(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).core.node_id == old(self).core.node_id,
-            final(self).core.instance_id() == old(self).core.instance_id(),
-            final(self).peers@[peer_idx as int].rdma.qp == old(
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec() == old(
                 self,
-            ).peers@[peer_idx as int].rdma.qp,
+            ).peers_spec()@[peer_idx as int].rdma_spec().qp_spec(),
             forall|j: int|
-                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
-                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
             forall|k: int|
                 0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
-                    && final(tokens)@[k]@.source() is RdmaQueuePair && final(tokens)@[k]@.node()
-                    == old(self).core.node(),
+                    && final(tokens)@[k]@.source().is_rdma_qp() && final(tokens)@[k]@.node() == old(
+                    self,
+                ).core_spec().node(),
     {
         hide(CacheCore::well_formed);
+        self.check_peer_ready(peer_idx)?;
+        if serve_tier.as_index() >= self.core.tier_count() {
+            return Err(CoreError::InvalidArgument);
+        }
+        if let Some(pd) = pd {
+            self.check_peer_pd(peer_idx, pd)?;
+        }
         let ghost before = self.core;
         let ghost before_peers = self.peers@;
         let res = self.peers[peer_idx].poll_progress(
@@ -2588,10 +3183,11 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     }
 
     /// Round-robin non-blocking progress sweep across all attached `PeerSession`s.
+    /// A supplied PD enables replenishment using each session's own PD.
     pub fn poll_all_peers_progress(
         &mut self,
         serve_tier: TierId,
-        pd: Option<&'a rdma::ProtectionDomain<'a>>,
+        replenish: Option<&'a rdma::ProtectionDomain<'a>>,
         tokens: &mut Vec<Tracked<EventSourceToken>>,
         Tracked(shares): Tracked<&mut ShareSource>,
         Tracked(instance): Tracked<&TransferInstance>,
@@ -2599,41 +3195,47 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         requires
             old(self).well_formed(),
             forall|i: int|
-                0 <= i < old(self).peers@.len() ==> {
-                    let p = #[trigger] old(self).peers@[i];
-                    &&& p.rdma.qp.ready()
-                    &&& p.rdma.qp.state() is ReadyToSend
-                    &&& (pd matches Some(pd_ref) ==> pd_ref.id() == p.rdma.window_pool.pd())
+                0 <= i < old(self).peers_spec()@.len() ==> {
+                    let p = #[trigger] old(self).peers_spec()@[i];
+                    &&& p.rdma_spec().qp_spec().ready()
+                    &&& p.rdma_spec().qp_spec().state() is ReadyToSend
                 },
-            pd matches Some(pd_ref) ==> pd_ref.node() == old(self).core.node(),
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
             forall|k: int|
                 0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
                     tokens,
-                )@[k]@.source() is RdmaQueuePair && old(tokens)@[k]@.node() == old(
+                )@[k]@.source().is_rdma_qp() && old(tokens)@[k]@.node() == old(
                     self,
-                ).core.node(),
+                ).core_spec().node(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
             forall|i: int|
-                0 <= i < final(self).peers@.len() ==> (#[trigger] final(self).peers@[i]).rdma.qp
-                    == old(self).peers@[i].rdma.qp,
+                0 <= i < final(self).peers_spec()@.len() ==> (
+                #[trigger] final(self).peers_spec()@[i]).rdma_spec().qp_spec() == old(
+                    self,
+                ).peers_spec()@[i].rdma_spec().qp_spec(),
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
             forall|k: int|
                 0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
-                    && final(tokens)@[k]@.source() is RdmaQueuePair && final(tokens)@[k]@.node()
-                    == old(self).core.node(),
+                    && final(tokens)@[k]@.source().is_rdma_qp() && final(tokens)@[k]@.node() == old(
+                    self,
+                ).core_spec().node(),
     {
         hide(CacheCore::well_formed);
+        if serve_tier.as_index() >= self.core.tier_count() {
+            return Err(CoreError::InvalidArgument);
+        }
+        self.check_all_peers_ready()?;
+
         let mut total = PeerProgress::empty();
         let mut idx: usize = 0;
         while idx < self.peers.len()
@@ -2641,10 +3243,10 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 idx <= self.peers@.len(),
                 self.well_formed(),
                 self.host == old(self).host,
-                self.cuda == old(self).cuda,
+                self.device == old(self).device,
                 self.nvme == old(self).nvme,
                 self.peers@.len() == old(self).peers@.len(),
-                self.core.node_id == old(self).core.node_id,
+                self.core.node_id_spec() == old(self).core.node_id_spec(),
                 self.core.instance_id() == old(self).core.instance_id(),
                 forall|i: int|
                     0 <= i < self.peers@.len() ==> {
@@ -2653,10 +3255,6 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                         &&& p.rdma.qp.ready()
                         &&& p.rdma.qp.state() is ReadyToSend
                     },
-                forall|i: int|
-                    idx <= i < self.peers@.len() ==> (pd matches Some(pd_ref) ==> pd_ref.id() == (
-                    #[trigger] self.peers@[i]).rdma.window_pool.pd()),
-                pd matches Some(pd_ref) ==> pd_ref.node() == self.core.node(),
                 instance.id() == self.core.instance_id(),
                 shares.well_formed(),
                 shares.id() == old(shares).id(),
@@ -2665,10 +3263,15 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 shares.node() == self.core.node(),
                 forall|k: int|
                     0 <= k < tokens@.len() ==> (#[trigger] tokens@[k])@.well_formed()
-                        && tokens@[k]@.source() is RdmaQueuePair && tokens@[k]@.node()
+                        && tokens@[k]@.source().is_rdma_qp() && tokens@[k]@.node()
                         == self.core.node(),
             decreases self.peers@.len() - idx,
         {
+            let pd = if replenish.is_some() {
+                Some(self.peers[idx].rdma.qp.protection_domain())
+            } else {
+                None
+            };
             let p = self.poll_peer_progress(
                 idx,
                 serve_tier,
@@ -2703,26 +3306,27 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: Result<Option<u32>, CoreError>)
         requires
             old(self).well_formed(),
-            (peer_idx as int) < old(self).peers@.len(),
-            old(self).peers@[peer_idx as int].rdma.qp.ready(),
-            old(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
-            instance.id() == old(self).core.instance_id(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().ready(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend,
+            instance.id() == old(self).core_spec().instance_id(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).core.node_id == old(self).core.node_id,
-            final(self).core.instance_id() == old(self).core.instance_id(),
-            final(self).peers@[peer_idx as int].rdma.qp == old(
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec() == old(
                 self,
-            ).peers@[peer_idx as int].rdma.qp,
+            ).peers_spec()@[peer_idx as int].rdma_spec().qp_spec(),
             forall|j: int|
-                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
-                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
     {
         hide(CacheCore::well_formed);
+        self.check_peer_ready(peer_idx)?;
+
         let ghost before = self.core;
         let ghost before_peers = self.peers@;
         let res = self.peers[peer_idx].revoke_lease_cooperative_first(
@@ -2753,23 +3357,28 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         requires
             old(self).well_formed(),
             forall|i: int|
-                0 <= i < old(self).peers@.len() ==> {
-                    let p = #[trigger] old(self).peers@[i];
-                    &&& p.rdma.qp.ready()
-                    &&& p.rdma.qp.state() is ReadyToSend
+                0 <= i < old(self).peers_spec()@.len() ==> {
+                    let p = #[trigger] old(self).peers_spec()@[i];
+                    &&& p.rdma_spec().qp_spec().ready()
+                    &&& p.rdma_spec().qp_spec().state() is ReadyToSend
                 },
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
             forall|i: int|
-                0 <= i < final(self).peers@.len() ==> (#[trigger] final(self).peers@[i]).rdma.qp
-                    == old(self).peers@[i].rdma.qp,
+                0 <= i < final(self).peers_spec()@.len() ==> (
+                #[trigger] final(self).peers_spec()@[i]).rdma_spec().qp_spec() == old(
+                    self,
+                ).peers_spec()@[i].rdma_spec().qp_spec(),
     {
         hide(CacheCore::well_formed);
+        self.core.check_published_frame(frame)?;
+        self.check_all_peers_ready()?;
+
         let mut total_evicted: usize = 0;
         let mut idx: usize = 0;
         while idx < self.peers.len()
@@ -2777,7 +3386,7 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 idx <= self.peers@.len(),
                 self.well_formed(),
                 self.host == old(self).host,
-                self.cuda == old(self).cuda,
+                self.device == old(self).device,
                 self.nvme == old(self).nvme,
                 self.peers@.len() == old(self).peers@.len(),
                 self.core.instance_id() == old(self).core.instance_id(),
@@ -2820,23 +3429,25 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         BackendResult<()>)
         requires
             old(self).well_formed(),
-            (peer_idx as int) < old(self).peers@.len(),
         ensures
             final(self).well_formed(),
-            final(self).core == old(self).core,
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).core.node_id == old(self).core.node_id,
-            final(self).core.instance_id() == old(self).core.instance_id(),
-            final(self).peers@[peer_idx as int].rdma.qp == old(
+            final(self).core_spec() == old(self).core_spec(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec() == old(
                 self,
-            ).peers@[peer_idx as int].rdma.qp,
+            ).peers_spec()@[peer_idx as int].rdma_spec().qp_spec(),
             forall|j: int|
-                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
-                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
     {
+        if peer_idx >= self.peers.len() {
+            return Err(CoreError::InvalidArgument);
+        }
         self.peers[peer_idx].rdma.acknowledge_quarantined_window(&self.core, mw_slot)
     }
 
@@ -2849,31 +3460,45 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: BackendResult<()>)
         requires
             old(self).well_formed(),
-            (peer_idx as int) < old(self).peers@.len(),
-            (mw_slot as int) < old(self).peers@[peer_idx as int].rdma.window_pool.slots.len(),
-            old(self).peers@[peer_idx as int].rdma.window_pool.slots[mw_slot as int].state
+            (mw_slot as int) < old(
+                self,
+            ).peers_spec()@[peer_idx as int].rdma_spec().window_pool_spec().slots_spec().len(),
+            old(
+                self,
+            ).peers_spec()@[peer_idx as int].rdma_spec().window_pool_spec().slots_spec()[mw_slot as int].state_spec()
                 == crate::backends::rdma::MwSlotState::Vacant,
-            pd.id() == old(self).peers@[peer_idx as int].rdma.window_pool.pd(),
-            pd.node() == old(self).core.node(),
+            pd.id() == old(self).peers_spec()@[peer_idx as int].rdma_spec().window_pool_spec().pd(),
+            pd.node() == old(self).core_spec().node(),
             name.well_formed(),
-            name.source() is RdmaQueuePair,
+            name.source().is_rdma_qp(),
             name.node() == pd.node(),
         ensures
             final(self).well_formed(),
-            final(self).core == old(self).core,
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).core.node_id == old(self).core.node_id,
-            final(self).core.instance_id() == old(self).core.instance_id(),
-            final(self).peers@[peer_idx as int].rdma.qp == old(
+            final(self).core_spec() == old(self).core_spec(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec() == old(
                 self,
-            ).peers@[peer_idx as int].rdma.qp,
+            ).peers_spec()@[peer_idx as int].rdma_spec().qp_spec(),
             forall|j: int|
-                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
-                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
     {
+        if peer_idx >= self.peers.len() {
+            return Err(CoreError::InvalidArgument);
+        }
+        self.check_peer_pd(peer_idx, pd)?;
+        let slots = &self.peers[peer_idx].rdma.window_pool.slots;
+        if mw_slot as usize >= slots.len() {
+            return Err(CoreError::InvalidArgument);
+        }
+        if !matches!(slots[mw_slot as usize].state, crate::backends::rdma::MwSlotState::Vacant) {
+            return Err(CoreError::WouldConflict);
+        }
         self.peers[peer_idx].rdma.replenish_window(&self.core, mw_slot, pd, Tracked(name))
     }
 
@@ -2882,23 +3507,25 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     >)
         requires
             old(self).well_formed(),
-            (peer_idx as int) < old(self).peers@.len(),
         ensures
             final(self).well_formed(),
-            final(self).core == old(self).core,
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).peers@[peer_idx as int].rdma.cq == old(
+            final(self).core_spec() == old(self).core_spec(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().cq_spec() == old(
                 self,
-            ).peers@[peer_idx as int].rdma.cq,
+            ).peers_spec()@[peer_idx as int].rdma_spec().cq_spec(),
             forall|j: int|
-                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
-                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
-            r.is_ok() ==> final(self).peers@[peer_idx as int].rdma.qp.state()
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
+            r.is_ok() ==> final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state()
                 == rdma::QueuePairState::Error,
     {
+        if peer_idx >= self.peers.len() {
+            return Err(CoreError::InvalidArgument);
+        }
         self.peers[peer_idx].rdma.enter_qp_error(&self.core)
     }
 
@@ -2910,25 +3537,32 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: Result<(), CoreError>)
         requires
             old(self).well_formed(),
-            (peer_idx as int) < old(self).peers@.len(),
-            old(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend || old(
-                self,
-            ).peers@[peer_idx as int].rdma.qp.state() is Error,
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend
+                || old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is Error,
             psn <= 0xffffff,
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
             forall|j: int|
-                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
-                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
-            r.is_ok() ==> final(self).peers@[peer_idx as int].rdma.qp.ready()
-                && final(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
+            r.is_ok() ==> final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().ready()
+                && final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend,
     {
         hide(CacheCore::well_formed);
+        if peer_idx >= self.peers.len() {
+            return Err(CoreError::InvalidArgument);
+        }
+        if psn > 0xffffff {
+            return Err(CoreError::InvalidArgument);
+        }
+        if self.peers[peer_idx].reconnect_epoch == u64::MAX {
+            return Err(CoreError::SequenceExhausted);
+        }
         if self.peers[peer_idx].rdma.cq.in_flight_count() != 0 {
             return Err(CoreError::WouldConflict);
         }
@@ -2960,20 +3594,20 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         Result<(), CoreError>)
         requires
             old(self).well_formed(),
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            r.is_ok() ==> final(self).peers@.len() == 0,
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            r.is_ok() ==> final(self).peers_spec()@.len() == 0,
     {
         hide(CacheCore::well_formed);
         while self.peers.len() > 0
             invariant
                 self.well_formed(),
                 self.host == old(self).host,
-                self.cuda == old(self).cuda,
+                self.device == old(self).device,
                 self.nvme == old(self).nvme,
                 self.core.instance_id() == old(self).core.instance_id(),
                 instance.id() == self.core.instance_id(),
@@ -2987,35 +3621,43 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             let ghost rdma_tl = peer.rdma.timeline_id;
             let res = peer.shutdown(&mut self.core, &mut self.host_ctx, Tracked(instance));
             let ghost after_leases = peer.rdma.active_leases@;
+            let ghost fp = peer_step_with_pins(rdma_tl, None, before_leases);
             proof {
                 reveal(peer_core_step_except);
+                reveal(core_transition);
                 lemma_core_wf_facts(&self.core);
                 lemma_core_wf_facts(&before);
                 self.host.ctx.source.borrow().lemma_all_future_unsubmitted(
                     instance,
-                    &self.core.ledger.borrow().submitted,
+                    &self.core.borrow_ledger().submitted,
                 );
                 self.host_ctx.source.borrow().lemma_all_future_unsubmitted(
                     instance,
-                    &self.core.ledger.borrow().submitted,
+                    &self.core.borrow_ledger().submitted,
                 );
-                lemma_peer_core_step_preserves_host(&before, &self.core, rdma_tl, self.host);
-                if let Some(ref n) = self.nvme {
-                    assert(peer_session_compatible(
-                        &before,
-                        self.host,
-                        &self.cuda,
-                        &self.nvme,
-                        &pre_pop_peers[last_idx],
-                    ));
-                    lemma_peer_core_step_preserves_nvme(&before, &self.core, rdma_tl, n);
-                }
+                lemma_peer_step_footprint_with_pins(
+                    &before,
+                    &self.core,
+                    rdma_tl,
+                    None,
+                    before_leases,
+                    after_leases,
+                );
+                lemma_core_transition_preserves_host(&before, &self.core, fp, self.host);
+                assert(peer_session_compatible(
+                    &before,
+                    self.host,
+                    &self.device,
+                    &self.nvme,
+                    &pre_pop_peers[last_idx],
+                ));
+                lemma_preserve_nvme(&before, &self.core, fp, &self.nvme);
                 assert forall|j: int| 0 <= j < self.peers@.len() implies {
                     &&& (#[trigger] self.peers@[j]).well_formed(&self.core)
                     &&& peer_session_compatible(
                         &self.core,
                         self.host,
-                        &self.cuda,
+                        &self.device,
                         &self.nvme,
                         &self.peers@[j],
                     )
@@ -3024,7 +3666,7 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                     assert(peer_session_compatible(
                         &before,
                         self.host,
-                        &self.cuda,
+                        &self.device,
                         &self.nvme,
                         &pre_pop_peers[j],
                     ));
@@ -3053,74 +3695,78 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                     assert(self.peers@[q] == pre_pop_peers[q]);
                 }
             }
-            match &self.cuda {
-                CudaAttachment::None => {},
-                CudaAttachment::Borrowed(c) => {
-                    c.timeline.stream.lemma_source_fresh(
+            match &self.device {
+                DeviceAttachment::None => {},
+                DeviceAttachment::Borrowed(c) => {
+                    proof {
+                        c.lemma_device_layout(&before);
+                    }
+                    c.stream().lemma_source_fresh(
                         Tracked(instance),
-                        Tracked(&self.core.ledger.borrow().submitted),
+                        Tracked(&self.core.borrow_ledger().submitted),
                     );
                     proof {
                         assert(peer_session_compatible(
                             &before,
                             self.host,
-                            &self.cuda,
+                            &self.device,
                             &self.nvme,
                             &pre_pop_peers[last_idx],
                         ));
-                        lemma_peer_core_step_preserves_idle_cuda(&before, &self.core, rdma_tl, *c);
+                        c.preserve_idle_across_core_transition(&before, &self.core, fp);
                     }
                 },
-                CudaAttachment::Owned(c) => {
-                    let ghost puts = c.active_gpu_puts@;
-                    let ghost ctl = c.timeline.timeline_id;
-                    c.timeline.stream.lemma_source_fresh(
+                DeviceAttachment::Owned(c) => {
+                    proof {
+                        c.lemma_device_layout(&before);
+                    }
+                    c.stream().lemma_source_fresh(
                         Tracked(instance),
-                        Tracked(&self.core.ledger.borrow().submitted),
+                        Tracked(&self.core.borrow_ledger().submitted),
                     );
                     proof {
                         assert(peer_session_compatible(
                             &before,
                             self.host,
-                            &self.cuda,
+                            &self.device,
                             &self.nvme,
                             &pre_pop_peers[last_idx],
                         ));
                         reveal(peer_core_step_except);
+                        reveal(core_transition);
                         reveal(FrameTable::same_layout);
                         reveal(FrameTable::preserves_initializing);
-                        assert(self.core.frames.consistent(self.core.kernel_view())) by {
+                        assert(self.core.frames_spec().consistent(self.core.kernel_view())) by {
                             reveal(CacheCore::well_formed);
                         }
                         lemma_core_wf_facts(&before);
                         assert forall|f: FrameId|
-                            f.0 < before.frames.metas.len() && (#[trigger] before.frames.meta(
+                            f.0 < before.frames_spec().metas_spec().len() && (
+                            #[trigger] before.frames_spec().meta(f)).state
+                                == STATE_INITIALIZING implies self.core.frames_spec().ghosts_spec()@.contains_key(
+                        f.0 as nat) && self.core.frames_spec().ghosts_spec()@[f.0 as nat]
+                            == before.frames_spec().frame(f) by {
+                            assert(f.0 < self.core.frames_spec().metas_spec().len());
+                            assert(self.core.frames_spec().frame(f) == before.frames_spec().frame(
                                 f,
-                            )).state
-                                == STATE_INITIALIZING implies self.core.frames.ghosts@.contains_key(
-                            f.0 as nat,
-                        ) && self.core.frames.ghosts@[f.0 as nat] == before.frames.frame(f) by {
-                            assert(f.0 < self.core.frames.metas.len());
-                            assert(self.core.frames.frame(f) == before.frames.frame(f));
+                            ));
                         }
                         let ghost pre_core = self.core;
-                        lemma_prove_cuda_puts_dest_preserved(
+                        let tracked (frame_ghosts, ledger) =
+                            self.core.borrow_frame_ghosts_and_ledger();
+                        c.prove_pending_destinations_preserved(
                             &before,
-                            self.core.frames.ghosts.borrow_mut(),
-                            self.core.ledger.borrow(),
+                            frame_ghosts,
+                            ledger,
                             instance,
-                            puts,
-                            ctl,
-                            puts.len(),
                         );
                         assert(self.core == pre_core);
-                        lemma_peer_core_step_preserves_cuda(
+                        c.preserve_across_core_transition_with_bindings(
                             &before,
                             &self.core,
-                            self.core.version_registry.borrow(),
-                            self.pending_gpu_bindings.borrow(),
-                            rdma_tl,
-                            c,
+                            self.core.borrow_version_registry(),
+                            self.pending_device_bindings.borrow(),
+                            fp,
                         );
                     }
                 },
@@ -3130,310 +3776,50 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         Ok(())
     }
 
-    // =========================================================================
-    // Single-Peer Convenience Wrappers (Peer 0)
-    // =========================================================================
-    pub fn send_control(
+    pub fn revoke_peer_lease_unilateral(
         &mut self,
-        payload: ControlPayload,
-        Tracked(instance): Tracked<&TransferInstance>,
-    ) -> (r: Result<(), ChannelError<T::Error>>)
-        requires
-            old(self).well_formed(),
-            old(self).peers@.len() >= 1,
-            instance.id() == old(self).core.instance_id(),
-        ensures
-            final(self).well_formed(),
-            final(self).core == old(self).core,
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).peers@[0].rdma == old(self).peers@[0].rdma,
-    {
-        self.send_control_to(0, payload, Tracked(instance))
-    }
-
-    pub fn send_fetch_request(
-        &mut self,
-        key: ObjectKey,
-        Tracked(instance): Tracked<&TransferInstance>,
-    ) -> (r: Result<u64, ChannelError<T::Error>>)
-        requires
-            old(self).well_formed(),
-            old(self).peers@.len() >= 1,
-            old(self).peers@[0].next_request_id < u64::MAX,
-            instance.id() == old(self).core.instance_id(),
-        ensures
-            final(self).well_formed(),
-            final(self).core == old(self).core,
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).peers@[0].rdma == old(self).peers@[0].rdma,
-    {
-        self.send_fetch_request_to(0, key, Tracked(instance))
-    }
-
-    pub fn serve_fetch_request(
-        &mut self,
-        tier: TierId,
-        request_id: u64,
-        key: ObjectKey,
-        Tracked(shares): Tracked<&mut ShareSource>,
-        Tracked(instance): Tracked<&TransferInstance>,
-    ) -> (r: Result<ServeOutcome, CoreError>)
-        requires
-            old(self).well_formed(),
-            old(self).peers@.len() >= 1,
-            old(self).peers@[0].rdma.qp.ready(),
-            old(self).peers@[0].rdma.qp.state() is ReadyToSend,
-            old(self).peers@[0].next_grant_tag < u64::MAX,
-            instance.id() == old(self).core.instance_id(),
-            old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
-        ensures
-            final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).peers@[0].rdma.qp == old(self).peers@[0].rdma.qp,
-            final(shares).well_formed(),
-            final(shares).id() == old(shares).id(),
-            final(shares).node() == old(shares).node(),
-    {
-        self.serve_fetch_request_for_peer(
-            0,
-            tier,
-            request_id,
-            key,
-            Tracked(shares),
-            Tracked(instance),
-        )
-    }
-
-    pub fn poll_peer_event(&mut self, Tracked(instance): Tracked<&TransferInstance>) -> (r: Result<
-        DistributedEvent,
-        CoreError,
-    >)
-        requires
-            old(self).well_formed(),
-            old(self).peers@.len() >= 1,
-            old(self).peers@[0].rdma.qp.ready(),
-            old(self).peers@[0].rdma.qp.state() is ReadyToSend,
-            instance.id() == old(self).core.instance_id(),
-        ensures
-            final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).peers@[0].rdma.qp == old(self).peers@[0].rdma.qp,
-            r matches Ok(DistributedEvent::ReadGrant(ref g)) ==> g.valid(final(self)),
-    {
-        self.poll_peer_event_from(0, Tracked(instance))
-    }
-
-    pub fn pull_with_grant(
-        &mut self,
-        key: ObjectKey,
-        dst_tier: TierId,
-        target: PullTarget,
-        grant: PendingReadGrant,
-        Tracked(instance): Tracked<&TransferInstance>,
-    ) -> (r: Result<FetchOutcome, CoreError>)
-        requires
-            old(self).well_formed(),
-            old(self).peers@.len() >= 1,
-            grant.valid(old(self)),
-            old(self).peers@[0].rdma.qp.ready(),
-            old(self).peers@[0].rdma.qp.state() is ReadyToSend,
-            old(self).core.frames.tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
-            instance.id() == old(self).core.instance_id(),
-            match target {
-                PullTarget::Host => old(self).peers@[0].rdma.effective_host_mr_spec() matches Some(
-                    s,
-                ) && s.tier == dst_tier && s.mr.access().local_write
-                    && s.mr.gpu_device_spec().is_none(),
-                PullTarget::GpuGdr => old(self).peers@[0].rdma.effective_gpu_mr_spec() matches Some(
-                    s,
-                ) && s.tier == dst_tier && s.mr.access().local_write
-                    && s.mr.gpu_device_spec() is Some,
-            },
-        ensures
-            final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).peers@[0].rdma.qp.ready(),
-            final(self).peers@[0].rdma.qp.state() is ReadyToSend,
-    {
-        self.pull_with_grant_from(0, key, dst_tier, target, grant, Tracked(instance))
-    }
-
-    pub fn fetch_remote_frame(
-        &mut self,
-        key: ObjectKey,
-        dst_tier: TierId,
-        target: PullTarget,
-        Tracked(instance): Tracked<&TransferInstance>,
-    ) -> (r: Result<FetchOutcome, CoreError>)
-        requires
-            old(self).well_formed(),
-            old(self).peers@.len() >= 1,
-            old(self).peers@[0].rdma.qp.ready(),
-            old(self).peers@[0].rdma.qp.state() is ReadyToSend,
-            old(self).peers@[0].next_request_id < u64::MAX,
-            old(self).core.frames.tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
-            instance.id() == old(self).core.instance_id(),
-            match target {
-                PullTarget::Host => old(self).peers@[0].rdma.effective_host_mr_spec() matches Some(
-                    s,
-                ) && s.tier == dst_tier && s.mr.access().local_write
-                    && s.mr.gpu_device_spec().is_none(),
-                PullTarget::GpuGdr => old(self).peers@[0].rdma.effective_gpu_mr_spec() matches Some(
-                    s,
-                ) && s.tier == dst_tier && s.mr.access().local_write
-                    && s.mr.gpu_device_spec() is Some,
-            },
-        ensures
-            final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).peers@[0].rdma.qp.ready(),
-            final(self).peers@[0].rdma.qp.state() is ReadyToSend,
-    {
-        self.fetch_from_peer(0, key, dst_tier, target, Tracked(instance))
-    }
-
-    pub fn revoke_lease_unilateral(
-        &mut self,
+        peer_idx: usize,
         grant_tag: GrantTag,
         Tracked(instance): Tracked<&TransferInstance>,
     ) -> (r: Result<u32, CoreError>)
         requires
             old(self).well_formed(),
-            old(self).peers@.len() >= 1,
-            old(self).peers@[0].rdma.qp.ready(),
-            old(self).peers@[0].rdma.qp.state() is ReadyToSend,
-            instance.id() == old(self).core.instance_id(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().ready(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend,
+            instance.id() == old(self).core_spec().instance_id(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).peers@[0].rdma.qp == old(self).peers@[0].rdma.qp,
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec() == old(
+                self,
+            ).peers_spec()@[peer_idx as int].rdma_spec().qp_spec(),
     {
         hide(CacheCore::well_formed);
+        self.check_peer_ready(peer_idx)?;
+
         let ghost before = self.core;
         let ghost before_peers = self.peers@;
-        let res = self.peers[0].revoke_lease_unilateral(
+        let res = self.peers[peer_idx].revoke_lease_unilateral(
             &mut self.core,
             &mut self.host_ctx,
             grant_tag,
             Tracked(instance),
         );
-        self.restore_after_peer_step(0, Ghost(before), Ghost(before_peers), Tracked(instance));
+        self.restore_after_peer_step(
+            peer_idx,
+            Ghost(before),
+            Ghost(before_peers),
+            Tracked(instance),
+        );
         res
     }
+}
 
-    pub fn acknowledge_quarantined_window(&mut self, mw_slot: u32) -> (r: BackendResult<()>)
-        requires
-            old(self).well_formed(),
-            old(self).peers@.len() >= 1,
-        ensures
-            final(self).well_formed(),
-            final(self).core == old(self).core,
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).peers@[0].rdma.qp == old(self).peers@[0].rdma.qp,
-    {
-        self.acknowledge_peer_quarantined_window(0, mw_slot)
-    }
-
-    pub fn replenish_window(
-        &mut self,
-        mw_slot: u32,
-        pd: &'a rdma::ProtectionDomain<'a>,
-        Tracked(name): Tracked<EventSourceToken>,
-    ) -> (r: BackendResult<()>)
-        requires
-            old(self).well_formed(),
-            old(self).peers@.len() >= 1,
-            (mw_slot as int) < old(self).peers@[0].rdma.window_pool.slots.len(),
-            old(self).peers@[0].rdma.window_pool.slots[mw_slot as int].state
-                == crate::backends::rdma::MwSlotState::Vacant,
-            pd.id() == old(self).peers@[0].rdma.window_pool.pd(),
-            pd.node() == old(self).core.node(),
-            name.well_formed(),
-            name.source() is RdmaQueuePair,
-            name.node() == pd.node(),
-        ensures
-            final(self).well_formed(),
-            final(self).core == old(self).core,
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).peers@[0].rdma.qp == old(self).peers@[0].rdma.qp,
-    {
-        self.replenish_peer_window(0, mw_slot, pd, Tracked(name))
-    }
-
-    pub fn enter_qp_error(&mut self) -> (r: BackendResult<Tracked<rdma::QpErrorWitness>>)
-        requires
-            old(self).well_formed(),
-            old(self).peers@.len() >= 1,
-        ensures
-            final(self).well_formed(),
-            final(self).core == old(self).core,
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).peers@[0].rdma.cq == old(self).peers@[0].rdma.cq,
-            r.is_ok() ==> final(self).peers@[0].rdma.qp.state() == rdma::QueuePairState::Error,
-    {
-        self.enter_peer_qp_error(0)
-    }
-
-    pub fn reset_and_reconnect(
-        &mut self,
-        psn: u32,
-        Tracked(instance): Tracked<&TransferInstance>,
-    ) -> (r: Result<(), CoreError>)
-        requires
-            old(self).well_formed(),
-            old(self).peers@.len() >= 1,
-            old(self).peers@[0].rdma.qp.state() is ReadyToSend || old(
-                self,
-            ).peers@[0].rdma.qp.state() is Error,
-            psn <= 0xffffff,
-            instance.id() == old(self).core.instance_id(),
-        ensures
-            final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            r.is_ok() ==> final(self).peers@[0].rdma.qp.ready()
-                && final(self).peers@[0].rdma.qp.state() is ReadyToSend,
-    {
-        self.reset_and_reconnect_peer(0, psn, Tracked(instance))
-    }
-
-    // =========================================================================
-    // 4-Tier Local NVMe (`io_uring` `O_DIRECT`) Lifecycle & Data-Path Methods
-    // =========================================================================
+#[cfg(feature = "nvme")]
+impl<'a, T: ByteTransport, D: DeviceBackend<'a>> DistributedEngine<'a, T, D> {
     pub fn spill_host_to_nvme(
         &mut self,
         Tracked(instance): Tracked<&TransferInstance>,
@@ -3442,34 +3828,103 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: Result<(FrameId, Ticket), (CoreError, Option<Ticket>)>)
         requires
             old(self).well_formed(),
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).peers == old(self).peers,
-            final(self).core.spec == old(self).core.spec,
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().spec_spec() == old(self).core_spec().spec_spec(),
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
-            r matches Ok((_, ticket)) ==> ticket != Ticket::NONE && (final(self).nvme matches Some(
-                n,
-            ) && ticket.timeline_id() == n.timeline) && final(self).core.timelines.valid_ticket(
-                ticket,
-            ),
+            r matches Ok((_, ticket)) ==> ticket != Ticket::NONE && (
+            final(self).nvme_spec() matches Some(n) && ticket.timeline_id() == n.timeline_spec())
+                && final(self).core_spec().timelines_spec().valid_ticket(ticket),
             r matches Err((_, Some(ticket))) ==> ticket != Ticket::NONE && (
-            final(self).nvme matches Some(n) && ticket.timeline_id() == n.timeline)
-                && final(self).core.timelines.valid_ticket(ticket),
+            final(self).nvme_spec() matches Some(n) && ticket.timeline_id() == n.timeline_spec())
+                && final(self).core_spec().timelines_spec().valid_ticket(ticket),
     {
         hide(CacheCore::well_formed);
         let Some((src_frame, _ver)) = self.core.lookup_tier(key, self.host.tier) else {
             return Err((CoreError::Miss, None));
         };
+        let (dst_frame, ticket) = match self.stage_dram_to_nvme(
+            Tracked(instance),
+            Tracked(shares),
+            src_frame,
+        ) {
+            Ok(pair) => pair,
+            Err(e) => return Err((e, None)),
+        };
+        let submit_res = self.submit_staged_nvme();
+        let rem_staged = match &self.nvme {
+            Some(n) => n.staged_len(),
+            None => 0,
+        };
+        match submit_res {
+            Ok(n) if n > 0 && rem_staged == 0 => Ok((dst_frame, ticket)),
+            Ok(_) => Err((CoreError::WouldConflict, Some(ticket))),
+            Err(e) => Err((e, Some(ticket))),
+        }
+    }
+
+    /// Submit the currently staged NVMe operations.
+    pub fn submit_staged_nvme(&mut self) -> (r: BackendResult<usize>)
+        requires
+            old(self).well_formed(),
+        ensures
+            final(self).well_formed(),
+            final(self).core_spec() == old(self).core_spec(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            match old(self).nvme_spec() {
+                Some(n) => final(self).nvme_spec() matches Some(new) && new.timeline_spec()
+                    == n.timeline_spec(),
+                None => final(self).nvme_spec() is None,
+            },
+    {
+        match &mut self.nvme {
+            Some(nvme) => nvme.submit(Ghost(&self.core)),
+            None => Ok(0),
+        }
+    }
+
+    pub fn stage_dram_to_nvme(
+        &mut self,
+        Tracked(instance): Tracked<&TransferInstance>,
+        Tracked(shares): Tracked<&mut ShareSource>,
+        src_frame: FrameId,
+    ) -> (r: BackendResult<(FrameId, Ticket)>)
+        requires
+            old(self).well_formed(),
+            instance.id() == old(self).core_spec().instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
+        ensures
+            final(self).well_formed(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().spec_spec() == old(self).core_spec().spec_spec(),
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+            r matches Ok((_, ticket)) ==> ticket != Ticket::NONE && (
+            final(self).nvme_spec() matches Some(n) && ticket.timeline_id() == n.timeline_spec())
+                && final(self).core_spec().timelines_spec().valid_ticket(ticket),
+    {
+        hide(CacheCore::well_formed);
+        if src_frame.0 as usize >= self.core.frame_count() {
+            return Err(CoreError::InvalidArgument);
+        }
         let Some(mut nvme) = self.nvme.take() else {
-            return Err((CoreError::UnsupportedTier, None));
+            return Err(CoreError::UnsupportedTier);
         };
         let ghost before = self.core;
         let ghost tl = nvme.timeline;
@@ -3488,43 +3943,32 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 assert(peer_session_compatible(
                     &before,
                     self.host,
-                    &self.cuda,
+                    &self.device,
                     &old(self).nvme,
                     &self.peers@[i],
                 ));
             }
+            if let Some(ref device) = self.device.spec_ref() {
+                device.lemma_device_layout(&before);
+            }
             Self::lemma_preserve_siblings(
                 &before,
                 &self.core,
-                Some(tl),
-                Some(src_ev),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(Some(tl), Some(src_ev)),
                 self.host,
                 &self.host_ctx,
-                &self.cuda,
+                &self.device,
                 &none_nvme,
                 self.peers@,
             );
-            assert(self.core.frames.versions@ == before.frames.versions@) by {
+            assert(self.core.frames_spec().versions_spec()@
+                == before.frames_spec().versions_spec()@) by {
                 reveal(CacheCore::well_formed);
             }
             assert(self.core.all_versions_bound());
         }
-        let (dst_frame, ticket) = match staged {
-            Ok(pair) => pair,
-            Err(e) => {
-                self.nvme = Some(nvme);
-                return Err((e, None));
-            },
-        };
-        let submit_res = nvme.submit(Ghost(&self.core));
-        let rem_staged = nvme.staged_len();
         self.nvme = Some(nvme);
-        match submit_res {
-            Ok(n) if n > 0 && rem_staged == 0 => Ok((dst_frame, ticket)),
-            Ok(_) => Err((CoreError::WouldConflict, Some(ticket))),
-            Err(e) => Err((e, Some(ticket))),
-        }
+        staged
     }
 
     pub fn warm_host_from_nvme(
@@ -3535,27 +3979,25 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: Result<(FrameId, Ticket), (CoreError, Option<Ticket>)>)
         requires
             old(self).well_formed(),
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).peers == old(self).peers,
-            final(self).core.spec == old(self).core.spec,
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().spec_spec() == old(self).core_spec().spec_spec(),
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
-            r matches Ok((_, ticket)) ==> ticket != Ticket::NONE && (final(self).nvme matches Some(
-                n,
-            ) && ticket.timeline_id() == n.timeline) && final(self).core.timelines.valid_ticket(
-                ticket,
-            ),
+            r matches Ok((_, ticket)) ==> ticket != Ticket::NONE && (
+            final(self).nvme_spec() matches Some(n) && ticket.timeline_id() == n.timeline_spec())
+                && final(self).core_spec().timelines_spec().valid_ticket(ticket),
             r matches Err((_, Some(ticket))) ==> ticket != Ticket::NONE && (
-            final(self).nvme matches Some(n) && ticket.timeline_id() == n.timeline)
-                && final(self).core.timelines.valid_ticket(ticket),
+            final(self).nvme_spec() matches Some(n) && ticket.timeline_id() == n.timeline_spec())
+                && final(self).core_spec().timelines_spec().valid_ticket(ticket),
     {
         hide(CacheCore::well_formed);
         let Some(nvme_tier) = self.nvme_tier() else {
@@ -3564,8 +4006,57 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         let Some((src_frame, _ver)) = self.core.lookup_tier(key, nvme_tier) else {
             return Err((CoreError::Miss, None));
         };
+        let (dst_frame, ticket) = match self.stage_nvme_to_dram(
+            Tracked(instance),
+            Tracked(shares),
+            src_frame,
+        ) {
+            Ok(pair) => pair,
+            Err(e) => return Err((e, None)),
+        };
+        let submit_res = self.submit_staged_nvme();
+        let rem_staged = match &self.nvme {
+            Some(n) => n.staged_len(),
+            None => 0,
+        };
+        match submit_res {
+            Ok(n) if n > 0 && rem_staged == 0 => Ok((dst_frame, ticket)),
+            Ok(_) => Err((CoreError::WouldConflict, Some(ticket))),
+            Err(e) => Err((e, Some(ticket))),
+        }
+    }
+
+    pub fn stage_nvme_to_dram(
+        &mut self,
+        Tracked(instance): Tracked<&TransferInstance>,
+        Tracked(shares): Tracked<&mut ShareSource>,
+        src_frame: FrameId,
+    ) -> (r: BackendResult<(FrameId, Ticket)>)
+        requires
+            old(self).well_formed(),
+            instance.id() == old(self).core_spec().instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
+        ensures
+            final(self).well_formed(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().spec_spec() == old(self).core_spec().spec_spec(),
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+            r matches Ok((_, ticket)) ==> ticket != Ticket::NONE && (
+            final(self).nvme_spec() matches Some(n) && ticket.timeline_id() == n.timeline_spec())
+                && final(self).core_spec().timelines_spec().valid_ticket(ticket),
+    {
+        hide(CacheCore::well_formed);
+        if src_frame.0 as usize >= self.core.frame_count() {
+            return Err(CoreError::InvalidArgument);
+        }
         let Some(mut nvme) = self.nvme.take() else {
-            return Err((CoreError::UnsupportedTier, None));
+            return Err(CoreError::UnsupportedTier);
         };
         let ghost before = self.core;
         let ghost tl = nvme.timeline;
@@ -3584,43 +4075,32 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 assert(peer_session_compatible(
                     &before,
                     self.host,
-                    &self.cuda,
+                    &self.device,
                     &old(self).nvme,
                     &self.peers@[i],
                 ));
             }
+            if let Some(ref device) = self.device.spec_ref() {
+                device.lemma_device_layout(&before);
+            }
             Self::lemma_preserve_siblings(
                 &before,
                 &self.core,
-                Some(tl),
-                Some(src_ev),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(Some(tl), Some(src_ev)),
                 self.host,
                 &self.host_ctx,
-                &self.cuda,
+                &self.device,
                 &none_nvme,
                 self.peers@,
             );
-            assert(self.core.frames.versions@ == before.frames.versions@) by {
+            assert(self.core.frames_spec().versions_spec()@
+                == before.frames_spec().versions_spec()@) by {
                 reveal(CacheCore::well_formed);
             }
             assert(self.core.all_versions_bound());
         }
-        let (dst_frame, ticket) = match staged {
-            Ok(pair) => pair,
-            Err(e) => {
-                self.nvme = Some(nvme);
-                return Err((e, None));
-            },
-        };
-        let submit_res = nvme.submit(Ghost(&self.core));
-        let rem_staged = nvme.staged_len();
         self.nvme = Some(nvme);
-        match submit_res {
-            Ok(n) if n > 0 && rem_staged == 0 => Ok((dst_frame, ticket)),
-            Ok(_) => Err((CoreError::WouldConflict, Some(ticket))),
-            Err(e) => Err((e, Some(ticket))),
-        }
+        staged
     }
 
     pub fn poll_nvme_completions(
@@ -3630,16 +4110,18 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: Result<NvmeProgress, (CoreError, NvmeProgress)>)
         requires
             old(self).well_formed(),
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).peers == old(self).peers,
-            final(self).core.node_id == old(self).core.node_id,
-            final(self).core.instance_id() == old(self).core.instance_id(),
-            final(self).core.tiers == old(self).core.tiers,
-            old(self).core.spec@.versions_monotonic(final(self).core.spec@),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            final(self).core_spec().tiers_spec() == old(self).core_spec().tiers_spec(),
+            old(self).core_spec().spec_spec()@.versions_monotonic(
+                final(self).core_spec().spec_spec()@,
+            ),
             r matches Ok(p) ==> p.completed + p.failed <= budget,
     {
         hide(CacheCore::well_formed);
@@ -3648,6 +4130,7 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         };
         let ghost before = self.core;
         let ghost tl = nvme.timeline;
+        let ghost poll_fp = nvme.poll_footprint();
         let res = nvme.poll_completions_up_to(&mut self.core, Tracked(instance), budget);
         proof {
             let ghost none_nvme: Option<NvmeBackend> = None;
@@ -3656,7 +4139,7 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 assert(peer_session_compatible(
                     &before,
                     self.host,
-                    &self.cuda,
+                    &self.device,
                     &old(self).nvme,
                     &self.peers@[i],
                 ));
@@ -3664,16 +4147,15 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             Self::lemma_preserve_siblings(
                 &before,
                 &self.core,
-                Some(tl),
-                None,
-                FrameTouchMode::PreserveParkedInit,
+                poll_fp,
                 self.host,
                 &self.host_ctx,
-                &self.cuda,
+                &self.device,
                 &none_nvme,
                 self.peers@,
             );
-            assert(self.core.frames.versions@ == before.frames.versions@) by {
+            assert(self.core.frames_spec().versions_spec()@
+                == before.frames_spec().versions_spec()@) by {
                 reveal(core_transition);
             }
             assert(self.core.all_versions_bound());
@@ -3686,16 +4168,18 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         Result<NvmeProgress, (CoreError, NvmeProgress)>)
         requires
             old(self).well_formed(),
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).peers == old(self).peers,
-            final(self).core.node_id == old(self).core.node_id,
-            final(self).core.instance_id() == old(self).core.instance_id(),
-            final(self).core.tiers == old(self).core.tiers,
-            old(self).core.spec@.versions_monotonic(final(self).core.spec@),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            final(self).core_spec().tiers_spec() == old(self).core_spec().tiers_spec(),
+            old(self).core_spec().spec_spec()@.versions_monotonic(
+                final(self).core_spec().spec_spec()@,
+            ),
     {
         hide(CacheCore::well_formed);
         let Some(mut nvme) = self.nvme.take() else {
@@ -3709,6 +4193,7 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         }
         let ghost before = self.core;
         let ghost tl = nvme.timeline;
+        let ghost poll_fp = nvme.poll_footprint();
         let res = nvme.wait_one_completion(
             &mut self.core,
             Tracked(instance),
@@ -3721,7 +4206,7 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 assert(peer_session_compatible(
                     &before,
                     self.host,
-                    &self.cuda,
+                    &self.device,
                     &old(self).nvme,
                     &self.peers@[i],
                 ));
@@ -3729,16 +4214,15 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             Self::lemma_preserve_siblings(
                 &before,
                 &self.core,
-                Some(tl),
-                None,
-                FrameTouchMode::PreserveParkedInit,
+                poll_fp,
                 self.host,
                 &self.host_ctx,
-                &self.cuda,
+                &self.device,
                 &none_nvme,
                 self.peers@,
             );
-            assert(self.core.frames.versions@ == before.frames.versions@) by {
+            assert(self.core.frames_spec().versions_spec()@
+                == before.frames_spec().versions_spec()@) by {
                 reveal(core_transition);
             }
             assert(self.core.all_versions_bound());
@@ -3754,18 +4238,19 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: Result<NvmeProgress, (CoreError, NvmeProgress)>)
         requires
             old(self).well_formed(),
-            instance.id() == old(self).core.instance_id(),
-            old(self).core.timelines.valid_ticket(ticket),
+            instance.id() == old(self).core_spec().instance_id(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).peers == old(self).peers,
-            final(self).core.node_id == old(self).core.node_id,
-            final(self).core.instance_id() == old(self).core.instance_id(),
-            final(self).core.tiers == old(self).core.tiers,
-            old(self).core.spec@.versions_monotonic(final(self).core.spec@),
-            r.is_ok() ==> final(self).core.timelines.retired(ticket),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            final(self).core_spec().tiers_spec() == old(self).core_spec().tiers_spec(),
+            old(self).core_spec().spec_spec()@.versions_monotonic(
+                final(self).core_spec().spec_spec()@,
+            ),
+            r.is_ok() ==> final(self).core_spec().timelines_spec().retired(ticket),
     {
         hide(CacheCore::well_formed);
         let Some(mut nvme) = self.nvme.take() else {
@@ -3777,21 +4262,22 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         proof {
             lemma_core_wf_facts(&self.core);
         }
-        if ticket.timeline() != nvme.timeline {
+        if ticket.is_none() || ticket.timeline() != nvme.timeline
+            || !self.core.timelines().contains_ticket(ticket) {
             self.nvme = Some(nvme);
             return Err((CoreError::InvalidArgument, progress));
         }
         while steps < BITMAP_CAPACITY as usize && (nvme.in_flight_len() > 0 || nvme.staged_len()
-            > 0) && !self.core.timelines.is_retired(ticket)
+            > 0) && !self.core.timelines().is_retired(ticket)
             invariant
                 steps <= BITMAP_CAPACITY as usize,
                 progress.completed + progress.failed == steps,
                 self.core.well_formed(),
                 self.core.all_versions_bound(),
-                self.core.timelines.bounds(),
+                self.core.timelines_spec().bounds(),
                 self.host.well_formed(&self.core),
                 self.host_ctx.ready(self.core.instance_id(), self.core.node()),
-                source_fresh_for_ledger(self.host_ctx.source@, self.core.ledger@),
+                source_fresh_for_ledger(self.host_ctx.source@, self.core.ledger_spec()@),
                 self.host_ctx.source@.source() != self.host.ctx.source@.source(),
                 self.host.buffer.align() % (DIRECT_IO_ALIGNMENT as usize) == 0,
                 self.peers == old(self).peers,
@@ -3799,49 +4285,32 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 forall|i: int|
                     0 <= i < self.peers@.len() ==> {
                         let p = #[trigger] self.peers@[i];
-                        &&& peer_session_compatible(&self.core, self.host, &self.cuda, &None, &p)
+                        &&& peer_session_compatible(&self.core, self.host, &self.device, &None, &p)
                         &&& tl != p.rdma.timeline_id
                     },
                 nvme.well_formed(&self.core),
                 nvme.timeline == tl,
                 nvme.timeline != self.host.timeline,
-                self.cuda == old(self).cuda,
-                self.pending_gpu_bindings == old(self).pending_gpu_bindings,
-                match self.cuda {
-                    CudaAttachment::None => true,
-                    CudaAttachment::Borrowed(c) => {
-                        &&& c.well_formed(&self.core)
-                        &&& c.active_gpu_puts@.len() == 0
-                        &&& c.timeline.timeline_id != self.host.timeline
-                        &&& nvme.timeline != c.timeline.timeline_id
-                        &&& c.pinned_host matches Some(h) ==> h.tier == self.host.tier
-                            && h.first_frame == self.host.first_frame && h.num_frames
-                            == self.host.num_frames
-                    },
-                    CudaAttachment::Owned(c) => {
-                        &&& c.well_formed(&self.core)
-                        &&& cuda_puts_bindings_covered(
-                            c.active_gpu_puts@,
-                            self.pending_gpu_bindings@,
-                        )
-                        &&& c.timeline.timeline_id != self.host.timeline
-                        &&& nvme.timeline != c.timeline.timeline_id
-                        &&& c.pinned_host matches Some(h) ==> h.tier == self.host.tier
-                            && h.first_frame == self.host.first_frame && h.num_frames
-                            == self.host.num_frames
-                    },
-                },
+                self.device == old(self).device,
+                self.pending_device_bindings == old(self).pending_device_bindings,
+                Self::device_attachment_valid(
+                    &self.core,
+                    self.host,
+                    &self.device,
+                    self.pending_device_bindings@,
+                ),
+                self.device.spec_ref() matches Some(c) ==> nvme.timeline != c.timeline_id_spec(),
                 self.nvme is None,
                 self.host == old(self).host,
-                self.core.node_id == old(self).core.node_id,
+                self.core.node_id_spec() == old(self).core.node_id_spec(),
                 self.core.instance_id() == old(self).core.instance_id(),
-                self.core.tiers == old(self).core.tiers,
+                self.core.tiers_spec() == old(self).core.tiers_spec(),
                 instance.id() == self.core.instance_id(),
-                self.core.timelines.valid_ticket(ticket),
-                old(self).core.spec@.versions_monotonic(self.core.spec@),
+                self.core.timelines_spec().valid_ticket(ticket),
+                old(self).core.spec_spec()@.versions_monotonic(self.core.spec_spec()@),
             decreases (BITMAP_CAPACITY as usize) - steps,
         {
-            if nvme.staged_len() > 0 && !self.core.timelines.is_retired(ticket) {
+            if nvme.staged_len() > 0 && !self.core.timelines().is_retired(ticket) {
                 match nvme.submit(Ghost(&self.core)) {
                     Ok(n) => {
                         if n == 0 && nvme.in_flight_len() == 0 {
@@ -3860,27 +4329,27 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 return Err((CoreError::WouldConflict, progress));
             }
             let ghost before_step = self.core;
+            let ghost poll_fp = nvme.poll_footprint();
             let step_res = nvme.wait_one_completion(&mut self.core, Tracked(instance), progress);
             proof {
                 let ghost none_nvme: Option<NvmeBackend> = None;
                 Self::lemma_preserve_siblings(
                     &before_step,
                     &self.core,
-                    Some(tl),
-                    None,
-                    FrameTouchMode::PreserveParkedInit,
+                    poll_fp,
                     self.host,
                     &self.host_ctx,
-                    &self.cuda,
+                    &self.device,
                     &none_nvme,
                     self.peers@,
                 );
                 lemma_versions_monotonic_trans(
-                    old(self).core.spec@,
-                    before_step.spec@,
-                    self.core.spec@,
+                    old(self).core.spec_spec()@,
+                    before_step.spec_spec()@,
+                    self.core.spec_spec()@,
                 );
-                assert(self.core.frames.versions@ == before_step.frames.versions@) by {
+                assert(self.core.frames_spec().versions_spec()@
+                    == before_step.frames_spec().versions_spec()@) by {
                     reveal(core_transition);
                 }
                 assert(self.core.all_versions_bound());
@@ -3898,7 +4367,7 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             }
         }
         self.nvme = Some(nvme);
-        if self.core.timelines.is_retired(ticket) {
+        if self.core.timelines().is_retired(ticket) {
             Ok(progress)
         } else {
             Err((CoreError::WouldConflict, progress))
@@ -3913,16 +4382,18 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: BackendResult<FrameId>)
         requires
             old(self).well_formed(),
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).peers == old(self).peers,
-            old(self).core.spec@.versions_monotonic(final(self).core.spec@),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            old(self).core_spec().spec_spec()@.versions_monotonic(
+                final(self).core_spec().spec_spec()@,
+            ),
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
@@ -3949,16 +4420,18 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: BackendResult<FrameId>)
         requires
             old(self).well_formed(),
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).peers == old(self).peers,
-            old(self).core.spec@.versions_monotonic(final(self).core.spec@),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            old(self).core_spec().spec_spec()@.versions_monotonic(
+                final(self).core_spec().spec_spec()@,
+            ),
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
@@ -3976,84 +4449,113 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             Err((e, _)) => Err(e),
         }
     }
+}
 
+impl<'a, T: ByteTransport, D: DeviceBackend<'a>> DistributedEngine<'a, T, D> {
     // =========================================================================
     // Verified Facade Mechanism Primitives (Cross-Tier Hops, Leases, Multi-Tier Serving)
     // =========================================================================
     /// Synchronously copy a published GPU-VRAM or Pinned-Host frame into the
     /// opposite tier (`GPU <-> Pinned Host`) using caller's idle `src_stream` /
-    /// `src_timeline`. Works with both `CudaAttachment::Borrowed` and `Owned`
+    /// `src_timeline`. Works with both `DeviceAttachment::Borrowed` and `Owned`
     /// while preserving existing `VersionId` and cluster-wide `VersionBinding`.
     pub fn copy_hop_cuda_sync(
         &mut self,
         Tracked(instance): Tracked<&TransferInstance>,
         Tracked(shares): Tracked<&mut ShareSource>,
-        src_stream: &mut CudaStream,
-        src_timeline: u8,
+        src_stream: &mut D::Stream,
+        src_timeline: TimelineId,
         src_frame: FrameId,
         dst_tier: TierId,
     ) -> (r: BackendResult<(VersionId, FrameId)>)
         requires
             old(self).well_formed(),
-            old(self).cuda.spec_ref() matches Some(c) && {
-                &&& caller_stream_valid(
-                    *old(src_stream),
-                    &old(self).core,
-                    src_timeline,
-                    c.timeline.stream,
-                )
-                &&& src_timeline != old(self).host.timeline
-                &&& src_timeline != c.timeline.timeline_id
+            old(self).device_spec().spec_ref() matches Some(c) && {
+                &&& c.caller_stream_valid(*old(src_stream), &old(self).core_spec(), src_timeline)
+                &&& src_timeline != old(self).host_spec().timeline_spec()
+                &&& src_timeline != c.timeline_id_spec()
                 &&& forall|i: int|
-                    0 <= i < old(self).peers@.len() ==> src_timeline != (#[trigger] old(
+                    0 <= i < old(self).peers_spec()@.len() ==> src_timeline != (#[trigger] old(
                         self,
-                    ).peers@[i]).rdma.timeline_id
-                &&& (old(self).nvme matches Some(n) ==> src_timeline != n.timeline)
-                &&& old(self).core.timelines.confirmed_seq[src_timeline as int] + 1 == old(
+                    ).peers_spec()@[i]).rdma_spec().timeline_id_spec()
+                &&& nvme_timeline_distinct(&old(self).nvme_spec(), src_timeline)
+                &&& old(self).core_spec().timelines_spec().confirmed_seq_spec()[src_timeline as int]
+                    + 1 == old(
                     self,
-                ).core.timelines.next_seq[src_timeline as int]
-                &&& old(src_stream).device() == c.device
+                ).core_spec().timelines_spec().next_seq_spec()[src_timeline as int]
+                &&& old(src_stream).device_spec() == c.device_spec()
             },
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers == old(self).peers,
-            final(self).core.node_id == old(self).core.node_id,
-            final(self).core.instance_id() == old(self).core.instance_id(),
-            final(self).core.tiers == old(self).core.tiers,
-            old(self).core.spec@.versions_monotonic(final(self).core.spec@),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            final(self).core_spec().tiers_spec() == old(self).core_spec().tiers_spec(),
+            old(self).core_spec().spec_spec()@.versions_monotonic(
+                final(self).core_spec().spec_spec()@,
+            ),
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
-            final(self).cuda.spec_ref() matches Some(c) ==> caller_stream_valid(
+            final(self).device_spec().spec_ref() matches Some(c) ==> c.caller_stream_valid(
                 *final(src_stream),
-                &final(self).core,
+                &final(self).core_spec(),
                 src_timeline,
-                c.timeline.stream,
             ),
             r matches Ok((ver, dst_frame)) ==> {
-                &&& final(self).cuda.spec_ref() matches Some(c) && ((dst_tier == c.gpu_tier
-                    && c.owns_gpu(dst_frame)) || c.owns_pinned_host(dst_frame))
-                &&& final(self).core.timelines.confirmed_seq[src_timeline as int] + 1
-                    == final(self).core.timelines.next_seq[src_timeline as int]
-                &&& final(self).core.frames.meta(dst_frame).state == STATE_PUBLISHED
-                &&& final(self).core.frames.frame(dst_frame).tier == dst_tier
-                &&& final(self).core.spec@.versions.contains_key(ver)
+                &&& final(self).device_spec().spec_ref() matches Some(c) && ((dst_tier
+                    == c.device_tier_spec() && c.owns_device(dst_frame)) || c.owns_pinned_host(
+                    dst_frame,
+                ))
+                &&& final(self).core_spec().timelines_spec().confirmed_seq_spec()[src_timeline as int]
+                    + 1
+                    == final(self).core_spec().timelines_spec().next_seq_spec()[src_timeline as int]
+                &&& final(self).core_spec().frames_spec().meta(dst_frame).state == STATE_PUBLISHED
+                &&& final(self).core_spec().frames_spec().frame(dst_frame).tier == dst_tier
+                &&& final(self).core_spec().spec_spec()@.versions.contains_key(ver)
             },
     {
         hide(CacheCore::well_formed);
-        let Some(cuda) = self.cuda.as_ref() else {
+        if src_frame.0 as usize >= self.core.frame_count() {
+            return Err(CoreError::InvalidArgument);
+        }
+        if dst_tier.as_index() >= self.core.tier_count() {
+            return Err(CoreError::InvalidArgument);
+        }
+        let Some(device) = self.device.as_ref() else {
             return Err(CoreError::UnsupportedTier);
         };
+        if src_timeline == device.timeline_id() || !is_caller_device_timeline::<D>(
+            &self.core,
+            src_timeline,
+            src_stream,
+        ) {
+            return Err(CoreError::InvalidArgument);
+        }
+        if !self.core.timeline_is_idle(src_timeline) {
+            return Err(CoreError::WouldConflict);
+        }
+        if !super::boundary::bind_caller_device_stream(
+            &mut self.caller_device_streams,
+            src_timeline,
+            src_stream,
+        ) {
+            return Err(CoreError::InvalidArgument);
+        }
         let ghost before = self.core;
         let ghost src_source = src_stream.source().source();
-        let res = cuda.copy_hop_sync(
+        proof {
+            device.lemma_caller_stream_valid(*src_stream, &before, src_timeline);
+            src_stream.lemma_source_kind();
+        }
+        let res = device.copy_hop_sync(
             &mut self.core,
             Tracked(instance),
             Tracked(shares),
@@ -4068,12 +4570,10 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             Self::lemma_preserve_siblings(
                 &before,
                 &self.core,
-                Some(src_timeline),
-                Some(src_source),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(Some(src_timeline), Some(src_source)),
                 self.host,
                 &self.host_ctx,
-                &self.cuda,
+                &self.device,
                 &self.nvme,
                 self.peers@,
             );
@@ -4092,24 +4592,27 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: BackendResult<VersionId>)
         requires
             old(self).well_formed(),
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers == old(self).peers,
-            final(self).core.spec == old(self).core.spec,
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().spec_spec() == old(self).core_spec().spec_spec(),
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
             final(dst)@.len() == old(dst)@.len(),
-            r matches Ok(ver) ==> final(self).core.spec@.versions.contains_key(ver),
+            r matches Ok(ver) ==> final(self).core_spec().spec_spec()@.versions.contains_key(ver),
     {
         hide(CacheCore::well_formed);
+        if frame.0 as usize >= self.core.frame_count() {
+            return Err(CoreError::InvalidArgument);
+        }
         let ghost before = self.core;
         let res = self.host.read_frame_into_with(
             &mut self.host_ctx,
@@ -4127,45 +4630,24 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 lemma_core_transition_preserves_peer_session(
                     &before,
                     &self.core,
-                    None,
-                    Some(old(self).host_ctx.source@.source()),
-                    FrameTouchMode::PreserveAllInit,
+                    CoreFootprint::preserve_all(None, Some(old(self).host_ctx.source@.source())),
                     &self.peers@[i],
                 );
             }
-            match &self.cuda {
-                CudaAttachment::None => {},
-                CudaAttachment::Borrowed(c) => {
-                    lemma_core_transition_preserves_cuda(
-                        &before,
-                        &self.core,
-                        None,
-                        Some(old(self).host_ctx.source@.source()),
-                        FrameTouchMode::PreserveAllInit,
-                        *c,
-                    );
-                },
-                CudaAttachment::Owned(c) => {
-                    lemma_core_transition_preserves_cuda(
-                        &before,
-                        &self.core,
-                        None,
-                        Some(old(self).host_ctx.source@.source()),
-                        FrameTouchMode::PreserveAllInit,
-                        c,
-                    );
-                },
-            }
-            if let Some(ref n) = self.nvme {
-                lemma_core_transition_preserves_nvme(
+            if let Some(ref c) = self.device.spec_ref() {
+                c.lemma_device_layout(&before);
+                c.preserve_across_core_transition(
                     &before,
                     &self.core,
-                    None,
-                    Some(old(self).host_ctx.source@.source()),
-                    FrameTouchMode::PreserveAllInit,
-                    n,
+                    CoreFootprint::preserve_all(None, Some(old(self).host_ctx.source@.source())),
                 );
             }
+            lemma_preserve_nvme(
+                &before,
+                &self.core,
+                CoreFootprint::preserve_all(None, Some(old(self).host_ctx.source@.source())),
+                &self.nvme,
+            );
             assert(self.core.all_versions_bound()) by {
                 reveal(FrameTable::same_directory);
             }
@@ -4174,88 +4656,102 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     }
 
     /// Asynchronously read a specific published GPU-VRAM or Pinned-Host frame
-    /// into caller's `CudaSlice` on `dst_stream` (1-hop D2D or H2D Ordered Handoff).
+    /// into caller's device slice on `dst_stream` (1-hop D2D or H2D Ordered Handoff).
     pub fn get_into_gpu_frame(
         &mut self,
         Tracked(instance): Tracked<&TransferInstance>,
         Tracked(shares): Tracked<&mut ShareSource>,
         frame: FrameId,
-        dst_stream: &mut CudaStream,
-        dst_timeline: u8,
-        dst: &CudaSlice,
+        dst_stream: &mut D::Stream,
+        dst_timeline: TimelineId,
+        dst: &D::Slice<'_>,
         Tracked(dst_tok): Tracked<&mut SlotToken>,
     ) -> (r: BackendResult<(VersionId, Ticket, Ghost<TransferEvent>)>)
         requires
             old(self).well_formed(),
-            old(self).cuda.spec_ref() matches Some(c) && {
-                &&& caller_stream_valid(
-                    *old(dst_stream),
-                    &old(self).core,
-                    dst_timeline,
-                    c.timeline.stream,
-                )
-                &&& dst_timeline != old(self).host.timeline
-                &&& dst_timeline != c.timeline.timeline_id
+            old(self).device_spec().spec_ref() matches Some(c) && {
+                &&& c.caller_stream_valid(*old(dst_stream), &old(self).core_spec(), dst_timeline)
+                &&& dst_timeline != old(self).host_spec().timeline_spec()
+                &&& dst_timeline != c.timeline_id_spec()
                 &&& forall|i: int|
-                    0 <= i < old(self).peers@.len() ==> dst_timeline != (#[trigger] old(
+                    0 <= i < old(self).peers_spec()@.len() ==> dst_timeline != (#[trigger] old(
                         self,
-                    ).peers@[i]).rdma.timeline_id
-                &&& (old(self).nvme matches Some(n) ==> dst_timeline != n.timeline)
-                &&& dst.slot_ref().loc.space is GpuAlloc
-                    ==> dst.slot_ref().loc.space->GpuAlloc_device == c.device
+                    ).peers_spec()@[i]).rdma_spec().timeline_id_spec()
+                &&& nvme_timeline_distinct(&old(self).nvme_spec(), dst_timeline)
+                &&& dst.slot_ref().loc.space.is_gpu() ==> dst.slot_ref().loc.space.gpu_device()
+                    == c.device_spec()
             },
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
             dst.well_formed(),
-            dst.instance_id() == old(self).core.instance_id(),
-            dst.slot_ref().loc.node == old(self).core.node(),
-            old(self).cuda.spec_ref() matches Some(c) ==> dst.slot_ref().sub_len == old(
+            dst.instance_id() == old(self).core_spec().instance_id(),
+            dst.slot_ref().loc.node == old(self).core_spec().node(),
+            old(self).device_spec().spec_ref() matches Some(c) ==> dst.slot_ref().sub_len == old(
                 self,
-            ).core.frames.tier_frame_size(c.gpu_tier),
-            slot_is_owned(*old(dst_tok), old(self).core.instance_id(), dst.slot_ref().loc),
-            write_admitted(slot_frontier(*old(dst_tok)), old(self).core.citations()),
-            old(self).core.disjoint_from_published(ISet::empty().insert(dst.slot_ref().loc)),
+            ).core_spec().frames_spec().tier_frame_size(c.device_tier_spec()),
+            slot_is_owned(*old(dst_tok), old(self).core_spec().instance_id(), dst.slot_ref().loc),
+            write_admitted(slot_frontier(*old(dst_tok)), old(self).core_spec().citations()),
+            old(self).core_spec().disjoint_from_published(ISet::empty().insert(dst.slot_ref().loc)),
             forall|f: FrameId|
-                f.0 < old(self).core.frames.metas.len() ==> dst.slot_ref().loc != (#[trigger] old(
-                    self,
-                ).core.frames.frame(f)).slot.loc,
+                f.0 < old(self).core_spec().frames_spec().metas_spec().len() ==> dst.slot_ref().loc
+                    != (#[trigger] old(self).core_spec().frames_spec().frame(f)).slot.loc,
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers == old(self).peers,
-            final(self).core.spec == old(self).core.spec,
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().spec_spec() == old(self).core_spec().spec_spec(),
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
-            final(self).cuda.spec_ref() matches Some(c) ==> caller_stream_valid(
+            final(self).device_spec().spec_ref() matches Some(c) ==> c.caller_stream_valid(
                 *final(dst_stream),
-                &final(self).core,
+                &final(self).core_spec(),
                 dst_timeline,
-                c.timeline.stream,
             ),
             r matches Ok((version, ticket, ev)) ==> {
                 &&& ticket != Ticket::NONE
                 &&& ticket.timeline_id() == dst_timeline
-                &&& final(self).core.spec@.versions.contains_key(version)
+                &&& final(self).core_spec().spec_spec()@.versions.contains_key(version)
                 &&& slot_owned(
                     *final(dst_tok),
-                    old(self).core.instance_id(),
+                    old(self).core_spec().instance_id(),
                     dst.slot_ref().loc,
                     Frontier { last_writer: Some(ev@), readers: ISet::empty() },
                 )
             },
     {
         hide(CacheCore::well_formed);
-        let Some(cuda) = self.cuda.as_ref() else {
+        if frame.0 as usize >= self.core.frame_count() {
+            return Err(CoreError::InvalidArgument);
+        }
+        let Some(device) = self.device.as_ref() else {
             return Err(CoreError::UnsupportedTier);
         };
+        if dst_timeline == device.timeline_id() || !is_caller_device_timeline::<D>(
+            &self.core,
+            dst_timeline,
+            dst_stream,
+        ) || self.core.tier_frame_size(device.device_tier_id()) != Some(dst.len()) {
+            return Err(CoreError::InvalidArgument);
+        }
+        if !super::boundary::bind_caller_device_stream(
+            &mut self.caller_device_streams,
+            dst_timeline,
+            dst_stream,
+        ) {
+            return Err(CoreError::InvalidArgument);
+        }
         let ghost before = self.core;
         let ghost src_ev = dst_stream.source().source();
-        let res = cuda.get_into_gpu(
+        proof {
+            device.lemma_caller_stream_valid(*dst_stream, &before, dst_timeline);
+            dst_stream.lemma_source_kind();
+        }
+        let res = device.get_into_device(
             &mut self.core,
             Tracked(instance),
             Tracked(shares),
@@ -4271,12 +4767,10 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             Self::lemma_preserve_siblings(
                 &before,
                 &self.core,
-                Some(dst_timeline),
-                Some(src_ev),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(Some(dst_timeline), Some(src_ev)),
                 self.host,
                 &self.host_ctx,
-                &self.cuda,
+                &self.device,
                 &self.nvme,
                 self.peers@,
             );
@@ -4294,38 +4788,40 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: BackendResult<Option<HostLease<'a>>>)
         requires
             old(self).well_formed(),
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers == old(self).peers,
-            final(self).core.spec == old(self).core.spec,
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().spec_spec() == old(self).core_spec().spec_spec(),
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
             r matches Ok(Some(lease)) ==> {
                 &&& lease.slice.well_formed()
-                &&& lease.slice.instance_id() == final(self).core.instance_id()
-                &&& lease.slice.slot_ref() == final(self).core.frames.frame(lease.handle.frame).slot
-                &&& final(self).core.active_lease_matches(lease.handle)
-                &&& !final(self).core.active_leases[lease.handle.slot as int]->Some_0.internal
-                &&& lease.cap@.is_local()
-                &&& lease.cap@.instance_id() == final(self).core.instance_id()
+                &&& lease.slice.instance_id() == final(self).core_spec().instance_id()
+                &&& lease.slice.slot_ref() == final(self).core_spec().frames_spec().frame(
+                    lease.handle.frame_spec(),
+                ).slot
+                &&& final(self).core_spec().active_lease_matches(lease.handle)
+                &&& !final(self).core_spec().active_leases_spec()[lease.handle.slot_spec() as int]->Some_0.internal
+                &&& lease.cap@.is_cooperative()
+                &&& lease.cap@.instance_id() == final(self).core_spec().instance_id()
                 &&& lease.cap@.loc() == lease.slice.slot_ref().loc
                 &&& lease.cap@.share()
-                    == final(self).core.active_leases[lease.handle.slot as int]->Some_0.share@
-                &&& read_admitted(lease.cap@.frontier(), final(self).core.citations())
+                    == final(self).core_spec().active_leases_spec()[lease.handle.slot_spec() as int]->Some_0.share@
+                &&& read_admitted(lease.cap@.frontier(), final(self).core_spec().citations())
                 &&& lease.cap@.frontier().readers.is_empty()
-                &&& final(self).core.frames.returned_reads(
-                    lease.handle.frame,
+                &&& final(self).core_spec().frames_spec().returned_reads(
+                    lease.handle.frame_spec(),
                     lease.cap@,
                     Ticket::NONE,
-                    final(self).core.kernel_view(),
+                    final(self).core_spec().kernel_view(),
                 )
             },
     {
@@ -4345,12 +4841,10 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             Self::lemma_preserve_siblings(
                 &before,
                 &self.core,
-                None,
-                None,
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(None, None),
                 self.host,
                 &self.host_ctx,
-                &self.cuda,
+                &self.device,
                 &self.nvme,
                 self.peers@,
             );
@@ -4387,45 +4881,49 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: BackendResult<Option<GpuLease>>)
         requires
             old(self).well_formed(),
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers == old(self).peers,
-            final(self).core.spec == old(self).core.spec,
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().spec_spec() == old(self).core_spec().spec_spec(),
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
             r matches Ok(Some(lease)) ==> {
-                &&& lease.handle.frame == lease.frame
-                &&& final(self).cuda.spec_ref() matches Some(c) && c.owns_gpu(lease.frame)
-                &&& final(self).core.active_lease_matches(lease.handle)
-                &&& !final(self).core.active_leases[lease.handle.slot as int]->Some_0.internal
-                &&& lease.cap@.is_local()
-                &&& lease.cap@.instance_id() == final(self).core.instance_id()
-                &&& lease.cap@.loc() == final(self).core.frames.frame(lease.frame).slot.loc
+                &&& lease.handle.frame_spec() == lease.frame
+                &&& final(self).device_spec().spec_ref() matches Some(c) && c.owns_device(
+                    lease.frame,
+                )
+                &&& final(self).core_spec().active_lease_matches(lease.handle)
+                &&& !final(self).core_spec().active_leases_spec()[lease.handle.slot_spec() as int]->Some_0.internal
+                &&& lease.cap@.is_cooperative()
+                &&& lease.cap@.instance_id() == final(self).core_spec().instance_id()
+                &&& lease.cap@.loc() == final(self).core_spec().frames_spec().frame(
+                    lease.frame,
+                ).slot.loc
                 &&& lease.cap@.share()
-                    == final(self).core.active_leases[lease.handle.slot as int]->Some_0.share@
-                &&& read_admitted(lease.cap@.frontier(), final(self).core.citations())
+                    == final(self).core_spec().active_leases_spec()[lease.handle.slot_spec() as int]->Some_0.share@
+                &&& read_admitted(lease.cap@.frontier(), final(self).core_spec().citations())
                 &&& lease.cap@.frontier().readers.is_empty()
-                &&& final(self).core.frames.returned_reads(
+                &&& final(self).core_spec().frames_spec().returned_reads(
                     lease.frame,
                     lease.cap@,
                     Ticket::NONE,
-                    final(self).core.kernel_view(),
+                    final(self).core_spec().kernel_view(),
                 )
             },
     {
         hide(CacheCore::well_formed);
-        let Some(gpu_tier) = self.gpu_tier() else {
+        let Some(device) = self.device.as_ref() else {
             return Err(CoreError::UnsupportedTier);
         };
-        let Some((frame, _ver)) = self.core.lookup_tier(key, gpu_tier) else {
+        let Some((frame, _ver)) = self.core.lookup_tier(key, device.device_tier_id()) else {
             return Ok(None);
         };
         let ghost before = self.core;
@@ -4435,37 +4933,33 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             Tracked(shares),
             Tracked(instance),
         )?;
-        let sync_point = match self.cuda.as_ref() {
-            Some(c) => c.frame_sync_point(frame),
-            None => SyncPoint::HostComplete,
-        };
         proof {
             lemma_core_transition_no_event(&before, &self.core, None, None);
             Self::lemma_preserve_siblings(
                 &before,
                 &self.core,
-                None,
-                None,
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(None, None),
                 self.host,
                 &self.host_ctx,
-                &self.cuda,
+                &self.device,
                 &self.nvme,
                 self.peers@,
             );
             assert(self.core.all_versions_bound()) by {
                 reveal(FrameTable::same_directory);
             }
-            let c = self.cuda.spec_ref().unwrap();
+            device.lemma_device_layout(&self.core);
             lemma_slab_owns_tier_frame(
                 &self.core,
-                c.gpu_tier,
-                c.gpu_first_frame,
-                c.gpu_num_frames,
-                c.gpu_buffer.space(),
+                device.device_tier_spec(),
+                device.device_first_frame_spec(),
+                device.device_num_frames_spec(),
+                device.buffer_spec().reg_space(),
                 frame,
             );
+            device.lemma_frame_ownership(frame);
         }
+        let sync_point = device.frame_sync_point(frame);
         Ok(Some(GpuLease { handle, version, frame, sync_point, cap }))
     }
 
@@ -4480,32 +4974,43 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: BackendResult<()>)
         requires
             old(self).well_formed(),
-            instance.id() == old(self).core.instance_id(),
-            old(self).core.timelines.valid_ticket(read_ticket),
-            old(self).core.active_lease_matches(handle) ==> {
-                let share = old(self).core.active_leases[handle.slot as int]->Some_0.share@;
+            instance.id() == old(self).core_spec().instance_id(),
+            old(self).core_spec().active_lease_matches(handle) ==> {
+                let share = old(
+                    self,
+                ).core_spec().active_leases_spec()[handle.slot_spec() as int]->Some_0.share@;
                 &&& cap.share() == share
-                &&& old(self).core.frames.returned_reads(
-                    handle.frame,
+                &&& old(self).core_spec().frames_spec().returned_reads(
+                    handle.frame_spec(),
                     cap,
                     read_ticket,
-                    old(self).core.kernel_view(),
+                    old(self).core_spec().kernel_view(),
                 )
             },
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers == old(self).peers,
-            final(self).core.spec == old(self).core.spec,
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec() == old(self).peers_spec(),
+            final(self).core_spec().spec_spec() == old(self).core_spec().spec_spec(),
     {
         hide(CacheCore::well_formed);
-        let idx = handle.slot as usize;
-        if idx >= self.core.active_leases.len() {
+        if handle.core_id() != self.core.runtime_id() || handle.frame().0 as usize
+            >= self.core.frame_count() {
             return Err(CoreError::InvalidArgument);
         }
-        let is_internal = match &self.core.active_leases[idx] {
+        proof {
+            lemma_core_wf_facts(&self.core);
+        }
+        if !self.core.timelines().contains_ticket(read_ticket) {
+            return Err(CoreError::InvalidArgument);
+        }
+        let idx = handle.slot() as usize;
+        if idx >= self.core.local_leases().len() {
+            return Err(CoreError::InvalidArgument);
+        }
+        let is_internal = match &self.core.local_leases()[idx] {
             Some(lease) => lease.internal,
             None => false,
         };
@@ -4524,12 +5029,10 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
             Self::lemma_preserve_siblings(
                 &before,
                 &self.core,
-                None,
-                None,
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(None, None),
                 self.host,
                 &self.host_ctx,
-                &self.cuda,
+                &self.device,
                 &self.nvme,
                 self.peers@,
             );
@@ -4554,33 +5057,44 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: Result<ServeOutcome, CoreError>)
         requires
             old(self).well_formed(),
-            (peer_idx as int) < old(self).peers@.len(),
-            old(self).peers@[peer_idx as int].rdma.qp.ready(),
-            old(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
-            old(self).peers@[peer_idx as int].next_grant_tag < u64::MAX,
-            instance.id() == old(self).core.instance_id(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().ready(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend,
+            old(self).peers_spec()@[peer_idx as int].next_grant_tag_spec() < u64::MAX,
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).core.node_id == old(self).core.node_id,
-            final(self).core.instance_id() == old(self).core.instance_id(),
-            final(self).peers@[peer_idx as int].rdma.qp == old(
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec() == old(
                 self,
-            ).peers@[peer_idx as int].rdma.qp,
+            ).peers_spec()@[peer_idx as int].rdma_spec().qp_spec(),
             forall|j: int|
-                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
-                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
     {
         hide(CacheCore::well_formed);
+        self.check_peer_ready(peer_idx)?;
+        if primary_tier.as_index() >= self.core.tier_count() {
+            return Err(CoreError::InvalidArgument);
+        }
+        if let Some(tier) = fallback_tier {
+            if tier.as_index() >= self.core.tier_count() {
+                return Err(CoreError::InvalidArgument);
+            }
+        }
+        if self.peers[peer_idx].next_grant_tag == u64::MAX {
+            return Err(CoreError::SequenceExhausted);
+        }
         let ghost before = self.core;
         let ghost before_peers = self.peers@;
         let res = self.peers[peer_idx].serve_fetch_request_multi(
@@ -4618,53 +5132,76 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: Result<FetchOutcome, CoreError>)
         requires
             old(self).well_formed(),
-            (peer_idx as int) < old(self).peers@.len(),
-            old(self).peers@[peer_idx as int].rdma.qp.ready(),
-            old(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
-            old(self).peers@[peer_idx as int].next_request_id < u64::MAX,
-            old(self).core.frames.tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
-            instance.id() == old(self).core.instance_id(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().ready(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend,
+            old(self).peers_spec()@[peer_idx as int].next_request_id_spec() < u64::MAX,
+            old(self).core_spec().frames_spec().tier_frame_size(dst_tier) as u64
+                <= rdma::MAX_RDMA_MSG_LEN,
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
-            pd matches Some(p) ==> p.id() == old(self).peers@[peer_idx as int].rdma.window_pool.pd()
-                && p.node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
+            pd matches Some(p) ==> p.id() == old(
+                self,
+            ).peers_spec()@[peer_idx as int].rdma_spec().window_pool_spec().pd() && p.node() == old(
+                self,
+            ).core_spec().node(),
             forall|k: int|
                 0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
                     tokens,
-                )@[k]@.source() is RdmaQueuePair && old(tokens)@[k]@.node() == old(
+                )@[k]@.source().is_rdma_qp() && old(tokens)@[k]@.node() == old(
                     self,
-                ).core.node(),
+                ).core_spec().node(),
             match target {
                 PullTarget::Host => old(
                     self,
-                ).peers@[peer_idx as int].rdma.effective_host_mr_spec() matches Some(s) && s.tier
-                    == dst_tier && s.mr.access().local_write && s.mr.gpu_device_spec().is_none(),
+                ).peers_spec()@[peer_idx as int].rdma_spec().effective_host_mr_spec() matches Some(
+                    s,
+                ) && s.tier_spec() == dst_tier && s.mr_spec().access().local_write
+                    && s.mr_spec().gpu_device_spec().is_none(),
                 PullTarget::GpuGdr => old(
                     self,
-                ).peers@[peer_idx as int].rdma.effective_gpu_mr_spec() matches Some(s) && s.tier
-                    == dst_tier && s.mr.access().local_write && s.mr.gpu_device_spec() is Some,
+                ).peers_spec()@[peer_idx as int].rdma_spec().effective_gpu_mr_spec() matches Some(s)
+                    && s.tier_spec() == dst_tier && s.mr_spec().access().local_write
+                    && s.mr_spec().gpu_device_spec() is Some,
             },
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).peers@[peer_idx as int].rdma.qp.ready(),
-            final(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().ready(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend,
             forall|j: int|
-                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
-                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
             forall|k: int|
                 0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
-                    && final(tokens)@[k]@.source() is RdmaQueuePair && final(tokens)@[k]@.node()
-                    == old(self).core.node(),
+                    && final(tokens)@[k]@.source().is_rdma_qp() && final(tokens)@[k]@.node() == old(
+                    self,
+                ).core_spec().node(),
     {
         hide(CacheCore::well_formed);
+        self.check_peer_ready(peer_idx)?;
+        if primary_serve_tier.as_index() >= self.core.tier_count() {
+            return Err(CoreError::InvalidArgument);
+        }
+        if let Some(tier) = fallback_serve_tier {
+            if tier.as_index() >= self.core.tier_count() {
+                return Err(CoreError::InvalidArgument);
+            }
+        }
+        self.check_pull_target(peer_idx, dst_tier, target)?;
+        if self.peers[peer_idx].next_request_id == u64::MAX {
+            return Err(CoreError::SequenceExhausted);
+        }
+        if let Some(pd) = pd {
+            self.check_peer_pd(peer_idx, pd)?;
+        }
         if self.peers[peer_idx].rdma.qp.effective_max_rd_atomic_exec() == 0 {
             return Err(CoreError::InvalidArgument);
         }
@@ -4691,6 +5228,367 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         res
     }
 
+    /// Drain one peer's queue of fetch requests for caller admission.
+    pub fn take_inbound_fetches(&mut self, peer_idx: usize) -> (r: Result<
+        Vec<(u64, ObjectKey)>,
+        CoreError,
+    >)
+        requires
+            old(self).well_formed(),
+        ensures
+            final(self).well_formed(),
+            final(self).core_spec() == old(self).core_spec(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            peer_idx < old(self).peers_spec()@.len()
+                ==> final(self).peers_spec()@[peer_idx as int].rdma_spec() == old(
+                self,
+            ).peers_spec()@[peer_idx as int].rdma_spec(),
+            peer_idx >= old(self).peers_spec()@.len() ==> r == Err(CoreError::InvalidArgument)
+                && *final(self) == *old(self),
+            forall|j: int|
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
+            r matches Ok(requests) ==> {
+                &&& peer_idx < old(self).peers_spec()@.len()
+                &&& requests@ == old(self).peers_spec()@[peer_idx as int].inbound_fetches()
+                &&& final(self).peers_spec()@[peer_idx as int].inbound_fetches().len() == 0
+            },
+    {
+        if peer_idx >= self.peers.len() {
+            return Err(CoreError::InvalidArgument);
+        }
+        Ok(self.peers[peer_idx].take_inbound_fetches(&self.core))
+    }
+
+    /// Available Type-2 MW bind headroom for one peer.
+    pub fn peer_bind_budget(&self, peer_idx: usize) -> (r: Result<usize, CoreError>)
+        requires
+            self.well_formed(),
+        ensures
+            peer_idx >= self.peers_spec()@.len() ==> r == Err(CoreError::InvalidArgument),
+            r matches Ok(n) ==> peer_idx < self.peers_spec()@.len() && n
+                <= self.peers_spec()@[peer_idx as int].rdma_spec().window_pool_spec().free_spec()@.len(),
+    {
+        if peer_idx >= self.peers.len() {
+            return Err(CoreError::InvalidArgument);
+        }
+        Ok(self.peers[peer_idx].bind_budget(&self.core))
+    }
+
+    /// Send a miss for a fetch the caller has decided to reject.
+    pub fn reject_fetch_request(
+        &mut self,
+        peer_idx: usize,
+        request_id: u64,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<(), CoreError>)
+        requires
+            old(self).well_formed(),
+            instance.id() == old(self).core_spec().instance_id(),
+        ensures
+            final(self).well_formed(),
+            final(self).core_spec() == old(self).core_spec(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            peer_idx < old(self).peers_spec()@.len()
+                ==> final(self).peers_spec()@[peer_idx as int].rdma_spec() == old(
+                self,
+            ).peers_spec()@[peer_idx as int].rdma_spec(),
+            peer_idx >= old(self).peers_spec()@.len() ==> r == Err(CoreError::InvalidArgument)
+                && *final(self) == *old(self),
+            forall|j: int|
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
+    {
+        if peer_idx >= self.peers.len() {
+            return Err(CoreError::InvalidArgument);
+        }
+        self.peers[peer_idx].reject_fetch_request(&self.core, request_id, Tracked(instance))
+    }
+
+    /// Post a bind for a caller-selected published frame. The pump sends its grant when ready.
+    pub fn grant_fetch_from_frame(
+        &mut self,
+        peer_idx: usize,
+        request_id: u64,
+        key: ObjectKey,
+        frame: FrameId,
+        Tracked(shares): Tracked<&mut ShareSource>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<(), CoreError>)
+        requires
+            old(self).well_formed(),
+            peer_idx < old(self).peers_spec()@.len() ==> {
+                let peer = old(self).peers_spec()@[peer_idx as int];
+                &&& peer.rdma_spec().qp_spec().ready()
+                &&& peer.rdma_spec().qp_spec().state() is ReadyToSend
+            },
+            instance.id() == old(self).core_spec().instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
+        ensures
+            final(self).well_formed(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            peer_idx < old(self).peers_spec()@.len()
+                ==> final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec() == old(
+                self,
+            ).peers_spec()@[peer_idx as int].rdma_spec().qp_spec(),
+            peer_idx >= old(self).peers_spec()@.len() ==> r == Err(CoreError::InvalidArgument)
+                && *final(self) == *old(self),
+            forall|j: int|
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+    {
+        hide(CacheCore::well_formed);
+        self.check_peer_ready(peer_idx)?;
+        self.core.check_published_frame(frame)?;
+        let ghost before = self.core;
+        let ghost before_peers = self.peers@;
+        let res = self.peers[peer_idx].grant_fetch_from_frame(
+            &mut self.core,
+            request_id,
+            key,
+            frame,
+            Tracked(shares),
+            Tracked(instance),
+        );
+        self.restore_after_peer_step(
+            peer_idx,
+            Ghost(before),
+            Ghost(before_peers),
+            Tracked(instance),
+        );
+        res
+    }
+
+    /// Admit one fetch notice and post the selected frames in one bind doorbell.
+    pub fn grant_fetch_batch(
+        &mut self,
+        peer_idx: usize,
+        serve_tier: TierId,
+        entries: &[(u64, ObjectKey)],
+        Tracked(shares): Tracked<&mut ShareSource>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<usize, CoreError>)
+        requires
+            old(self).well_formed(),
+            peer_idx < old(self).peers_spec()@.len() ==> {
+                let peer = old(self).peers_spec()@[peer_idx as int];
+                &&& peer.rdma_spec().qp_spec().ready()
+                &&& peer.rdma_spec().qp_spec().state() is ReadyToSend
+            },
+            instance.id() == old(self).core_spec().instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
+        ensures
+            final(self).well_formed(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            peer_idx < old(self).peers_spec()@.len()
+                ==> final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec() == old(
+                self,
+            ).peers_spec()@[peer_idx as int].rdma_spec().qp_spec(),
+            peer_idx >= old(self).peers_spec()@.len() ==> r == Err(CoreError::InvalidArgument)
+                && *final(self) == *old(self),
+            forall|j: int|
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+    {
+        hide(CacheCore::well_formed);
+        self.check_peer_ready(peer_idx)?;
+        if serve_tier.as_index() >= self.core.tier_count() {
+            return Err(CoreError::InvalidArgument);
+        }
+        let ghost before = self.core;
+        let ghost before_peers = self.peers@;
+        let res = self.peers[peer_idx].grant_fetch_batch(
+            &mut self.core,
+            serve_tier,
+            entries,
+            Tracked(shares),
+            Tracked(instance),
+        );
+        self.restore_after_peer_step(
+            peer_idx,
+            Ghost(before),
+            Ghost(before_peers),
+            Tracked(instance),
+        );
+        res
+    }
+
+    /// Pump one peer's CQ and protocol frames. Fetch requests remain queued for admission.
+    pub fn pump_peer_nonblocking(
+        &mut self,
+        peer_idx: usize,
+        pd: Option<&'a rdma::ProtectionDomain<'a>>,
+        tokens: &mut Vec<Tracked<EventSourceToken>>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<PeerProgress, CoreError>)
+        requires
+            old(self).well_formed(),
+            instance.id() == old(self).core_spec().instance_id(),
+            peer_idx < old(self).peers_spec()@.len() ==> {
+                let peer = old(self).peers_spec()@[peer_idx as int];
+                &&& peer.rdma_spec().qp_spec().ready()
+                &&& peer.rdma_spec().qp_spec().state() is ReadyToSend
+                &&& (pd matches Some(p) ==> p.id() == peer.rdma_spec().window_pool_spec().pd()
+                    && p.node() == old(self).core_spec().node())
+            },
+            forall|k: int|
+                0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
+                    tokens,
+                )@[k]@.source().is_rdma_qp() && old(tokens)@[k]@.node() == old(
+                    self,
+                ).core_spec().node(),
+        ensures
+            final(self).well_formed(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            peer_idx < old(self).peers_spec()@.len()
+                ==> final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec() == old(
+                self,
+            ).peers_spec()@[peer_idx as int].rdma_spec().qp_spec(),
+            peer_idx >= old(self).peers_spec()@.len() ==> r == Err(CoreError::InvalidArgument)
+                && *final(self) == *old(self),
+            forall|j: int|
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
+            forall|k: int|
+                0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
+                    && final(tokens)@[k]@.source().is_rdma_qp() && final(tokens)@[k]@.node() == old(
+                    self,
+                ).core_spec().node(),
+    {
+        hide(CacheCore::well_formed);
+        self.check_peer_ready(peer_idx)?;
+        if let Some(pd) = pd {
+            self.check_peer_pd(peer_idx, pd)?;
+        }
+        let ghost before = self.core;
+        let ghost before_peers = self.peers@;
+        let res = self.peers[peer_idx].pump_nonblocking(
+            &mut self.core,
+            pd,
+            tokens,
+            Tracked(instance),
+        );
+        self.restore_after_peer_step(
+            peer_idx,
+            Ghost(before),
+            Ghost(before_peers),
+            Tracked(instance),
+        );
+        res
+    }
+
+    /// Sweep each peer once, leaving fetch admission to the caller.
+    /// A supplied PD enables replenishment using each session's own PD.
+    pub fn pump_all_peers_nonblocking(
+        &mut self,
+        replenish: Option<&'a rdma::ProtectionDomain<'a>>,
+        tokens: &mut Vec<Tracked<EventSourceToken>>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<PeerProgress, CoreError>)
+        requires
+            old(self).well_formed(),
+            forall|i: int|
+                0 <= i < old(self).peers_spec()@.len() ==> {
+                    let p = #[trigger] old(self).peers_spec()@[i];
+                    &&& p.rdma_spec().qp_spec().ready()
+                    &&& p.rdma_spec().qp_spec().state() is ReadyToSend
+                },
+            instance.id() == old(self).core_spec().instance_id(),
+            forall|k: int|
+                0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
+                    tokens,
+                )@[k]@.source().is_rdma_qp() && old(tokens)@[k]@.node() == old(
+                    self,
+                ).core_spec().node(),
+        ensures
+            final(self).well_formed(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            forall|i: int|
+                0 <= i < final(self).peers_spec()@.len() ==> (
+                #[trigger] final(self).peers_spec()@[i]).rdma_spec().qp_spec() == old(
+                    self,
+                ).peers_spec()@[i].rdma_spec().qp_spec(),
+            forall|k: int|
+                0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
+                    && final(tokens)@[k]@.source().is_rdma_qp() && final(tokens)@[k]@.node() == old(
+                    self,
+                ).core_spec().node(),
+    {
+        hide(CacheCore::well_formed);
+        self.check_all_peers_ready()?;
+
+        let mut total = PeerProgress::empty();
+        let mut idx: usize = 0;
+        while idx < self.peers.len()
+            invariant
+                idx <= self.peers@.len(),
+                self.well_formed(),
+                self.host == old(self).host,
+                self.device == old(self).device,
+                self.nvme == old(self).nvme,
+                self.peers@.len() == old(self).peers@.len(),
+                self.core.node_id_spec() == old(self).core.node_id_spec(),
+                self.core.instance_id() == old(self).core.instance_id(),
+                forall|i: int|
+                    0 <= i < self.peers@.len() ==> {
+                        let p = #[trigger] self.peers@[i];
+                        &&& p.rdma.qp == old(self).peers@[i].rdma.qp
+                        &&& p.rdma.qp.ready()
+                        &&& p.rdma.qp.state() is ReadyToSend
+                    },
+                instance.id() == self.core.instance_id(),
+                forall|k: int|
+                    0 <= k < tokens@.len() ==> (#[trigger] tokens@[k])@.well_formed()
+                        && tokens@[k]@.source().is_rdma_qp() && tokens@[k]@.node()
+                        == self.core.node(),
+            decreases self.peers@.len() - idx,
+        {
+            let pd = if replenish.is_some() {
+                Some(self.peers[idx].rdma.qp.protection_domain())
+            } else {
+                None
+            };
+            let progress = self.pump_peer_nonblocking(idx, pd, tokens, Tracked(instance))?;
+            total.accumulate(progress);
+            idx += 1;
+        }
+        Ok(total)
+    }
+
     /// Non-blocking progress sweep on `peer_idx` serving inbound `FetchRequest`s
     /// from `primary_serve_tier` with optional `fallback_serve_tier`.
     pub fn poll_peer_progress_multi(
@@ -4705,44 +5603,59 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
     ) -> (r: Result<PeerProgress, CoreError>)
         requires
             old(self).well_formed(),
-            (peer_idx as int) < old(self).peers@.len(),
-            old(self).peers@[peer_idx as int].rdma.qp.ready(),
-            old(self).peers@[peer_idx as int].rdma.qp.state() is ReadyToSend,
-            instance.id() == old(self).core.instance_id(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().ready(),
+            old(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec().state() is ReadyToSend,
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
-            pd matches Some(p) ==> p.id() == old(self).peers@[peer_idx as int].rdma.window_pool.pd()
-                && p.node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
+            pd matches Some(p) ==> p.id() == old(
+                self,
+            ).peers_spec()@[peer_idx as int].rdma_spec().window_pool_spec().pd() && p.node() == old(
+                self,
+            ).core_spec().node(),
             forall|k: int|
                 0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
                     tokens,
-                )@[k]@.source() is RdmaQueuePair && old(tokens)@[k]@.node() == old(
+                )@[k]@.source().is_rdma_qp() && old(tokens)@[k]@.node() == old(
                     self,
-                ).core.node(),
+                ).core_spec().node(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
-            final(self).core.node_id == old(self).core.node_id,
-            final(self).core.instance_id() == old(self).core.instance_id(),
-            final(self).peers@[peer_idx as int].rdma.qp == old(
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
+            final(self).core_spec().node_id_spec() == old(self).core_spec().node_id_spec(),
+            final(self).core_spec().instance_id() == old(self).core_spec().instance_id(),
+            final(self).peers_spec()@[peer_idx as int].rdma_spec().qp_spec() == old(
                 self,
-            ).peers@[peer_idx as int].rdma.qp,
+            ).peers_spec()@[peer_idx as int].rdma_spec().qp_spec(),
             forall|j: int|
-                0 <= j < old(self).peers@.len() && j != peer_idx as int ==> (
-                #[trigger] final(self).peers@[j]) == old(self).peers@[j],
+                0 <= j < old(self).peers_spec()@.len() && j != peer_idx as int ==> (
+                #[trigger] final(self).peers_spec()@[j]) == old(self).peers_spec()@[j],
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
             forall|k: int|
                 0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
-                    && final(tokens)@[k]@.source() is RdmaQueuePair && final(tokens)@[k]@.node()
-                    == old(self).core.node(),
+                    && final(tokens)@[k]@.source().is_rdma_qp() && final(tokens)@[k]@.node() == old(
+                    self,
+                ).core_spec().node(),
     {
         hide(CacheCore::well_formed);
+        self.check_peer_ready(peer_idx)?;
+        if primary_serve_tier.as_index() >= self.core.tier_count() {
+            return Err(CoreError::InvalidArgument);
+        }
+        if let Some(tier) = fallback_serve_tier {
+            if tier.as_index() >= self.core.tier_count() {
+                return Err(CoreError::InvalidArgument);
+            }
+        }
+        if let Some(pd) = pd {
+            self.check_peer_pd(peer_idx, pd)?;
+        }
         let ghost before = self.core;
         let ghost before_peers = self.peers@;
         let res = self.peers[peer_idx].poll_progress_multi(
@@ -4765,11 +5678,12 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
 
     /// Round-robin non-blocking progress sweep across all attached `PeerSession`s,
     /// serving inbound `FetchRequest`s from `primary_serve_tier` with optional `fallback_serve_tier`.
+    /// A supplied PD enables replenishment using each session's own PD.
     pub fn poll_all_peers_progress_multi(
         &mut self,
         primary_serve_tier: TierId,
         fallback_serve_tier: Option<TierId>,
-        pd: Option<&'a rdma::ProtectionDomain<'a>>,
+        replenish: Option<&'a rdma::ProtectionDomain<'a>>,
         tokens: &mut Vec<Tracked<EventSourceToken>>,
         Tracked(shares): Tracked<&mut ShareSource>,
         Tracked(instance): Tracked<&TransferInstance>,
@@ -4777,41 +5691,52 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
         requires
             old(self).well_formed(),
             forall|i: int|
-                0 <= i < old(self).peers@.len() ==> {
-                    let p = #[trigger] old(self).peers@[i];
-                    &&& p.rdma.qp.ready()
-                    &&& p.rdma.qp.state() is ReadyToSend
-                    &&& (pd matches Some(pd_ref) ==> pd_ref.id() == p.rdma.window_pool.pd())
+                0 <= i < old(self).peers_spec()@.len() ==> {
+                    let p = #[trigger] old(self).peers_spec()@[i];
+                    &&& p.rdma_spec().qp_spec().ready()
+                    &&& p.rdma_spec().qp_spec().state() is ReadyToSend
                 },
-            pd matches Some(pd_ref) ==> pd_ref.node() == old(self).core.node(),
-            instance.id() == old(self).core.instance_id(),
+            instance.id() == old(self).core_spec().instance_id(),
             old(shares).well_formed(),
-            old(shares).id() == old(self).core.instance_id(),
-            old(shares).node() == old(self).core.node(),
+            old(shares).id() == old(self).core_spec().instance_id(),
+            old(shares).node() == old(self).core_spec().node(),
             forall|k: int|
                 0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
                     tokens,
-                )@[k]@.source() is RdmaQueuePair && old(tokens)@[k]@.node() == old(
+                )@[k]@.source().is_rdma_qp() && old(tokens)@[k]@.node() == old(
                     self,
-                ).core.node(),
+                ).core_spec().node(),
         ensures
             final(self).well_formed(),
-            final(self).host == old(self).host,
-            final(self).cuda == old(self).cuda,
-            final(self).nvme == old(self).nvme,
-            final(self).peers@.len() == old(self).peers@.len(),
+            final(self).host_spec() == old(self).host_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).nvme_spec() == old(self).nvme_spec(),
+            final(self).peers_spec()@.len() == old(self).peers_spec()@.len(),
             forall|i: int|
-                0 <= i < final(self).peers@.len() ==> (#[trigger] final(self).peers@[i]).rdma.qp
-                    == old(self).peers@[i].rdma.qp,
+                0 <= i < final(self).peers_spec()@.len() ==> (
+                #[trigger] final(self).peers_spec()@[i]).rdma_spec().qp_spec() == old(
+                    self,
+                ).peers_spec()@[i].rdma_spec().qp_spec(),
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
             forall|k: int|
                 0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
-                    && final(tokens)@[k]@.source() is RdmaQueuePair && final(tokens)@[k]@.node()
-                    == old(self).core.node(),
+                    && final(tokens)@[k]@.source().is_rdma_qp() && final(tokens)@[k]@.node() == old(
+                    self,
+                ).core_spec().node(),
     {
         hide(CacheCore::well_formed);
+        if primary_serve_tier.as_index() >= self.core.tier_count() {
+            return Err(CoreError::InvalidArgument);
+        }
+        if let Some(tier) = fallback_serve_tier {
+            if tier.as_index() >= self.core.tier_count() {
+                return Err(CoreError::InvalidArgument);
+            }
+        }
+        self.check_all_peers_ready()?;
+
         let mut total = PeerProgress::empty();
         let mut idx: usize = 0;
         while idx < self.peers.len()
@@ -4819,10 +5744,10 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 idx <= self.peers@.len(),
                 self.well_formed(),
                 self.host == old(self).host,
-                self.cuda == old(self).cuda,
+                self.device == old(self).device,
                 self.nvme == old(self).nvme,
                 self.peers@.len() == old(self).peers@.len(),
-                self.core.node_id == old(self).core.node_id,
+                self.core.node_id_spec() == old(self).core.node_id_spec(),
                 self.core.instance_id() == old(self).core.instance_id(),
                 forall|i: int|
                     0 <= i < self.peers@.len() ==> {
@@ -4831,10 +5756,6 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                         &&& p.rdma.qp.ready()
                         &&& p.rdma.qp.state() is ReadyToSend
                     },
-                forall|i: int|
-                    idx <= i < self.peers@.len() ==> (pd matches Some(pd_ref) ==> pd_ref.id() == (
-                    #[trigger] self.peers@[i]).rdma.window_pool.pd()),
-                pd matches Some(pd_ref) ==> pd_ref.node() == self.core.node(),
                 instance.id() == self.core.instance_id(),
                 shares.well_formed(),
                 shares.id() == old(shares).id(),
@@ -4843,10 +5764,15 @@ impl<'a, T: ByteTransport> DistributedEngine<'a, T> {
                 shares.node() == self.core.node(),
                 forall|k: int|
                     0 <= k < tokens@.len() ==> (#[trigger] tokens@[k])@.well_formed()
-                        && tokens@[k]@.source() is RdmaQueuePair && tokens@[k]@.node()
+                        && tokens@[k]@.source().is_rdma_qp() && tokens@[k]@.node()
                         == self.core.node(),
             decreases self.peers@.len() - idx,
         {
+            let pd = if replenish.is_some() {
+                Some(self.peers[idx].rdma.qp.protection_domain())
+            } else {
+                None
+            };
             let p = self.poll_peer_progress_multi(
                 idx,
                 primary_serve_tier,

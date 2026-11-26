@@ -6,8 +6,6 @@
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use transfer::transport::ByteTransport;
 
@@ -24,7 +22,6 @@ pub struct TcpTransport {
     read_buf: Vec<u8>,
     read_pos: usize,
     write_buf: Vec<u8>,
-    recv_paused: Arc<AtomicBool>,
 }
 
 impl TcpTransport {
@@ -41,19 +38,7 @@ impl TcpTransport {
             read_buf: Vec::with_capacity(READ_CHUNK_SIZE),
             read_pos: 0,
             write_buf: Vec::with_capacity(256),
-            recv_paused: Arc::new(AtomicBool::new(false)),
         })
-    }
-
-    /// Return a shared handle that pauses non-blocking `try_recv_frame` while `true`
-    /// without affecting blocking `recv_frame` or `send_frame`.
-    pub fn recv_pause_handle(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.recv_paused)
-    }
-
-    /// Toggle whether non-blocking `try_recv_frame` suppresses reading new frames.
-    pub fn set_recv_paused(&self, paused: bool) {
-        self.recv_paused.store(paused, Ordering::Release);
     }
 
     pub fn inner(&self) -> &TcpStream {
@@ -234,9 +219,6 @@ impl ByteTransport for TcpTransport {
     }
 
     fn try_recv_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
-        if self.recv_paused.load(Ordering::Acquire) {
-            return Ok(None);
-        }
         if let Some(frame) = self.try_extract_frame()? {
             return Ok(Some(frame));
         }
@@ -323,38 +305,5 @@ mod tests {
         let got_big = rx.recv_frame().expect("recv big frame");
         assert_eq!(got_big, big);
         let _tx = sender.join().expect("join sender");
-    }
-
-    #[test]
-    fn tcp_transport_recv_pause_suppresses_try_recv_without_dropping_frames() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        let addr = listener.local_addr().expect("local addr");
-
-        let client_stream = TcpStream::connect(addr).expect("connect");
-        let (server_stream, _) = listener.accept().expect("accept");
-
-        let mut tx = TcpTransport::with_timeout(client_stream, Duration::from_secs(2))
-            .expect("tx transport");
-        let mut rx = TcpTransport::with_timeout(server_stream, Duration::from_secs(2))
-            .expect("rx transport");
-        let pause = rx.recv_pause_handle();
-
-        // Send 2 frames so frame 1 is read into internal read_buf along with frame 2.
-        tx.send_frame(b"first-frame").expect("send 1");
-        tx.send_frame(b"second-frame").expect("send 2");
-        assert_eq!(rx.recv_frame().expect("recv 1"), b"first-frame");
-
-        // Pause non-blocking try_recv_frame: buffered frame 2 AND newly sent frame 3 must
-        // NOT be consumed by try_recv_frame while paused.
-        pause.store(true, Ordering::Release);
-        tx.send_frame(b"third-frame").expect("send 3");
-        assert_eq!(rx.try_recv_frame().expect("paused try_recv"), None);
-        assert_eq!(rx.try_recv_frame().expect("paused try_recv 2"), None);
-
-        // Unpause: both frames arrive completely intact in order.
-        pause.store(false, Ordering::Release);
-        assert_eq!(rx.recv_frame().expect("recv 2"), b"second-frame");
-        assert_eq!(rx.recv_frame().expect("recv 3"), b"third-frame");
-        assert_eq!(rx.try_recv_frame().expect("drained"), None);
     }
 }

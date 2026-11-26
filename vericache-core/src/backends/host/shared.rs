@@ -4,7 +4,7 @@ use transfer::host::{self, HostContext};
 verus! {
 
 impl HostBackend {
-    fn write_and_certify_host_slot_with(
+    pub(crate) fn write_and_certify_host_slot_with(
         &self,
         ctx: &mut HostContext,
         core: &mut CacheCore,
@@ -12,21 +12,23 @@ impl HostBackend {
         frame: FrameId,
         Ghost(slot): Ghost<SlotRef>,
         Tracked(tok): Tracked<&mut SlotToken>,
-        data: &[u8],
+        data: Option<&[u8]>,
     ) -> (r: (Ticket, Ghost<ValueCertificate>))
         requires
             old(core).well_formed(),
             self.well_formed(old(core)),
             old(ctx).ready(old(core).instance_id(), old(core).node()),
-            source_fresh_for_ledger(old(ctx).source@, old(core).ledger@),
+            source_fresh_for_ledger(old(ctx).source@, old(core).ledger_spec()@),
             old(ctx).source@.source() != self.ctx.source@.source(),
             instance.id() == old(core).instance_id(),
-            old(core).timelines.next_seq[self.timeline as int] <= MAX_TICKET_SEQ,
-            data@.len() == old(core).frames.tier_frame_size(self.tier),
+            old(core).timelines_spec().next_seq_spec()[self.timeline as int] <= MAX_TICKET_SEQ,
+            data matches Some(bytes) ==> bytes@.len() == old(core).frames_spec().tier_frame_size(
+                self.tier,
+            ),
             self.owns(frame),
-            frame.0 < old(core).frames.metas.len(),
-            old(core).frames.meta(frame).state == STATE_INITIALIZING,
-            old(core).frames.frame(frame).slot == slot,
+            frame.0 < old(core).frames_spec().metas_spec().len(),
+            old(core).frames_spec().meta(frame).state == STATE_INITIALIZING,
+            old(core).frames_spec().frame(frame).slot == slot,
             slot_is_owned(*old(tok), old(core).instance_id(), slot.loc),
             write_admitted(slot_frontier(*old(tok)), old(core).citations()),
         ensures
@@ -34,53 +36,58 @@ impl HostBackend {
             self.well_formed(final(core)),
             final(ctx).ready(final(core).instance_id(), final(core).node()),
             final(ctx).source@.source() == old(ctx).source@.source(),
-            source_fresh_for_ledger(final(ctx).source@, final(core).ledger@),
-            final(core).node_id == old(core).node_id,
-            final(core).tiers == old(core).tiers,
-            final(core).frames == old(core).frames,
-            final(core).catalog == old(core).catalog,
-            final(core).next_version_seq == old(core).next_version_seq,
-            final(core).version_seq_limit == old(core).version_seq_limit,
-            final(core).active_leases == old(core).active_leases,
-            final(core).spec == old(core).spec,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines.count == old(core).timelines.count,
-            final(core).timelines.kinds == old(core).timelines.kinds,
-            forall|t: u8|
-                t < old(core).timelines.count && t != self.timeline ==> {
-                    &&& (#[trigger] final(core).timelines.next_seq[t as int]) == old(
+            source_fresh_for_ledger(final(ctx).source@, final(core).ledger_spec()@),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec() == old(core).frames_spec(),
+            final(core).catalog_spec() == old(core).catalog_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            final(core).version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+            final(core).active_leases_spec() == old(core).active_leases_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            forall|t: TimelineId|
+                t < old(core).timelines_spec().count_spec() && t != self.timeline ==> {
+                    &&& (#[trigger] final(core).timelines_spec().next_seq_spec()[t as int]) == old(
                         core,
-                    ).timelines.next_seq[t as int]
-                    &&& final(core).timelines.confirmed_seq[t as int] == old(
+                    ).timelines_spec().next_seq_spec()[t as int]
+                    &&& final(core).timelines_spec().confirmed_seq_spec()[t as int] == old(
                         core,
-                    ).timelines.confirmed_seq[t as int]
+                    ).timelines_spec().confirmed_seq_spec()[t as int]
                     &&& forall|s: u64|
-                        1 <= s < old(core).timelines.next_seq[t as int]
-                            ==> #[trigger] final(core).timelines.events@[(t, s)] == old(
-                            core,
-                        ).timelines.events@[(t, s)]
+                        1 <= s < old(core).timelines_spec().next_seq_spec()[t as int]
+                            ==> #[trigger] final(core).timelines_spec().events_spec()@[(t, s)]
+                            == old(core).timelines_spec().events_spec()@[(t, s)]
                 },
-            old(core).ledger@.submitted.map().submap_of(final(core).ledger@.submitted.map()),
-            old(core).ledger@.knows.set().subset_of(final(core).ledger@.knows.set()),
-            old(core).ledger@.succeeded.dom().subset_of(final(core).ledger@.succeeded.dom()),
-            final(core).ledger@.submitted.dom() == old(core).ledger@.submitted.dom().insert(
-                r.1@.writer,
+            old(core).ledger_spec()@.submitted.map().submap_of(
+                final(core).ledger_spec()@.submitted.map(),
             ),
-            final(core).ledger@.revoked == old(core).ledger@.revoked,
+            old(core).ledger_spec()@.knows.set().subset_of(final(core).ledger_spec()@.knows.set()),
+            old(core).ledger_spec()@.succeeded.dom().subset_of(
+                final(core).ledger_spec()@.succeeded.dom(),
+            ),
+            final(core).ledger_spec()@.submitted.dom() == old(
+                core,
+            ).ledger_spec()@.submitted.dom().insert(r.1@.writer),
+            final(core).ledger_spec()@.revoked == old(core).ledger_spec()@.revoked,
             r.1@.writer.source == old(ctx).source@.source(),
-            final(core).ledger@.submitted.map()[r.1@.writer].access.writes == ISet::empty().insert(
-                slot.loc,
-            ),
+            final(core).ledger_spec()@.submitted.map()[r.1@.writer].access.writes
+                == ISet::empty().insert(slot.loc),
             slot_is_owned(*final(tok), final(core).instance_id(), slot.loc),
             slot_frontier(*final(tok)).readers.is_empty(),
             slot_frontier(*final(tok)).last_writer == Some(r.1@.writer),
             r.1@.slot == slot,
-            r.1@.bytes == data@,
+            data matches Some(bytes) ==> r.1@.bytes == bytes@,
             r.1@.bytes.len() == slot.slot_len,
-            final(core).timelines.issued(r.0.timeline_id(), r.0.sequence()),
+            final(core).timelines_spec().issued(r.0.timeline_id(), r.0.sequence()),
             r.0 != Ticket::NONE,
-            r.1@.writer == final(core).timelines.events@[(r.0.timeline_id(), r.0.sequence())],
-            replica_valid(final(core).ledger@, final(core).node(), r.1@),
+            r.1@.writer == final(core).timelines_spec().events_spec()@[(
+                r.0.timeline_id(),
+                r.0.sequence(),
+            )],
+            replica_valid(final(core).ledger_spec()@, final(core).node(), r.1@),
             final(core).citations().contains(r.1@.writer),
     {
         hide(CacheCore::well_formed);
@@ -103,20 +110,34 @@ impl HostBackend {
             );
             assert(dst.slot_ref() == slot);
             lemma_citations_closure(core);
-            lemma_fresh_source_event_absent(ctx.source@, core.ledger@);
+            lemma_fresh_source_event_absent(ctx.source@, core.ledger_spec()@);
             core.lemma_citations_admit_closure(slot_frontier(*tok), ISet::empty());
             assert(ISet::empty().union(core.citations()) =~= core.citations());
         }
-        let Tracked(completion) = host::write_slice(
-            ctx,
-            Tracked(instance),
-            &dst,
-            data,
-            Tracked(tok),
-            Tracked(&core.ledger.borrow().submitted),
-            Tracked(&core.ledger.borrow().knows),
-            Ghost(core.citations()),
-        );
+        let (Tracked(completion), Ghost(bytes)) = match data {
+            Some(data) => {
+                let completion = host::write_slice(
+                    ctx,
+                    Tracked(instance),
+                    &dst,
+                    data,
+                    Tracked(tok),
+                    Tracked(&core.borrow_ledger().submitted),
+                    Tracked(&core.borrow_ledger().knows),
+                    Ghost(core.citations()),
+                );
+                (completion, Ghost(data@))
+            },
+            None => host::record_external_write(
+                ctx,
+                Tracked(instance),
+                &dst,
+                Tracked(tok),
+                Tracked(&core.borrow_ledger().submitted),
+                Tracked(&core.borrow_ledger().knows),
+                Ghost(core.citations()),
+            ),
+        };
         proof {
             lemma_write_disjoint_from_published(
                 core,
@@ -129,8 +150,9 @@ impl HostBackend {
         let ghost write_preds = sub_val.preds;
         let ticket = core.issue_ticket(self.timeline, Tracked(completion.submitted)).unwrap();
         proof {
-            assert(core.timelines.events@[(self.timeline, ticket.sequence())] == writer);
-            assert(core.timelines.observed(
+            assert(core.timelines_spec().events_spec()@[(self.timeline, ticket.sequence())]
+                == writer);
+            assert(core.timelines_spec().observed(
                 self.timeline,
                 ticket.sequence(),
                 core.node(),
@@ -141,8 +163,8 @@ impl HostBackend {
         let ghost cert;
         proof {
             lemma_observed_event_in_citations(
-                before_write.ledger@,
-                core.ledger@,
+                before_write.ledger_spec()@,
+                core.ledger_spec()@,
                 core.node(),
                 writer,
                 sub_val,
@@ -152,17 +174,17 @@ impl HostBackend {
             lemma_source_fresh_stepped(
                 before_ctx.source@,
                 ctx.source@,
-                before_write.ledger@,
-                core.ledger@,
+                before_write.ledger_spec()@,
+                core.ledger_spec()@,
                 writer,
             );
-            assert(source_fresh_for_ledger(self.ctx.source@, core.ledger@)) by {
+            assert(source_fresh_for_ledger(self.ctx.source@, core.ledger_spec()@)) by {
                 assert forall|e: TransferEvent| #[trigger]
-                    core.ledger@.submitted.dom().contains(e) && e.source
+                    core.ledger_spec()@.submitted.dom().contains(e) && e.source
                         == self.ctx.source@.source() && e.observer
                         == self.ctx.source@.node() implies e.seq < self.ctx.source@.next_seq() by {
                     assert(e != writer);
-                    assert(before_write.ledger@.submitted.dom().contains(e));
+                    assert(before_write.ledger_spec()@.submitted.dom().contains(e));
                 }
             }
             lemma_slab_bound_same_frames(
@@ -173,17 +195,16 @@ impl HostBackend {
                 self.num_frames,
                 self.buffer.space(),
             );
-            assert(core.ledger@.submitted.map()[writer].access.writes =~= ISet::empty().insert(
-                slot.loc,
-            ));
+            assert(core.ledger_spec()@.submitted.map()[writer].access.writes
+                =~= ISet::empty().insert(slot.loc));
             cert =
             lemma_certify_host_write(
-                before_write.ledger@,
-                core.ledger@,
+                before_write.ledger_spec()@,
+                core.ledger_spec()@,
                 core.node(),
                 writer,
                 slot,
-                data@,
+                bytes,
             );
         }
         (ticket, Ghost(cert))
@@ -203,50 +224,56 @@ impl HostBackend {
             old(core).well_formed(),
             self.well_formed(old(core)),
             old(ctx).ready(old(core).instance_id(), old(core).node()),
-            source_fresh_for_ledger(old(ctx).source@, old(core).ledger@),
-            old(ctx).source@.source() != self.ctx.source@.source(),
+            source_fresh_for_ledger(old(ctx).source@, old(core).ledger_spec()@),
+            old(ctx).source@.source() != self.ctx_spec().source@.source(),
             instance.id() == old(core).instance_id(),
         ensures
             final(core).well_formed(),
             self.well_formed(final(core)),
             final(ctx).ready(final(core).instance_id(), final(core).node()),
             final(ctx).source@.source() == old(ctx).source@.source(),
-            source_fresh_for_ledger(final(ctx).source@, final(core).ledger@),
-            final(core).node_id == old(core).node_id,
-            final(core).tiers == old(core).tiers,
-            final(core).version_registry == old(core).version_registry,
-            old(core).spec@.versions_monotonic(final(core).spec@),
+            source_fresh_for_ledger(final(ctx).source@, final(core).ledger_spec()@),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            old(core).spec_spec()@.versions_monotonic(final(core).spec_spec()@),
             core_transition(
                 old(core),
                 final(core),
-                Some(self.timeline),
-                Some(old(ctx).source@.source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(self.timeline_spec()),
+                    Some(old(ctx).source@.source()),
+                ),
             ),
             match r {
-                Err(_) => final(core).spec == old(core).spec,
+                Err(_) => final(core).spec_spec() == old(core).spec_spec(),
                 Ok((ver, frame)) => {
                     &&& self.owns(frame)
-                    &&& ver.origin_node == old(core).node_id
-                    &&& ver.seq == old(core).next_version_seq
-                    &&& final(core).next_version_seq == old(core).next_version_seq + 1
-                    &&& final(core).spec@.versions == old(core).spec@.versions.insert(ver, data@)
-                    &&& final(core).spec@.catalog == old(core).spec@.catalog.insert(key, ver)
-                    &&& final(core).catalog.slot(key, self.tier.index() as int) == Some(frame)
-                    &&& final(core).frames.meta(frame).state == STATE_PUBLISHED
+                    &&& ver.origin_node == old(core).node_id_spec()
+                    &&& ver.seq == old(core).next_version_seq_spec()
+                    &&& final(core).next_version_seq_spec() == old(core).next_version_seq_spec() + 1
+                    &&& final(core).spec_spec()@.versions == old(core).spec_spec()@.versions.insert(
+                        ver,
+                        data@,
+                    )
+                    &&& final(core).spec_spec()@.catalog == old(core).spec_spec()@.catalog.insert(
+                        key,
+                        ver,
+                    )
+                    &&& final(core).catalog_spec().slot(key, self.tier_spec().index() as int)
+                        == Some(frame)
+                    &&& final(core).frames_spec().meta(frame).state == STATE_PUBLISHED
                 },
             },
     {
         hide(CacheCore::well_formed);
         hide(replica_valid);
         hide(complete_receipts);
-        if data.len() != core.tier_frame_size(self.tier) {
+        if data.len() != core.registered_tier_frame_size(self.tier) {
             proof {
                 lemma_core_transition_refl(
                     core,
-                    Some(self.timeline),
-                    Some(ctx.source@.source()),
-                    FrameTouchMode::PreserveAllInit,
+                    CoreFootprint::preserve_all(Some(self.timeline), Some(ctx.source@.source())),
                 );
             }
             return Err(CoreError::InvalidArgument);
@@ -257,9 +284,10 @@ impl HostBackend {
                 proof {
                     lemma_core_transition_refl(
                         core,
-                        Some(self.timeline),
-                        Some(ctx.source@.source()),
-                        FrameTouchMode::PreserveAllInit,
+                        CoreFootprint::preserve_all(
+                            Some(self.timeline),
+                            Some(ctx.source@.source()),
+                        ),
                     );
                 }
                 return Err(e);
@@ -286,7 +314,7 @@ impl HostBackend {
                 handle.frame,
             );
         }
-        if core.timelines.next_seq[self.timeline as usize] > MAX_TICKET_SEQ {
+        if core.timelines().next_sequences()[self.timeline as usize] > MAX_TICKET_SEQ {
             let ghost before_abort = *core;
             core.abort_write(handle, Tracked(tok));
             proof {
@@ -298,21 +326,22 @@ impl HostBackend {
                     self.num_frames,
                     self.buffer.space(),
                 );
-                assert(core.frames.preserves_remote_leases(&old(core).frames)) by {
-                    assert forall|f: FrameId| f.0 < old(core).frames.metas.len() implies {
-                        &&& (#[trigger] core.frames.frame(f)).remote_shares == old(
+                assert(core.frames_spec().preserves_fenced_leases(&old(core).frames_spec())) by {
+                    assert forall|f: FrameId|
+                        f.0 < old(core).frames_spec().metas_spec().len() implies {
+                        &&& (#[trigger] core.frames_spec().frame(f)).fenced_shares == old(
                             core,
-                        ).frames.frame(f).remote_shares
-                        &&& core.frames.meta(f).active_remote_leases == old(core).frames.meta(
-                            f,
-                        ).active_remote_leases
+                        ).frames_spec().frame(f).fenced_shares
+                        &&& core.frames_spec().meta(f).active_fenced_leases == old(
+                            core,
+                        ).frames_spec().meta(f).active_fenced_leases
                     } by {
-                        assert(before_abort.frames.frame(f).remote_shares == old(core).frames.frame(
-                            f,
-                        ).remote_shares);
-                        assert(before_abort.frames.meta(f).active_remote_leases == old(
+                        assert(before_abort.frames_spec().frame(f).fenced_shares == old(
                             core,
-                        ).frames.meta(f).active_remote_leases);
+                        ).frames_spec().frame(f).fenced_shares);
+                        assert(before_abort.frames_spec().meta(f).active_fenced_leases == old(
+                            core,
+                        ).frames_spec().meta(f).active_fenced_leases);
                     }
                 }
                 lemma_core_transition_no_event(
@@ -334,7 +363,7 @@ impl HostBackend {
             frame,
             handle.slot,
             Tracked(&mut tok),
-            data,
+            Some(data),
         );
         let ghost before_finish = *core;
         core.finish_write(handle, Tracked(tok), ticket, cert);
@@ -349,53 +378,54 @@ impl HostBackend {
                 self.num_frames,
                 self.buffer.space(),
             );
-            assert(core.frames.same_layout(&old(core).frames)) by {
+            assert(core.frames_spec().same_layout(&old(core).frames_spec())) by {
                 reveal(FrameTable::same_layout);
             }
-            assert(core.frames.preserves_initializing(&old(core).frames, None)) by {
+            assert(core.frames_spec().preserves_initializing(&old(core).frames_spec(), None)) by {
                 reveal(FrameTable::preserves_initializing);
             }
-            assert(core.frames.preserves_remote_leases(&old(core).frames)) by {
-                assert forall|f: FrameId| f.0 < old(core).frames.metas.len() implies {
-                    &&& (#[trigger] core.frames.frame(f)).remote_shares == old(core).frames.frame(
-                        f,
-                    ).remote_shares
-                    &&& core.frames.meta(f).active_remote_leases == old(core).frames.meta(
-                        f,
-                    ).active_remote_leases
-                } by {
-                    assert(before_finish.frames.frame(f).remote_shares == old(core).frames.frame(
-                        f,
-                    ).remote_shares);
-                    assert(before_finish.frames.meta(f).active_remote_leases == old(
+            assert(core.frames_spec().preserves_fenced_leases(&old(core).frames_spec())) by {
+                assert forall|f: FrameId| f.0 < old(core).frames_spec().metas_spec().len() implies {
+                    &&& (#[trigger] core.frames_spec().frame(f)).fenced_shares == old(
                         core,
-                    ).frames.meta(f).active_remote_leases);
+                    ).frames_spec().frame(f).fenced_shares
+                    &&& core.frames_spec().meta(f).active_fenced_leases == old(
+                        core,
+                    ).frames_spec().meta(f).active_fenced_leases
+                } by {
+                    assert(before_finish.frames_spec().frame(f).fenced_shares == old(
+                        core,
+                    ).frames_spec().frame(f).fenced_shares);
+                    assert(before_finish.frames_spec().meta(f).active_fenced_leases == old(
+                        core,
+                    ).frames_spec().meta(f).active_fenced_leases);
                 }
             }
             assert forall|f: FrameId|
-                f.0 < old(core).frames.metas.len() && (#[trigger] old(core).frames.meta(f)).state
-                    == STATE_INITIALIZING implies slot.loc != old(core).frames.frame(
-                f,
-            ).slot.loc by {
-                assert(old(core).frames.meta(frame).state == STATE_EMPTY);
+                f.0 < old(core).frames_spec().metas_spec().len() && (#[trigger] old(
+                    core,
+                ).frames_spec().meta(f)).state == STATE_INITIALIZING implies slot.loc != old(
+                core,
+            ).frames_spec().frame(f).slot.loc by {
+                assert(old(core).frames_spec().meta(frame).state == STATE_EMPTY);
                 assert(frame != f);
                 if frame.0 < f.0 {
-                    assert(old(core).frames.ghosts@[frame.0 as nat].slot.loc != old(
+                    assert(old(core).frames_spec().ghosts_spec()@[frame.0 as nat].slot.loc != old(
                         core,
-                    ).frames.ghosts@[f.0 as nat].slot.loc);
+                    ).frames_spec().ghosts_spec()@[f.0 as nat].slot.loc);
                 } else {
-                    assert(old(core).frames.ghosts@[f.0 as nat].slot.loc != old(
+                    assert(old(core).frames_spec().ghosts_spec()@[f.0 as nat].slot.loc != old(
                         core,
-                    ).frames.ghosts@[frame.0 as nat].slot.loc);
+                    ).frames_spec().ghosts_spec()@[frame.0 as nat].slot.loc);
                 }
             }
             lemma_core_wf_facts(old(core));
             lemma_core_wf_facts(core);
             lemma_published_frame_replica_valid(core, frame);
-            assert(core.frames.frame(frame).cert == Some(cert@)) by {
+            assert(core.frames_spec().frame(frame).cert == Some(cert@)) by {
                 reveal(FrameTable::same_directory);
             }
-            assert(core.frames.frame(frame).bound_version == Some(ver)) by {
+            assert(core.frames_spec().frame(frame).bound_version == Some(ver)) by {
                 reveal(FrameTable::same_directory);
             }
             lemma_core_transition_single_event(
@@ -426,8 +456,8 @@ impl HostBackend {
             old(core).well_formed(),
             self.well_formed(old(core)),
             old(ctx).ready(old(core).instance_id(), old(core).node()),
-            source_fresh_for_ledger(old(ctx).source@, old(core).ledger@),
-            old(ctx).source@.source() != self.ctx.source@.source(),
+            source_fresh_for_ledger(old(ctx).source@, old(core).ledger_spec()@),
+            old(ctx).source@.source() != self.ctx_spec().source@.source(),
             instance.id() == old(core).instance_id(),
             old(shares).well_formed(),
             old(shares).id() == old(core).instance_id(),
@@ -437,29 +467,28 @@ impl HostBackend {
             self.well_formed(final(core)),
             final(ctx).ready(final(core).instance_id(), final(core).node()),
             final(ctx).source@.source() == old(ctx).source@.source(),
-            source_fresh_for_ledger(final(ctx).source@, final(core).ledger@),
+            source_fresh_for_ledger(final(ctx).source@, final(core).ledger_spec()@),
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
             final(dst)@.len() == old(dst)@.len(),
-            final(core).node_id == old(core).node_id,
-            final(core).tiers == old(core).tiers,
-            final(core).spec == old(core).spec,
-            final(core).version_registry == old(core).version_registry,
-            final(core).frames.same_directory(&old(core).frames),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).frames_spec().same_directory(&old(core).frames_spec()),
             core_transition(
                 old(core),
                 final(core),
-                None,
-                Some(old(ctx).source@.source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(None, Some(old(ctx).source@.source())),
             ),
-            r matches Ok(ver) ==> self.owns(frame) && old(core).frames.meta(frame).state
-                == STATE_PUBLISHED && old(core).frames.frame(frame).bound_version == Some(ver)
-                && old(core).frames.frame(frame).cert is Some && host_read_witness(
+            r matches Ok(ver) ==> self.owns(frame) && old(core).frames_spec().meta(frame).state
+                == STATE_PUBLISHED && old(core).frames_spec().frame(frame).bound_version == Some(
+                ver,
+            ) && old(core).frames_spec().frame(frame).cert is Some && host_read_witness(
                 final(core),
                 old(ctx).source@.next_event(),
-                old(core).frames.frame(frame).cert.unwrap(),
+                old(core).frames_spec().frame(frame).cert.unwrap(),
                 ver,
                 final(dst)@,
             ),
@@ -467,13 +496,11 @@ impl HostBackend {
         hide(CacheCore::well_formed);
         hide(replica_valid);
         hide(complete_receipts);
-        if dst.len() != core.tier_frame_size(self.tier) {
+        if dst.len() != core.registered_tier_frame_size(self.tier) {
             proof {
                 lemma_core_transition_refl(
                     core,
-                    None,
-                    Some(ctx.source@.source()),
-                    FrameTouchMode::PreserveAllInit,
+                    CoreFootprint::preserve_all(None, Some(ctx.source@.source())),
                 );
             }
             return Err(CoreError::InvalidArgument);
@@ -482,9 +509,7 @@ impl HostBackend {
             proof {
                 lemma_core_transition_refl(
                     core,
-                    None,
-                    Some(ctx.source@.source()),
-                    FrameTouchMode::PreserveAllInit,
+                    CoreFootprint::preserve_all(None, Some(ctx.source@.source())),
                 );
             }
             return Err(CoreError::UnsupportedTier);
@@ -500,9 +525,7 @@ impl HostBackend {
                 proof {
                     lemma_core_transition_refl(
                         core,
-                        None,
-                        Some(ctx.source@.source()),
-                        FrameTouchMode::PreserveAllInit,
+                        CoreFootprint::preserve_all(None, Some(ctx.source@.source())),
                     );
                 }
                 return Err(e);
@@ -515,7 +538,9 @@ impl HostBackend {
         let tracked mut perm = ReadPerm::Shared(cap);
         proof {
             lemma_published_frame_slot_valid(old(core), frame);
-            assert(before_read_core.frames.published(frame) == old(core).frames.published(frame));
+            assert(before_read_core.frames_spec().published(frame) == old(
+                core,
+            ).frames_spec().published(frame));
             lemma_core_wf_facts(core);
             lemma_slab_bound_same_directory(
                 old(core),
@@ -533,9 +558,9 @@ impl HostBackend {
                 self.buffer.space(),
                 frame,
             );
-            assert(src.slot_ref() == core.frames.frame(frame).slot);
+            assert(src.slot_ref() == core.frames_spec().frame(frame).slot);
             lemma_citations_closure(core);
-            lemma_fresh_source_event_absent(ctx.source@, core.ledger@);
+            lemma_fresh_source_event_absent(ctx.source@, core.ledger_spec()@);
             core.lemma_citations_admit_closure(perm.frontier(), ISet::empty());
             assert(ISet::empty().union(core.citations()) =~= core.citations());
         }
@@ -545,8 +570,8 @@ impl HostBackend {
             &src,
             dst,
             Tracked(&mut perm),
-            Tracked(&core.ledger.borrow().submitted),
-            Tracked(&core.ledger.borrow().knows),
+            Tracked(&core.borrow_ledger().submitted),
+            Tracked(&core.borrow_ledger().knows),
             Ghost(core.citations()),
         );
         let tracked cap = perm.into_shared();
@@ -563,8 +588,8 @@ impl HostBackend {
         );
         proof {
             lemma_observed_event_in_citations(
-                before_read_core.ledger@,
-                core.ledger@,
+                before_read_core.ledger_spec()@,
+                core.ledger_spec()@,
                 core.node(),
                 reader,
                 sub_val,
@@ -574,17 +599,17 @@ impl HostBackend {
             lemma_source_fresh_stepped(
                 before_ctx.source@,
                 ctx.source@,
-                before_read_core.ledger@,
-                core.ledger@,
+                before_read_core.ledger_spec()@,
+                core.ledger_spec()@,
                 reader,
             );
-            assert(source_fresh_for_ledger(self.ctx.source@, core.ledger@)) by {
+            assert(source_fresh_for_ledger(self.ctx.source@, core.ledger_spec()@)) by {
                 assert forall|e: TransferEvent| #[trigger]
-                    core.ledger@.submitted.dom().contains(e) && e.source
+                    core.ledger_spec()@.submitted.dom().contains(e) && e.source
                         == self.ctx.source@.source() && e.observer
                         == self.ctx.source@.node() implies e.seq < self.ctx.source@.next_seq() by {
                     assert(e != reader);
-                    assert(before_read_core.ledger@.submitted.dom().contains(e));
+                    assert(before_read_core.ledger_spec()@.submitted.dom().contains(e));
                 }
             }
             lemma_returned_reads_observed(core, frame, cap, reader);
@@ -610,52 +635,54 @@ impl HostBackend {
                 self.num_frames,
                 self.buffer.space(),
             );
-            assert(core.frames.same_directory(&old(core).frames));
-            assert(core.frames.same_layout(&old(core).frames)) by {
+            assert(core.frames_spec().same_directory(&old(core).frames_spec()));
+            assert(core.frames_spec().same_layout(&old(core).frames_spec())) by {
                 reveal(FrameTable::same_layout);
             }
-            assert(core.frames.preserves_initializing(&old(core).frames, None)) by {
+            assert(core.frames_spec().preserves_initializing(&old(core).frames_spec(), None)) by {
                 reveal(FrameTable::preserves_initializing);
             }
-            assert(core.frames.preserves_remote_leases(&old(core).frames)) by {
-                assert forall|f: FrameId| f.0 < old(core).frames.metas.len() implies {
-                    &&& (#[trigger] core.frames.frame(f)).remote_shares == old(core).frames.frame(
-                        f,
-                    ).remote_shares
-                    &&& core.frames.meta(f).active_remote_leases == old(core).frames.meta(
-                        f,
-                    ).active_remote_leases
-                } by {
-                    assert(before_release.frames.frame(f).remote_shares == old(core).frames.frame(
-                        f,
-                    ).remote_shares);
-                    assert(before_release.frames.meta(f).active_remote_leases == old(
+            assert(core.frames_spec().preserves_fenced_leases(&old(core).frames_spec())) by {
+                assert forall|f: FrameId| f.0 < old(core).frames_spec().metas_spec().len() implies {
+                    &&& (#[trigger] core.frames_spec().frame(f)).fenced_shares == old(
                         core,
-                    ).frames.meta(f).active_remote_leases);
+                    ).frames_spec().frame(f).fenced_shares
+                    &&& core.frames_spec().meta(f).active_fenced_leases == old(
+                        core,
+                    ).frames_spec().meta(f).active_fenced_leases
+                } by {
+                    assert(before_release.frames_spec().frame(f).fenced_shares == old(
+                        core,
+                    ).frames_spec().frame(f).fenced_shares);
+                    assert(before_release.frames_spec().meta(f).active_fenced_leases == old(
+                        core,
+                    ).frames_spec().meta(f).active_fenced_leases);
                 }
             }
             assert forall|s: int|
-                0 <= s < old(core).active_leases.len() && (#[trigger] old(
+                0 <= s < old(core).active_leases_spec().len() && (#[trigger] old(
                     core,
-                ).active_leases[s] matches Some(l) && l.internal) implies core.active_leases[s]
-                == old(core).active_leases[s] by {
-                assert(s != lease.slot as int);
+                ).active_leases_spec()[s] matches Some(l)
+                    && l.internal) implies core.active_leases_spec()[s] == old(
+                core,
+            ).active_leases_spec()[s] by {
+                assert(s != lease.slot_spec() as int);
             }
             lemma_core_wf_facts(old(core));
             lemma_core_wf_facts(core);
             lemma_published_frame_replica_valid(core, frame);
-            assert(core.frames.frame(frame).cert == Some(cert)) by {
+            assert(core.frames_spec().frame(frame).cert == Some(cert)) by {
                 reveal(FrameTable::same_directory);
             }
-            assert(core.frames.frame(frame).bound_version == Some(version)) by {
+            assert(core.frames_spec().frame(frame).bound_version == Some(version)) by {
                 reveal(FrameTable::same_directory);
             }
             assert(reader.source.succeeds_on_observe()) by {
                 assert(reader.source == before_ctx.source@.source());
             }
-            assert(core.ledger@.citations(core.node()).contains(reader));
-            assert(event_succeeded(core.ledger@, core.node(), reader));
-            assert(core.ledger@.submitted.map()[reader] == sub_val);
+            assert(core.ledger_spec()@.citations(core.node()).contains(reader));
+            assert(event_succeeded(core.ledger_spec()@, core.node(), reader));
+            assert(core.ledger_spec()@.submitted.map()[reader] == sub_val);
             assert(sub_val.access.reads.contains(cert.slot.loc));
             assert(effect_implies(sub_val.effect, read_bytes_effect(cert.slot, dst@)));
             lemma_core_transition_single_event(

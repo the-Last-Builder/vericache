@@ -32,7 +32,7 @@ impl Fixture {
         let (Tracked(instance), allocations, Tracked(mut sources), _) = NodeContext::bootstrap(
             0,
         ).into_sources();
-        let host = HostContext::new(Tracked(sources.mint(EventSourceKind::Host)));
+        let host = HostContext::new(Tracked(sources.mint(EventSourceKind::host())));
         Self {
             host,
             allocations,
@@ -62,7 +62,7 @@ impl Fixture {
     fn stream(&mut self, device: u32) -> CudaStream {
         CudaStream::new(
             device,
-            Tracked(self.sources.borrow_mut().mint(EventSourceKind::CudaStream)),
+            Tracked(self.sources.borrow_mut().mint(EventSourceKind::cuda_stream())),
         ).unwrap()
     }
 

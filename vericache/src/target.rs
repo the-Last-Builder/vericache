@@ -6,17 +6,17 @@ use transfer::transport::ByteTransport;
 use vericache_core::spec::{ObjectKey, VersionId};
 
 use crate::cache::VeriCache;
+use crate::device::DeviceRuntime;
 use crate::policy::{EvictionPolicy, PeerRoutingPolicy, TieringPolicy};
-use crate::resources::{GpuSlot, GpuStream};
-use crate::{CacheError, GpuReadHit, ReadHit};
+use crate::{CacheError, DefaultDeviceRuntime, GpuReadHit, ReadHit};
 
 /// Destination buffer passed to [`VeriCache::get`].
-pub trait ReadTarget {
+pub trait ReadTarget<RT: DeviceRuntime = DefaultDeviceRuntime> {
     type Output;
 
     fn load<T, E, P, R>(
         self,
-        cache: &mut VeriCache<'_, T, E, P, R>,
+        cache: &mut VeriCache<'_, T, E, P, R, RT>,
         key: ObjectKey,
     ) -> Result<Option<Self::Output>, CacheError>
     where
@@ -27,12 +27,12 @@ pub trait ReadTarget {
 }
 
 /// Source payload passed to [`VeriCache::put`].
-pub trait WriteSource {
+pub trait WriteSource<RT: DeviceRuntime = DefaultDeviceRuntime> {
     type Output;
 
     fn store<T, E, P, R>(
         self,
-        cache: &mut VeriCache<'_, T, E, P, R>,
+        cache: &mut VeriCache<'_, T, E, P, R, RT>,
         key: ObjectKey,
     ) -> Result<Self::Output, CacheError>
     where
@@ -42,36 +42,42 @@ pub trait WriteSource {
         R: PeerRoutingPolicy;
 }
 
-/// GPU destination descriptor pairing a caller [`GpuStream`] and managed [`GpuSlot`].
-pub struct GpuDst<'a> {
-    pub stream: &'a mut GpuStream,
-    pub slot: &'a mut GpuSlot,
+/// Device destination descriptor pairing a caller stream and slot.
+pub struct DeviceDst<'a, RT: DeviceRuntime> {
+    pub stream: &'a mut RT::Stream,
+    pub slot: &'a mut RT::Slot,
 }
 
-impl<'a> GpuDst<'a> {
-    pub fn new(stream: &'a mut GpuStream, slot: &'a mut GpuSlot) -> Self {
+impl<'a, RT: DeviceRuntime> DeviceDst<'a, RT> {
+    pub fn new(stream: &'a mut RT::Stream, slot: &'a mut RT::Slot) -> Self {
         Self { stream, slot }
     }
 }
 
-/// GPU source descriptor pairing a caller [`GpuStream`] and managed [`GpuSlot`].
-pub struct GpuSrc<'a> {
-    pub stream: &'a mut GpuStream,
-    pub slot: &'a mut GpuSlot,
+/// Device source descriptor pairing a caller stream and slot.
+pub struct DeviceSrc<'a, RT: DeviceRuntime> {
+    pub stream: &'a mut RT::Stream,
+    pub slot: &'a mut RT::Slot,
 }
 
-impl<'a> GpuSrc<'a> {
-    pub fn new(stream: &'a mut GpuStream, slot: &'a mut GpuSlot) -> Self {
+impl<'a, RT: DeviceRuntime> DeviceSrc<'a, RT> {
+    pub fn new(stream: &'a mut RT::Stream, slot: &'a mut RT::Slot) -> Self {
         Self { stream, slot }
     }
 }
 
-impl ReadTarget for &mut [u8] {
+/// Destination descriptor for the default GPU runtime.
+pub type GpuDst<'a> = DeviceDst<'a, DefaultDeviceRuntime>;
+
+/// Source descriptor for the default GPU runtime.
+pub type GpuSrc<'a> = DeviceSrc<'a, DefaultDeviceRuntime>;
+
+impl<RT: DeviceRuntime> ReadTarget<RT> for &mut [u8] {
     type Output = ReadHit;
 
     fn load<T, E, P, R>(
         self,
-        cache: &mut VeriCache<'_, T, E, P, R>,
+        cache: &mut VeriCache<'_, T, E, P, R, RT>,
         key: ObjectKey,
     ) -> Result<Option<ReadHit>, CacheError>
     where
@@ -84,12 +90,12 @@ impl ReadTarget for &mut [u8] {
     }
 }
 
-impl ReadTarget for &mut Vec<u8> {
+impl<RT: DeviceRuntime> ReadTarget<RT> for &mut Vec<u8> {
     type Output = ReadHit;
 
     fn load<T, E, P, R>(
         self,
-        cache: &mut VeriCache<'_, T, E, P, R>,
+        cache: &mut VeriCache<'_, T, E, P, R, RT>,
         key: ObjectKey,
     ) -> Result<Option<ReadHit>, CacheError>
     where
@@ -102,12 +108,12 @@ impl ReadTarget for &mut Vec<u8> {
     }
 }
 
-impl ReadTarget for GpuDst<'_> {
+impl<RT: DeviceRuntime> ReadTarget<RT> for DeviceDst<'_, RT> {
     type Output = GpuReadHit;
 
     fn load<T, E, P, R>(
         self,
-        cache: &mut VeriCache<'_, T, E, P, R>,
+        cache: &mut VeriCache<'_, T, E, P, R, RT>,
         key: ObjectKey,
     ) -> Result<Option<GpuReadHit>, CacheError>
     where
@@ -120,12 +126,12 @@ impl ReadTarget for GpuDst<'_> {
     }
 }
 
-impl WriteSource for &[u8] {
+impl<RT: DeviceRuntime> WriteSource<RT> for &[u8] {
     type Output = VersionId;
 
     fn store<T, E, P, R>(
         self,
-        cache: &mut VeriCache<'_, T, E, P, R>,
+        cache: &mut VeriCache<'_, T, E, P, R, RT>,
         key: ObjectKey,
     ) -> Result<VersionId, CacheError>
     where
@@ -138,12 +144,12 @@ impl WriteSource for &[u8] {
     }
 }
 
-impl WriteSource for GpuSrc<'_> {
+impl<RT: DeviceRuntime> WriteSource<RT> for DeviceSrc<'_, RT> {
     type Output = VersionId;
 
     fn store<T, E, P, R>(
         self,
-        cache: &mut VeriCache<'_, T, E, P, R>,
+        cache: &mut VeriCache<'_, T, E, P, R, RT>,
         key: ObjectKey,
     ) -> Result<VersionId, CacheError>
     where

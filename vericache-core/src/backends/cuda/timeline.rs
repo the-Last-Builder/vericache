@@ -7,17 +7,33 @@ verus! {
 
 /// One slot in the bounded CUDA event ring.
 pub struct EventSlot {
-    pub event: CudaEvent,
-    pub generation: u64,
-    pub recorded_seq: u64,
-    pub in_use: bool,
+    pub(crate) event: CudaEvent,
+    pub(crate) generation: u64,
+    pub(crate) recorded_seq: u64,
+    pub(crate) in_use: bool,
 }
 
 impl EventSlot {
-    pub open spec fn valid(
+    pub open(crate) spec fn recorded_seq_spec(&self) -> u64 {
+        self.recorded_seq
+    }
+
+    pub open(crate) spec fn generation_spec(&self) -> u64 {
+        self.generation
+    }
+
+    pub open(crate) spec fn in_use_spec(&self) -> bool {
+        self.in_use
+    }
+
+    pub open(crate) spec fn event_spec(&self) -> CudaEvent {
+        self.event
+    }
+
+    pub open(crate) spec fn valid(
         &self,
         table: &TimelineTable,
-        t: u8,
+        t: TimelineId,
         device: DeviceId,
         node: NodeId,
         ledger: &KnowledgeLedger,
@@ -28,21 +44,21 @@ impl EventSlot {
         &&& self.event.infos().instance_id() == ledger.submitted.instance_id()
         &&& self.event.infos().map().submap_of(ledger.submitted.map())
         &&& self.event.recorded().subset_of(self.event.infos().dom())
-        &&& self.recorded_seq < table.next_seq[t as int]
+        &&& self.recorded_seq < table.next_seq_spec()[t as int]
         &&& table.prefix_in(
             t,
             self.recorded_seq,
             closure_from(self.event.infos().map(), self.event.recorded()),
         )
-        &&& !self.in_use ==> self.recorded_seq <= table.confirmed_seq[t as int]
+        &&& !self.in_use ==> self.recorded_seq <= table.confirmed_seq_spec()[t as int]
     }
 
     pub fn new(event: CudaEvent) -> (slot: Self)
         ensures
-            slot.event == event,
-            slot.generation == 0,
-            slot.recorded_seq == 0,
-            !slot.in_use,
+            slot.event_spec() == event,
+            slot.generation_spec() == 0,
+            slot.recorded_seq_spec() == 0,
+            !slot.in_use_spec(),
     {
         Self { event, generation: 0, recorded_seq: 0, in_use: false }
     }
@@ -52,7 +68,7 @@ impl EventSlot {
 pub open spec fn event_ring_valid(
     ring: Seq<EventSlot>,
     table: &TimelineTable,
-    t: u8,
+    t: TimelineId,
     device: DeviceId,
     node: NodeId,
     ledger: &KnowledgeLedger,
@@ -61,23 +77,47 @@ pub open spec fn event_ring_valid(
 }
 
 #[verifier::opaque]
-pub open spec fn ring_latest_covers(ring: Seq<EventSlot>, newest: int) -> bool {
+pub open(crate) spec fn ring_latest_covers(ring: Seq<EventSlot>, newest: int) -> bool {
     0 <= newest < ring.len() && forall|i: int|
         0 <= i < ring.len() ==> (#[trigger] ring[i]).recorded_seq <= ring[newest].recorded_seq
 }
 
 /// Ordered CUDA stream timeline backed by a bounded `CudaEvent` ring.
 pub struct CudaTimeline {
-    pub timeline_id: u8,
-    pub device: DeviceId,
-    pub stream: CudaStream,
-    pub event_ring: Vec<EventSlot>,
-    pub ring_head: usize,
-    pub ring_tail: usize,
+    pub(crate) timeline_id: TimelineId,
+    pub(crate) device: DeviceId,
+    pub(crate) stream: CudaStream,
+    pub(crate) event_ring: Vec<EventSlot>,
+    pub(crate) ring_head: usize,
+    pub(crate) ring_tail: usize,
 }
 
 impl CudaTimeline {
-    pub open spec fn newest(&self) -> int {
+    pub open(crate) spec fn ring_tail_spec(&self) -> usize {
+        self.ring_tail
+    }
+
+    pub open(crate) spec fn ring_head_spec(&self) -> usize {
+        self.ring_head
+    }
+
+    pub open(crate) spec fn device_spec(&self) -> DeviceId {
+        self.device
+    }
+
+    pub open(crate) spec fn event_ring_spec(&self) -> Vec<EventSlot> {
+        self.event_ring
+    }
+
+    pub open(crate) spec fn timeline_id_spec(&self) -> TimelineId {
+        self.timeline_id
+    }
+
+    pub open(crate) spec fn stream_spec(&self) -> CudaStream {
+        self.stream
+    }
+
+    pub open(crate) spec fn newest(&self) -> int {
         if self.ring_tail == 0 {
             self.event_ring.len() - 1
         } else {
@@ -85,28 +125,28 @@ impl CudaTimeline {
         }
     }
 
-    pub open spec fn closure(&self) -> ISet<TransferEvent> {
+    pub open(crate) spec fn closure(&self) -> ISet<TransferEvent> {
         closure_from(self.stream.infos().map(), self.stream.tail())
     }
 
-    pub open spec fn well_formed(
+    pub open(crate) spec fn well_formed(
         &self,
         table: &TimelineTable,
         node: NodeId,
         ledger: &KnowledgeLedger,
     ) -> bool {
         let t = self.timeline_id;
-        &&& t < table.count && table.count <= MAX_TIMELINES
-        &&& table.kinds[t as int] == (TimelineKind::CudaStream { device: self.device })
+        &&& t < table.count_spec() && table.count_spec() <= MAX_TIMELINES
+        &&& table.kinds_spec()[t as int] == (TimelineKind::CudaStream { device: self.device })
         &&& source_fresh_for_ledger(self.stream.source(), *ledger)
-        &&& self.stream.source().source() is CudaStream
+        &&& self.stream.source().source().is_cuda_stream()
         &&& self.stream.well_formed()
         &&& self.stream.device() == self.device
         &&& self.stream.source().node() == node
         &&& self.stream.source().id() == ledger.submitted.instance_id()
         &&& self.stream.infos().map().submap_of(ledger.submitted.map())
         &&& self.stream.tail().subset_of(self.stream.infos().dom())
-        &&& table.prefix_in(t, (table.next_seq[t as int] - 1) as u64, self.closure())
+        &&& table.prefix_in(t, (table.next_seq_spec()[t as int] - 1) as u64, self.closure())
         &&& self.ring_head < self.event_ring.len() <= u32::MAX
         &&& self.ring_tail < self.event_ring.len()
         &&& ring_latest_covers(self.event_ring@, self.newest())
@@ -145,7 +185,7 @@ impl CudaTimeline {
     }
 
     /// Allocate a CUDA stream and bounded event pool without touching `core`.
-    pub fn create_hardware(
+    pub(crate) fn create_hardware(
         Tracked(instance): Tracked<&TransferInstance>,
         device: DeviceId,
         Ghost(node): Ghost<NodeId>,
@@ -156,7 +196,7 @@ impl CudaTimeline {
             stream_source.well_formed(),
             stream_source.id() == instance.id(),
             stream_source.node() == node,
-            stream_source.source() is CudaStream,
+            stream_source.source().is_cuda_stream(),
             stream_source.next_seq() == 0,
             0 < ring_len <= u32::MAX,
         ensures
@@ -220,13 +260,13 @@ impl CudaTimeline {
         Ok((stream, slots))
     }
 
-    pub fn destroy_hardware(stream: CudaStream, slots: Vec<EventSlot>) {
+    pub(crate) fn destroy_hardware(stream: CudaStream, slots: Vec<EventSlot>) {
         let _ = Self::destroy_slots(slots);
         let _ = stream.destroy();
     }
 
     /// Register pre-allocated CUDA stream + event pool into `core`.
-    pub fn register(
+    pub(crate) fn register(
         core: &mut CacheCore,
         device: DeviceId,
         stream: CudaStream,
@@ -234,13 +274,13 @@ impl CudaTimeline {
     ) -> (tl: Self)
         requires
             old(core).well_formed(),
-            old(core).timelines.count < MAX_TIMELINES,
+            old(core).timelines_spec().count_spec() < MAX_TIMELINES,
             stream.well_formed(),
             stream.device() == device,
-            stream.source().source() is CudaStream,
+            stream.source().source().is_cuda_stream(),
             stream.source().id() == old(core).instance_id(),
             stream.source().node() == old(core).node(),
-            source_fresh_for_ledger(stream.source(), old(core).ledger@),
+            source_fresh_for_ledger(stream.source(), old(core).ledger_spec()@),
             stream.tail() == ISet::empty(),
             stream.infos().map() == IMap::empty(),
             0 < slots.len() <= u32::MAX,
@@ -258,14 +298,18 @@ impl CudaTimeline {
                 },
         ensures
             final(core).well_formed(),
-            final(core).node_id == old(core).node_id,
-            final(core).tiers == old(core).tiers,
-            final(core).frames == old(core).frames,
-            final(core).catalog == old(core).catalog,
-            final(core).ledger == old(core).ledger,
-            final(core).spec == old(core).spec,
-            tl.well_formed(&final(core).timelines, final(core).node(), &final(core).ledger@),
-            tl.timeline_id == old(core).timelines.count,
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec() == old(core).frames_spec(),
+            final(core).catalog_spec() == old(core).catalog_spec(),
+            final(core).ledger_spec() == old(core).ledger_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            tl.well_formed(
+                &final(core).timelines_spec(),
+                final(core).node(),
+                &final(core).ledger_spec()@,
+            ),
+            tl.timeline_id == old(core).timelines_spec().count_spec(),
             tl.device == device,
             tl.event_ring.len() == slots.len(),
     {
@@ -285,14 +329,14 @@ impl CudaTimeline {
         proof {
             lemma_cuda_timeline_init_wf(
                 &tl.event_ring@,
-                &core.timelines,
+                &core.timelines_spec(),
                 timeline_id,
                 device,
                 node,
-                &core.ledger@,
+                &core.ledger_spec()@,
                 tl.newest(),
             );
-            lemma_empty_imap_submap(core.ledger@.submitted.map());
+            lemma_empty_imap_submap(core.ledger_spec()@.submitted.map());
         }
         tl
     }
@@ -311,28 +355,28 @@ impl CudaTimeline {
             stream_source.well_formed(),
             stream_source.id() == old(core).instance_id(),
             stream_source.node() == old(core).node(),
-            stream_source.source() is CudaStream,
+            stream_source.source().is_cuda_stream(),
             stream_source.next_seq() == 0,
-            source_fresh_for_ledger(stream_source, old(core).ledger@),
+            source_fresh_for_ledger(stream_source, old(core).ledger_spec()@),
         ensures
             final(core).well_formed(),
-            final(core).node_id == old(core).node_id,
-            final(core).tiers == old(core).tiers,
-            final(core).frames == old(core).frames,
-            final(core).catalog == old(core).catalog,
-            final(core).ledger == old(core).ledger,
-            final(core).spec == old(core).spec,
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec() == old(core).frames_spec(),
+            final(core).catalog_spec() == old(core).catalog_spec(),
+            final(core).ledger_spec() == old(core).ledger_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
             match r {
                 Err(_) => *final(core) == *old(core),
                 Ok(tl) => {
                     &&& tl.well_formed(
-                        &final(core).timelines,
+                        &final(core).timelines_spec(),
                         final(core).node(),
-                        &final(core).ledger@,
+                        &final(core).ledger_spec()@,
                     )
-                    &&& tl.timeline_id == old(core).timelines.count
-                    &&& tl.device == device
-                    &&& tl.event_ring.len() == ring_len
+                    &&& tl.timeline_id_spec() == old(core).timelines_spec().count_spec()
+                    &&& tl.device_spec() == device
+                    &&& tl.event_ring_spec().len() == ring_len
                 },
             },
     {
@@ -345,7 +389,7 @@ impl CudaTimeline {
         if ring_len == 0 || ring_len > u32::MAX as usize {
             return Err(CoreError::InvalidArgument);
         }
-        if core.timelines.count >= MAX_TIMELINES {
+        if core.timeline_count() >= MAX_TIMELINES {
             return Err(CoreError::CapacityExhausted);
         }
         let (stream, slots) = Self::create_hardware(
@@ -363,29 +407,31 @@ impl CudaTimeline {
     pub fn record_event(&mut self, core: &CacheCore) -> (r: BackendResult<SyncPoint>)
         requires
             core.well_formed(),
-            old(self).well_formed(&core.timelines, core.node(), &core.ledger@),
+            old(self).well_formed(&core.timelines_spec(), core.node(), &core.ledger_spec()@),
         ensures
-            final(self).well_formed(&core.timelines, core.node(), &core.ledger@),
-            final(self).stream == old(self).stream,
-            final(self).timeline_id == old(self).timeline_id,
-            final(self).device == old(self).device,
-            final(self).event_ring.len() == old(self).event_ring.len(),
+            final(self).well_formed(&core.timelines_spec(), core.node(), &core.ledger_spec()@),
+            final(self).stream_spec() == old(self).stream_spec(),
+            final(self).timeline_id_spec() == old(self).timeline_id_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).event_ring_spec().len() == old(self).event_ring_spec().len(),
             match r {
-                Err(_) => final(self).event_ring@ == old(self).event_ring@ && final(self).ring_head
-                    == old(self).ring_head && final(self).ring_tail == old(self).ring_tail,
+                Err(_) => final(self).event_ring_spec()@ == old(self).event_ring_spec()@
+                    && final(self).ring_head_spec() == old(self).ring_head_spec()
+                    && final(self).ring_tail_spec() == old(self).ring_tail_spec(),
                 Ok(point) => point matches SyncPoint::TimelineEvent {
                     timeline,
                     event_slot,
                     generation,
                 } && {
-                    let slot = final(self).event_ring[event_slot as int];
-                    &&& timeline == final(self).timeline_id
-                    &&& (event_slot as usize) < final(self).event_ring.len()
+                    let slot = final(self).event_ring_spec()[event_slot as int];
+                    &&& timeline == final(self).timeline_id_spec()
+                    &&& (event_slot as usize) < final(self).event_ring_spec().len()
                     &&& generation != 0
-                    &&& slot.in_use
-                    &&& slot.generation == generation
-                    &&& slot.recorded_seq == core.timelines.next_seq[timeline as int] - 1
-                    &&& slot.event.recorded() == final(self).stream.tail()
+                    &&& slot.in_use_spec()
+                    &&& slot.generation_spec() == generation
+                    &&& slot.recorded_seq_spec()
+                        == core.timelines_spec().next_seq_spec()[timeline as int] - 1
+                    &&& slot.event_spec().recorded() == final(self).stream_spec().tail()
                 },
             },
     {
@@ -398,11 +444,11 @@ impl CudaTimeline {
             lemma_core_wf_facts(core);
             lemma_event_ring_index(
                 before_ring,
-                &core.timelines,
+                &core.timelines_spec(),
                 self.timeline_id,
                 self.device,
                 core.node(),
-                &core.ledger@,
+                &core.ledger_spec()@,
                 i as int,
             );
         }
@@ -421,7 +467,7 @@ impl CudaTimeline {
             return Err(cuda_error(e));
         }
         slot.generation += 1;
-        slot.recorded_seq = core.timelines.next_seq[self.timeline_id as usize] - 1;
+        slot.recorded_seq = core.timelines().next_sequences()[self.timeline_id as usize] - 1;
         slot.in_use = true;
         let generation = slot.generation;
         self.ring_tail = Self::next_slot(i, self.event_ring.len());
@@ -430,11 +476,11 @@ impl CudaTimeline {
             lemma_event_ring_after_record(
                 before_ring,
                 self.event_ring@,
-                &core.timelines,
+                &core.timelines_spec(),
                 self.timeline_id,
                 self.device,
                 core.node(),
-                &core.ledger@,
+                &core.ledger_spec()@,
                 i as int,
             );
         }
@@ -450,19 +496,24 @@ impl CudaTimeline {
     /// M2 readiness check: returns `true` ONLY when `point` is `HostComplete`,
     /// or when its CUDA event slot has matching non-zero generation, is NOT
     /// still `in_use`/recycled, and its `recorded_seq` is confirmed on `core`.
+    pub open(crate) spec fn sync_point_ready(&self, core: &CacheCore, point: SyncPoint) -> bool {
+        match point {
+            SyncPoint::HostComplete => true,
+            SyncPoint::TimelineEvent { timeline, event_slot, generation } => timeline
+                == self.timeline_id_spec() && (event_slot as usize) < self.event_ring_spec().len()
+                && generation != 0 && !self.event_ring_spec()[event_slot as int].in_use_spec()
+                && self.event_ring_spec()[event_slot as int].generation_spec() == generation
+                && self.event_ring_spec()[event_slot as int].recorded_seq_spec()
+                <= core.timelines_spec().confirmed_seq_spec()[timeline as int],
+        }
+    }
+
     pub fn is_sync_point_ready(&self, core: &CacheCore, point: SyncPoint) -> (ready: bool)
         requires
-            self.timeline_id < core.timelines.count <= MAX_TIMELINES,
+            core.timelines_spec().bounds(),
+            self.timeline_id_spec() < core.timelines_spec().count_spec() <= MAX_TIMELINES,
         ensures
-            ready == match point {
-                SyncPoint::HostComplete => true,
-                SyncPoint::TimelineEvent { timeline, event_slot, generation } => timeline
-                    == self.timeline_id && (event_slot as usize) < self.event_ring.len()
-                    && generation != 0 && !self.event_ring[event_slot as int].in_use
-                    && self.event_ring[event_slot as int].generation == generation
-                    && self.event_ring[event_slot as int].recorded_seq
-                    <= core.timelines.confirmed_seq[timeline as int],
-            },
+            ready == self.sync_point_ready(core, point),
     {
         match point {
             SyncPoint::HostComplete => true,
@@ -471,14 +522,14 @@ impl CudaTimeline {
                 != 0 && !self.event_ring[event_slot as usize].in_use
                 && self.event_ring[event_slot as usize].generation == generation
                 && self.event_ring[event_slot as usize].recorded_seq
-                <= core.timelines.confirmed_seq[timeline as usize],
+                <= core.timelines().confirmed_sequences()[timeline as usize],
         }
     }
 
     /// Ordered Handoff: if `point` references a live in-use event on this
     /// timeline, enqueue `cuda::stream_wait_event` on `dst_stream` without
     /// blocking the host CPU. If already ready, this is a no-op.
-    pub fn wait_sync_point(
+    pub(crate) fn wait_sync_point(
         &self,
         dst_stream: &mut CudaStream,
         core: &CacheCore,
@@ -486,17 +537,17 @@ impl CudaTimeline {
     ) -> (r: BackendResult<()>)
         requires
             core.well_formed(),
-            self.well_formed(&core.timelines, core.node(), &core.ledger@),
+            self.well_formed(&core.timelines_spec(), core.node(), &core.ledger_spec()@),
             old(dst_stream).well_formed(),
             old(dst_stream).source().node() == core.node(),
             old(dst_stream).source().id() == core.instance_id(),
-            old(dst_stream).infos().map().submap_of(core.ledger@.submitted.map()),
+            old(dst_stream).infos().map().submap_of(core.ledger_spec()@.submitted.map()),
             old(dst_stream).tail().subset_of(old(dst_stream).infos().dom()),
         ensures
             final(dst_stream).well_formed(),
             final(dst_stream).source() == old(dst_stream).source(),
             final(dst_stream).device() == old(dst_stream).device(),
-            final(dst_stream).infos().map().submap_of(core.ledger@.submitted.map()),
+            final(dst_stream).infos().map().submap_of(core.ledger_spec()@.submitted.map()),
             final(dst_stream).tail().subset_of(final(dst_stream).infos().dom()),
             old(dst_stream).tail().subset_of(final(dst_stream).tail()),
             r.is_err() ==> *final(dst_stream) == *old(dst_stream),
@@ -520,11 +571,11 @@ impl CudaTimeline {
                 proof {
                     lemma_event_ring_index(
                         self.event_ring@,
-                        &core.timelines,
+                        &core.timelines_spec(),
                         self.timeline_id,
                         self.device,
                         core.node(),
-                        &core.ledger@,
+                        &core.ledger_spec()@,
                         idx as int,
                     );
                 }
@@ -539,7 +590,7 @@ impl CudaTimeline {
                             lemma_stream_wait_preserves_submap(
                                 before_stream.infos().map(),
                                 slot.event.infos().map(),
-                                core.ledger@.submitted.map(),
+                                core.ledger_spec()@.submitted.map(),
                                 before_stream.tail(),
                                 slot.event.recorded(),
                             );
@@ -561,47 +612,53 @@ impl CudaTimeline {
     ) -> (r: Result<usize, (CoreError, usize)>)
         requires
             old(core).well_formed(),
-            old(self).well_formed(&old(core).timelines, old(core).node(), &old(core).ledger@),
+            old(self).well_formed(
+                &old(core).timelines_spec(),
+                old(core).node(),
+                &old(core).ledger_spec()@,
+            ),
             instance.id() == old(core).instance_id(),
         ensures
             final(core).well_formed(),
             final(self).well_formed(
-                &final(core).timelines,
+                &final(core).timelines_spec(),
                 final(core).node(),
-                &final(core).ledger@,
+                &final(core).ledger_spec()@,
             ),
-            final(self).stream == old(self).stream,
-            final(self).timeline_id == old(self).timeline_id,
-            final(self).device == old(self).device,
-            final(self).event_ring.len() == old(self).event_ring.len(),
-            final(core).node_id == old(core).node_id,
-            final(core).tiers == old(core).tiers,
-            final(core).frames == old(core).frames,
-            final(core).catalog == old(core).catalog,
-            final(core).spec == old(core).spec,
-            final(core).version_seq_start == old(core).version_seq_start,
-            final(core).next_version_seq == old(core).next_version_seq,
-            final(core).version_seq_limit == old(core).version_seq_limit,
-            final(core).active_leases == old(core).active_leases,
-            final(core).free_lease_slots == old(core).free_lease_slots,
-            final(core).lease_generation == old(core).lease_generation,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines.count == old(core).timelines.count,
-            final(core).timelines.kinds == old(core).timelines.kinds,
-            final(core).timelines.events == old(core).timelines.events,
-            final(core).timelines.next_seq == old(core).timelines.next_seq,
-            final(core).timelines.confirmed_seq[old(self).timeline_id as int] >= old(
+            final(self).stream_spec() == old(self).stream_spec(),
+            final(self).timeline_id_spec() == old(self).timeline_id_spec(),
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).event_ring_spec().len() == old(self).event_ring_spec().len(),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec() == old(core).frames_spec(),
+            final(core).catalog_spec() == old(core).catalog_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).version_seq_start_spec() == old(core).version_seq_start_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            final(core).version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+            final(core).active_leases_spec() == old(core).active_leases_spec(),
+            final(core).free_lease_slots_spec() == old(core).free_lease_slots_spec(),
+            final(core).lease_generation_spec() == old(core).lease_generation_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
                 core,
-            ).timelines.confirmed_seq[old(self).timeline_id as int],
-            forall|u: u8|
-                u < old(core).timelines.count && u != old(self).timeline_id
-                    ==> #[trigger] final(core).timelines.confirmed_seq[u as int] == old(
-                    core,
-                ).timelines.confirmed_seq[u as int],
-            final(core).ledger@.submitted == old(core).ledger@.submitted,
-            final(core).ledger@.succeeded == old(core).ledger@.succeeded,
-            final(core).ledger@.revoked == old(core).ledger@.revoked,
-            old(core).ledger@.knows.set().subset_of(final(core).ledger@.knows.set()),
+            ).timelines_spec().next_seq_spec(),
+            final(core).timelines_spec().confirmed_seq_spec()[old(self).timeline_id_spec() as int]
+                >= old(core).timelines_spec().confirmed_seq_spec()[old(
+                self,
+            ).timeline_id_spec() as int],
+            forall|u: TimelineId|
+                u < old(core).timelines_spec().count_spec() && u != old(self).timeline_id_spec()
+                    ==> #[trigger] final(core).timelines_spec().confirmed_seq_spec()[u as int]
+                    == old(core).timelines_spec().confirmed_seq_spec()[u as int],
+            final(core).ledger_spec()@.submitted == old(core).ledger_spec()@.submitted,
+            final(core).ledger_spec()@.succeeded == old(core).ledger_spec()@.succeeded,
+            final(core).ledger_spec()@.revoked == old(core).ledger_spec()@.revoked,
+            old(core).ledger_spec()@.knows.set().subset_of(final(core).ledger_spec()@.knows.set()),
             final(core).kernel_view().extends(old(core).kernel_view()),
     {
         hide(CacheCore::well_formed);
@@ -622,37 +679,37 @@ impl CudaTimeline {
                 self.device == old(self).device,
                 self.stream == old(self).stream,
                 core.well_formed(),
-                self.well_formed(&core.timelines, core.node(), &core.ledger@),
+                self.well_formed(&core.timelines_spec(), core.node(), &core.ledger_spec()@),
                 instance.id() == core.instance_id(),
                 node == core.node(),
-                core.node_id == old(core).node_id,
-                core.tiers == old(core).tiers,
-                core.frames == old(core).frames,
-                core.catalog == old(core).catalog,
-                core.spec == old(core).spec,
-                core.version_seq_start == old(core).version_seq_start,
-                core.next_version_seq == old(core).next_version_seq,
-                core.version_seq_limit == old(core).version_seq_limit,
-                core.active_leases == old(core).active_leases,
-                core.free_lease_slots == old(core).free_lease_slots,
-                core.lease_generation == old(core).lease_generation,
-                core.version_registry == old(core).version_registry,
-                core.timelines.count == old(core).timelines.count,
-                core.timelines.kinds == old(core).timelines.kinds,
-                core.timelines.events == old(core).timelines.events,
-                core.timelines.next_seq == old(core).timelines.next_seq,
-                core.timelines.confirmed_seq[t as int] >= old(
+                core.node_id_spec() == old(core).node_id_spec(),
+                core.tiers_spec() == old(core).tiers_spec(),
+                core.frames_spec() == old(core).frames_spec(),
+                core.catalog_spec() == old(core).catalog_spec(),
+                core.spec_spec() == old(core).spec_spec(),
+                core.version_seq_start_spec() == old(core).version_seq_start_spec(),
+                core.next_version_seq_spec() == old(core).next_version_seq_spec(),
+                core.version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+                core.active_leases_spec() == old(core).active_leases_spec(),
+                core.free_lease_slots_spec() == old(core).free_lease_slots_spec(),
+                core.lease_generation_spec() == old(core).lease_generation_spec(),
+                core.version_registry_spec() == old(core).version_registry_spec(),
+                core.timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+                core.timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+                core.timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+                core.timelines_spec().next_seq_spec() == old(core).timelines_spec().next_seq_spec(),
+                core.timelines_spec().confirmed_seq_spec()[t as int] >= old(
                     core,
-                ).timelines.confirmed_seq[t as int],
-                forall|u: u8|
-                    u < old(core).timelines.count && u != t
-                        ==> #[trigger] core.timelines.confirmed_seq[u as int] == old(
+                ).timelines_spec().confirmed_seq_spec()[t as int],
+                forall|u: TimelineId|
+                    u < old(core).timelines_spec().count_spec() && u != t
+                        ==> #[trigger] core.timelines_spec().confirmed_seq_spec()[u as int] == old(
                         core,
-                    ).timelines.confirmed_seq[u as int],
-                core.ledger@.submitted == old(core).ledger@.submitted,
-                core.ledger@.succeeded == old(core).ledger@.succeeded,
-                core.ledger@.revoked == old(core).ledger@.revoked,
-                old(core).ledger@.knows.set().subset_of(core.ledger@.knows.set()),
+                    ).timelines_spec().confirmed_seq_spec()[u as int],
+                core.ledger_spec()@.submitted == old(core).ledger_spec()@.submitted,
+                core.ledger_spec()@.succeeded == old(core).ledger_spec()@.succeeded,
+                core.ledger_spec()@.revoked == old(core).ledger_spec()@.revoked,
+                old(core).ledger_spec()@.knows.set().subset_of(core.ledger_spec()@.knows.set()),
                 core.kernel_view().extends(old(core).kernel_view()),
             decreases ring_len - polled,
         {
@@ -667,11 +724,11 @@ impl CudaTimeline {
                 lemma_core_wf_facts(core);
                 lemma_event_ring_index(
                     before_ring,
-                    &core.timelines,
+                    &core.timelines_spec(),
                     t,
                     self.device,
                     node,
-                    &core.ledger@,
+                    &core.ledger_spec()@,
                     i as int,
                 );
             }
@@ -683,7 +740,7 @@ impl CudaTimeline {
                 EventStatus::NotReady => break,
                 EventStatus::Ready(w) => w,
             };
-            let cur_confirmed = core.timelines.confirmed_seq[t as usize];
+            let cur_confirmed = core.timelines().confirmed_sequences()[t as usize];
             let rec_seq = self.event_ring[i].recorded_seq;
             let prefix = if rec_seq > cur_confirmed {
                 rec_seq
@@ -693,11 +750,11 @@ impl CudaTimeline {
             proof {
                 lemma_event_ready_observes_prefix(
                     &before_ring[i as int],
-                    &core.timelines,
+                    &core.timelines_spec(),
                     t,
                     self.device,
                     node,
-                    &core.ledger@,
+                    &core.ledger_spec()@,
                     k,
                     prefix,
                 );
@@ -711,22 +768,22 @@ impl CudaTimeline {
                     before_ring,
                     self.event_ring@,
                     before_newest,
-                    &before_core.timelines,
-                    &core.timelines,
+                    &before_core.timelines_spec(),
+                    &core.timelines_spec(),
                     t,
                     self.device,
                     node,
-                    &before_core.ledger@,
-                    &core.ledger@,
+                    &before_core.ledger_spec()@,
+                    &core.ledger_spec()@,
                     i as int,
                 );
                 lemma_cuda_extends_trans(
                     old(core).kernel_view(),
                     before_core.kernel_view(),
                     core.kernel_view(),
-                    old(core).ledger@.knows.set(),
-                    before_core.ledger@.knows.set(),
-                    core.ledger@.knows.set(),
+                    old(core).ledger_spec()@.knows.set(),
+                    before_core.ledger_spec()@.knows.set(),
+                    core.ledger_spec()@.knows.set(),
                 );
             }
             polled += 1;
@@ -738,14 +795,14 @@ impl CudaTimeline {
     }
 
     /// Retry recording a CUDA event for any issued-but-uncovered stream tail.
-    pub fn record_uncovered_tail(&mut self, core: &CacheCore) -> (r: BackendResult<
+    pub(crate) fn record_uncovered_tail(&mut self, core: &CacheCore) -> (r: BackendResult<
         Option<SyncPoint>,
     >)
         requires
             core.well_formed(),
-            old(self).well_formed(&core.timelines, core.node(), &core.ledger@),
+            old(self).well_formed(&core.timelines_spec(), core.node(), &core.ledger_spec()@),
         ensures
-            final(self).well_formed(&core.timelines, core.node(), &core.ledger@),
+            final(self).well_formed(&core.timelines_spec(), core.node(), &core.ledger_spec()@),
             final(self).stream == old(self).stream,
             final(self).timeline_id == old(self).timeline_id,
             final(self).device == old(self).device,
@@ -758,8 +815,8 @@ impl CudaTimeline {
             lemma_core_wf_facts(core);
         }
         let t = self.timeline_id as usize;
-        let last = core.timelines.next_seq[t] - 1;
-        if last <= core.timelines.confirmed_seq[t] {
+        let last = core.timelines().next_sequences()[t] - 1;
+        if last <= core.timelines().confirmed_sequences()[t] {
             return Ok(None);
         }
         let newest = if self.ring_tail == 0 {

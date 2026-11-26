@@ -392,7 +392,7 @@ proof fn lemma_rdma_control_reap_window(
     ops: [Option<PendingOperation>; BITMAP_SLOTS],
     bitmap: SlidingBitmap,
     table: &TimelineTable,
-    t: u8,
+    t: TimelineId,
     ledger: &KnowledgeLedger,
     before: rdma::CqSnapshot,
     after: rdma::CqSnapshot,
@@ -438,50 +438,58 @@ proof fn lemma_rdma_data_reap_events(before: rdma::CqSnapshot, after: rdma::CqSn
 }
 
 /// Pure proof helper: restore `CacheCore::well_formed()` after `complete_data`
-/// advances `core.timelines` and `core.ledger` (no writes added to `submitted`).
-proof fn lemma_rdma_core_after_complete(before_core: &CacheCore, after_core: &CacheCore, t: u8)
+/// advances `core.timelines_spec()` and `core.ledger` (no writes added to `submitted`).
+proof fn lemma_rdma_core_after_complete(
+    before_core: &CacheCore,
+    after_core: &CacheCore,
+    t: TimelineId,
+)
     requires
         before_core.well_formed(),
-        after_core.node_id == before_core.node_id,
-        after_core.tiers == before_core.tiers,
-        after_core.frames == before_core.frames,
-        after_core.catalog == before_core.catalog,
-        after_core.version_seq_start == before_core.version_seq_start,
-        after_core.next_version_seq == before_core.next_version_seq,
-        after_core.version_seq_limit == before_core.version_seq_limit,
-        after_core.active_leases == before_core.active_leases,
-        after_core.free_lease_slots == before_core.free_lease_slots,
-        after_core.lease_generation == before_core.lease_generation,
-        after_core.spec == before_core.spec,
-        after_core.version_registry == before_core.version_registry,
-        after_core.timelines.well_formed(
+        after_core.node_id_spec() == before_core.node_id_spec(),
+        after_core.tiers_spec() == before_core.tiers_spec(),
+        after_core.frames_spec() == before_core.frames_spec(),
+        after_core.catalog_spec() == before_core.catalog_spec(),
+        after_core.version_seq_start_spec() == before_core.version_seq_start_spec(),
+        after_core.next_version_seq_spec() == before_core.next_version_seq_spec(),
+        after_core.version_seq_limit_spec() == before_core.version_seq_limit_spec(),
+        after_core.active_leases_spec() == before_core.active_leases_spec(),
+        after_core.free_lease_slots_spec() == before_core.free_lease_slots_spec(),
+        after_core.lease_generation_spec() == before_core.lease_generation_spec(),
+        after_core.spec_spec() == before_core.spec_spec(),
+        after_core.version_registry_spec() == before_core.version_registry_spec(),
+        after_core.timelines_spec().well_formed(
             before_core.instance_id(),
             before_core.node(),
-            &after_core.ledger@,
+            &after_core.ledger_spec()@,
         ),
-        after_core.timelines.polled(&before_core.timelines, t),
-        after_core.timelines.count == before_core.timelines.count,
-        after_core.timelines.kinds == before_core.timelines.kinds,
-        after_core.timelines.next_seq == before_core.timelines.next_seq,
-        after_core.timelines.events == before_core.timelines.events,
-        after_core.ledger@.submitted == before_core.ledger@.submitted,
-        after_core.ledger@.revoked == before_core.ledger@.revoked,
-        before_core.ledger@.knows.set().subset_of(after_core.ledger@.knows.set()),
-        before_core.ledger@.succeeded.dom().subset_of(after_core.ledger@.succeeded.dom()),
+        after_core.timelines_spec().polled(&before_core.timelines_spec(), t),
+        after_core.timelines_spec().count_spec() == before_core.timelines_spec().count_spec(),
+        after_core.timelines_spec().kinds_spec() == before_core.timelines_spec().kinds_spec(),
+        after_core.timelines_spec().next_seq_spec() == before_core.timelines_spec().next_seq_spec(),
+        after_core.timelines_spec().events_spec() == before_core.timelines_spec().events_spec(),
+        after_core.ledger_spec()@.submitted == before_core.ledger_spec()@.submitted,
+        after_core.ledger_spec()@.revoked == before_core.ledger_spec()@.revoked,
+        before_core.ledger_spec()@.knows.set().subset_of(after_core.ledger_spec()@.knows.set()),
+        before_core.ledger_spec()@.succeeded.dom().subset_of(
+            after_core.ledger_spec()@.succeeded.dom(),
+        ),
     ensures
         after_core.well_formed(),
 {
     hide(CacheCore::well_formed);
     hide(replica_valid);
     lemma_core_wf_facts(before_core);
-    assert(complete_receipts(after_core.ledger@)) by {
-        assert(complete_receipts(before_core.ledger@));
+    assert(complete_receipts(after_core.ledger_spec()@)) by {
+        assert(complete_receipts(before_core.ledger_spec()@));
     }
     assert(after_core.kernel_view().extends(before_core.kernel_view())) by {
         broadcast use {vstd::imap::group_imap_lemmas, vstd::iset::group_iset_lemmas};
 
     }
-    assert(before_core.ledger@.submitted.map().submap_of(after_core.ledger@.submitted.map())) by {
+    assert(before_core.ledger_spec()@.submitted.map().submap_of(
+        after_core.ledger_spec()@.submitted.map(),
+    )) by {
         broadcast use vstd::imap::group_imap_lemmas;
 
     }
@@ -489,50 +497,56 @@ proof fn lemma_rdma_core_after_complete(before_core: &CacheCore, after_core: &Ca
 }
 
 /// Pure proof helper: restore `CacheCore::well_formed()` after `record_submission`
-/// appends one disjoint data event to `core.timelines` and `core.ledger`.
+/// appends one disjoint data event to `core.timelines_spec()` and `core.ledger`.
 pub(super) proof fn lemma_rdma_core_after_submit(
     before_core: &CacheCore,
     after_core: &CacheCore,
-    t: u8,
+    t: TimelineId,
     ev: TransferEvent,
     val: EventInfo<TransferDomain>,
 )
     requires
         before_core.well_formed(),
-        after_core.node_id == before_core.node_id,
-        after_core.tiers == before_core.tiers,
-        after_core.frames == before_core.frames,
-        after_core.catalog == before_core.catalog,
-        after_core.version_seq_start == before_core.version_seq_start,
-        after_core.next_version_seq == before_core.next_version_seq,
-        after_core.version_seq_limit == before_core.version_seq_limit,
-        after_core.active_leases == before_core.active_leases,
-        after_core.free_lease_slots == before_core.free_lease_slots,
-        after_core.lease_generation == before_core.lease_generation,
-        after_core.spec == before_core.spec,
-        after_core.version_registry == before_core.version_registry,
-        after_core.timelines.well_formed(
+        after_core.node_id_spec() == before_core.node_id_spec(),
+        after_core.tiers_spec() == before_core.tiers_spec(),
+        after_core.frames_spec() == before_core.frames_spec(),
+        after_core.catalog_spec() == before_core.catalog_spec(),
+        after_core.version_seq_start_spec() == before_core.version_seq_start_spec(),
+        after_core.next_version_seq_spec() == before_core.next_version_seq_spec(),
+        after_core.version_seq_limit_spec() == before_core.version_seq_limit_spec(),
+        after_core.active_leases_spec() == before_core.active_leases_spec(),
+        after_core.free_lease_slots_spec() == before_core.free_lease_slots_spec(),
+        after_core.lease_generation_spec() == before_core.lease_generation_spec(),
+        after_core.spec_spec() == before_core.spec_spec(),
+        after_core.version_registry_spec() == before_core.version_registry_spec(),
+        after_core.timelines_spec().well_formed(
             before_core.instance_id(),
             before_core.node(),
-            &after_core.ledger@,
+            &after_core.ledger_spec()@,
         ),
-        after_core.timelines.count == before_core.timelines.count,
-        after_core.timelines.kinds == before_core.timelines.kinds,
-        after_core.timelines.confirmed_seq == before_core.timelines.confirmed_seq,
-        after_core.timelines.next_seq@ == before_core.timelines.next_seq@.update(
+        after_core.timelines_spec().count_spec() == before_core.timelines_spec().count_spec(),
+        after_core.timelines_spec().kinds_spec() == before_core.timelines_spec().kinds_spec(),
+        after_core.timelines_spec().confirmed_seq_spec()
+            == before_core.timelines_spec().confirmed_seq_spec(),
+        after_core.timelines_spec().next_seq_spec()@
+            == before_core.timelines_spec().next_seq_spec()@.update(
             t as int,
-            (before_core.timelines.next_seq[t as int] + 1) as u64,
+            (before_core.timelines_spec().next_seq_spec()[t as int] + 1) as u64,
         ),
-        after_core.timelines.events@ == before_core.timelines.events@.insert(
-            (t, before_core.timelines.next_seq[t as int]),
+        after_core.timelines_spec().events_spec()@
+            == before_core.timelines_spec().events_spec()@.insert(
+            (t, before_core.timelines_spec().next_seq_spec()[t as int]),
             ev,
         ),
-        after_core.ledger@.submitted.map() == before_core.ledger@.submitted.map().insert(ev, val),
-        before_core.ledger@.submitted.map().submap_of(after_core.ledger@.submitted.map()),
-        after_core.ledger@.knows == before_core.ledger@.knows,
-        after_core.ledger@.succeeded == before_core.ledger@.succeeded,
-        after_core.ledger@.revoked == before_core.ledger@.revoked,
-        val.preds.subset_of(before_core.ledger@.submitted.dom()),
+        after_core.ledger_spec()@.submitted.map()
+            == before_core.ledger_spec()@.submitted.map().insert(ev, val),
+        before_core.ledger_spec()@.submitted.map().submap_of(
+            after_core.ledger_spec()@.submitted.map(),
+        ),
+        after_core.ledger_spec()@.knows == before_core.ledger_spec()@.knows,
+        after_core.ledger_spec()@.succeeded == before_core.ledger_spec()@.succeeded,
+        after_core.ledger_spec()@.revoked == before_core.ledger_spec()@.revoked,
+        val.preds.subset_of(before_core.ledger_spec()@.submitted.dom()),
         before_core.disjoint_from_published(val.access.writes),
     ensures
         after_core.well_formed(),
@@ -540,19 +554,19 @@ pub(super) proof fn lemma_rdma_core_after_submit(
     hide(CacheCore::well_formed);
     hide(replica_valid);
     lemma_core_wf_facts(before_core);
-    assert(complete_receipts(after_core.ledger@)) by {
+    assert(complete_receipts(after_core.ledger_spec()@)) by {
         broadcast use {vstd::imap::group_imap_lemmas, vstd::iset::group_iset_lemmas};
 
         assert forall|e: TransferEvent| #[trigger]
-            after_core.ledger@.submitted.dom().contains(
+            after_core.ledger_spec()@.submitted.dom().contains(
                 e,
-            ) implies after_core.ledger@.submitted.map()[e].preds.subset_of(
-            after_core.ledger@.submitted.dom(),
+            ) implies after_core.ledger_spec()@.submitted.map()[e].preds.subset_of(
+            after_core.ledger_spec()@.submitted.dom(),
         ) by {
             if e != ev {
-                assert(before_core.ledger@.submitted.dom().contains(e));
-                assert(before_core.ledger@.submitted.map()[e]
-                    == after_core.ledger@.submitted.map()[e]);
+                assert(before_core.ledger_spec()@.submitted.dom().contains(e));
+                assert(before_core.ledger_spec()@.submitted.map()[e]
+                    == after_core.ledger_spec()@.submitted.map()[e]);
             }
         }
     }
@@ -565,23 +579,26 @@ pub(super) proof fn lemma_rdma_core_after_submit(
 
     }
     assert forall|e: TransferEvent, f: FrameId|
-        after_core.ledger@.submitted.dom().contains(e)
-            && !before_core.ledger@.submitted.dom().contains(e) && f.0
-            < after_core.frames.metas.len() && (#[trigger] after_core.frames.meta(f)).state
-            == STATE_PUBLISHED implies !(
-    #[trigger] after_core.ledger@.submitted.map()[e]).access.writes.contains(
-        after_core.frames.frame(f).slot.loc,
+        after_core.ledger_spec()@.submitted.dom().contains(e)
+            && !before_core.ledger_spec()@.submitted.dom().contains(e) && f.0
+            < after_core.frames_spec().metas_spec().len() && (
+        #[trigger] after_core.frames_spec().meta(f)).state == STATE_PUBLISHED implies !(
+    #[trigger] after_core.ledger_spec()@.submitted.map()[e]).access.writes.contains(
+        after_core.frames_spec().frame(f).slot.loc,
     ) by {
         broadcast use vstd::imap::group_imap_lemmas;
 
         assert(e == ev);
-        assert(before_core.frames.meta(f).state == STATE_PUBLISHED);
+        assert(before_core.frames_spec().meta(f).state == STATE_PUBLISHED);
     }
-    assert(before_core.ledger@.knows.set().subset_of(after_core.ledger@.knows.set())) by {
+    assert(before_core.ledger_spec()@.knows.set().subset_of(after_core.ledger_spec()@.knows.set()))
+        by {
         broadcast use vstd::iset::group_iset_lemmas;
 
     }
-    assert(before_core.ledger@.succeeded.dom().subset_of(after_core.ledger@.succeeded.dom())) by {
+    assert(before_core.ledger_spec()@.succeeded.dom().subset_of(
+        after_core.ledger_spec()@.succeeded.dom(),
+    )) by {
         broadcast use vstd::iset::group_iset_lemmas;
 
     }
@@ -644,13 +661,13 @@ impl<'a> RdmaBackend<'a> {
         &&& forall|i: int| 0 <= i < out.len() ==> #[trigger] Self::delivers(cs[i], out[i])
     }
 
-    /// Dispatch one reaped CQ completion into `core.timelines`, `core.ledger`,
+    /// Dispatch one reaped CQ completion into `core.timelines_spec()`, `core.ledger`,
     /// `self.bitmap`, and `self.in_flight_ops`.
     fn dispatch_one(
         ops: &mut [Option<PendingOperation>; BITMAP_SLOTS],
         bitmap: &mut SlidingBitmap,
         core: &mut CacheCore,
-        t: u8,
+        t: TimelineId,
         next_control_wr_id: u64,
         c: rdma::Completed,
         Ghost(before): Ghost<rdma::CqSnapshot>,
@@ -661,9 +678,9 @@ impl<'a> RdmaBackend<'a> {
             rdma_window_wf(
                 *old(ops),
                 *old(bitmap),
-                &old(core).timelines,
+                &old(core).timelines_spec(),
                 t,
-                &old(core).ledger@,
+                &old(core).ledger_spec()@,
                 before,
                 old(core).instance_id(),
                 next_control_wr_id,
@@ -677,40 +694,44 @@ impl<'a> RdmaBackend<'a> {
             rdma_window_wf(
                 *final(ops),
                 *final(bitmap),
-                &final(core).timelines,
+                &final(core).timelines_spec(),
                 t,
-                &final(core).ledger@,
+                &final(core).ledger_spec()@,
                 after,
                 final(core).instance_id(),
                 next_control_wr_id,
             ),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames == old(core).frames,
-            final(core).catalog == old(core).catalog,
-            final(core).spec == old(core).spec,
-            final(core).next_version_seq == old(core).next_version_seq,
-            final(core).version_seq_limit == old(core).version_seq_limit,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines.count == old(core).timelines.count,
-            final(core).timelines.kinds == old(core).timelines.kinds,
-            final(core).timelines.events == old(core).timelines.events,
-            final(core).timelines.next_seq == old(core).timelines.next_seq,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec() == old(core).frames_spec(),
+            final(core).catalog_spec() == old(core).catalog_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            final(core).version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
             peer_core_step(old(core), final(core), t),
-            final(core).ledger@.submitted == old(core).ledger@.submitted,
-            final(core).ledger@.revoked == old(core).ledger@.revoked,
-            old(core).ledger@.knows.set().subset_of(final(core).ledger@.knows.set()),
-            old(core).ledger@.succeeded.dom().subset_of(final(core).ledger@.succeeded.dom()),
+            final(core).ledger_spec()@.submitted == old(core).ledger_spec()@.submitted,
+            final(core).ledger_spec()@.revoked == old(core).ledger_spec()@.revoked,
+            old(core).ledger_spec()@.knows.set().subset_of(final(core).ledger_spec()@.knows.set()),
+            old(core).ledger_spec()@.succeeded.dom().subset_of(
+                final(core).ledger_spec()@.succeeded.dom(),
+            ),
             result matches PeerCompletion::Data(op, _) ==> rdma_data_events(before).contains_key(
                 op.sequence,
             ) && rdma_data_events(after) == rdma_data_events(before).remove(op.sequence)
-                && final(core).ledger@.knows.set().contains(
+                && final(core).ledger_spec()@.knows.set().contains(
                 (old(core).node(), rdma_data_events(before)[op.sequence]),
             ),
             result matches PeerCompletion::Data(op, Ok(())) ==> rdma_data_events(
                 before,
-            ).contains_key(op.sequence) && final(core).ledger@.succeeded.contains(
+            ).contains_key(op.sequence) && final(core).ledger_spec()@.succeeded.contains(
                 rdma_data_events(before)[op.sequence],
             ),
             result matches PeerCompletion::BindFailed { wr_id, .. } ==> !rdma_data_events(
@@ -745,9 +766,9 @@ impl<'a> RdmaBackend<'a> {
                     lemma_rdma_control_reap_window(
                         *ops,
                         *bitmap,
-                        &core.timelines,
+                        &core.timelines_spec(),
                         t,
-                        &core.ledger@,
+                        &core.ledger_spec()@,
                         before,
                         after,
                         id,
@@ -763,9 +784,9 @@ impl<'a> RdmaBackend<'a> {
                     lemma_rdma_control_reap_window(
                         *ops,
                         *bitmap,
-                        &core.timelines,
+                        &core.timelines_spec(),
                         t,
-                        &core.ledger@,
+                        &core.ledger_spec()@,
                         before,
                         after,
                         id,
@@ -781,27 +802,20 @@ impl<'a> RdmaBackend<'a> {
         proof {
             reveal(rdma_window_wf);
             lemma_rdma_data_reap_events(before, after, s);
-            assert(core.timelines.events@[(t, s)] == pending[s]);
-            assert(core.timelines.observed(t, s, node, known@));
+            assert(core.timelines_spec().events_spec()@[(t, s)] == pending[s]);
+            assert(core.timelines_spec().observed(t, s, node, known@));
         }
-        let op = complete_data(
-            ops,
-            bitmap,
-            &mut core.timelines,
-            t,
-            s,
-            Ghost(pending),
-            Ghost(node),
-            known,
-            success,
-            Tracked(core.ledger.borrow_mut()),
-        );
+        let op = core.complete_data(ops, bitmap, t, s, Ghost(pending), Ghost(node), known, success);
         proof {
-            assert(before_core.ledger@.knows.set().subset_of(core.ledger@.knows.set())) by {
+            assert(before_core.ledger_spec()@.knows.set().subset_of(
+                core.ledger_spec()@.knows.set(),
+            )) by {
                 broadcast use vstd::iset::group_iset_lemmas;
 
             }
-            assert(before_core.ledger@.succeeded.dom().subset_of(core.ledger@.succeeded.dom())) by {
+            assert(before_core.ledger_spec()@.succeeded.dom().subset_of(
+                core.ledger_spec()@.succeeded.dom(),
+            )) by {
                 broadcast use vstd::map::group_map_lemmas;
 
             }
@@ -818,11 +832,11 @@ impl<'a> RdmaBackend<'a> {
             if outcome.is_ok() {
                 broadcast use vstd::map::group_map_lemmas;
 
-                assert(core.ledger@.succeeded.contains(pending[s]));
+                assert(core.ledger_spec()@.succeeded.contains(pending[s]));
             }
             reveal(peer_core_step_except);
+            reveal(core_transition);
             reveal(FrameTable::same_layout);
-            reveal(FrameTable::preserves_initializing);
             broadcast use {vstd::imap::group_imap_lemmas, vstd::iset::group_iset_lemmas};
 
         }
@@ -842,44 +856,49 @@ impl<'a> RdmaBackend<'a> {
         ensures
             final(core).well_formed(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames == old(core).frames,
-            final(core).catalog == old(core).catalog,
-            final(core).spec == old(core).spec,
-            final(core).next_version_seq == old(core).next_version_seq,
-            final(core).version_seq_limit == old(core).version_seq_limit,
-            final(core).version_registry == old(core).version_registry,
-            final(self).timeline_id == old(self).timeline_id,
-            final(self).peer_node == old(self).peer_node,
-            final(self).qp == old(self).qp,
-            final(self).window_pool == old(self).window_pool,
-            final(self).host_mr == old(self).host_mr,
-            final(self).gpu_mr == old(self).gpu_mr,
-            final(self).shared_host_mr == old(self).shared_host_mr,
-            final(self).shared_gpu_mr == old(self).shared_gpu_mr,
-            final(self).active_leases == old(self).active_leases,
-            final(self).completed_pulls == old(self).completed_pulls,
-            final(self).next_control_wr_id == old(self).next_control_wr_id,
-            final(core).timelines.events == old(core).timelines.events,
-            final(core).timelines.next_seq == old(core).timelines.next_seq,
-            peer_core_step(old(core), final(core), old(self).timeline_id),
-            final(core).ledger@.submitted == old(core).ledger@.submitted,
-            final(core).ledger@.revoked == old(core).ledger@.revoked,
-            old(core).ledger@.knows.set().subset_of(final(core).ledger@.knows.set()),
-            old(core).ledger@.succeeded.dom().subset_of(final(core).ledger@.succeeded.dom()),
-            r matches Ok(None) ==> final(self).cq == old(self).cq && *final(core) == *old(core),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec() == old(core).frames_spec(),
+            final(core).catalog_spec() == old(core).catalog_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            final(core).version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(self).timeline_id_spec() == old(self).timeline_id_spec(),
+            final(self).peer_node_spec() == old(self).peer_node_spec(),
+            final(self).qp_spec() == old(self).qp_spec(),
+            final(self).window_pool_spec() == old(self).window_pool_spec(),
+            final(self).host_mr_spec() == old(self).host_mr_spec(),
+            final(self).gpu_mr_spec() == old(self).gpu_mr_spec(),
+            final(self).shared_host_mr_spec() == old(self).shared_host_mr_spec(),
+            final(self).shared_gpu_mr_spec() == old(self).shared_gpu_mr_spec(),
+            final(self).active_leases_spec() == old(self).active_leases_spec(),
+            final(self).completed_pulls_spec() == old(self).completed_pulls_spec(),
+            final(self).next_control_wr_id_spec() == old(self).next_control_wr_id_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
+            peer_core_step(old(core), final(core), old(self).timeline_id_spec()),
+            final(core).ledger_spec()@.submitted == old(core).ledger_spec()@.submitted,
+            final(core).ledger_spec()@.revoked == old(core).ledger_spec()@.revoked,
+            old(core).ledger_spec()@.knows.set().subset_of(final(core).ledger_spec()@.knows.set()),
+            old(core).ledger_spec()@.succeeded.dom().subset_of(
+                final(core).ledger_spec()@.succeeded.dom(),
+            ),
+            r matches Ok(None) ==> final(self).cq_spec() == old(self).cq_spec() && *final(core)
+                == *old(core),
             r matches Ok(Some(result)) ==> exists|c: rdma::Completed|
-                c.describes(old(self).cq, final(self).cq, instance.id())
+                c.describes(old(self).cq_spec(), final(self).cq_spec(), instance.id())
                     && #[trigger] Self::delivers(c, result),
             r matches Ok(Some(PeerCompletion::Data(op, _))) ==> old(self).pending().contains_key(
                 op.sequence,
-            ) && final(core).ledger@.knows.set().contains(
+            ) && final(core).ledger_spec()@.knows.set().contains(
                 (old(core).node(), old(self).pending()[op.sequence]),
             ),
             r matches Ok(Some(PeerCompletion::Data(op, Ok(()))))
-                ==> final(core).ledger@.succeeded.contains(old(self).pending()[op.sequence]),
+                ==> final(core).ledger_spec()@.succeeded.contains(old(self).pending()[op.sequence]),
     {
         hide(CacheCore::well_formed);
         hide(replica_valid);
@@ -918,12 +937,12 @@ impl<'a> RdmaBackend<'a> {
 
             lemma_completed_pulls_after_step(
                 self.completed_pulls,
-                &before_core.timelines,
-                &core.timelines,
+                &before_core.timelines_spec(),
+                &core.timelines_spec(),
                 self.timeline_id,
                 self.cq.observer(),
-                &before_core.ledger@,
-                &core.ledger@,
+                &before_core.ledger_spec()@,
+                &core.ledger_spec()@,
             );
             lemma_rdma_leases_same_frames(
                 self.active_leases@,
@@ -955,7 +974,7 @@ impl<'a> RdmaBackend<'a> {
     }
 
     /// Poll a batch of up to `max_entries` completions from the RDMA CQ.
-    pub fn poll_cq_batch(
+    pub(crate) fn poll_cq_batch(
         &mut self,
         core: &mut CacheCore,
         max_entries: usize,
@@ -968,15 +987,15 @@ impl<'a> RdmaBackend<'a> {
         ensures
             final(core).well_formed(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames == old(core).frames,
-            final(core).catalog == old(core).catalog,
-            final(core).spec == old(core).spec,
-            final(core).next_version_seq == old(core).next_version_seq,
-            final(core).version_seq_limit == old(core).version_seq_limit,
-            final(core).version_registry == old(core).version_registry,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec() == old(core).frames_spec(),
+            final(core).catalog_spec() == old(core).catalog_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            final(core).version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
             final(self).timeline_id == old(self).timeline_id,
             final(self).peer_node == old(self).peer_node,
             final(self).qp == old(self).qp,
@@ -1041,28 +1060,31 @@ impl<'a> RdmaBackend<'a> {
                 ).0,
                 snapshot.observer == core.node(),
                 core.well_formed(),
-                core.node_id == before_core.node_id,
+                core.node_id_spec() == before_core.node_id_spec(),
                 core.instance_id() == before_core.instance_id(),
-                core.tiers == before_core.tiers,
-                core.frames == before_core.frames,
-                core.catalog == before_core.catalog,
-                core.spec == before_core.spec,
-                core.next_version_seq == before_core.next_version_seq,
-                core.version_seq_limit == before_core.version_seq_limit,
-                core.version_registry == before_core.version_registry,
-                core.timelines.count == before_core.timelines.count,
-                core.timelines.kinds == before_core.timelines.kinds,
-                core.timelines.next_seq == before_core.timelines.next_seq,
-                core.timelines.events == before_core.timelines.events,
-                before_core.ledger@.knows.set().subset_of(core.ledger@.knows.set()),
-                before_core.ledger@.succeeded.dom().subset_of(core.ledger@.succeeded.dom()),
+                core.tiers_spec() == before_core.tiers_spec(),
+                core.frames_spec() == before_core.frames_spec(),
+                core.catalog_spec() == before_core.catalog_spec(),
+                core.spec_spec() == before_core.spec_spec(),
+                core.next_version_seq_spec() == before_core.next_version_seq_spec(),
+                core.version_seq_limit_spec() == before_core.version_seq_limit_spec(),
+                core.version_registry_spec() == before_core.version_registry_spec(),
+                core.timelines_spec().count_spec() == before_core.timelines_spec().count_spec(),
+                core.timelines_spec().kinds_spec() == before_core.timelines_spec().kinds_spec(),
+                core.timelines_spec().next_seq_spec()
+                    == before_core.timelines_spec().next_seq_spec(),
+                core.timelines_spec().events_spec() == before_core.timelines_spec().events_spec(),
+                before_core.ledger_spec()@.knows.set().subset_of(core.ledger_spec()@.knows.set()),
+                before_core.ledger_spec()@.succeeded.dom().subset_of(
+                    core.ledger_spec()@.succeeded.dom(),
+                ),
                 instance.id() == core.instance_id(),
                 rdma_window_wf(
                     self.in_flight_ops,
                     self.bitmap,
-                    &core.timelines,
+                    &core.timelines_spec(),
                     self.timeline_id,
-                    &core.ledger@,
+                    &core.ledger_spec()@,
                     snapshot,
                     core.instance_id(),
                     self.next_control_wr_id,
@@ -1095,8 +1117,12 @@ impl<'a> RdmaBackend<'a> {
             proof {
                 broadcast use {vstd::iset::group_iset_lemmas, vstd::map::group_map_lemmas};
 
-                assert(before_core.ledger@.knows.set().subset_of(core.ledger@.knows.set()));
-                assert(before_core.ledger@.succeeded.dom().subset_of(core.ledger@.succeeded.dom()));
+                assert(before_core.ledger_spec()@.knows.set().subset_of(
+                    core.ledger_spec()@.knows.set(),
+                ));
+                assert(before_core.ledger_spec()@.succeeded.dom().subset_of(
+                    core.ledger_spec()@.succeeded.dom(),
+                ));
                 assert forall|j: int| 0 <= j < out.len() implies #[trigger] Self::delivers(
                     batch[j],
                     out[j],
@@ -1130,12 +1156,12 @@ impl<'a> RdmaBackend<'a> {
             );
             lemma_completed_pulls_after_step(
                 self.completed_pulls,
-                &before_core.timelines,
-                &core.timelines,
+                &before_core.timelines_spec(),
+                &core.timelines_spec(),
                 self.timeline_id,
                 self.cq.observer(),
-                &before_core.ledger@,
-                &core.ledger@,
+                &before_core.ledger_spec()@,
+                &core.ledger_spec()@,
             );
             lemma_rdma_leases_same_frames(
                 self.active_leases@,
@@ -1506,10 +1532,9 @@ impl<'a> RdmaBackend<'a> {
                 w.state() is Binding && w.state()->Binding_wr_id == wr_id && w.id()
                     == before_cq.pending[wr_id].kind->BindWindow_window_id && w.node()
                     == before_cq.observer ==> (#[trigger] witness@.matches(w)),
-            old(self).timeline_id < core.timelines.count,
-            core.timelines.kinds[old(self).timeline_id as int] == (TimelineKind::RdmaQueuePair {
-                peer_node: old(self).peer_node,
-            }),
+            old(self).timeline_id < core.timelines_spec().count_spec(),
+            core.timelines_spec().kinds_spec()[old(self).timeline_id as int] == (
+            TimelineKind::RdmaQueuePair { peer_node: old(self).peer_node }),
             old(self).qp.cq_id() == old(self).cq.id(),
             old(self).qp.state() is ReadyToSend ==> old(self).qp.peer() == old(self).peer_node
                 && old(self).qp.pd_id() == old(self).window_pool.pd(),
@@ -1541,19 +1566,19 @@ impl<'a> RdmaBackend<'a> {
             rdma_window_wf(
                 old(self).in_flight_ops,
                 old(self).bitmap,
-                &core.timelines,
+                &core.timelines_spec(),
                 old(self).timeline_id,
-                &core.ledger@,
+                &core.ledger_spec()@,
                 after_cq,
                 core.instance_id(),
                 old(self).next_control_wr_id,
             ),
             completed_pulls_wf(
                 old(self).completed_pulls,
-                &core.timelines,
+                &core.timelines_spec(),
                 old(self).timeline_id,
                 old(self).cq.observer(),
-                &core.ledger@,
+                &core.ledger_spec()@,
             ),
             rdma_leases_disjoint(old(self).active_leases@),
             rdma_leases_valid(
@@ -1615,11 +1640,11 @@ impl<'a> RdmaBackend<'a> {
                     by {
                     reveal(ActiveRemoteLease::valid);
                 };
-                assert(core.frames.same_directory(&core.frames)) by {
+                assert(core.frames_spec().same_directory(&core.frames_spec())) by {
                     reveal(FrameTable::same_directory);
                 };
-                assert(core.frames.same_other_pins(
-                    &core.frames,
+                assert(core.frames_spec().same_other_pins(
+                    &core.frames_spec(),
                     Some(before_leases[idx as int].frame),
                 )) by {
                     reveal(FrameTable::same_other_pins);
@@ -1689,10 +1714,9 @@ impl<'a> RdmaBackend<'a> {
                 w.state() is Binding && w.state()->Binding_wr_id == wr_id && w.id()
                     == before_cq.pending[wr_id].kind->BindWindow_window_id && w.node()
                     == before_cq.observer ==> (#[trigger] witness@.matches(w)),
-            old(self).timeline_id < core.timelines.count,
-            core.timelines.kinds[old(self).timeline_id as int] == (TimelineKind::RdmaQueuePair {
-                peer_node: old(self).peer_node,
-            }),
+            old(self).timeline_id < core.timelines_spec().count_spec(),
+            core.timelines_spec().kinds_spec()[old(self).timeline_id as int] == (
+            TimelineKind::RdmaQueuePair { peer_node: old(self).peer_node }),
             old(self).qp.cq_id() == old(self).cq.id(),
             old(self).qp.state() is ReadyToSend ==> old(self).qp.peer() == old(self).peer_node
                 && old(self).qp.pd_id() == old(self).window_pool.pd(),
@@ -1724,19 +1748,19 @@ impl<'a> RdmaBackend<'a> {
             rdma_window_wf(
                 old(self).in_flight_ops,
                 old(self).bitmap,
-                &core.timelines,
+                &core.timelines_spec(),
                 old(self).timeline_id,
-                &core.ledger@,
+                &core.ledger_spec()@,
                 after_cq,
                 core.instance_id(),
                 old(self).next_control_wr_id,
             ),
             completed_pulls_wf(
                 old(self).completed_pulls,
-                &core.timelines,
+                &core.timelines_spec(),
                 old(self).timeline_id,
                 old(self).cq.observer(),
-                &core.ledger@,
+                &core.ledger_spec()@,
             ),
             rdma_leases_disjoint(old(self).active_leases@),
             rdma_leases_valid(
@@ -1797,11 +1821,11 @@ impl<'a> RdmaBackend<'a> {
                     by {
                     reveal(ActiveRemoteLease::valid);
                 };
-                assert(core.frames.same_directory(&core.frames)) by {
+                assert(core.frames_spec().same_directory(&core.frames_spec())) by {
                     reveal(FrameTable::same_directory);
                 };
-                assert(core.frames.same_other_pins(
-                    &core.frames,
+                assert(core.frames_spec().same_other_pins(
+                    &core.frames_spec(),
                     Some(before_leases[idx as int].frame),
                 )) by {
                     reveal(FrameTable::same_other_pins);
@@ -1871,10 +1895,9 @@ impl<'a> RdmaBackend<'a> {
                 w.state() is Invalidating && w.state()->Invalidating_wr_id == wr_id && w.id()
                     == before_cq.pending[wr_id].kind->LocalInvalidate_window_id && w.node()
                     == before_cq.observer ==> (#[trigger] witness@.matches(w)),
-            old(self).timeline_id < core.timelines.count,
-            core.timelines.kinds[old(self).timeline_id as int] == (TimelineKind::RdmaQueuePair {
-                peer_node: old(self).peer_node,
-            }),
+            old(self).timeline_id < core.timelines_spec().count_spec(),
+            core.timelines_spec().kinds_spec()[old(self).timeline_id as int] == (
+            TimelineKind::RdmaQueuePair { peer_node: old(self).peer_node }),
             old(self).qp.cq_id() == old(self).cq.id(),
             old(self).qp.state() is ReadyToSend ==> old(self).qp.peer() == old(self).peer_node
                 && old(self).qp.pd_id() == old(self).window_pool.pd(),
@@ -1906,19 +1929,19 @@ impl<'a> RdmaBackend<'a> {
             rdma_window_wf(
                 old(self).in_flight_ops,
                 old(self).bitmap,
-                &core.timelines,
+                &core.timelines_spec(),
                 old(self).timeline_id,
-                &core.ledger@,
+                &core.ledger_spec()@,
                 after_cq,
                 core.instance_id(),
                 old(self).next_control_wr_id,
             ),
             completed_pulls_wf(
                 old(self).completed_pulls,
-                &core.timelines,
+                &core.timelines_spec(),
                 old(self).timeline_id,
                 old(self).cq.observer(),
-                &core.ledger@,
+                &core.ledger_spec()@,
             ),
             rdma_leases_disjoint(old(self).active_leases@),
             rdma_leases_valid(
@@ -1986,10 +2009,13 @@ impl<'a> RdmaBackend<'a> {
                     Tracked(Some(returned)),
                 );
                 proof {
-                    assert(core.frames.same_directory(&core.frames)) by {
+                    assert(core.frames_spec().same_directory(&core.frames_spec())) by {
                         reveal(FrameTable::same_directory);
                     };
-                    assert(core.frames.same_other_pins(&core.frames, Some(lease.frame))) by {
+                    assert(core.frames_spec().same_other_pins(
+                        &core.frames_spec(),
+                        Some(lease.frame),
+                    )) by {
                         reveal(FrameTable::same_other_pins);
                     };
                     lemma_rdma_leases_swap_remove(
@@ -2049,11 +2075,11 @@ impl<'a> RdmaBackend<'a> {
                         by {
                         reveal(ActiveRemoteLease::valid);
                     };
-                    assert(core.frames.same_directory(&core.frames)) by {
+                    assert(core.frames_spec().same_directory(&core.frames_spec())) by {
                         reveal(FrameTable::same_directory);
                     };
-                    assert(core.frames.same_other_pins(
-                        &core.frames,
+                    assert(core.frames_spec().same_other_pins(
+                        &core.frames_spec(),
                         Some(before_leases[idx as int].frame),
                     )) by {
                         reveal(FrameTable::same_other_pins);
@@ -2118,10 +2144,9 @@ impl<'a> RdmaBackend<'a> {
             after_cq == rdma::CqSnapshot::of(old(self).cq),
             after_cq.pending == before_cq.pending.remove(wr_id),
             before_cq.pending.contains_key(wr_id),
-            old(self).timeline_id < core.timelines.count,
-            core.timelines.kinds[old(self).timeline_id as int] == (TimelineKind::RdmaQueuePair {
-                peer_node: old(self).peer_node,
-            }),
+            old(self).timeline_id < core.timelines_spec().count_spec(),
+            core.timelines_spec().kinds_spec()[old(self).timeline_id as int] == (
+            TimelineKind::RdmaQueuePair { peer_node: old(self).peer_node }),
             old(self).qp.cq_id() == old(self).cq.id(),
             old(self).qp.state() is ReadyToSend ==> old(self).qp.peer() == old(self).peer_node
                 && old(self).qp.pd_id() == old(self).window_pool.pd(),
@@ -2153,19 +2178,19 @@ impl<'a> RdmaBackend<'a> {
             rdma_window_wf(
                 old(self).in_flight_ops,
                 old(self).bitmap,
-                &core.timelines,
+                &core.timelines_spec(),
                 old(self).timeline_id,
-                &core.ledger@,
+                &core.ledger_spec()@,
                 after_cq,
                 core.instance_id(),
                 old(self).next_control_wr_id,
             ),
             completed_pulls_wf(
                 old(self).completed_pulls,
-                &core.timelines,
+                &core.timelines_spec(),
                 old(self).timeline_id,
                 old(self).cq.observer(),
-                &core.ledger@,
+                &core.ledger_spec()@,
             ),
             rdma_leases_disjoint(old(self).active_leases@),
             rdma_leases_valid(
@@ -2224,11 +2249,11 @@ impl<'a> RdmaBackend<'a> {
                 ))) by {
                     reveal(ActiveRemoteLease::valid);
                 };
-                assert(core.frames.same_directory(&core.frames)) by {
+                assert(core.frames_spec().same_directory(&core.frames_spec())) by {
                     reveal(FrameTable::same_directory);
                 };
-                assert(core.frames.same_other_pins(
-                    &core.frames,
+                assert(core.frames_spec().same_other_pins(
+                    &core.frames_spec(),
                     Some(before_leases[idx as int].frame),
                 )) by {
                     reveal(FrameTable::same_other_pins);
@@ -2283,10 +2308,9 @@ impl<'a> RdmaBackend<'a> {
         requires
             self.well_formed(core),
         ensures
-            self.timeline_id < core.timelines.count,
-            core.timelines.kinds[self.timeline_id as int] == (TimelineKind::RdmaQueuePair {
-                peer_node: self.peer_node,
-            }),
+            self.timeline_id < core.timelines_spec().count_spec(),
+            core.timelines_spec().kinds_spec()[self.timeline_id as int] == (
+            TimelineKind::RdmaQueuePair { peer_node: self.peer_node }),
             self.qp.cq_id() == self.cq.id(),
             self.qp.state() is ReadyToSend ==> self.qp.peer() == self.peer_node && self.qp.pd_id()
                 == self.window_pool.pd(),
@@ -2312,19 +2336,19 @@ impl<'a> RdmaBackend<'a> {
             rdma_window_wf(
                 self.in_flight_ops,
                 self.bitmap,
-                &core.timelines,
+                &core.timelines_spec(),
                 self.timeline_id,
-                &core.ledger@,
+                &core.ledger_spec()@,
                 rdma::CqSnapshot::of(self.cq),
                 core.instance_id(),
                 self.next_control_wr_id,
             ),
             completed_pulls_wf(
                 self.completed_pulls,
-                &core.timelines,
+                &core.timelines_spec(),
                 self.timeline_id,
                 self.cq.observer(),
-                &core.ledger@,
+                &core.ledger_spec()@,
             ),
             rdma_leases_disjoint(self.active_leases@),
             rdma_leases_valid(self.active_leases@, &self.window_pool, &self.qp, core),
@@ -2348,7 +2372,7 @@ impl<'a> RdmaBackend<'a> {
     /// (auto-finalizing `Unbinding` invalidations cleanly), never discarding
     /// any unrelated data or control CQE.
     #[verifier::rlimit(350)]
-    pub fn pump_cq(
+    pub(crate) fn pump_cq(
         &mut self,
         core: &mut CacheCore,
         Tracked(instance): Tracked<&TransferInstance>,
@@ -2360,15 +2384,15 @@ impl<'a> RdmaBackend<'a> {
         ensures
             final(core).well_formed(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames == old(core).frames,
-            final(core).catalog == old(core).catalog,
-            final(core).spec == old(core).spec,
-            final(core).next_version_seq == old(core).next_version_seq,
-            final(core).version_seq_limit == old(core).version_seq_limit,
-            final(core).version_registry == old(core).version_registry,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec() == old(core).frames_spec(),
+            final(core).catalog_spec() == old(core).catalog_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            final(core).version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
             peer_core_step(old(core), final(core), old(self).timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -2376,14 +2400,18 @@ impl<'a> RdmaBackend<'a> {
                 old(self).active_leases@,
                 final(self).active_leases@,
             ),
-            final(core).timelines.count == old(core).timelines.count,
-            final(core).timelines.kinds == old(core).timelines.kinds,
-            final(core).timelines.events == old(core).timelines.events,
-            final(core).timelines.next_seq == old(core).timelines.next_seq,
-            final(core).ledger@.submitted == old(core).ledger@.submitted,
-            final(core).ledger@.revoked == old(core).ledger@.revoked,
-            old(core).ledger@.knows.set().subset_of(final(core).ledger@.knows.set()),
-            old(core).ledger@.succeeded.dom().subset_of(final(core).ledger@.succeeded.dom()),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
+            final(core).ledger_spec()@.submitted == old(core).ledger_spec()@.submitted,
+            final(core).ledger_spec()@.revoked == old(core).ledger_spec()@.revoked,
+            old(core).ledger_spec()@.knows.set().subset_of(final(core).ledger_spec()@.knows.set()),
+            old(core).ledger_spec()@.succeeded.dom().subset_of(
+                final(core).ledger_spec()@.succeeded.dom(),
+            ),
             final(self).timeline_id == old(self).timeline_id,
             final(self).peer_node == old(self).peer_node,
             final(self).qp == old(self).qp,
@@ -2532,12 +2560,12 @@ impl<'a> RdmaBackend<'a> {
             );
             lemma_completed_pulls_after_step(
                 self.completed_pulls,
-                &before_core.timelines,
-                &core.timelines,
+                &before_core.timelines_spec(),
+                &core.timelines_spec(),
                 self.timeline_id,
                 self.cq.observer(),
-                &before_core.ledger@,
-                &core.ledger@,
+                &before_core.ledger_spec()@,
+                &core.ledger_spec()@,
             );
             lemma_rdma_leases_same_frames(
                 self.active_leases@,
@@ -2561,21 +2589,20 @@ impl<'a> RdmaBackend<'a> {
                 self.completed_pulls[slot] = Some((seq, st));
                 proof {
                     assert(before_cq.pending.contains_key(seq));
-                    assert(before_core.timelines.issued(self.timeline_id, seq)) by {
+                    assert(before_core.timelines_spec().issued(self.timeline_id, seq)) by {
                         reveal(rdma_window_wf);
                     };
-                    assert(core.timelines.issued(self.timeline_id, seq));
-                    assert(core.timelines.events@[(self.timeline_id, seq)] == rdma_data_events(
-                        before_cq,
-                    )[seq]) by {
+                    assert(core.timelines_spec().issued(self.timeline_id, seq));
+                    assert(core.timelines_spec().events_spec()@[(self.timeline_id, seq)]
+                        == rdma_data_events(before_cq)[seq]) by {
                         reveal(rdma_window_wf);
                     };
                     assert(completed_pulls_wf(
                         self.completed_pulls,
-                        &core.timelines,
+                        &core.timelines_spec(),
                         self.timeline_id,
                         self.cq.observer(),
-                        &core.ledger@,
+                        &core.ledger_spec()@,
                     ));
                     assert forall|k: int| 0 <= k < BITMAP_CAPACITY && k != slot as int implies (
                     #[trigger] self.completed_pulls[k]) == before_pulls[k] by {}
@@ -2658,7 +2685,7 @@ impl<'a> RdmaBackend<'a> {
 
     /// Drain all currently available CQ completions by repeatedly calling `pump_cq`.
     #[verifier::rlimit(400)]
-    pub fn pump_cq_all(
+    pub(crate) fn pump_cq_all(
         &mut self,
         core: &mut CacheCore,
         Tracked(instance): Tracked<&TransferInstance>,
@@ -2670,15 +2697,15 @@ impl<'a> RdmaBackend<'a> {
         ensures
             final(core).well_formed(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames == old(core).frames,
-            final(core).catalog == old(core).catalog,
-            final(core).spec == old(core).spec,
-            final(core).next_version_seq == old(core).next_version_seq,
-            final(core).version_seq_limit == old(core).version_seq_limit,
-            final(core).version_registry == old(core).version_registry,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec() == old(core).frames_spec(),
+            final(core).catalog_spec() == old(core).catalog_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            final(core).version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
             peer_core_step(old(core), final(core), old(self).timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -2686,14 +2713,18 @@ impl<'a> RdmaBackend<'a> {
                 old(self).active_leases@,
                 final(self).active_leases@,
             ),
-            final(core).timelines.count == old(core).timelines.count,
-            final(core).timelines.kinds == old(core).timelines.kinds,
-            final(core).timelines.events == old(core).timelines.events,
-            final(core).timelines.next_seq == old(core).timelines.next_seq,
-            final(core).ledger@.submitted == old(core).ledger@.submitted,
-            final(core).ledger@.revoked == old(core).ledger@.revoked,
-            old(core).ledger@.knows.set().subset_of(final(core).ledger@.knows.set()),
-            old(core).ledger@.succeeded.dom().subset_of(final(core).ledger@.succeeded.dom()),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
+            final(core).ledger_spec()@.submitted == old(core).ledger_spec()@.submitted,
+            final(core).ledger_spec()@.revoked == old(core).ledger_spec()@.revoked,
+            old(core).ledger_spec()@.knows.set().subset_of(final(core).ledger_spec()@.knows.set()),
+            old(core).ledger_spec()@.succeeded.dom().subset_of(
+                final(core).ledger_spec()@.succeeded.dom(),
+            ),
             final(self).timeline_id == old(self).timeline_id,
             final(self).peer_node == old(self).peer_node,
             final(self).qp == old(self).qp,
@@ -2766,15 +2797,15 @@ impl<'a> RdmaBackend<'a> {
                 core.well_formed(),
                 self.well_formed(core),
                 instance.id() == core.instance_id(),
-                core.node_id == before_core.node_id,
+                core.node_id_spec() == before_core.node_id_spec(),
                 core.instance_id() == before_core.instance_id(),
-                core.tiers == before_core.tiers,
-                core.frames == before_core.frames,
-                core.catalog == before_core.catalog,
-                core.spec == before_core.spec,
-                core.next_version_seq == before_core.next_version_seq,
-                core.version_seq_limit == before_core.version_seq_limit,
-                core.version_registry == before_core.version_registry,
+                core.tiers_spec() == before_core.tiers_spec(),
+                core.frames_spec() == before_core.frames_spec(),
+                core.catalog_spec() == before_core.catalog_spec(),
+                core.spec_spec() == before_core.spec_spec(),
+                core.next_version_seq_spec() == before_core.next_version_seq_spec(),
+                core.version_seq_limit_spec() == before_core.version_seq_limit_spec(),
+                core.version_registry_spec() == before_core.version_registry_spec(),
                 peer_core_step(&before_core, core, self.timeline_id),
                 peer_foreign_shares_preserved(
                     &before_core,
@@ -2782,14 +2813,17 @@ impl<'a> RdmaBackend<'a> {
                     before_leases,
                     self.active_leases@,
                 ),
-                core.timelines.count == before_core.timelines.count,
-                core.timelines.kinds == before_core.timelines.kinds,
-                core.timelines.events == before_core.timelines.events,
-                core.timelines.next_seq == before_core.timelines.next_seq,
-                core.ledger@.submitted == before_core.ledger@.submitted,
-                core.ledger@.revoked == before_core.ledger@.revoked,
-                before_core.ledger@.knows.set().subset_of(core.ledger@.knows.set()),
-                before_core.ledger@.succeeded.dom().subset_of(core.ledger@.succeeded.dom()),
+                core.timelines_spec().count_spec() == before_core.timelines_spec().count_spec(),
+                core.timelines_spec().kinds_spec() == before_core.timelines_spec().kinds_spec(),
+                core.timelines_spec().events_spec() == before_core.timelines_spec().events_spec(),
+                core.timelines_spec().next_seq_spec()
+                    == before_core.timelines_spec().next_seq_spec(),
+                core.ledger_spec()@.submitted == before_core.ledger_spec()@.submitted,
+                core.ledger_spec()@.revoked == before_core.ledger_spec()@.revoked,
+                before_core.ledger_spec()@.knows.set().subset_of(core.ledger_spec()@.knows.set()),
+                before_core.ledger_spec()@.succeeded.dom().subset_of(
+                    core.ledger_spec()@.succeeded.dom(),
+                ),
                 self.timeline_id == old(self).timeline_id,
                 self.peer_node == old(self).peer_node,
                 self.qp == old(self).qp,
@@ -2857,13 +2891,14 @@ impl<'a> RdmaBackend<'a> {
                             broadcast use vstd::iset::group_iset_lemmas;
 
                         };
-                        assert(before_core.ledger@.knows.set().subset_of(core.ledger@.knows.set()))
-                            by {
+                        assert(before_core.ledger_spec()@.knows.set().subset_of(
+                            core.ledger_spec()@.knows.set(),
+                        )) by {
                             broadcast use vstd::iset::group_iset_lemmas;
 
                         };
-                        assert(before_core.ledger@.succeeded.dom().subset_of(
-                            core.ledger@.succeeded.dom(),
+                        assert(before_core.ledger_spec()@.succeeded.dom().subset_of(
+                            core.ledger_spec()@.succeeded.dom(),
                         )) by {
                             broadcast use vstd::iset::group_iset_lemmas;
 

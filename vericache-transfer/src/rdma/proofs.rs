@@ -172,10 +172,10 @@ proof fn gdr_read_round_trip_bytes(
         donor.is_full(),
         initiator.is_full(),
         host1.is_full(),
-        host0.loc.space is HostAlloc,
-        donor.loc.space is GpuAlloc,
-        initiator.loc.space is GpuAlloc,
-        host1.loc.space is HostAlloc,
+        host0.loc.space.is_host(),
+        donor.loc.space.is_gpu(),
+        initiator.loc.space.is_gpu(),
+        host1.loc.space.is_host(),
         host0.loc.node == donor.loc.node,
         donor.loc.node != initiator.loc.node,
         initiator.loc.node == host1.loc.node,
@@ -298,6 +298,7 @@ proof fn reaping_preserves_pending(
 /// Exercise a multi-WR doorbell followed by a single batched observation. Even
 /// on partial posting, every later request is still absent when polling begins.
 #[allow(dead_code)]
+#[verifier::spinoff_prover]
 fn batch_submission_and_observation(
     qp: &mut QueuePair,
     cq: &mut CompletionQueue,
@@ -422,202 +423,6 @@ fn batch_submission_and_observation(
         }
     }
     Ok((result, completions))
-}
-
-pub(super) fn receive_read<T: ByteTransport>(
-    channel: &mut Channel<T>,
-    qp: &mut QueuePair,
-    cq: &mut CompletionQueue,
-    local: &MemoryRegionSlice,
-    cpu: &crate::host::HostSlice,
-    host: &mut HostContext,
-    out: &mut [u8],
-    expected: &[u8],
-    Tracked(instance): Tracked<&TransferInstance>,
-    Tracked(owned): Tracked<SlotToken>,
-    recover: bool,
-) -> (r: Result<(i32, Tracked<SlotToken>, Tracked<Completion>), RdmaError>)
-    requires
-        can_receive_read(
-            *old(channel),
-            *old(qp),
-            *old(cq),
-            *local,
-            *cpu,
-            *old(host),
-            old(out)@.len(),
-            instance.id(),
-            owned,
-        ),
-        expected@.len() == old(out)@.len(),
-    ensures
-        r.is_ok() ==> final(cq).same_queue(*old(cq)) && final(cq).well_formed()
-            && final(cq).pending().is_empty() && final(qp).cq_id() == old(qp).cq_id()
-            && final(qp).source().node() == old(qp).source().node() && final(channel).same_session(
-            *old(channel),
-        ) && final(host).ready(instance.id(), local.slot_ref().loc.node),
-        r.is_ok() ==> final(out)@ == expected@,
-        r matches Ok((_, slot, done)) ==> completed_slot(
-            instance.id(),
-            local.slot_ref(),
-            slot@,
-            done@,
-        ),
-        r matches Ok((status, _, _)) ==> (status != 0) == recover,
-{
-    let grant = match channel.recv_remote_read_grant(Tracked(instance)) {
-        Ok(v) => v,
-        Err(_) => return Err(RdmaError(71)),
-    };
-    if recover && channel.recv_completion_notice(Tracked(instance)).is_err() {
-        return Err(RdmaError(71));
-    }
-    let Some(cap) = grant.capability else {
-        return Err(RdmaError(71));
-    };
-    if local.len() != cap.len() {
-        return Err(RdmaError(22));
-    }
-    let Tracked(mut s) = grant.statement;
-    let Tracked(share_opt) = grant.share;
-    let tracked share_cap = share_opt.tracked_unwrap();
-    let ghost incoming_fr = share_cap.frontier();
-    let ghost prior_facts = s.closure();
-    let ghost share_id = grant.kind@->Some_0->ReadShare_share_id;
-    let tracked mut remote_perm = ReadPerm::Shared(share_cap);
-    let tracked mut local_tok = owned;
-    proof {
-        assert(ISet::<TransferEvent>::empty().union(s.facts) =~= s.facts);
-    }
-    let (Ghost(ev), Tracked(receipt)) = post_rdma_read(
-        qp,
-        cq,
-        Tracked(instance),
-        local,
-        &cap,
-        1,
-        false,
-        Tracked(&mut remote_perm),
-        Tracked(&mut local_tok),
-        Tracked(&mut s.submitted),
-        Tracked(&s.knows),
-        Ghost(s.facts),
-    )?;
-    let tracked mut successes = SucceededMap::empty(instance.id());
-    let (status, submitted, knows) = match wait_one(cq, Tracked(instance))? {
-        Completed::Data { submitted, knows, succeeded: _success, .. } if !recover => {
-            proof {
-                successes.insert(_success.get());
-            }
-            (0, submitted, knows)
-        },
-        Completed::DataFailed { status, submitted, knows, .. } if recover => (
-            status,
-            submitted,
-            knows,
-        ),
-        Completed::DataFailed { status, .. } => return Err(RdmaError(status)),
-        _ => return Err(RdmaError(71)),
-    };
-    let Tracked(observed) = submitted;
-    let Tracked(known) = knows;
-    let ghost one = ISet::empty().insert(ev);
-    let tracked mut infos = SubmittedMap::empty(instance.id());
-    proof {
-        infos.insert(observed);
-    }
-    assert(cq.pending() =~= Map::empty());
-    let result = if recover {
-        let Tracked(written) = crate::host::write_slice(
-            host,
-            Tracked(instance),
-            cpu,
-            expected,
-            Tracked(&mut local_tok),
-            Tracked(&infos),
-            Tracked(&known),
-            Ghost(one),
-        );
-        let tracked writes = written.infos();
-        let ghost cited = ISet::empty().insert(written.submitted.key());
-        let tracked mut read_perm = ReadPerm::Owned(local_tok);
-        let done = crate::host::read_slice(
-            host,
-            Tracked(instance),
-            cpu,
-            out,
-            Tracked(&mut read_perm),
-            Tracked(&writes),
-            Tracked(&written.knows),
-            Ghost(cited),
-        );
-        proof {
-            local_tok = read_perm.into_owned();
-        }
-        done
-    } else {
-        let tracked mut read_perm = ReadPerm::Owned(local_tok);
-        let done = crate::host::read_slice(
-            host,
-            Tracked(instance),
-            cpu,
-            out,
-            Tracked(&mut read_perm),
-            Tracked(&infos),
-            Tracked(&known),
-            Ghost(one),
-        );
-        proof {
-            local_tok = read_perm.into_owned();
-        }
-        done
-    };
-    let mut i = 0usize;
-    while i < out.len()
-        invariant
-            i <= out.len(),
-            out.len() == expected.len(),
-            forall|j: int| 0 <= j < i ==> #[trigger] out@[j] == expected@[j],
-        decreases out.len() - i,
-    {
-        if out[i] != expected[i] {
-            return Err(RdmaError(74));
-        }
-        i += 1;
-    }
-    assert(out@ =~= expected@);
-    if recover {
-        return Ok((status, Tracked(local_tok), result));
-    }
-    let tracked share_cap = remote_perm.into_shared();
-    let tracked s = Statement { submitted: infos, knows: known, facts: one, succeeded: successes };
-    proof {
-        assert(receipt.value() == observed.value());
-        assert forall|x: TransferEvent| #[trigger]
-            receipt.value().preds.contains(x) implies s.closure().contains(x) by {
-            assert(s.submitted.map()[ev].preds.contains(x));
-        }
-        assert(prior_facts == receipt.value().preds);
-        assert(s.closure().contains(ev));
-        assert(covers(incoming_fr, prior_facts));
-        assert(share_cap.frontier().readers == incoming_fr.readers.insert(ev));
-        assert(share_cap.frontier().last_writer == incoming_fr.last_writer);
-        assert(share_cap.frontier().readers.subset_of(s.closure()));
-        if let Some(w) = incoming_fr.last_writer {
-            assert(prior_facts.contains(w));
-            assert(s.closure().contains(w));
-        }
-        assert(share_matches(share_cap, instance.id(), cap.slot_ref(), share_id, s.closure()));
-    }
-    if channel.send_remote_read_release(
-        grant.tag,
-        &grant.user_bytes,
-        Tracked(s),
-        Tracked(share_cap),
-    ).is_err() {
-        return Err(RdmaError(71));
-    }
-    Ok((0, Tracked(local_tok), result))
 }
 
 } // verus!

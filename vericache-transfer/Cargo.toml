@@ -2,7 +2,7 @@
 name = "vericache-transfer"
 version.workspace = true
 edition.workspace = true
-description = "Verified hardware-FFI and ghost-state layer for VeriCache across Host, CUDA, RDMA, NVMe, and cross-node token transport."
+description = "Verified Host, CUDA, NVMe, and RDMA drivers for VeriCache."
 
 [package.metadata.verus]
 verify = true
@@ -10,9 +10,32 @@ verify = true
 [lib]
 name = "transfer"
 
+[features]
+default = ["cuda", "nvme", "rdma"]
+cuda = []
+nvme = []
+rdma = []
+
 [dependencies]
 foundation.workspace = true
+transfer_core.workspace = true
 vstd.workspace = true
 
 [lints]
 workspace = true
+
+[[test]]
+name = "host_cuda_e2e"
+required-features = ["cuda"]
+
+[[test]]
+name = "nvme_e2e"
+required-features = ["nvme"]
+
+[[test]]
+name = "rdma_e2e"
+required-features = ["rdma"]
+
+[[test]]
+name = "gdr_e2e"
+required-features = ["cuda", "rdma"]

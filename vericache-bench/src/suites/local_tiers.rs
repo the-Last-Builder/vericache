@@ -9,6 +9,7 @@ use transfer::domain::DeviceId;
 use transfer::host::{self, HostContext};
 use vericache_core::backends::cuda::CudaBackend;
 use vericache_core::backends::host::HostBackend;
+use vericache_core::backends::NoDevice;
 use vericache_core::backends::nvme::NvmeBackend;
 use vericache_core::engine::LocalEngine;
 #[cfg(verus_only)]
@@ -113,7 +114,7 @@ fn run_1a_gpu_to_host_scatter_inner(
         CudaEvent::new(dev, Ghost(0), Tracked(caps.instance.borrow())).expect("CudaEvent::new");
 
     let eng_ctx = HostContext::new(caps.mint_host());
-    let mut engine = LocalEngine::new(core, &host, eng_ctx, Some(cuda_backend), None);
+    let mut engine = LocalEngine::new(core, &host, eng_ctx, Some(cuda_backend), None).expect("assemble local engine");
 
     // Allocate 16 genuinely non-contiguous GPU Paged KV blocks (interleaved with spacer
     // allocations so blocks are non-adjacent in HBM, mimicking vLLM PagedAttention).
@@ -138,18 +139,12 @@ fn run_1a_gpu_to_host_scatter_inner(
             &h_slice,
             &data,
             Tracked(&mut h_tok),
-            Tracked(&engine.core.ledger.borrow().submitted),
-            Tracked(&engine.core.ledger.borrow().knows),
-            Ghost(engine.core.citations()),
+            Tracked(&engine.core().ledger().borrow().submitted),
+            Tracked(&engine.core().ledger().borrow().knows),
+            Ghost(engine.core().citations()),
         );
         let ghost w_ev = w_comp.submitted.key();
-        let t_w = engine
-            .core
-            .issue_ticket(engine.host.timeline_id(), Tracked(w_comp.submitted))
-            .expect("issue host prep ticket");
-        engine
-            .core
-            .mark_timeline_complete(engine.host.timeline_id(), t_w.seq(), Tracked(w_comp.knows));
+        engine.record_host_completion(Tracked(w_comp));
 
         let (g_buf, Tracked(mut g_tok)) =
             cuda::alloc_device(Tracked(caps.alloc.borrow_mut()), dev, block_len)
@@ -157,9 +152,11 @@ fn run_1a_gpu_to_host_scatter_inner(
         let g_slice = g_buf.slot_slice(0);
         let h_cuda = h_buf.as_cuda_slice();
         let tracked mut h_perm = ReadPerm::Owned(h_tok);
-        let ghost citations = engine.core.citations();
+        let ghost citations = engine.core().citations();
         let (Ghost(copy_ev), receipt) = {
-            let tracked ledger = engine.core.ledger.borrow_mut();
+            let tracked mut submitted = caps.instance.borrow().duplicate_submitted(
+            &engine.core().ledger().borrow().submitted,
+        );
             cuda::memcpy_async(
                 &mut caller_stream,
                 Tracked(caps.instance.borrow()),
@@ -167,15 +164,13 @@ fn run_1a_gpu_to_host_scatter_inner(
                 &h_cuda,
                 Tracked(&mut h_perm),
                 Tracked(&mut g_tok),
-                Tracked(&mut ledger.submitted),
-                Tracked(&ledger.knows),
+                Tracked(&mut submitted),
+                Tracked(&engine.core().ledger().borrow().knows),
                 Ghost(citations),
             )
             .expect("upload paged block")
         };
-        last_ticket = engine
-            .core
-            .issue_ticket(caller_tl, receipt)
+        last_ticket = engine.record_cuda_submission(&caller_stream, caller_tl, receipt)
             .expect("issue prep ticket");
         proof {
             offsets = offsets.push(i * block_len);
@@ -208,13 +203,7 @@ fn run_1a_gpu_to_host_scatter_inner(
     proof {
         offsets = offsets.push(frame_size);
     }
-    let Tracked(k_prep) = cuda::stream_synchronize(&caller_stream, Tracked(caps.instance.borrow()))
-        .expect("sync prep stream");
-    if last_ticket != Ticket::NONE {
-        engine
-            .core
-            .mark_timeline_complete(caller_tl, last_ticket.seq(), Tracked(k_prep));
-    }
+    engine.synchronize_caller_stream(&caller_stream, caller_tl, last_ticket, Tracked(caps.instance.borrow())).unwrap();
 
     let mut src_slices: Vec<CudaSlice<'_>> = Vec::with_capacity(num_blocks);
     let mut s_idx = 0usize;
@@ -256,20 +245,15 @@ fn run_1a_gpu_to_host_scatter_inner(
             .expect("sync after put_gpu_scatter");
 
         // D2H hop from gathered GPU VRAM frame -> Pinned Host Frame + CudaEvent sync.
-        let (host_f, _t_hop, _sp_hop) = {
-            let cuda_b = engine.cuda.as_mut().unwrap();
-            let res = cuda_b
-                .copy_hop_cuda(
-                    &mut engine.core,
-                    Tracked(caps.instance.borrow()),
-                    Tracked(caps.shares.borrow_mut()),
-                    gpu_f,
-                    host_tier,
-                )
-                .expect("copy_hop_cuda GPU->PinnedHost");
-            cuda::event_record(&mut done_event, &cuda_b.timeline.stream).expect("event_record");
-            res
-        };
+        let (host_f, _t_hop, _sp_hop) = engine
+            .copy_hop_cuda(
+                Tracked(caps.instance.borrow()),
+                Tracked(caps.shares.borrow_mut()),
+                gpu_f,
+                host_tier,
+            )
+            .expect("copy_hop_cuda GPU->PinnedHost");
+        cuda::event_record(&mut done_event, engine.cuda().unwrap().stream()).expect("event_record");
         engine
             .synchronize_cuda(Tracked(caps.instance.borrow()))
             .expect("sync after D2H copy_hop_cuda");
@@ -277,8 +261,8 @@ fn run_1a_gpu_to_host_scatter_inner(
 
         engine.evict_frame(gpu_f).expect("evict gpu_f");
         engine.evict_frame(host_f).expect("evict host_f");
-        let r1 = engine.reclaim_draining(gpu_tier, 8);
-        let r2 = engine.reclaim_draining(host_tier, 8);
+        let r1 = engine.reclaim_draining(gpu_tier, 8).unwrap();
+        let r2 = engine.reclaim_draining(host_tier, 8).unwrap();
         assert!(r1 + r2 == 2, "reclaim both gpu and pinned host frames");
 
         if it >= job.warmup_iters {
@@ -338,7 +322,7 @@ fn run_1a_host_to_gpu_scatter_inner(
         CudaEvent::new(dev, Ghost(0), Tracked(caps.instance.borrow())).expect("CudaEvent::new");
 
     let eng_ctx = HostContext::new(caps.mint_host());
-    let mut engine = LocalEngine::new(core, &host, eng_ctx, Some(cuda_backend), None);
+    let mut engine = LocalEngine::new(core, &host, eng_ctx, Some(cuda_backend), None).expect("assemble local engine");
 
     // Publish a frame in Pinned Host DRAM (NOT in GPU VRAM, so get_into_gpu_scatter executes
     // a direct 1-hop Pinned Host Frame -> 16 non-contiguous GPU blocks H2D scatter!).
@@ -406,11 +390,7 @@ fn run_1a_host_to_gpu_scatter_inner(
             .expect("get_into_gpu_scatter")
             .expect("pinned host hit");
         cuda::event_record(&mut done_event, &caller_stream).expect("event_record");
-        let Tracked(k_out) = cuda::stream_synchronize(&caller_stream, Tracked(caps.instance.borrow()))
-            .expect("stream_synchronize");
-        engine
-            .core
-            .mark_timeline_complete(caller_tl, t_out.seq(), Tracked(k_out));
+        engine.synchronize_caller_stream(&caller_stream, caller_tl, t_out, Tracked(caps.instance.borrow())).unwrap();
         let dt_ns = t0.elapsed().as_nanos() as u64;
 
         if it >= job.warmup_iters {
@@ -448,7 +428,7 @@ fn run_1b_nvme_write_spill_inner(
 
     let nvme = NvmeBackend::new(
         &mut core,
-        &host.ctx,
+        host.context(),
         Tracked(caps.instance.borrow()),
         Tracked(caps.alloc.borrow_mut()),
         caps.mint_nvme(),
@@ -458,7 +438,7 @@ fn run_1b_nvme_write_spill_inner(
     )
     .expect("NvmeBackend::new");
     let eng_ctx = HostContext::new(caps.mint_host());
-    let mut engine = LocalEngine::new(core, &host, eng_ctx, None, Some(nvme));
+    let mut engine = LocalEngine::<NoDevice>::new(core, &host, eng_ctx, None, Some(nvme)).expect("assemble local engine");
     let nvme_tier = engine.nvme_tier().unwrap();
 
     // Pre-populate `qd` Host DRAM frames with deterministic payloads.
@@ -507,15 +487,12 @@ fn run_1b_nvme_write_spill_inner(
             assert!(prog.failed == 0);
             nvme_frames.push(nf);
         } else {
-            let mut nvme_b = engine.nvme.take().unwrap();
             let mut last_ticket = Ticket::NONE;
             let mut h_idx = 0usize;
             while h_idx < host_frames.len() {
                 let hf = host_frames[h_idx];
-                let (nf, ticket) = nvme_b
+                let (nf, ticket) = engine
                     .stage_dram_to_nvme(
-                        engine.host,
-                        &mut engine.core,
                         Tracked(caps.instance.borrow()),
                         Tracked(caps.shares.borrow_mut()),
                         hf,
@@ -525,10 +502,9 @@ fn run_1b_nvme_write_spill_inner(
                 last_ticket = ticket;
                 h_idx += 1;
             }
-            nvme_b
-                .submit(Ghost(&engine.core))
+            engine
+                .submit_staged_nvme()
                 .expect("nvme batch submit");
-            engine.nvme = Some(nvme_b);
             let prog = engine
                 .wait_nvme_ticket(Tracked(caps.instance.borrow()), last_ticket)
                 .expect("wait_nvme_ticket batch");
@@ -541,7 +517,7 @@ fn run_1b_nvme_write_spill_inner(
             engine.evict_frame(nvme_frames[f_idx]).expect("evict nvme frame");
             f_idx += 1;
         }
-        let reclaimed = engine.reclaim_draining(nvme_tier, qd + 4);
+        let reclaimed = engine.reclaim_draining(nvme_tier, qd + 4).unwrap();
         assert!(reclaimed == qd, "reclaim all nvme spill frames");
 
         if b >= warmup_batches {
@@ -578,7 +554,7 @@ fn run_1b_nvme_read_cold_inner(
 
     let nvme = NvmeBackend::new(
         &mut core,
-        &host.ctx,
+        host.context(),
         Tracked(caps.instance.borrow()),
         Tracked(caps.alloc.borrow_mut()),
         caps.mint_nvme(),
@@ -588,7 +564,7 @@ fn run_1b_nvme_read_cold_inner(
     )
     .expect("NvmeBackend::new");
     let eng_ctx = HostContext::new(caps.mint_host());
-    let mut engine = LocalEngine::new(core, &host, eng_ctx, None, Some(nvme));
+    let mut engine = LocalEngine::<NoDevice>::new(core, &host, eng_ctx, None, Some(nvme)).expect("assemble local engine");
     let host_tier = engine.host_tier();
 
     // Seed `qd` frames onto NVMe, then evict their DRAM copies so they live ONLY on NVMe.
@@ -613,7 +589,7 @@ fn run_1b_nvme_read_cold_inner(
             .expect("wait seed spill");
         assert!(prog.failed == 0);
         engine.evict_frame(hf).expect("evict seed dram");
-        assert!(engine.reclaim_draining(host_tier, 4) == 1);
+        assert!(engine.reclaim_draining(host_tier, 4).unwrap() == 1);
         keys.push(key);
         nvme_frames.push(nf);
         i += 1;
@@ -650,15 +626,12 @@ fn run_1b_nvme_read_cold_inner(
             assert!(prog.failed == 0);
             dram_frames.push(df);
         } else {
-            let mut nvme_b = engine.nvme.take().unwrap();
             let mut last_ticket = Ticket::NONE;
             let mut n_idx = 0usize;
             while n_idx < nvme_frames.len() {
                 let nf = nvme_frames[n_idx];
-                let (df, ticket) = nvme_b
+                let (df, ticket) = engine
                     .stage_nvme_to_dram(
-                        engine.host,
-                        &mut engine.core,
                         Tracked(caps.instance.borrow()),
                         Tracked(caps.shares.borrow_mut()),
                         nf,
@@ -668,10 +641,9 @@ fn run_1b_nvme_read_cold_inner(
                 last_ticket = ticket;
                 n_idx += 1;
             }
-            nvme_b
-                .submit(Ghost(&engine.core))
+            engine
+                .submit_staged_nvme()
                 .expect("nvme batch read submit");
-            engine.nvme = Some(nvme_b);
             let prog = engine
                 .wait_nvme_ticket(Tracked(caps.instance.borrow()), last_ticket)
                 .expect("wait_nvme_ticket batch read");
@@ -684,7 +656,7 @@ fn run_1b_nvme_read_cold_inner(
             engine.evict_frame(dram_frames[d_idx]).expect("evict warmed dram");
             d_idx += 1;
         }
-        let reclaimed = engine.reclaim_draining(host_tier, qd + 4);
+        let reclaimed = engine.reclaim_draining(host_tier, qd + 4).unwrap();
         assert!(reclaimed == qd, "reclaim all warmed dram frames");
 
         if b >= warmup_batches {

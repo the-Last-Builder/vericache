@@ -198,10 +198,21 @@ pub fn poll_completion_queue(
             _ => *final(cq) == *old(cq),
         },
 {
-    let Some((wr_id, status, work)) = ffi::poll(cq)? else {
+    let Some((wr_id, status, work, evidence)) = ffi::poll(cq)? else {
         return Ok(PollStatus::Empty);
     };
-    Ok(PollStatus::Completed(complete_one_cqe(cq, wr_id, status, work, Tracked(instance))))
+    Ok(
+        PollStatus::Completed(
+            complete_one_cqe(
+                cq,
+                wr_id,
+                status,
+                work,
+                Tracked(instance),
+                Tracked(evidence.borrow()),
+            ),
+        ),
+    )
 }
 
 #[cfg_attr(not(verus_only), allow(unused_variables))]
@@ -211,12 +222,20 @@ fn complete_one_cqe(
     status: i32,
     work: ffi::WorkKind,
     Tracked(instance): Tracked<&TransferInstance>,
+    Tracked(evidence): Tracked<&ObservedEvents>,
 ) -> (c: Completed)
     requires
         old(cq).well_formed(),
         old(cq).infos().instance_id() == instance.id(),
         old(cq).pending().contains_key(wr_id),
         ffi::matches_pending(work, old(cq).pending()[wr_id].kind),
+        ffi::observed_cqe(
+            *evidence,
+            instance.id(),
+            old(cq).observer(),
+            old(cq).pending()[wr_id].kind,
+            status,
+        ),
     ensures
         final(cq).well_formed(),
         final(cq).same_queue(*old(cq)),
@@ -235,7 +254,14 @@ fn complete_one_cqe(
         cq.in_flight = Ghost(cq.pending().remove(wr_id));
         if data {
             observation =
-            Some(instance.observe(node, ISet::empty().insert(ev), cq.in_flight_infos.borrow()));
+            Some(
+                instance.observe_completed(
+                    node,
+                    ISet::empty().insert(ev),
+                    cq.in_flight_infos.borrow(),
+                    evidence,
+                ),
+            );
             let tracked s = cq.in_flight_infos.borrow_mut().remove(ev);
             if exists|k: u64|
                 cq.pending().contains_key(k) && (#[trigger] cq.pending()[k]).kind == (
@@ -256,7 +282,7 @@ fn complete_one_cqe(
                     event: Ghost(ev),
                     submitted,
                     knows,
-                    succeeded: Tracked(Succeeded::mint(instance.id(), ev)),
+                    succeeded: Tracked(evidence.success(instance.id(), ev)),
                 }
             } else {
                 Completed::DataFailed { wr_id, status, event: Ghost(ev), submitted, knows }
@@ -395,15 +421,28 @@ pub fn poll_completion_queue_batch(
                 i <= j < raw.len() ==> cq.pending().contains_key(raw@[j].0) && ffi::matches_pending(
                     raw@[j].2,
                     cq.pending()[raw@[j].0].kind,
+                ) && ffi::observed_cqe(
+                    raw@[j].3@,
+                    instance.id(),
+                    cq.observer(),
+                    cq.pending()[raw@[j].0].kind,
+                    raw@[j].1,
                 ),
             forall|j: int, k: int|
                 0 <= j < k < raw.len() ==> (#[trigger] raw@[j]).0 != (#[trigger] raw@[k]).0,
         decreases raw.len() - i,
     {
-        let (id, status, kind) = raw[i];
+        let (id, status, kind, evidence) = &raw [i];
         let ghost current = CqSnapshot::of(*cq);
         assert(completion_prefix(out@, i as int, before, instance.id()) == (current, true));
-        let c = complete_one_cqe(cq, id, status, kind, Tracked(instance));
+        let c = complete_one_cqe(
+            cq,
+            *id,
+            *status,
+            *kind,
+            Tracked(instance),
+            Tracked(evidence.borrow()),
+        );
         let ghost previous = out@;
         out.push(c);
         proof {

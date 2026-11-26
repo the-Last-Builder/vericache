@@ -87,82 +87,101 @@ pub(super) proof fn lemma_nvme_preserve_core_after_submission(
     before: &CacheCore,
     after: &CacheCore,
     dst_frame: FrameId,
-    timeline: u8,
+    timeline: TimelineId,
     seq: u64,
     ev: TransferEvent,
     val: EventInfo<TransferDomain>,
 )
     requires
         before.well_formed(),
-        dst_frame.0 < before.frames.metas.len(),
-        before.frames.meta(dst_frame).state == STATE_INITIALIZING,
-        after.node_id == before.node_id,
-        after.tiers == before.tiers,
-        after.frames == before.frames,
-        after.catalog == before.catalog,
-        after.version_seq_start == before.version_seq_start,
-        after.next_version_seq == before.next_version_seq,
-        after.version_seq_limit == before.version_seq_limit,
-        after.active_leases == before.active_leases,
-        after.free_lease_slots == before.free_lease_slots,
-        after.lease_generation == before.lease_generation,
-        after.spec == before.spec,
-        after.version_registry == before.version_registry,
-        timeline < before.timelines.count,
-        seq == before.timelines.next_seq[timeline as int],
-        after.timelines.well_formed(after.instance_id(), after.node(), &after.ledger@),
-        after.timelines.count == before.timelines.count,
-        after.timelines.kinds == before.timelines.kinds,
-        after.timelines.confirmed_seq == before.timelines.confirmed_seq,
-        after.timelines.next_seq@ == before.timelines.next_seq@.update(
+        dst_frame.0 < before.frames_spec().metas_spec().len(),
+        before.frames_spec().meta(dst_frame).state == STATE_INITIALIZING,
+        after.node_id_spec() == before.node_id_spec(),
+        after.tiers_spec() == before.tiers_spec(),
+        after.frames_spec() == before.frames_spec(),
+        after.catalog_spec() == before.catalog_spec(),
+        after.version_seq_start_spec() == before.version_seq_start_spec(),
+        after.next_version_seq_spec() == before.next_version_seq_spec(),
+        after.version_seq_limit_spec() == before.version_seq_limit_spec(),
+        after.active_leases_spec() == before.active_leases_spec(),
+        after.free_lease_slots_spec() == before.free_lease_slots_spec(),
+        after.lease_generation_spec() == before.lease_generation_spec(),
+        after.spec_spec() == before.spec_spec(),
+        after.version_registry_spec() == before.version_registry_spec(),
+        timeline < before.timelines_spec().count_spec(),
+        seq == before.timelines_spec().next_seq_spec()[timeline as int],
+        after.timelines_spec().well_formed(
+            after.instance_id(),
+            after.node(),
+            &after.ledger_spec()@,
+        ),
+        after.timelines_spec().count_spec() == before.timelines_spec().count_spec(),
+        after.timelines_spec().kinds_spec() == before.timelines_spec().kinds_spec(),
+        after.timelines_spec().confirmed_seq_spec() == before.timelines_spec().confirmed_seq_spec(),
+        after.timelines_spec().next_seq_spec()@ == before.timelines_spec().next_seq_spec()@.update(
             timeline as int,
             (seq + 1) as u64,
         ),
-        after.timelines.events@ == before.timelines.events@.insert((timeline, seq), ev),
-        after.ledger@.submitted.instance_id() == before.instance_id(),
-        after.ledger@.submitted.map() == before.ledger@.submitted.map().insert(ev, val),
-        before.ledger@.submitted.map().submap_of(after.ledger@.submitted.map()),
-        after.ledger@.knows == before.ledger@.knows,
-        after.ledger@.succeeded == before.ledger@.succeeded,
-        after.ledger@.revoked == before.ledger@.revoked,
-        val.preds.subset_of(before.ledger@.submitted.dom()),
-        val.access.writes == ISet::empty().insert(before.frames.frame(dst_frame).slot.loc),
+        after.timelines_spec().events_spec()@ == before.timelines_spec().events_spec()@.insert(
+            (timeline, seq),
+            ev,
+        ),
+        after.ledger_spec()@.submitted.instance_id() == before.instance_id(),
+        after.ledger_spec()@.submitted.map() == before.ledger_spec()@.submitted.map().insert(
+            ev,
+            val,
+        ),
+        before.ledger_spec()@.submitted.map().submap_of(after.ledger_spec()@.submitted.map()),
+        after.ledger_spec()@.knows == before.ledger_spec()@.knows,
+        after.ledger_spec()@.succeeded == before.ledger_spec()@.succeeded,
+        after.ledger_spec()@.revoked == before.ledger_spec()@.revoked,
+        val.preds.subset_of(before.ledger_spec()@.submitted.dom()),
+        val.access.writes == ISet::empty().insert(before.frames_spec().frame(dst_frame).slot.loc),
     ensures
         after.well_formed(),
         after.kernel_view().extends(before.kernel_view()),
 {
-    assert(before.ledger@.citations(after.node()).subset_of(after.ledger@.citations(after.node())));
+    assert(before.ledger_spec()@.citations(after.node()).subset_of(
+        after.ledger_spec()@.citations(after.node()),
+    ));
     assert forall|i: int|
-        0 <= i < before.timelines.count implies #[trigger] after.timelines.confirmed_seq[i]
-        >= before.timelines.confirmed_seq[i] && after.timelines.next_seq[i]
-        >= before.timelines.next_seq[i] && after.timelines.kinds[i]
-        == before.timelines.kinds[i] by {}
-    assert forall|u: u8, s: u64|
-        before.timelines.issued(u, s) implies #[trigger] after.timelines.events@[(u, s)]
-        == before.timelines.events@[(u, s)] by {}
+        0 <= i
+            < before.timelines_spec().count_spec() implies #[trigger] after.timelines_spec().confirmed_seq_spec()[i]
+        >= before.timelines_spec().confirmed_seq_spec()[i]
+        && after.timelines_spec().next_seq_spec()[i] >= before.timelines_spec().next_seq_spec()[i]
+        && after.timelines_spec().kinds_spec()[i] == before.timelines_spec().kinds_spec()[i] by {}
+    assert forall|u: TimelineId, s: u64|
+        before.timelines_spec().issued(
+            u,
+            s,
+        ) implies #[trigger] after.timelines_spec().events_spec()@[(u, s)]
+        == before.timelines_spec().events_spec()@[(u, s)] by {}
     assert(after.kernel_view().extends(before.kernel_view()));
     assert forall|e: TransferEvent| #[trigger]
-        after.ledger@.submitted.dom().contains(
+        after.ledger_spec()@.submitted.dom().contains(
             e,
-        ) implies after.ledger@.submitted.map()[e].preds.subset_of(
-        after.ledger@.submitted.dom(),
+        ) implies after.ledger_spec()@.submitted.map()[e].preds.subset_of(
+        after.ledger_spec()@.submitted.dom(),
     ) by {
-        if before.ledger@.submitted.dom().contains(e) {
-            assert(before.ledger@.submitted.map()[e] == after.ledger@.submitted.map()[e]);
+        if before.ledger_spec()@.submitted.dom().contains(e) {
+            assert(before.ledger_spec()@.submitted.map()[e]
+                == after.ledger_spec()@.submitted.map()[e]);
         } else {
             assert(e == ev);
         }
     }
     before.lemma_non_published_write_disjoint(dst_frame, val.access.writes);
     assert forall|e: TransferEvent, f: FrameId|
-        after.ledger@.submitted.dom().contains(e) && !before.ledger@.submitted.dom().contains(e)
-            && f.0 < after.frames.metas.len() && (#[trigger] after.frames.meta(f)).state
-            == STATE_PUBLISHED implies !(
-    #[trigger] after.ledger@.submitted.map()[e]).access.writes.contains(
-        after.frames.frame(f).slot.loc,
+        after.ledger_spec()@.submitted.dom().contains(e)
+            && !before.ledger_spec()@.submitted.dom().contains(e) && f.0
+            < after.frames_spec().metas_spec().len() && (#[trigger] after.frames_spec().meta(
+            f,
+        )).state == STATE_PUBLISHED implies !(
+    #[trigger] after.ledger_spec()@.submitted.map()[e]).access.writes.contains(
+        after.frames_spec().frame(f).slot.loc,
     ) by {
         assert(e == ev);
-        assert(before.frames.meta(f).state == STATE_PUBLISHED);
+        assert(before.frames_spec().meta(f).state == STATE_PUBLISHED);
     }
     after.preserve_after_ledger_growth(*before);
 }
@@ -170,33 +189,39 @@ pub(super) proof fn lemma_nvme_preserve_core_after_submission(
 pub(super) proof fn lemma_nvme_preserve_core_after_complete(
     before: &CacheCore,
     after: &CacheCore,
-    timeline: u8,
+    timeline: TimelineId,
 )
     requires
         before.well_formed(),
-        after.node_id == before.node_id,
-        after.tiers == before.tiers,
-        after.frames == before.frames,
-        after.catalog == before.catalog,
-        after.version_seq_start == before.version_seq_start,
-        after.next_version_seq == before.next_version_seq,
-        after.version_seq_limit == before.version_seq_limit,
-        after.active_leases == before.active_leases,
-        after.free_lease_slots == before.free_lease_slots,
-        after.lease_generation == before.lease_generation,
-        after.spec == before.spec,
-        after.version_registry == before.version_registry,
-        after.timelines.well_formed(after.instance_id(), after.node(), &after.ledger@),
-        after.timelines.polled(&before.timelines, timeline),
-        after.ledger@.submitted == before.ledger@.submitted,
-        after.ledger@.revoked == before.ledger@.revoked,
-        before.ledger@.knows.set().subset_of(after.ledger@.knows.set()),
-        before.ledger@.succeeded.dom().subset_of(after.ledger@.succeeded.dom()),
+        after.node_id_spec() == before.node_id_spec(),
+        after.tiers_spec() == before.tiers_spec(),
+        after.frames_spec() == before.frames_spec(),
+        after.catalog_spec() == before.catalog_spec(),
+        after.version_seq_start_spec() == before.version_seq_start_spec(),
+        after.next_version_seq_spec() == before.next_version_seq_spec(),
+        after.version_seq_limit_spec() == before.version_seq_limit_spec(),
+        after.active_leases_spec() == before.active_leases_spec(),
+        after.free_lease_slots_spec() == before.free_lease_slots_spec(),
+        after.lease_generation_spec() == before.lease_generation_spec(),
+        after.spec_spec() == before.spec_spec(),
+        after.version_registry_spec() == before.version_registry_spec(),
+        after.timelines_spec().well_formed(
+            after.instance_id(),
+            after.node(),
+            &after.ledger_spec()@,
+        ),
+        after.timelines_spec().polled(&before.timelines_spec(), timeline),
+        after.ledger_spec()@.submitted == before.ledger_spec()@.submitted,
+        after.ledger_spec()@.revoked == before.ledger_spec()@.revoked,
+        before.ledger_spec()@.knows.set().subset_of(after.ledger_spec()@.knows.set()),
+        before.ledger_spec()@.succeeded.dom().subset_of(after.ledger_spec()@.succeeded.dom()),
     ensures
         after.well_formed(),
         after.kernel_view().extends(before.kernel_view()),
 {
-    assert(before.ledger@.citations(after.node()).subset_of(after.ledger@.citations(after.node())));
+    assert(before.ledger_spec()@.citations(after.node()).subset_of(
+        after.ledger_spec()@.citations(after.node()),
+    ));
     assert(after.kernel_view().extends(before.kernel_view()));
     after.preserve_after_ledger_growth(*before);
 }
@@ -289,7 +314,7 @@ pub(super) proof fn lemma_nvme_ring_pending_remove(old_ring: IoUring, new_ring: 
 pub(super) proof fn lemma_nvme_completion_observed(
     before_core: &CacheCore,
     after_core: &CacheCore,
-    timeline: u8,
+    timeline: TimelineId,
     seq: u64,
     ev: TransferEvent,
     knows: Knows,
@@ -299,19 +324,21 @@ pub(super) proof fn lemma_nvme_completion_observed(
     requires
         before_core.well_formed(),
         after_core.well_formed(),
-        after_core.node_id == before_core.node_id,
-        before_core.timelines.issued(timeline, seq),
-        before_core.timelines.events@[(timeline, seq)] == ev,
-        after_core.ledger@.submitted == before_core.ledger@.submitted,
-        after_core.ledger@.knows.set() == before_core.ledger@.knows.set().union(knows.set()),
+        after_core.node_id_spec() == before_core.node_id_spec(),
+        before_core.timelines_spec().issued(timeline, seq),
+        before_core.timelines_spec().events_spec()@[(timeline, seq)] == ev,
+        after_core.ledger_spec()@.submitted == before_core.ledger_spec()@.submitted,
+        after_core.ledger_spec()@.knows.set() == before_core.ledger_spec()@.knows.set().union(
+            knows.set(),
+        ),
         knows.set() == knowledge_of(before_core.node(), preds.insert(ev)),
         op.copy@.writer == ev,
-        nvme_copy_retained(op.copy@, before_core.ledger@, before_core.node()),
+        nvme_copy_retained(op.copy@, before_core.ledger_spec()@, before_core.node()),
         op.src_cap@.well_formed(),
         op.src_cap@.instance_id() == after_core.instance_id(),
-        op.src_cap@.loc() == after_core.frames.frame(op.hop.src_frame).slot.loc,
+        op.src_cap@.loc() == after_core.frames_spec().frame(op.hop.src_frame).slot.loc,
         op.src_cap@.frontier().readers == ISet::empty().insert(ev),
-        op.hop.src_frame.0 < after_core.frames.metas.len(),
+        op.hop.src_frame.0 < after_core.frames_spec().metas_spec().len(),
         slot_owned(
             op.dst_tok@,
             after_core.instance_id(),
@@ -319,9 +346,9 @@ pub(super) proof fn lemma_nvme_completion_observed(
             Frontier { last_writer: Some(ev), readers: ISet::empty() },
         ),
     ensures
-        before_core.timelines.observed(timeline, seq, before_core.node(), knows),
+        before_core.timelines_spec().observed(timeline, seq, before_core.node(), knows),
         after_core.citations().contains(ev),
-        after_core.frames.returned_reads(
+        after_core.frames_spec().returned_reads(
             op.hop.src_frame,
             op.src_cap@,
             op.ticket,
@@ -330,7 +357,7 @@ pub(super) proof fn lemma_nvme_completion_observed(
         write_admitted(slot_frontier(op.dst_tok@), after_core.citations()),
         slot_frontier(op.dst_tok@).readers.is_empty(),
 {
-    assert(before_core.ledger@.submitted.dom().contains(ev));
+    assert(before_core.ledger_spec()@.submitted.dom().contains(ev));
     assert(preds.insert(ev).contains(ev));
     assert(knows.set().contains((before_core.node(), ev)));
     assert(after_core.citations().contains(ev));
@@ -446,7 +473,8 @@ proof fn lemma_nvme_disjoint_after_insert(
         forall|k: int|
             0 <= k < BITMAP_CAPACITY && k != idx ==> (#[trigger] old_transfers[k] matches Some(b)
                 ==> new_op.hop.dst_frame != b.hop.dst_frame && new_op.hop.dst_slot@.loc
-                != b.hop.dst_slot@.loc && new_op.hop.src_lease.slot != b.hop.src_lease.slot),
+                != b.hop.dst_slot@.loc && new_op.hop.src_lease.slot_spec()
+                != b.hop.src_lease.slot_spec()),
     ensures
         nvme_pending_disjoint(new_transfers),
 {
@@ -457,7 +485,7 @@ proof fn lemma_nvme_disjoint_after_insert(
         #[trigger] new_transfers[j],
     ) {
         (Some(a), Some(b)) => a.hop.dst_frame != b.hop.dst_frame && a.hop.dst_slot@.loc
-            != b.hop.dst_slot@.loc && a.hop.src_lease.slot != b.hop.src_lease.slot,
+            != b.hop.dst_slot@.loc && a.hop.src_lease.slot_spec() != b.hop.src_lease.slot_spec(),
         _ => true,
     } by {
         if i != idx && j != idx {
@@ -490,7 +518,7 @@ proof fn lemma_nvme_disjoint_after_remove(
         #[trigger] new_transfers[j],
     ) {
         (Some(a), Some(b)) => a.hop.dst_frame != b.hop.dst_frame && a.hop.dst_slot@.loc
-            != b.hop.dst_slot@.loc && a.hop.src_lease.slot != b.hop.src_lease.slot,
+            != b.hop.dst_slot@.loc && a.hop.src_lease.slot_spec() != b.hop.src_lease.slot_spec(),
         _ => true,
     } by {
         if i != idx && j != idx {
@@ -517,7 +545,7 @@ proof fn lemma_nvme_disjoint_pair(
     ensures
         a.hop.dst_frame != b.hop.dst_frame,
         a.hop.dst_slot@.loc != b.hop.dst_slot@.loc,
-        a.hop.src_lease.slot != b.hop.src_lease.slot,
+        a.hop.src_lease.slot_spec() != b.hop.src_lease.slot_spec(),
 {
     reveal(nvme_pending_disjoint);
 }
@@ -527,7 +555,7 @@ proof fn lemma_nvme_op_valid_after_stage(
     before_core: &CacheCore,
     after_hop_core: &CacheCore,
     after_core: &CacheCore,
-    timeline: u8,
+    timeline: TimelineId,
     i: int,
     new_op: InFlightNvmeOp,
     ev: TransferEvent,
@@ -535,86 +563,91 @@ proof fn lemma_nvme_op_valid_after_stage(
 )
     requires
         op.valid(before_core, timeline, i),
-        after_hop_core.frames.separated(),
-        after_hop_core.node_id == before_core.node_id,
-        after_hop_core.ledger == before_core.ledger,
-        after_hop_core.next_version_seq == before_core.next_version_seq,
-        after_hop_core.version_seq_limit == before_core.version_seq_limit,
-        after_hop_core.timelines.only_watermarks(&before_core.timelines),
-        after_hop_core.frames.same_directory(&before_core.frames),
-        after_hop_core.frames.preserves_initializing(&before_core.frames, None),
-        before_core.frames.meta(new_op.hop.dst_frame).state != STATE_INITIALIZING,
-        before_core.active_leases[new_op.hop.src_lease.slot as int].is_none(),
-        after_hop_core.active_leases.len() == before_core.active_leases.len(),
+        after_hop_core.frames_spec().separated(),
+        after_hop_core.node_id_spec() == before_core.node_id_spec(),
+        after_hop_core.ledger_spec() == before_core.ledger_spec(),
+        after_hop_core.next_version_seq_spec() == before_core.next_version_seq_spec(),
+        after_hop_core.version_seq_limit_spec() == before_core.version_seq_limit_spec(),
+        after_hop_core.timelines_spec().only_watermarks(&before_core.timelines_spec()),
+        after_hop_core.frames_spec().same_directory(&before_core.frames_spec()),
+        after_hop_core.frames_spec().preserves_initializing(&before_core.frames_spec(), None),
+        before_core.frames_spec().meta(new_op.hop.dst_frame).state != STATE_INITIALIZING,
+        before_core.active_leases_spec()[new_op.hop.src_lease.slot_spec() as int].is_none(),
+        after_hop_core.active_leases_spec().len() == before_core.active_leases_spec().len(),
         forall|s: int|
-            0 <= s < before_core.active_leases.len() && s != new_op.hop.src_lease.slot as int
-                ==> #[trigger] after_hop_core.active_leases[s] == before_core.active_leases[s],
-        after_core.node_id == after_hop_core.node_id,
-        after_core.frames == after_hop_core.frames,
-        after_core.active_leases == after_hop_core.active_leases,
-        after_core.next_version_seq == after_hop_core.next_version_seq,
-        after_core.version_seq_limit == after_hop_core.version_seq_limit,
-        after_core.timelines.count == after_hop_core.timelines.count,
-        after_core.timelines.next_seq[timeline as int]
-            == after_hop_core.timelines.next_seq[timeline as int] + 1,
-        after_core.timelines.events@ == after_hop_core.timelines.events@.insert(
+            0 <= s < before_core.active_leases_spec().len() && s
+                != new_op.hop.src_lease.slot_spec() as int
+                ==> #[trigger] after_hop_core.active_leases_spec()[s]
+                == before_core.active_leases_spec()[s],
+        after_core.node_id_spec() == after_hop_core.node_id_spec(),
+        after_core.frames_spec() == after_hop_core.frames_spec(),
+        after_core.active_leases_spec() == after_hop_core.active_leases_spec(),
+        after_core.next_version_seq_spec() == after_hop_core.next_version_seq_spec(),
+        after_core.version_seq_limit_spec() == after_hop_core.version_seq_limit_spec(),
+        after_core.timelines_spec().count_spec() == after_hop_core.timelines_spec().count_spec(),
+        after_core.timelines_spec().next_seq_spec()[timeline as int]
+            == after_hop_core.timelines_spec().next_seq_spec()[timeline as int] + 1,
+        after_core.timelines_spec().events_spec()@
+            == after_hop_core.timelines_spec().events_spec()@.insert(
             (timeline, new_op.ticket.sequence()),
             ev,
         ),
-        new_op.ticket.sequence() == after_hop_core.timelines.next_seq[timeline as int],
-        new_op.hop.dst_frame.0 < after_hop_core.frames.metas.len(),
-        new_op.hop.dst_slot@ == after_hop_core.frames.frame(new_op.hop.dst_frame).slot,
-        after_core.ledger@.submitted.instance_id()
-            == after_hop_core.ledger@.submitted.instance_id(),
-        after_core.ledger@.submitted.map() == after_hop_core.ledger@.submitted.map().insert(
-            ev,
-            val,
+        new_op.ticket.sequence()
+            == after_hop_core.timelines_spec().next_seq_spec()[timeline as int],
+        new_op.hop.dst_frame.0 < after_hop_core.frames_spec().metas_spec().len(),
+        new_op.hop.dst_slot@ == after_hop_core.frames_spec().frame(new_op.hop.dst_frame).slot,
+        after_core.ledger_spec()@.submitted.instance_id()
+            == after_hop_core.ledger_spec()@.submitted.instance_id(),
+        after_core.ledger_spec()@.submitted.map()
+            == after_hop_core.ledger_spec()@.submitted.map().insert(ev, val),
+        after_hop_core.ledger_spec()@.submitted.map().submap_of(
+            after_core.ledger_spec()@.submitted.map(),
         ),
-        after_hop_core.ledger@.submitted.map().submap_of(after_core.ledger@.submitted.map()),
-        after_core.ledger@.knows == after_hop_core.ledger@.knows,
-        after_core.ledger@.succeeded == after_hop_core.ledger@.succeeded,
-        after_core.ledger@.revoked == after_hop_core.ledger@.revoked,
+        after_core.ledger_spec()@.knows == after_hop_core.ledger_spec()@.knows,
+        after_core.ledger_spec()@.succeeded == after_hop_core.ledger_spec()@.succeeded,
+        after_core.ledger_spec()@.revoked == after_hop_core.ledger_spec()@.revoked,
         val.access.writes == ISet::empty().insert(new_op.hop.dst_slot@.loc),
     ensures
         op.valid(after_core, timeline, i),
         op.hop.dst_frame != new_op.hop.dst_frame,
         op.hop.dst_slot@.loc != new_op.hop.dst_slot@.loc,
-        op.hop.src_lease.slot != new_op.hop.src_lease.slot,
+        op.hop.src_lease.slot_spec() != new_op.hop.src_lease.slot_spec(),
         op.ticket.sequence() < new_op.ticket.sequence(),
 {
     hide(CacheCore::well_formed);
     hide(replica_valid);
     hide(complete_receipts);
-    assert(nvme_copy_retained(op.copy@, before_core.ledger@, before_core.node()));
+    assert(nvme_copy_retained(op.copy@, before_core.ledger_spec()@, before_core.node()));
     assert(op.hop.dst_frame != new_op.hop.dst_frame);
-    assert(op.hop.src_lease.slot != new_op.hop.src_lease.slot);
+    assert(op.hop.src_lease.slot_spec() != new_op.hop.src_lease.slot_spec());
     if op.hop.dst_frame.0 < new_op.hop.dst_frame.0 {
-        assert(after_hop_core.frames.ghosts@[op.hop.dst_frame.0 as nat].slot.loc
-            != after_hop_core.frames.ghosts@[new_op.hop.dst_frame.0 as nat].slot.loc);
+        assert(after_hop_core.frames_spec().ghosts_spec()@[op.hop.dst_frame.0 as nat].slot.loc
+            != after_hop_core.frames_spec().ghosts_spec()@[new_op.hop.dst_frame.0 as nat].slot.loc);
     } else {
-        assert(after_hop_core.frames.ghosts@[new_op.hop.dst_frame.0 as nat].slot.loc
-            != after_hop_core.frames.ghosts@[op.hop.dst_frame.0 as nat].slot.loc);
+        assert(after_hop_core.frames_spec().ghosts_spec()@[new_op.hop.dst_frame.0 as nat].slot.loc
+            != after_hop_core.frames_spec().ghosts_spec()@[op.hop.dst_frame.0 as nat].slot.loc);
     }
-    assert(after_hop_core.frames.meta(op.hop.dst_frame) == before_core.frames.meta(
+    assert(after_hop_core.frames_spec().meta(op.hop.dst_frame) == before_core.frames_spec().meta(
         op.hop.dst_frame,
     ));
-    assert(after_hop_core.frames.frame(op.hop.dst_frame) == before_core.frames.frame(
+    assert(after_hop_core.frames_spec().frame(op.hop.dst_frame) == before_core.frames_spec().frame(
         op.hop.dst_frame,
     ));
     assert(op.ticket.sequence() < new_op.ticket.sequence());
-    assert(after_core.timelines.events@[(timeline, op.ticket.sequence())] == op.copy@.writer) by {
+    assert(after_core.timelines_spec().events_spec()@[(timeline, op.ticket.sequence())]
+        == op.copy@.writer) by {
         broadcast use vstd::map::group_map_lemmas;
 
     }
-    assert(before_core.ledger@.citations(before_core.node()).subset_of(
-        after_core.ledger@.citations(after_core.node()),
+    assert(before_core.ledger_spec()@.citations(before_core.node()).subset_of(
+        after_core.ledger_spec()@.citations(after_core.node()),
     )) by {
         broadcast use {vstd::imap::group_imap_lemmas, vstd::iset::group_iset_lemmas};
 
     }
     lemma_retain_copy_after_disjoint_write(
-        before_core.ledger@,
-        after_core.ledger@,
+        before_core.ledger_spec()@,
+        after_core.ledger_spec()@,
         after_core.node(),
         op.copy@,
         ev,
@@ -626,7 +659,7 @@ proof fn lemma_nvme_op_valid_after_reap(
     op: InFlightNvmeOp,
     before_core: &CacheCore,
     after_core: &CacheCore,
-    timeline: u8,
+    timeline: TimelineId,
     i: int,
     idx: int,
     seq: u64,
@@ -639,27 +672,33 @@ proof fn lemma_nvme_op_valid_after_reap(
         i != idx,
         (seq % BITMAP_CAPACITY) as int == idx,
         op.hop.dst_frame != removed_op.hop.dst_frame,
-        op.hop.src_lease.slot != removed_op.hop.src_lease.slot,
-        after_core.node_id == before_core.node_id,
-        after_core.next_version_seq == before_core.next_version_seq,
-        after_core.version_seq_limit == before_core.version_seq_limit,
-        after_core.timelines.count == before_core.timelines.count,
-        after_core.timelines.next_seq == before_core.timelines.next_seq,
-        after_core.timelines.events == before_core.timelines.events,
-        after_core.ledger@.submitted == before_core.ledger@.submitted,
-        after_core.ledger@.revoked == before_core.ledger@.revoked,
-        before_core.ledger@.knows.set().subset_of(after_core.ledger@.knows.set()),
-        before_core.ledger@.succeeded.dom().subset_of(after_core.ledger@.succeeded.dom()),
-        after_core.frames.same_layout(&before_core.frames),
-        after_core.frames.preserves_initializing(
-            &before_core.frames,
+        op.hop.src_lease.slot_spec() != removed_op.hop.src_lease.slot_spec(),
+        after_core.node_id_spec() == before_core.node_id_spec(),
+        after_core.next_version_seq_spec() == before_core.next_version_seq_spec(),
+        after_core.version_seq_limit_spec() == before_core.version_seq_limit_spec(),
+        after_core.timelines_spec().count_spec() == before_core.timelines_spec().count_spec(),
+        after_core.timelines_spec().next_seq_spec() == before_core.timelines_spec().next_seq_spec(),
+        after_core.timelines_spec().events_spec() == before_core.timelines_spec().events_spec(),
+        after_core.ledger_spec()@.submitted == before_core.ledger_spec()@.submitted,
+        after_core.ledger_spec()@.revoked == before_core.ledger_spec()@.revoked,
+        before_core.ledger_spec()@.knows.set().subset_of(after_core.ledger_spec()@.knows.set()),
+        before_core.ledger_spec()@.succeeded.dom().subset_of(
+            after_core.ledger_spec()@.succeeded.dom(),
+        ),
+        after_core.frames_spec().same_layout(&before_core.frames_spec()),
+        after_core.frames_spec().preserves_initializing(
+            &before_core.frames_spec(),
             Some(removed_op.hop.dst_frame),
         ),
-        before_core.frames.versions@.submap_of(after_core.frames.versions@),
-        after_core.active_leases.len() == before_core.active_leases.len(),
+        before_core.frames_spec().versions_spec()@.submap_of(
+            after_core.frames_spec().versions_spec()@,
+        ),
+        after_core.active_leases_spec().len() == before_core.active_leases_spec().len(),
         forall|s: int|
-            0 <= s < before_core.active_leases.len() && s != removed_op.hop.src_lease.slot as int
-                ==> #[trigger] after_core.active_leases[s] == before_core.active_leases[s],
+            0 <= s < before_core.active_leases_spec().len() && s
+                != removed_op.hop.src_lease.slot_spec() as int
+                ==> #[trigger] after_core.active_leases_spec()[s]
+                == before_core.active_leases_spec()[s],
     ensures
         op.valid(after_core, timeline, i),
         op.ticket.sequence() != seq,
@@ -668,28 +707,32 @@ proof fn lemma_nvme_op_valid_after_reap(
     hide(replica_valid);
     hide(complete_receipts);
     hide(nvme_copy_retained);
-    assert(before_core.ledger@.citations(before_core.node()).subset_of(
-        after_core.ledger@.citations(after_core.node()),
+    assert(before_core.ledger_spec()@.citations(before_core.node()).subset_of(
+        after_core.ledger_spec()@.citations(after_core.node()),
     )) by {
         assert forall|e: TransferEvent|
-            before_core.ledger@.citations(before_core.node()).contains(
+            before_core.ledger_spec()@.citations(before_core.node()).contains(
                 e,
-            ) implies after_core.ledger@.citations(after_core.node()).contains(e) by {
-            assert(before_core.ledger@.knows.set().contains((before_core.node(), e)));
+            ) implies after_core.ledger_spec()@.citations(after_core.node()).contains(e) by {
+            assert(before_core.ledger_spec()@.knows.set().contains((before_core.node(), e)));
         }
     }
     assert(op.ticket.sequence() != seq) by {
         assert((op.ticket.sequence() % BITMAP_CAPACITY) as int == i);
         assert((seq % BITMAP_CAPACITY) as int == idx);
     }
-    assert(after_core.frames.meta(op.hop.dst_frame) == before_core.frames.meta(op.hop.dst_frame));
-    assert(after_core.frames.frame(op.hop.dst_frame) == before_core.frames.frame(op.hop.dst_frame));
-    assert(before_core.frames.versions@.dom().contains(op.hop.version));
-    assert(after_core.frames.versions@.dom().contains(op.hop.version));
-    assert(after_core.frames.versions@[op.hop.version] == op.hop.src_cert@.bytes);
+    assert(after_core.frames_spec().meta(op.hop.dst_frame) == before_core.frames_spec().meta(
+        op.hop.dst_frame,
+    ));
+    assert(after_core.frames_spec().frame(op.hop.dst_frame) == before_core.frames_spec().frame(
+        op.hop.dst_frame,
+    ));
+    assert(before_core.frames_spec().versions_spec()@.dom().contains(op.hop.version));
+    assert(after_core.frames_spec().versions_spec()@.dom().contains(op.hop.version));
+    assert(after_core.frames_spec().versions_spec()@[op.hop.version] == op.hop.src_cert@.bytes);
     lemma_retain_copy_after_knows_growth(
-        before_core.ledger@,
-        after_core.ledger@,
+        before_core.ledger_spec()@,
+        after_core.ledger_spec()@,
         after_core.node(),
         op.copy@,
     );
@@ -705,7 +748,7 @@ pub(super) proof fn lemma_nvme_pending_preserved_after_stage(
     before_core: &CacheCore,
     after_hop_core: &CacheCore,
     after_core: &CacheCore,
-    timeline: u8,
+    timeline: TimelineId,
     idx: int,
     new_op: InFlightNvmeOp,
     ev: TransferEvent,
@@ -727,42 +770,46 @@ pub(super) proof fn lemma_nvme_pending_preserved_after_stage(
             new_ring.pending()[new_op.ticket.sequence()],
         ),
         new_ring.pending()[new_op.ticket.sequence()].event == new_op.copy@.writer,
-        after_hop_core.node_id == before_core.node_id,
-        after_hop_core.ledger == before_core.ledger,
-        after_hop_core.next_version_seq == before_core.next_version_seq,
-        after_hop_core.version_seq_limit == before_core.version_seq_limit,
-        after_hop_core.timelines.only_watermarks(&before_core.timelines),
-        after_hop_core.frames.same_directory(&before_core.frames),
-        after_hop_core.frames.preserves_initializing(&before_core.frames, None),
-        before_core.frames.meta(new_op.hop.dst_frame).state != STATE_INITIALIZING,
-        before_core.active_leases[new_op.hop.src_lease.slot as int].is_none(),
-        after_hop_core.active_leases.len() == before_core.active_leases.len(),
+        after_hop_core.node_id_spec() == before_core.node_id_spec(),
+        after_hop_core.ledger_spec() == before_core.ledger_spec(),
+        after_hop_core.next_version_seq_spec() == before_core.next_version_seq_spec(),
+        after_hop_core.version_seq_limit_spec() == before_core.version_seq_limit_spec(),
+        after_hop_core.timelines_spec().only_watermarks(&before_core.timelines_spec()),
+        after_hop_core.frames_spec().same_directory(&before_core.frames_spec()),
+        after_hop_core.frames_spec().preserves_initializing(&before_core.frames_spec(), None),
+        before_core.frames_spec().meta(new_op.hop.dst_frame).state != STATE_INITIALIZING,
+        before_core.active_leases_spec()[new_op.hop.src_lease.slot_spec() as int].is_none(),
+        after_hop_core.active_leases_spec().len() == before_core.active_leases_spec().len(),
         forall|s: int|
-            0 <= s < before_core.active_leases.len() && s != new_op.hop.src_lease.slot as int
-                ==> #[trigger] after_hop_core.active_leases[s] == before_core.active_leases[s],
-        after_core.node_id == after_hop_core.node_id,
-        after_core.frames == after_hop_core.frames,
-        after_core.active_leases == after_hop_core.active_leases,
-        after_core.next_version_seq == after_hop_core.next_version_seq,
-        after_core.version_seq_limit == after_hop_core.version_seq_limit,
-        after_core.timelines.count == after_hop_core.timelines.count,
-        after_core.timelines.next_seq[timeline as int]
-            == after_hop_core.timelines.next_seq[timeline as int] + 1,
-        after_core.timelines.events@ == after_hop_core.timelines.events@.insert(
+            0 <= s < before_core.active_leases_spec().len() && s
+                != new_op.hop.src_lease.slot_spec() as int
+                ==> #[trigger] after_hop_core.active_leases_spec()[s]
+                == before_core.active_leases_spec()[s],
+        after_core.node_id_spec() == after_hop_core.node_id_spec(),
+        after_core.frames_spec() == after_hop_core.frames_spec(),
+        after_core.active_leases_spec() == after_hop_core.active_leases_spec(),
+        after_core.next_version_seq_spec() == after_hop_core.next_version_seq_spec(),
+        after_core.version_seq_limit_spec() == after_hop_core.version_seq_limit_spec(),
+        after_core.timelines_spec().count_spec() == after_hop_core.timelines_spec().count_spec(),
+        after_core.timelines_spec().next_seq_spec()[timeline as int]
+            == after_hop_core.timelines_spec().next_seq_spec()[timeline as int] + 1,
+        after_core.timelines_spec().events_spec()@
+            == after_hop_core.timelines_spec().events_spec()@.insert(
             (timeline, new_op.ticket.sequence()),
             ev,
         ),
-        new_op.ticket.sequence() == after_hop_core.timelines.next_seq[timeline as int],
-        after_core.ledger@.submitted.instance_id()
-            == after_hop_core.ledger@.submitted.instance_id(),
-        after_core.ledger@.submitted.map() == after_hop_core.ledger@.submitted.map().insert(
-            ev,
-            val,
+        new_op.ticket.sequence()
+            == after_hop_core.timelines_spec().next_seq_spec()[timeline as int],
+        after_core.ledger_spec()@.submitted.instance_id()
+            == after_hop_core.ledger_spec()@.submitted.instance_id(),
+        after_core.ledger_spec()@.submitted.map()
+            == after_hop_core.ledger_spec()@.submitted.map().insert(ev, val),
+        after_hop_core.ledger_spec()@.submitted.map().submap_of(
+            after_core.ledger_spec()@.submitted.map(),
         ),
-        after_hop_core.ledger@.submitted.map().submap_of(after_core.ledger@.submitted.map()),
-        after_core.ledger@.knows == after_hop_core.ledger@.knows,
-        after_core.ledger@.succeeded == after_hop_core.ledger@.succeeded,
-        after_core.ledger@.revoked == after_hop_core.ledger@.revoked,
+        after_core.ledger_spec()@.knows == after_hop_core.ledger_spec()@.knows,
+        after_core.ledger_spec()@.succeeded == after_hop_core.ledger_spec()@.succeeded,
+        after_core.ledger_spec()@.revoked == after_hop_core.ledger_spec()@.revoked,
         val.access.writes == ISet::empty().insert(new_op.hop.dst_slot@.loc),
     ensures
         nvme_pending_valid(new_transfers, new_ops, new_ring, after_core, timeline),
@@ -775,14 +822,15 @@ pub(super) proof fn lemma_nvme_pending_preserved_after_stage(
     lemma_core_frames_separated(after_hop_core);
     lemma_core_wf_facts(after_core);
     reveal(nvme_pending_valid);
-    assert(new_op.hop.dst_frame.0 < after_hop_core.frames.metas.len() && new_op.hop.dst_slot@
-        == after_hop_core.frames.frame(new_op.hop.dst_frame).slot) by {
+    assert(new_op.hop.dst_frame.0 < after_hop_core.frames_spec().metas_spec().len()
+        && new_op.hop.dst_slot@ == after_hop_core.frames_spec().frame(new_op.hop.dst_frame).slot)
+        by {
         reveal(InFlightNvmeOp::valid);
     }
-    assert(after_core.ledger@.submitted.instance_id()
-        == after_hop_core.ledger@.submitted.instance_id()) by {
-        assert(before_core.ledger@.submitted.instance_id()
-            == after_hop_core.ledger@.submitted.instance_id());
+    assert(after_core.ledger_spec()@.submitted.instance_id()
+        == after_hop_core.ledger_spec()@.submitted.instance_id()) by {
+        assert(before_core.ledger_spec()@.submitted.instance_id()
+            == after_hop_core.ledger_spec()@.submitted.instance_id());
     }
     assert forall|i: int| 0 <= i < BITMAP_CAPACITY implies (
     #[trigger] new_transfers[i] matches Some(op) ==> {
@@ -810,8 +858,8 @@ pub(super) proof fn lemma_nvme_pending_preserved_after_stage(
     }
     assert forall|k: int| 0 <= k < BITMAP_CAPACITY && k != idx implies (
     #[trigger] old_transfers[k] matches Some(b) ==> new_op.hop.dst_frame != b.hop.dst_frame
-        && new_op.hop.dst_slot@.loc != b.hop.dst_slot@.loc && new_op.hop.src_lease.slot
-        != b.hop.src_lease.slot) by {
+        && new_op.hop.dst_slot@.loc != b.hop.dst_slot@.loc && new_op.hop.src_lease.slot_spec()
+        != b.hop.src_lease.slot_spec()) by {
         if let Some(b) = old_transfers[k] {
             assert(b.valid(before_core, timeline, k));
             lemma_nvme_op_valid_after_stage(
@@ -839,7 +887,7 @@ pub(super) proof fn lemma_nvme_pending_preserved_after_reap(
     new_ring: IoUring,
     before_core: &CacheCore,
     after_core: &CacheCore,
-    timeline: u8,
+    timeline: TimelineId,
     idx: int,
     seq: u64,
     removed_op: InFlightNvmeOp,
@@ -854,26 +902,32 @@ pub(super) proof fn lemma_nvme_pending_preserved_after_reap(
         new_transfers == old_transfers.update(idx, None),
         new_ops@ == old_ops@.update(idx, None),
         new_ring.pending() == old_ring.pending().remove(seq),
-        after_core.node_id == before_core.node_id,
-        after_core.next_version_seq == before_core.next_version_seq,
-        after_core.version_seq_limit == before_core.version_seq_limit,
-        after_core.timelines.count == before_core.timelines.count,
-        after_core.timelines.next_seq == before_core.timelines.next_seq,
-        after_core.timelines.events == before_core.timelines.events,
-        after_core.ledger@.submitted == before_core.ledger@.submitted,
-        after_core.ledger@.revoked == before_core.ledger@.revoked,
-        before_core.ledger@.knows.set().subset_of(after_core.ledger@.knows.set()),
-        before_core.ledger@.succeeded.dom().subset_of(after_core.ledger@.succeeded.dom()),
-        after_core.frames.same_layout(&before_core.frames),
-        after_core.frames.preserves_initializing(
-            &before_core.frames,
+        after_core.node_id_spec() == before_core.node_id_spec(),
+        after_core.next_version_seq_spec() == before_core.next_version_seq_spec(),
+        after_core.version_seq_limit_spec() == before_core.version_seq_limit_spec(),
+        after_core.timelines_spec().count_spec() == before_core.timelines_spec().count_spec(),
+        after_core.timelines_spec().next_seq_spec() == before_core.timelines_spec().next_seq_spec(),
+        after_core.timelines_spec().events_spec() == before_core.timelines_spec().events_spec(),
+        after_core.ledger_spec()@.submitted == before_core.ledger_spec()@.submitted,
+        after_core.ledger_spec()@.revoked == before_core.ledger_spec()@.revoked,
+        before_core.ledger_spec()@.knows.set().subset_of(after_core.ledger_spec()@.knows.set()),
+        before_core.ledger_spec()@.succeeded.dom().subset_of(
+            after_core.ledger_spec()@.succeeded.dom(),
+        ),
+        after_core.frames_spec().same_layout(&before_core.frames_spec()),
+        after_core.frames_spec().preserves_initializing(
+            &before_core.frames_spec(),
             Some(removed_op.hop.dst_frame),
         ),
-        before_core.frames.versions@.submap_of(after_core.frames.versions@),
-        after_core.active_leases.len() == before_core.active_leases.len(),
+        before_core.frames_spec().versions_spec()@.submap_of(
+            after_core.frames_spec().versions_spec()@,
+        ),
+        after_core.active_leases_spec().len() == before_core.active_leases_spec().len(),
         forall|s: int|
-            0 <= s < before_core.active_leases.len() && s != removed_op.hop.src_lease.slot as int
-                ==> #[trigger] after_core.active_leases[s] == before_core.active_leases[s],
+            0 <= s < before_core.active_leases_spec().len() && s
+                != removed_op.hop.src_lease.slot_spec() as int
+                ==> #[trigger] after_core.active_leases_spec()[s]
+                == before_core.active_leases_spec()[s],
     ensures
         nvme_pending_valid(new_transfers, new_ops, new_ring, after_core, timeline),
 {

@@ -1,10 +1,10 @@
-use crate::backends::rdma_error;
+use super::rdma_error;
 use crate::spec::CoreError;
 #[cfg(verus_only)]
-use transfer::context::{EventSourceToken, ReturnedShare, SlotToken, TransferInstance};
+use transfer::context::{
+    EventSourceToken, ReturnedShare, SlotToken, SyncContext, TransferInstance,
+};
 use transfer::domain::NodeId;
-#[cfg(verus_only)]
-use transfer::host::HostContext;
 use transfer::rdma;
 use vstd::prelude::*;
 #[cfg(verus_only)]
@@ -26,14 +26,28 @@ pub enum MwSlotState {
 /// One slot in a [`WindowPool`], pairing a Type-2 [`rdma::MemoryWindow`] with a
 /// monotonically increasing generation counter (M5) to reject stale lease tokens.
 pub struct MwPoolSlot<'a> {
-    pub window: Option<rdma::MemoryWindow<'a>>,
-    pub generation: u32,
-    pub state: MwSlotState,
+    pub(crate) window: Option<rdma::MemoryWindow<'a>>,
+    pub(crate) generation: u32,
+    pub(crate) state: MwSlotState,
+}
+
+impl<'a> MwPoolSlot<'a> {
+    pub open(crate) spec fn generation_spec(&self) -> u32 {
+        self.generation
+    }
+
+    pub open(crate) spec fn state_spec(&self) -> MwSlotState {
+        self.state
+    }
+
+    pub open(crate) spec fn window_spec(&self) -> Option<rdma::MemoryWindow<'a>> {
+        self.window
+    }
 }
 
 /// Opaque structural invariant for a [`WindowPool`]'s slot array and free list.
 #[verifier::opaque]
-pub open spec fn window_pool_slots_wf<'a>(
+pub open(crate) spec fn window_pool_slots_wf<'a>(
     slots: Seq<MwPoolSlot<'a>>,
     free: Seq<u32>,
     pd_id: nat,
@@ -65,34 +79,42 @@ pub open spec fn window_pool_slots_wf<'a>(
 /// - **M5**: `checkout` monotonically increments `slot.generation`; stale
 ///   `(slot, generation)` pairs are rejected with `CoreError::StaleReplica`.
 /// - **M3**: `fail_bind` extracts and returns `Tracked<WindowBindGrant>` so the
-///   caller can restore `WindowBindRight` into its `ShareCap` without leaking.
+///   caller can restore `FenceRight` into its `ShareCap` without leaking.
 /// - **M4**: `retire_and_replenish` and `dealloc_all` preserve any live
 ///   `MemoryWindow` handle on `dealloc_window` failure instead of dropping it.
 pub struct WindowPool<'a> {
-    pub slots: Vec<MwPoolSlot<'a>>,
-    pub free: Vec<u32>,
-    pub pd_id: Ghost<nat>,
-    pub node: Ghost<NodeId>,
+    pub(crate) slots: Vec<MwPoolSlot<'a>>,
+    pub(crate) free: Vec<u32>,
+    pub(crate) pd_id: Ghost<nat>,
+    pub(crate) node: Ghost<NodeId>,
 }
 
 impl<'a> WindowPool<'a> {
-    pub open spec fn well_formed(&self) -> bool {
+    pub open(crate) spec fn free_spec(&self) -> Vec<u32> {
+        self.free
+    }
+
+    pub open(crate) spec fn slots_spec(&self) -> Vec<MwPoolSlot<'a>> {
+        self.slots
+    }
+
+    pub open(crate) spec fn well_formed(&self) -> bool {
         window_pool_slots_wf(self.slots@, self.free@, self.pd_id@, self.node@)
     }
 
-    pub open spec fn pd(&self) -> nat {
+    pub open(crate) spec fn pd(&self) -> nat {
         self.pd_id@
     }
 
-    pub open spec fn node(&self) -> NodeId {
+    pub open(crate) spec fn node(&self) -> NodeId {
         self.node@
     }
 
-    pub open spec fn len(&self) -> nat {
+    pub open(crate) spec fn len(&self) -> nat {
         self.slots@.len()
     }
 
-    pub open spec fn slot_window(&self, idx: int) -> Option<rdma::MemoryWindow<'a>> {
+    pub open(crate) spec fn slot_window(&self, idx: int) -> Option<rdma::MemoryWindow<'a>> {
         self.slots@[idx].window
     }
 
@@ -105,7 +127,7 @@ impl<'a> WindowPool<'a> {
 
     pub fn free_count(&self) -> (n: usize)
         ensures
-            n == self.free@.len(),
+            n == self.free_spec()@.len(),
     {
         self.free.len()
     }
@@ -127,10 +149,10 @@ impl<'a> WindowPool<'a> {
             pool.pd() == pd_id,
             pool.node() == node,
             pool.len() == windows.len(),
-            pool.free@.len() == windows.len(),
+            pool.free_spec()@.len() == windows.len(),
             forall|j: int|
-                0 <= j < pool.slots@.len() ==> (#[trigger] pool.slots@[j]).state
-                    == MwSlotState::Free,
+                0 <= j < pool.slots_spec()@.len() ==> (
+                #[trigger] pool.slots_spec()@[j]).state_spec() == MwSlotState::Free,
     {
         let len = windows.len();
         let mut slots = Vec::<MwPoolSlot<'a>>::with_capacity(len);
@@ -177,22 +199,26 @@ impl<'a> WindowPool<'a> {
             final(self).node() == old(self).node(),
             final(self).len() == old(self).len(),
             forall|j: int|
-                0 <= j < final(self).slots.len() ==> (#[trigger] final(self).slots[j]).window
-                    == old(self).slots[j].window,
+                0 <= j < final(self).slots_spec().len() ==> (
+                #[trigger] final(self).slots_spec()[j]).window_spec() == old(
+                    self,
+                ).slots_spec()[j].window_spec(),
             match r {
                 Err(_) => *final(self) == *old(self),
                 Ok((i, g)) => {
-                    &&& (i as int) < final(self).slots.len()
-                    &&& old(self).slots[i as int].state == MwSlotState::Free
-                    &&& final(self).slots[i as int].generation == g
-                    &&& g == old(self).slots[i as int].generation + 1
-                    &&& final(self).slots[i as int].state == MwSlotState::Binding(lease_tag)
-                    &&& final(self).slots[i as int].window matches Some(w) && w.state()
-                        == rdma::WindowState::Unbound && w.pd_id() == old(self).pd() && w.node()
-                        == old(self).node()
+                    &&& (i as int) < final(self).slots_spec().len()
+                    &&& old(self).slots_spec()[i as int].state_spec() == MwSlotState::Free
+                    &&& final(self).slots_spec()[i as int].generation_spec() == g
+                    &&& g == old(self).slots_spec()[i as int].generation_spec() + 1
+                    &&& final(self).slots_spec()[i as int].state_spec() == MwSlotState::Binding(
+                        lease_tag,
+                    )
+                    &&& final(self).slots_spec()[i as int].window_spec() matches Some(w)
+                        && w.state() == rdma::WindowState::Unbound && w.pd_id() == old(self).pd()
+                        && w.node() == old(self).node()
                     &&& forall|j: int|
-                        0 <= j < final(self).slots.len() && j != i as int
-                            ==> #[trigger] final(self).slots[j] == old(self).slots[j]
+                        0 <= j < final(self).slots_spec().len() && j != i as int
+                            ==> #[trigger] final(self).slots_spec()[j] == old(self).slots_spec()[j]
                 },
             },
     {
@@ -225,7 +251,7 @@ impl<'a> WindowPool<'a> {
     }
 
     /// Return an unbound MW slot back to the free list, rejecting stale generations (M5).
-    pub fn return_unbound(&mut self, i: u32, generation: u32) -> (r: Result<(), CoreError>)
+    pub(crate) fn return_unbound(&mut self, i: u32, generation: u32) -> (r: Result<(), CoreError>)
         requires
             old(self).well_formed(),
             (i as int) < old(self).slots.len(),
@@ -284,13 +310,16 @@ impl<'a> WindowPool<'a> {
         access: rdma::RemoteAccess,
         Tracked(grant): Tracked<rdma::WindowBindGrant>,
         wr_id: u64,
+        prepare: bool,
+        reserved: &mut Option<rdma::PreparedBind>,
     ) -> (r: Result<u32, (CoreError, Tracked<rdma::WindowBindGrant>)>)
         requires
             old(self).well_formed(),
-            (i as int) < old(self).slots.len(),
-            old(self).slots[i as int].generation == generation,
-            old(self).slots[i as int].state is Binding,
-            old(self).slots[i as int].window matches Some(w) && w.state()
+            old(reserved).is_none(),
+            (i as int) < old(self).slots_spec().len(),
+            old(self).slots_spec()[i as int].generation_spec() == generation,
+            old(self).slots_spec()[i as int].state_spec() is Binding,
+            old(self).slots_spec()[i as int].window_spec() matches Some(w) && w.state()
                 == rdma::WindowState::Unbound,
             qp.can_post(*old(cq), wr_id),
             qp.pd_id() == old(self).pd(),
@@ -310,23 +339,32 @@ impl<'a> WindowPool<'a> {
             final(self).node() == old(self).node(),
             final(self).len() == old(self).len(),
             forall|j: int|
-                0 <= j < final(self).slots.len() && j != i as int
-                    ==> #[trigger] final(self).slots[j] == old(self).slots[j],
+                0 <= j < final(self).slots_spec().len() && j != i as int
+                    ==> #[trigger] final(self).slots_spec()[j] == old(self).slots_spec()[j],
             match r {
                 Err((_, returned)) => {
+                    &&& final(reserved).is_none()
                     &&& returned@ == grant
-                    &&& final(self).slots@ == old(self).slots@
-                    &&& final(self).free@ == old(self).free@
+                    &&& final(self).slots_spec()@ == old(self).slots_spec()@
+                    &&& final(self).free_spec()@ == old(self).free_spec()@
                     &&& *final(cq) == *old(cq)
                 },
                 Ok(next_rkey) => {
                     &&& final(cq).same_queue(*old(cq))
                     &&& final(cq).well_formed()
-                    &&& final(self).slots[i as int].state == old(self).slots[i as int].state
-                    &&& final(self).slots[i as int].generation == generation
-                    &&& final(self).slots[i as int].window matches Some(w)
+                    &&& final(self).slots_spec()[i as int].state_spec() == old(
+                        self,
+                    ).slots_spec()[i as int].state_spec()
+                    &&& final(self).slots_spec()[i as int].generation_spec() == generation
+                    &&& final(self).slots_spec()[i as int].window_spec() matches Some(w)
+                    &&& final(reserved).is_some() == prepare
+                    &&& (*final(reserved) matches Some(p) ==> p.id() == wr_id && p.matches_window(
+                        qp,
+                        final(cq),
+                        &w,
+                    ))
                     &&& w.consistent()
-                    &&& w.id() == old(self).slots[i as int].window->Some_0.id()
+                    &&& w.id() == old(self).slots_spec()[i as int].window_spec()->Some_0.id()
                     &&& w.pd_id() == old(self).pd()
                     &&& w.node() == old(self).node()
                     &&& w.state() is Binding
@@ -343,7 +381,9 @@ impl<'a> WindowPool<'a> {
                             kind: rdma::PendingKind::BindWindow {
                                 qp_id: qp.id(),
                                 share: grant.share(),
-                                window_id: old(self).slots[i as int].window->Some_0.id(),
+                                window_id: old(
+                                    self,
+                                ).slots_spec()[i as int].window_spec()->Some_0.id(),
                                 target_slot: slice.slot_ref(),
                                 addr: w.state()->Binding_addr,
                                 next_rkey,
@@ -361,7 +401,7 @@ impl<'a> WindowPool<'a> {
         let idx = i as usize;
         let mut mw = self.slots[idx].window.take().unwrap();
         let next_rkey = mw.next_rkey();
-        match rdma::post_bind_window(
+        match rdma::post_or_prepare_bind_window(
             qp,
             cq,
             slice,
@@ -370,8 +410,10 @@ impl<'a> WindowPool<'a> {
             access,
             Tracked(grant),
             wr_id,
+            prepare,
         ) {
-            Ok(()) => {
+            Ok(pending) => {
+                *reserved = pending;
                 self.slots[idx].window = Some(mw);
                 Ok(next_rkey)
             },
@@ -394,10 +436,10 @@ impl<'a> WindowPool<'a> {
     ) -> (r: Result<rdma::RemoteCapability, CoreError>)
         requires
             old(self).well_formed(),
-            (i as int) < old(self).slots.len(),
-            old(self).slots[i as int].generation == generation,
-            old(self).slots[i as int].state is Binding,
-            old(self).slots[i as int].window matches Some(w) && w.state() is Binding
+            (i as int) < old(self).slots_spec().len(),
+            old(self).slots_spec()[i as int].generation_spec() == generation,
+            old(self).slots_spec()[i as int].state_spec() is Binding,
+            old(self).slots_spec()[i as int].window_spec() matches Some(w) && w.state() is Binding
                 && witness.matches(w),
         ensures
             final(self).well_formed(),
@@ -405,15 +447,15 @@ impl<'a> WindowPool<'a> {
             final(self).node() == old(self).node(),
             final(self).len() == old(self).len(),
             forall|j: int|
-                0 <= j < final(self).slots.len() && j != i as int
-                    ==> #[trigger] final(self).slots[j] == old(self).slots[j],
+                0 <= j < final(self).slots_spec().len() && j != i as int
+                    ==> #[trigger] final(self).slots_spec()[j] == old(self).slots_spec()[j],
             r matches Ok(cap) && {
-                let old_w = old(self).slots[i as int].window->Some_0;
-                &&& final(self).slots[i as int].state == MwSlotState::Bound(
-                    old(self).slots[i as int].state->Binding_0,
+                let old_w = old(self).slots_spec()[i as int].window_spec()->Some_0;
+                &&& final(self).slots_spec()[i as int].state_spec() == MwSlotState::Bound(
+                    old(self).slots_spec()[i as int].state_spec()->Binding_0,
                 )
-                &&& final(self).slots[i as int].generation == generation
-                &&& final(self).slots[i as int].window matches Some(w)
+                &&& final(self).slots_spec()[i as int].generation_spec() == generation
+                &&& final(self).slots_spec()[i as int].window_spec() matches Some(w)
                 &&& w.consistent()
                 &&& w.id() == old_w.id()
                 &&& w.state() == (rdma::WindowState::Bound {
@@ -450,7 +492,7 @@ impl<'a> WindowPool<'a> {
 
     /// Recover the `WindowBindGrant` on `Completed::BindFailed` (M3) and return
     /// the unbound MW slot to the pool's free list.
-    pub fn fail_bind(
+    pub(crate) fn fail_bind(
         &mut self,
         i: u32,
         generation: u32,
@@ -503,7 +545,7 @@ impl<'a> WindowPool<'a> {
 
     /// Acknowledge a peer `RevokeAck` for a `Quarantined` slot, transitioning it
     /// to `Vacant` so it may be replenished with a fresh Type-2 MW.
-    pub fn acknowledge_quarantined(&mut self, i: u32) -> (r: Result<(), CoreError>)
+    pub(crate) fn acknowledge_quarantined(&mut self, i: u32) -> (r: Result<(), CoreError>)
         requires
             old(self).well_formed(),
         ensures
@@ -538,7 +580,7 @@ impl<'a> WindowPool<'a> {
     }
 
     /// Transition all `Quarantined(_)` slots to `Vacant` (called on QP reset).
-    pub fn unquarantine_all(&mut self)
+    pub(crate) fn unquarantine_all(&mut self)
         requires
             old(self).well_formed(),
         ensures

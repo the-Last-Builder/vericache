@@ -7,13 +7,17 @@ default:
 # Verify every proof across the entire workspace (Z3 — fast daily check).
 verify:
     cargo verus verify --fwd-verus-args-to roots -p vericache-foundation -- -V spinoff-all
+    cargo verus verify --fwd-verus-args-to roots -p vericache-transfer-core -- -V spinoff-all
     cargo verus verify --fwd-verus-args-to roots -p vericache-transfer -- -V spinoff-all
+    cargo verus verify --fwd-verus-args-to roots -p vericache-kernel -- -V spinoff-all --no-cheating
     cargo verus verify --fwd-verus-args-to roots -p vericache-core -- -V spinoff-all --no-cheating
 
 # Verify every proof across the entire workspace using CVC5 (isolated target dir + spinoff-all multi-core parallelism).
 verify-cvc5:
     cargo verus verify --target-dir target/cvc5 --fwd-verus-args-to roots -p vericache-foundation -- -V cvc5 -V spinoff-all
+    cargo verus verify --target-dir target/cvc5 --fwd-verus-args-to roots -p vericache-transfer-core -- -V cvc5 -V spinoff-all
     cargo verus verify --target-dir target/cvc5 --fwd-verus-args-to roots -p vericache-transfer -- -V cvc5 -V spinoff-all
+    cargo verus verify --target-dir target/cvc5 --fwd-verus-args-to roots -p vericache-kernel -- -V cvc5 -V spinoff-all --rlimit 160 --no-cheating
     cargo verus verify --target-dir target/cvc5 --fwd-verus-args-to roots -p vericache-core -- -V cvc5 -V spinoff-all --rlimit 160 --no-cheating
 
 # Verify every proof with BOTH Z3 and CVC5 (AND cross-verification).
@@ -35,20 +39,22 @@ profile-cvc5 crate mod fn:
 audit-rules:
     ast-grep test --custom-languages allow --skip-snapshot-tests
 
-# Run full AST-level TCB, whitelist, and architecture boundary audits across all 3 crates.
+# Run full AST-level TCB, whitelist, and architecture boundary audits across all five crates.
 audit: audit-rules
     ./scripts/audit-tcb.sh
     just --justfile vericache-foundation/Justfile audit
+    just --justfile vericache-transfer-core/Justfile audit
     just --justfile vericache-transfer/Justfile audit
+    just --justfile vericache-kernel/Justfile audit
     just --justfile vericache-core/Justfile audit
 
 # Format every Rust/Verus source and test file across the workspace.
 fmt:
-    find vericache-foundation/src vericache-transfer/src vericache-transfer/tests vericache-core/src vericache-core/tests -name '*.rs' -exec verusfmt {} +
+    find vericache-foundation/src vericache-transfer-core/src vericache-transfer/src vericache-transfer/tests vericache-kernel/src vericache-core/src vericache-core/tests -name '*.rs' -exec verusfmt {} +
 
 # Check formatting across the workspace.
 fmt-check:
-    find vericache-foundation/src vericache-transfer/src vericache-transfer/tests vericache-core/src vericache-core/tests -name '*.rs' -exec verusfmt --check {} +
+    find vericache-foundation/src vericache-transfer-core/src vericache-transfer/src vericache-transfer/tests vericache-kernel/src vericache-core/src vericache-core/tests -name '*.rs' -exec verusfmt --check {} +
 
 # Fast daily gate: Z3 verify + audit + fmt-check.
 check: verify audit fmt-check

@@ -77,9 +77,9 @@ pub(super) proof fn lemma_cuda_single_put_proof(
 /// Opaque wrapper for timeline event prefix preservation (prevents CVC5 quantifier blowup).
 #[verifier::opaque]
 pub(super) open spec fn cuda_timeline_events_preserved(
-    before_events: Map<(u8, u64), TransferEvent>,
-    after_events: Map<(u8, u64), TransferEvent>,
-    timeline: u8,
+    before_events: Map<(TimelineId, u64), TransferEvent>,
+    after_events: Map<(TimelineId, u64), TransferEvent>,
+    timeline: TimelineId,
     old_next: u64,
 ) -> bool {
     forall|s: u64|
@@ -109,8 +109,8 @@ pub(super) open spec fn cuda_ledger_writes_only(
 /// Pure constructors for `cuda_timeline_events_preserved` and `cuda_ledger_writes_only`
 /// so callers never expand `IMap::submap_of`, `ISet::subset_of`, or `forall|s|`/`forall|e|`!
 pub(super) proof fn lemma_cuda_events_preserved_same(
-    events: Map<(u8, u64), TransferEvent>,
-    timeline: u8,
+    events: Map<(TimelineId, u64), TransferEvent>,
+    timeline: TimelineId,
     old_next: u64,
 )
     ensures
@@ -120,11 +120,11 @@ pub(super) proof fn lemma_cuda_events_preserved_same(
 }
 
 pub(super) proof fn lemma_cuda_events_preserved_insert(
-    before_events: Map<(u8, u64), TransferEvent>,
-    after_events: Map<(u8, u64), TransferEvent>,
-    timeline: u8,
+    before_events: Map<(TimelineId, u64), TransferEvent>,
+    after_events: Map<(TimelineId, u64), TransferEvent>,
+    timeline: TimelineId,
     old_next: u64,
-    ins_tl: u8,
+    ins_tl: TimelineId,
     ins_seq: u64,
     ev: TransferEvent,
 )
@@ -140,12 +140,12 @@ pub(super) proof fn lemma_cuda_events_preserved_insert(
 }
 
 pub(super) proof fn lemma_cuda_events_preserved_step(
-    before_events: Map<(u8, u64), TransferEvent>,
-    mid_events: Map<(u8, u64), TransferEvent>,
-    after_events: Map<(u8, u64), TransferEvent>,
-    timeline: u8,
+    before_events: Map<(TimelineId, u64), TransferEvent>,
+    mid_events: Map<(TimelineId, u64), TransferEvent>,
+    after_events: Map<(TimelineId, u64), TransferEvent>,
+    timeline: TimelineId,
     old_next: u64,
-    ins_tl: u8,
+    ins_tl: TimelineId,
     ins_seq: u64,
     ev: TransferEvent,
 )
@@ -198,9 +198,9 @@ pub(super) proof fn lemma_cuda_ledger_writes_only_insert(
 /// Pure timeline-event coverage preservation for a `PendingPutProof` (no `CacheCore` in scope).
 proof fn lemma_put_events_covered_after_step(
     events: Seq<TransferEvent>,
-    before_events: Map<(u8, u64), TransferEvent>,
-    after_events: Map<(u8, u64), TransferEvent>,
-    timeline: u8,
+    before_events: Map<(TimelineId, u64), TransferEvent>,
+    after_events: Map<(TimelineId, u64), TransferEvent>,
+    timeline: TimelineId,
     ticket_seq: u64,
     old_next: u64,
 )
@@ -231,8 +231,8 @@ proof fn lemma_put_events_covered_after_step(
 /// Pure helper proving `cuda_put_events_covered` for a 1-event `PendingPutProof`.
 pub(super) proof fn lemma_cuda_single_event_covered(
     events: Seq<TransferEvent>,
-    ev_map: Map<(u8, u64), TransferEvent>,
-    timeline: u8,
+    ev_map: Map<(TimelineId, u64), TransferEvent>,
+    timeline: TimelineId,
     seq: u64,
     ev: TransferEvent,
 )
@@ -267,12 +267,13 @@ pub(super) proof fn lemma_cuda_ticket_covers_exact(
     requires
         ticket != Ticket::NONE,
         1 <= ticket.sequence(),
-        timelines.events@[(ticket.timeline_id(), ticket.sequence())] == ev,
+        timelines.events_spec()@[(ticket.timeline_id(), ticket.sequence())] == ev,
     ensures
         timelines.ticket_covers(ticket, ev),
 {
     let s = ticket.sequence();
-    assert(1 <= s <= ticket.sequence() && timelines.events@[(ticket.timeline_id(), s)] == ev);
+    assert(1 <= s <= ticket.sequence() && timelines.events_spec()@[(ticket.timeline_id(), s)]
+        == ev);
 }
 
 /// Pure abort-writer coverage preservation (no `CacheCore` in scope).
@@ -284,30 +285,30 @@ proof fn lemma_abort_writer_covered_after_step(
 )
     requires
         ticket != Ticket::NONE,
-        before_table.count <= MAX_TIMELINES,
-        ticket.timeline_id() < before_table.count,
-        after_table.count == before_table.count,
-        ticket.sequence() < before_table.next_seq[ticket.timeline_id() as int],
+        before_table.count_spec() <= MAX_TIMELINES,
+        ticket.timeline_id() < before_table.count_spec(),
+        after_table.count_spec() == before_table.count_spec(),
+        ticket.sequence() < before_table.next_seq_spec()[ticket.timeline_id() as int],
         cuda_timeline_events_preserved(
-            before_table.events@,
-            after_table.events@,
+            before_table.events_spec()@,
+            after_table.events_spec()@,
             ticket.timeline_id(),
-            before_table.next_seq[ticket.timeline_id() as int],
+            before_table.next_seq_spec()[ticket.timeline_id() as int],
         ),
         before_table.ticket_covers(ticket, w),
     ensures
         after_table.ticket_covers(ticket, w),
 {
     reveal(cuda_timeline_events_preserved);
-    let old_next = before_table.next_seq[ticket.timeline_id() as int];
+    let old_next = before_table.next_seq_spec()[ticket.timeline_id() as int];
     assert forall|q: u64|
-        1 <= q <= ticket.sequence() && #[trigger] before_table.events@[(ticket.timeline_id(), q)]
-            == w implies after_table.events@[(ticket.timeline_id(), q)] == w by {
-        assert(1 <= q < old_next);
-        assert(after_table.events@[(ticket.timeline_id(), q)] == before_table.events@[(
+        1 <= q <= ticket.sequence() && #[trigger] before_table.events_spec()@[(
             ticket.timeline_id(),
             q,
-        )]);
+        )] == w implies after_table.events_spec()@[(ticket.timeline_id(), q)] == w by {
+        assert(1 <= q < old_next);
+        assert(after_table.events_spec()@[(ticket.timeline_id(), q)]
+            == before_table.events_spec()@[(ticket.timeline_id(), q)]);
     }
 }
 
@@ -327,13 +328,13 @@ pub(super) proof fn lemma_cuda_slabs_same_directory<'a>(
             backend.gpu_buffer.space(),
         ),
         backend.pinned_host matches Some(h) ==> h.well_formed(before) && h.tier != backend.gpu_tier
-            && before.frames.tier_frame_size(h.tier) == before.frames.tier_frame_size(
+            && before.frames_spec().tier_frame_size(h.tier) == before.frames_spec().tier_frame_size(
             backend.gpu_tier,
         ),
-        after.node_id == before.node_id,
+        after.node_id_spec() == before.node_id_spec(),
         after.instance_id() == before.instance_id(),
-        after.tiers == before.tiers,
-        after.frames.same_directory(&before.frames),
+        after.tiers_spec() == before.tiers_spec(),
+        after.frames_spec().same_directory(&before.frames_spec()),
     ensures
         slab_bound_to_core(
             after,
@@ -343,12 +344,12 @@ pub(super) proof fn lemma_cuda_slabs_same_directory<'a>(
             backend.gpu_buffer.space(),
         ),
         backend.pinned_host matches Some(h) ==> h.well_formed(after) && h.tier != backend.gpu_tier
-            && after.frames.tier_frame_size(h.tier) == after.frames.tier_frame_size(
+            && after.frames_spec().tier_frame_size(h.tier) == after.frames_spec().tier_frame_size(
             backend.gpu_tier,
         ),
-        after.frames.frame_size == before.frames.frame_size,
-        after.frames.tier_frame_sizes == before.frames.tier_frame_sizes,
-        after.frames.metas.len() == before.frames.metas.len(),
+        after.frames_spec().frame_size_spec() == before.frames_spec().frame_size_spec(),
+        after.frames_spec().tier_frame_sizes_spec() == before.frames_spec().tier_frame_sizes_spec(),
+        after.frames_spec().metas_spec().len() == before.frames_spec().metas_spec().len(),
 {
     lemma_slab_bound_same_directory(
         before,
@@ -385,10 +386,10 @@ pub(super) proof fn lemma_cuda_slabs_same_frames<'a>(
             backend.gpu_buffer.space(),
         ),
         backend.pinned_host matches Some(h) ==> h.well_formed(before) && h.tier != backend.gpu_tier,
-        after.node_id == before.node_id,
+        after.node_id_spec() == before.node_id_spec(),
         after.instance_id() == before.instance_id(),
-        after.tiers == before.tiers,
-        after.frames == before.frames,
+        after.tiers_spec() == before.tiers_spec(),
+        after.frames_spec() == before.frames_spec(),
     ensures
         slab_bound_to_core(
             after,
@@ -463,7 +464,7 @@ proof fn lemma_cuda_put_valid_after_disjoint_step(
     entry: &PendingGpuWrite,
     before_core: &CacheCore,
     after_core: &CacheCore,
-    timeline: u8,
+    timeline: TimelineId,
     new_frame: Option<FrameId>,
     disjoint_write_loc: Option<SlotLoc>,
 )
@@ -471,23 +472,27 @@ proof fn lemma_cuda_put_valid_after_disjoint_step(
         entry.valid(before_core, timeline),
         before_core.well_formed(),
         after_core.well_formed(),
-        after_core.node_id == before_core.node_id,
+        after_core.node_id_spec() == before_core.node_id_spec(),
         after_core.instance_id() == before_core.instance_id(),
-        after_core.next_version_seq >= before_core.next_version_seq,
-        after_core.version_seq_limit == before_core.version_seq_limit,
-        after_core.timelines.count == before_core.timelines.count,
-        after_core.timelines.next_seq[timeline as int]
-            >= before_core.timelines.next_seq[timeline as int],
+        after_core.next_version_seq_spec() >= before_core.next_version_seq_spec(),
+        after_core.version_seq_limit_spec() == before_core.version_seq_limit_spec(),
+        after_core.timelines_spec().count_spec() == before_core.timelines_spec().count_spec(),
+        after_core.timelines_spec().next_seq_spec()[timeline as int]
+            >= before_core.timelines_spec().next_seq_spec()[timeline as int],
         cuda_timeline_events_preserved(
-            before_core.timelines.events@,
-            after_core.timelines.events@,
+            before_core.timelines_spec().events_spec()@,
+            after_core.timelines_spec().events_spec()@,
             timeline,
-            before_core.timelines.next_seq[timeline as int],
+            before_core.timelines_spec().next_seq_spec()[timeline as int],
         ),
-        cuda_ledger_writes_only(before_core.ledger@, after_core.ledger@, disjoint_write_loc),
+        cuda_ledger_writes_only(
+            before_core.ledger_spec()@,
+            after_core.ledger_spec()@,
+            disjoint_write_loc,
+        ),
         disjoint_write_loc != Some(entry.slot@.loc),
-        after_core.frames.same_directory(&before_core.frames),
-        after_core.frames.preserves_initializing(&before_core.frames, new_frame),
+        after_core.frames_spec().same_directory(&before_core.frames_spec()),
+        after_core.frames_spec().preserves_initializing(&before_core.frames_spec(), new_frame),
         new_frame != Some(entry.frame),
     ensures
         entry.valid(after_core, timeline),
@@ -500,30 +505,31 @@ proof fn lemma_cuda_put_valid_after_disjoint_step(
     hide(TimelineTable::ticket_covers);
     lemma_core_wf_facts(before_core);
     lemma_core_wf_facts(after_core);
-    assert(after_core.frames.metas.len() == before_core.frames.metas.len()
-        && after_core.frames.versions@ == before_core.frames.versions@ && after_core.frames.meta(
+    assert(after_core.frames_spec().metas_spec().len()
+        == before_core.frames_spec().metas_spec().len() && after_core.frames_spec().versions_spec()@
+        == before_core.frames_spec().versions_spec()@ && after_core.frames_spec().meta(entry.frame)
+        == before_core.frames_spec().meta(entry.frame) && after_core.frames_spec().frame(
         entry.frame,
-    ) == before_core.frames.meta(entry.frame) && after_core.frames.frame(entry.frame)
-        == before_core.frames.frame(entry.frame)) by {
+    ) == before_core.frames_spec().frame(entry.frame)) by {
         reveal(FrameTable::same_directory);
         reveal(FrameTable::preserves_initializing);
     }
     lemma_ledger_preserves_dest_opaque(
-        before_core.ledger@,
-        after_core.ledger@,
+        before_core.ledger_spec()@,
+        after_core.ledger_spec()@,
         after_core.node(),
         entry.slot@.loc,
         disjoint_write_loc,
     );
-    let tok = after_core.frames.frame(entry.frame).token.unwrap();
+    let tok = after_core.frames_spec().frame(entry.frame).token.unwrap();
     lemma_iset_subset_trans(
         slot_frontier(tok).readers,
         before_core.citations(),
         after_core.citations(),
     );
-    assert(after_core.timelines.issued(timeline, entry.ticket.sequence()));
-    assert(after_core.timelines.events@[(timeline, entry.ticket.sequence())]
-        == before_core.timelines.events@[(timeline, entry.ticket.sequence())]) by {
+    assert(after_core.timelines_spec().issued(timeline, entry.ticket.sequence()));
+    assert(after_core.timelines_spec().events_spec()@[(timeline, entry.ticket.sequence())]
+        == before_core.timelines_spec().events_spec()@[(timeline, entry.ticket.sequence())]) by {
         reveal(cuda_timeline_events_preserved);
     }
     match entry.action {
@@ -532,22 +538,26 @@ proof fn lemma_cuda_put_valid_after_disjoint_step(
                 if !before_core.citations().contains(w) {
                     lemma_abort_writer_covered_after_step(
                         w,
-                        &before_core.timelines,
-                        &after_core.timelines,
+                        &before_core.timelines_spec(),
+                        &after_core.timelines_spec(),
                         entry.ticket,
                     );
                 }
             }
         },
         PendingGpuAction::Publish { proof, .. } => {
-            proof@.preserve(before_core.ledger@, after_core.ledger@, after_core.node());
+            proof@.preserve(
+                before_core.ledger_spec()@,
+                after_core.ledger_spec()@,
+                after_core.node(),
+            );
             lemma_put_events_covered_after_step(
                 proof@.events,
-                before_core.timelines.events@,
-                after_core.timelines.events@,
+                before_core.timelines_spec().events_spec()@,
+                after_core.timelines_spec().events_spec()@,
                 timeline,
                 entry.ticket.sequence(),
-                before_core.timelines.next_seq[timeline as int],
+                before_core.timelines_spec().next_seq_spec()[timeline as int],
             );
         },
     }
@@ -559,7 +569,7 @@ pub(super) proof fn lemma_cuda_puts_after_disjoint_step(
     puts: Seq<PendingGpuWrite>,
     before_core: &CacheCore,
     after_core: &CacheCore,
-    timeline: u8,
+    timeline: TimelineId,
     touched_frame: Option<FrameId>,
     disjoint_write_loc: Option<SlotLoc>,
 )
@@ -567,27 +577,32 @@ pub(super) proof fn lemma_cuda_puts_after_disjoint_step(
         cuda_puts_valid(puts, before_core, timeline),
         before_core.well_formed(),
         after_core.well_formed(),
-        after_core.node_id == before_core.node_id,
+        after_core.node_id_spec() == before_core.node_id_spec(),
         after_core.instance_id() == before_core.instance_id(),
-        after_core.next_version_seq >= before_core.next_version_seq,
-        after_core.version_seq_limit == before_core.version_seq_limit,
-        after_core.timelines.count == before_core.timelines.count,
-        after_core.timelines.next_seq[timeline as int]
-            >= before_core.timelines.next_seq[timeline as int],
+        after_core.next_version_seq_spec() >= before_core.next_version_seq_spec(),
+        after_core.version_seq_limit_spec() == before_core.version_seq_limit_spec(),
+        after_core.timelines_spec().count_spec() == before_core.timelines_spec().count_spec(),
+        after_core.timelines_spec().next_seq_spec()[timeline as int]
+            >= before_core.timelines_spec().next_seq_spec()[timeline as int],
         cuda_timeline_events_preserved(
-            before_core.timelines.events@,
-            after_core.timelines.events@,
+            before_core.timelines_spec().events_spec()@,
+            after_core.timelines_spec().events_spec()@,
             timeline,
-            before_core.timelines.next_seq[timeline as int],
+            before_core.timelines_spec().next_seq_spec()[timeline as int],
         ),
-        cuda_ledger_writes_only(before_core.ledger@, after_core.ledger@, disjoint_write_loc),
-        after_core.frames.same_directory(&before_core.frames),
-        after_core.frames.preserves_initializing(&before_core.frames, touched_frame),
-        touched_frame matches Some(f) ==> f.0 < before_core.frames.metas.len()
-            && before_core.frames.meta(f).state != STATE_INITIALIZING,
+        cuda_ledger_writes_only(
+            before_core.ledger_spec()@,
+            after_core.ledger_spec()@,
+            disjoint_write_loc,
+        ),
+        after_core.frames_spec().same_directory(&before_core.frames_spec()),
+        after_core.frames_spec().preserves_initializing(&before_core.frames_spec(), touched_frame),
+        touched_frame matches Some(f) ==> f.0 < before_core.frames_spec().metas_spec().len()
+            && before_core.frames_spec().meta(f).state != STATE_INITIALIZING,
         disjoint_write_loc matches Some(loc) ==> forall|f: FrameId|
-            f.0 < before_core.frames.metas.len() && (#[trigger] before_core.frames.meta(f)).state
-                == STATE_INITIALIZING ==> loc != before_core.frames.frame(f).slot.loc,
+            f.0 < before_core.frames_spec().metas_spec().len() && (
+            #[trigger] before_core.frames_spec().meta(f)).state == STATE_INITIALIZING ==> loc
+                != before_core.frames_spec().frame(f).slot.loc,
     ensures
         cuda_puts_valid(puts, after_core, timeline),
 {
@@ -627,7 +642,7 @@ pub(super) proof fn lemma_cuda_puts_push(
     entry: PendingGpuWrite,
     before_core: &CacheCore,
     after_core: &CacheCore,
-    timeline: u8,
+    timeline: TimelineId,
 )
     requires
         cuda_puts_valid(old_puts, before_core, timeline),
@@ -635,28 +650,36 @@ pub(super) proof fn lemma_cuda_puts_push(
         after_core.well_formed(),
         new_puts == old_puts.push(entry),
         entry.valid(after_core, timeline),
-        entry.frame.0 < before_core.frames.metas.len(),
-        before_core.frames.meta(entry.frame).state != STATE_INITIALIZING,
-        before_core.frames.frame(entry.frame).slot == entry.slot@,
+        entry.frame.0 < before_core.frames_spec().metas_spec().len(),
+        before_core.frames_spec().meta(entry.frame).state != STATE_INITIALIZING,
+        before_core.frames_spec().frame(entry.frame).slot == entry.slot@,
         entry.action matches PendingGpuAction::Publish { version, only_if_current: false, .. }
-            ==> version.origin_node == before_core.node_id && version.seq
-            == before_core.next_version_seq && version.seq < before_core.version_seq_limit,
-        after_core.node_id == before_core.node_id,
+            ==> version.origin_node == before_core.node_id_spec() && version.seq
+            == before_core.next_version_seq_spec() && version.seq
+            < before_core.version_seq_limit_spec(),
+        after_core.node_id_spec() == before_core.node_id_spec(),
         after_core.instance_id() == before_core.instance_id(),
-        after_core.next_version_seq >= before_core.next_version_seq,
-        after_core.version_seq_limit == before_core.version_seq_limit,
-        after_core.timelines.count == before_core.timelines.count,
-        after_core.timelines.next_seq[timeline as int]
-            >= before_core.timelines.next_seq[timeline as int],
+        after_core.next_version_seq_spec() >= before_core.next_version_seq_spec(),
+        after_core.version_seq_limit_spec() == before_core.version_seq_limit_spec(),
+        after_core.timelines_spec().count_spec() == before_core.timelines_spec().count_spec(),
+        after_core.timelines_spec().next_seq_spec()[timeline as int]
+            >= before_core.timelines_spec().next_seq_spec()[timeline as int],
         cuda_timeline_events_preserved(
-            before_core.timelines.events@,
-            after_core.timelines.events@,
+            before_core.timelines_spec().events_spec()@,
+            after_core.timelines_spec().events_spec()@,
             timeline,
-            before_core.timelines.next_seq[timeline as int],
+            before_core.timelines_spec().next_seq_spec()[timeline as int],
         ),
-        cuda_ledger_writes_only(before_core.ledger@, after_core.ledger@, Some(entry.slot@.loc)),
-        after_core.frames.same_directory(&before_core.frames),
-        after_core.frames.preserves_initializing(&before_core.frames, Some(entry.frame)),
+        cuda_ledger_writes_only(
+            before_core.ledger_spec()@,
+            after_core.ledger_spec()@,
+            Some(entry.slot@.loc),
+        ),
+        after_core.frames_spec().same_directory(&before_core.frames_spec()),
+        after_core.frames_spec().preserves_initializing(
+            &before_core.frames_spec(),
+            Some(entry.frame),
+        ),
     ensures
         cuda_puts_valid(new_puts, after_core, timeline),
 {
@@ -668,17 +691,18 @@ pub(super) proof fn lemma_cuda_puts_push(
     lemma_core_wf_facts(after_core);
     lemma_core_frames_separated(before_core);
     assert forall|f: FrameId|
-        f.0 < before_core.frames.metas.len() && (#[trigger] before_core.frames.meta(f)).state
-            == STATE_INITIALIZING implies entry.slot@.loc != before_core.frames.frame(
+        f.0 < before_core.frames_spec().metas_spec().len() && (
+        #[trigger] before_core.frames_spec().meta(f)).state
+            == STATE_INITIALIZING implies entry.slot@.loc != before_core.frames_spec().frame(
         f,
     ).slot.loc by {
         assert(f != entry.frame);
         if f.0 < entry.frame.0 {
-            assert(before_core.frames.ghosts@[f.0 as nat].slot.loc
-                != before_core.frames.ghosts@[entry.frame.0 as nat].slot.loc);
+            assert(before_core.frames_spec().ghosts_spec()@[f.0 as nat].slot.loc
+                != before_core.frames_spec().ghosts_spec()@[entry.frame.0 as nat].slot.loc);
         } else {
-            assert(before_core.frames.ghosts@[entry.frame.0 as nat].slot.loc
-                != before_core.frames.ghosts@[f.0 as nat].slot.loc);
+            assert(before_core.frames_spec().ghosts_spec()@[entry.frame.0 as nat].slot.loc
+                != before_core.frames_spec().ghosts_spec()@[f.0 as nat].slot.loc);
         }
     }
     lemma_cuda_puts_after_disjoint_step(
@@ -714,11 +738,11 @@ pub(super) proof fn lemma_cuda_puts_push(
             reveal(PendingGpuWrite::valid);
             assert(old_puts[k].frame != entry.frame);
             if old_puts[k].frame.0 < entry.frame.0 {
-                assert(before_core.frames.ghosts@[old_puts[k].frame.0 as nat].slot.loc
-                    != before_core.frames.ghosts@[entry.frame.0 as nat].slot.loc);
+                assert(before_core.frames_spec().ghosts_spec()@[old_puts[k].frame.0 as nat].slot.loc
+                    != before_core.frames_spec().ghosts_spec()@[entry.frame.0 as nat].slot.loc);
             } else {
-                assert(before_core.frames.ghosts@[entry.frame.0 as nat].slot.loc
-                    != before_core.frames.ghosts@[old_puts[k].frame.0 as nat].slot.loc);
+                assert(before_core.frames_spec().ghosts_spec()@[entry.frame.0 as nat].slot.loc
+                    != before_core.frames_spec().ghosts_spec()@[old_puts[k].frame.0 as nat].slot.loc);
             }
         }
     }
@@ -732,28 +756,34 @@ pub(super) proof fn lemma_cuda_timeline_preserved(
     after_core: &CacheCore,
 )
     requires
-        tl.well_formed(&before_core.timelines, before_core.node(), &before_core.ledger@),
+        tl.well_formed(
+            &before_core.timelines_spec(),
+            before_core.node(),
+            &before_core.ledger_spec()@,
+        ),
         before_core.well_formed(),
         after_core.well_formed(),
-        after_core.node_id == before_core.node_id,
+        after_core.node_id_spec() == before_core.node_id_spec(),
         after_core.instance_id() == before_core.instance_id(),
-        after_core.timelines.count == before_core.timelines.count,
-        after_core.timelines.kinds == before_core.timelines.kinds,
-        after_core.timelines.next_seq[tl.timeline_id as int]
-            == before_core.timelines.next_seq[tl.timeline_id as int],
-        after_core.timelines.confirmed_seq[tl.timeline_id as int]
-            >= before_core.timelines.confirmed_seq[tl.timeline_id as int],
+        after_core.timelines_spec().count_spec() == before_core.timelines_spec().count_spec(),
+        after_core.timelines_spec().kinds_spec() == before_core.timelines_spec().kinds_spec(),
+        after_core.timelines_spec().next_seq_spec()[tl.timeline_id as int]
+            == before_core.timelines_spec().next_seq_spec()[tl.timeline_id as int],
+        after_core.timelines_spec().confirmed_seq_spec()[tl.timeline_id as int]
+            >= before_core.timelines_spec().confirmed_seq_spec()[tl.timeline_id as int],
         forall|s: u64|
-            1 <= s < before_core.timelines.next_seq[tl.timeline_id as int]
-                ==> #[trigger] after_core.timelines.events@[(tl.timeline_id, s)]
-                == before_core.timelines.events@[(tl.timeline_id, s)],
-        before_core.ledger@.submitted.map().submap_of(after_core.ledger@.submitted.map()),
+            1 <= s < before_core.timelines_spec().next_seq_spec()[tl.timeline_id as int]
+                ==> #[trigger] after_core.timelines_spec().events_spec()@[(tl.timeline_id, s)]
+                == before_core.timelines_spec().events_spec()@[(tl.timeline_id, s)],
+        before_core.ledger_spec()@.submitted.map().submap_of(
+            after_core.ledger_spec()@.submitted.map(),
+        ),
         forall|e: TransferEvent| #[trigger]
-            after_core.ledger@.submitted.dom().contains(e)
-                && !before_core.ledger@.submitted.dom().contains(e) ==> e.source
+            after_core.ledger_spec()@.submitted.dom().contains(e)
+                && !before_core.ledger_spec()@.submitted.dom().contains(e) ==> e.source
                 != tl.stream.source().source() || e.observer != tl.stream.source().node(),
     ensures
-        tl.well_formed(&after_core.timelines, after_core.node(), &after_core.ledger@),
+        tl.well_formed(&after_core.timelines_spec(), after_core.node(), &after_core.ledger_spec()@),
 {
     hide(CacheCore::well_formed);
     hide(replica_valid);
@@ -762,52 +792,54 @@ pub(super) proof fn lemma_cuda_timeline_preserved(
     let t = tl.timeline_id;
     vstd::imap_lib::lemma_submap_of_trans(
         tl.stream.infos().map(),
-        before_core.ledger@.submitted.map(),
-        after_core.ledger@.submitted.map(),
+        before_core.ledger_spec()@.submitted.map(),
+        after_core.ledger_spec()@.submitted.map(),
     );
-    assert(source_fresh_for_ledger(tl.stream.source(), after_core.ledger@)) by {
+    assert(source_fresh_for_ledger(tl.stream.source(), after_core.ledger_spec()@)) by {
         assert forall|e: TransferEvent| #[trigger]
-            after_core.ledger@.submitted.dom().contains(e) && e.source
+            after_core.ledger_spec()@.submitted.dom().contains(e) && e.source
                 == tl.stream.source().source() && e.observer
                 == tl.stream.source().node() implies e.seq < tl.stream.source().next_seq() by {
-            assert(before_core.ledger@.submitted.dom().contains(e));
+            assert(before_core.ledger_spec()@.submitted.dom().contains(e));
         }
     }
     reveal(timeline::event_ring_valid);
     assert forall|j: int| 0 <= j < tl.event_ring.len() implies #[trigger] tl.event_ring[j].valid(
-        &after_core.timelines,
+        &after_core.timelines_spec(),
         t,
         tl.device,
         after_core.node(),
-        &after_core.ledger@,
+        &after_core.ledger_spec()@,
     ) by {
         assert(tl.event_ring[j].valid(
-            &before_core.timelines,
+            &before_core.timelines_spec(),
             t,
             tl.device,
             before_core.node(),
-            &before_core.ledger@,
+            &before_core.ledger_spec()@,
         ));
         vstd::imap_lib::lemma_submap_of_trans(
             tl.event_ring[j].event.infos().map(),
-            before_core.ledger@.submitted.map(),
-            after_core.ledger@.submitted.map(),
+            before_core.ledger_spec()@.submitted.map(),
+            after_core.ledger_spec()@.submitted.map(),
         );
         assert forall|q: u64| 1 <= q <= tl.event_ring[j].recorded_seq implies closure_from(
             tl.event_ring[j].event.infos().map(),
             tl.event_ring[j].event.recorded(),
-        ).contains(#[trigger] after_core.timelines.events@[(t, q)]) by {
-            assert(q < before_core.timelines.next_seq[t as int]);
-            assert(after_core.timelines.events@[(t, q)] == before_core.timelines.events@[(t, q)]);
+        ).contains(#[trigger] after_core.timelines_spec().events_spec()@[(t, q)]) by {
+            assert(q < before_core.timelines_spec().next_seq_spec()[t as int]);
+            assert(after_core.timelines_spec().events_spec()@[(t, q)]
+                == before_core.timelines_spec().events_spec()@[(t, q)]);
         }
     }
     assert forall|q: u64|
-        1 <= q <= (after_core.timelines.next_seq[t as int]
+        1 <= q <= (after_core.timelines_spec().next_seq_spec()[t as int]
             - 1) as u64 implies tl.closure().contains(
-        #[trigger] after_core.timelines.events@[(t, q)],
+        #[trigger] after_core.timelines_spec().events_spec()@[(t, q)],
     ) by {
-        assert(q < before_core.timelines.next_seq[t as int]);
-        assert(after_core.timelines.events@[(t, q)] == before_core.timelines.events@[(t, q)]);
+        assert(q < before_core.timelines_spec().next_seq_spec()[t as int]);
+        assert(after_core.timelines_spec().events_spec()@[(t, q)]
+            == before_core.timelines_spec().events_spec()@[(t, q)]);
     }
 }
 
@@ -821,16 +853,22 @@ pub(super) proof fn lemma_citations_admit_stream_closure(
 )
     requires
         core.well_formed(),
-        stream.infos().map().submap_of(core.ledger@.submitted.map()),
+        stream.infos().map().submap_of(core.ledger_spec()@.submitted.map()),
         stream.tail().subset_of(stream.infos().dom()),
     ensures
         read_admitted(fr, core.citations()) ==> read_admitted(
             fr,
-            closure_from(core.ledger@.submitted.map(), stream.tail().union(core.citations())),
+            closure_from(
+                core.ledger_spec()@.submitted.map(),
+                stream.tail().union(core.citations()),
+            ),
         ),
         write_admitted(fr, core.citations()) ==> write_admitted(
             fr,
-            closure_from(core.ledger@.submitted.map(), stream.tail().union(core.citations())),
+            closure_from(
+                core.ledger_spec()@.submitted.map(),
+                stream.tail().union(core.citations()),
+            ),
         ),
 {
     core.lemma_citations_admit_closure(fr, stream.tail());

@@ -17,33 +17,58 @@
 //!   wrong-tier, or actively-leased `FrameId`s, the verified `DistributedEngine` and
 //!   `CacheCore` enforce bounds, local lease protection, cooperative-first + Option-A
 //!   fenced RDMA Type-2B MW revocation, and cluster-wide `VersionBinding` agreement.
+//!
+//! The cache facade requires the `rdma` feature. Enable `nvme` to attach local
+//! NVMe storage and `cuda` to use the CUDA device runtime.
 
+#[cfg(feature = "rdma")]
 pub mod cache;
+#[cfg(all(feature = "cuda", feature = "rdma"))]
+mod cuda_runtime;
+#[cfg(feature = "rdma")]
+pub mod device;
+#[cfg(feature = "rdma")]
 pub mod lease;
 pub mod policy;
+#[cfg(feature = "rdma")]
 pub mod resources;
+#[cfg(feature = "rdma")]
 pub mod target;
 pub mod transport;
 
 use std::fmt;
 use vericache_core::spec::{CoreError, Ticket, VersionId};
 
+#[cfg(feature = "rdma")]
 pub use cache::{BatchReadSource, VeriCache};
-pub use lease::{GpuLeaseGuard, HostLeaseGuard};
+#[cfg(all(feature = "cuda", feature = "rdma"))]
+pub use cuda_runtime::{CudaRuntime, GpuSlot, GpuStream};
+#[cfg(feature = "rdma")]
+pub use device::{CpuOnlyRuntime, DeviceRuntime, NoDeviceSlot, NoDeviceStream};
+#[cfg(feature = "rdma")]
+pub use lease::{DeviceLeaseGuard, GpuLeaseGuard, HostLeaseGuard};
 pub use policy::{
     CascadeTiering, ConsistentHashPeers, DataDomain, DefaultPolicy, EvictionPolicy, HitLocation,
     LruEviction, NoEviction, NoTiering, PeerMeta, PeerRoutingPolicy, PolicySet, ProbeAllPeers,
     SpillWatermark, TieringPolicy,
 };
+#[cfg(feature = "rdma")]
 pub use resources::{
-    AttachedStorage, GpuConfig, GpuSlot, GpuStream, NodeStorage, NvmeConfig, PeerLink, RdmaConfig,
-    StorageConfig,
+    AttachedStorage, GpuConfig, NodeStorage, NvmeConfig, PeerLink, RdmaConfig, StorageConfig,
 };
-pub use target::{GpuDst, GpuSrc, ReadTarget, WriteSource};
+#[cfg(feature = "rdma")]
+pub use target::{DeviceDst, DeviceSrc, GpuDst, GpuSrc, ReadTarget, WriteSource};
 pub use transport::{NoTransport, TcpTransport};
 pub use vericache_core::spec::{FrameId, ObjectKey, TierKind};
 
-/// Unified error type returned by [`VeriCache`].
+/// Runtime used by the facade's default constructors and compatibility types.
+#[cfg(all(feature = "cuda", feature = "rdma"))]
+pub type DefaultDeviceRuntime = crate::cuda_runtime::CudaRuntime;
+/// Runtime used by the facade's default constructors and compatibility types.
+#[cfg(all(not(feature = "cuda"), feature = "rdma"))]
+pub type DefaultDeviceRuntime = crate::device::CpuOnlyRuntime;
+
+/// Unified error type returned by the cache facade.
 #[derive(Debug)]
 pub enum CacheError {
     Core(CoreError),
@@ -82,7 +107,7 @@ pub struct GpuReadHit {
     pub ticket: Ticket,
 }
 
-/// Summary of work performed during [`VeriCache::poll`].
+/// Summary of work performed during a cache poll.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PollSummary {
     pub nvme_spills_retired: usize,

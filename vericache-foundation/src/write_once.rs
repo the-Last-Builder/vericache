@@ -45,6 +45,14 @@ tokenized_state_machine!{ #[cfg_attr(verus_keep_ghost, verifier::reject_recursiv
         }
     }
 
+    property!{
+        unused_key_has_no_binding(k: K, v: V) {
+            have unused >= set { k };
+            have bindings >= [k => v];
+            assert(false);
+        }
+    }
+
     #[inductive(initialize)]
     fn initialize_inductive(post: Self) {}
 
@@ -129,6 +137,23 @@ pub proof fn binding_duplicate<K, V>(tracked tok: &WriteOnceTokens::bindings<K, 
         dup == *tok,
 {
     tok.clone()
+}
+
+/// Binding and unused-key tokens from the same instance describe distinct keys.
+pub proof fn unused_key_differs_from_binding<K, V>(
+    tracked instance: &WriteOnceTokens::Instance<K, V>,
+    tracked unused: &WriteOnceTokens::unused<K, V>,
+    tracked binding: &WriteOnceTokens::bindings<K, V>,
+)
+    requires
+        unused.instance_id() == instance.id(),
+        binding.instance_id() == instance.id(),
+    ensures
+        unused.element() != binding.key(),
+{
+    if unused.element() == binding.key() {
+        instance.unused_key_has_no_binding(unused.element(), binding.value(), unused, binding);
+    }
 }
 
 } // verus!

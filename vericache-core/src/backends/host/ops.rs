@@ -17,12 +17,12 @@ impl HostBackend {
             old(core).well_formed(),
             old(self).well_formed(old(core)),
             instance.id() == old(core).instance_id(),
-            old(core).timelines.next_seq[old(self).timeline as int] <= MAX_TICKET_SEQ,
-            data@.len() == old(core).frames.tier_frame_size(old(self).tier),
+            old(core).timelines_spec().next_seq_spec()[old(self).timeline as int] <= MAX_TICKET_SEQ,
+            data@.len() == old(core).frames_spec().tier_frame_size(old(self).tier),
             old(self).owns(frame),
-            frame.0 < old(core).frames.metas.len(),
-            old(core).frames.meta(frame).state == STATE_INITIALIZING,
-            old(core).frames.frame(frame).slot == slot,
+            frame.0 < old(core).frames_spec().metas_spec().len(),
+            old(core).frames_spec().meta(frame).state == STATE_INITIALIZING,
+            old(core).frames_spec().frame(frame).slot == slot,
             slot_is_owned(*old(tok), old(core).instance_id(), slot.loc),
             write_admitted(slot_frontier(*old(tok)), old(core).citations()),
         ensures
@@ -33,22 +33,25 @@ impl HostBackend {
             final(self).timeline == old(self).timeline,
             final(self).first_frame == old(self).first_frame,
             final(self).num_frames == old(self).num_frames,
-            final(core).node_id == old(core).node_id,
-            final(core).tiers == old(core).tiers,
-            final(core).frames == old(core).frames,
-            final(core).catalog == old(core).catalog,
-            final(core).next_version_seq == old(core).next_version_seq,
-            final(core).spec == old(core).spec,
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec() == old(core).frames_spec(),
+            final(core).catalog_spec() == old(core).catalog_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
             slot_is_owned(*final(tok), final(core).instance_id(), slot.loc),
             slot_frontier(*final(tok)).readers.is_empty(),
             slot_frontier(*final(tok)).last_writer == Some(r.1@.writer),
             r.1@.slot == slot,
             r.1@.bytes == data@,
             r.1@.bytes.len() == slot.slot_len,
-            final(core).timelines.issued(r.0.timeline_id(), r.0.sequence()),
+            final(core).timelines_spec().issued(r.0.timeline_id(), r.0.sequence()),
             r.0 != Ticket::NONE,
-            r.1@.writer == final(core).timelines.events@[(r.0.timeline_id(), r.0.sequence())],
-            replica_valid(final(core).ledger@, final(core).node(), r.1@),
+            r.1@.writer == final(core).timelines_spec().events_spec()@[(
+                r.0.timeline_id(),
+                r.0.sequence(),
+            )],
+            replica_valid(final(core).ledger_spec()@, final(core).node(), r.1@),
             final(core).citations().contains(r.1@.writer),
     {
         hide(CacheCore::well_formed);
@@ -71,7 +74,7 @@ impl HostBackend {
             );
             assert(dst.slot_ref() == slot);
             lemma_citations_closure(core);
-            lemma_fresh_source_event_absent(self.ctx.source@, core.ledger@);
+            lemma_fresh_source_event_absent(self.ctx.source@, core.ledger_spec()@);
             core.lemma_citations_admit_closure(slot_frontier(*tok), ISet::empty());
             assert(ISet::empty().union(core.citations()) =~= core.citations());
         }
@@ -81,8 +84,8 @@ impl HostBackend {
             &dst,
             data,
             Tracked(tok),
-            Tracked(&core.ledger.borrow().submitted),
-            Tracked(&core.ledger.borrow().knows),
+            Tracked(&core.borrow_ledger().submitted),
+            Tracked(&core.borrow_ledger().knows),
             Ghost(core.citations()),
         );
         proof {
@@ -97,8 +100,9 @@ impl HostBackend {
         let ghost write_preds = sub_val.preds;
         let ticket = core.issue_ticket(self.timeline, Tracked(completion.submitted)).unwrap();
         proof {
-            assert(core.timelines.events@[(self.timeline, ticket.sequence())] == writer);
-            assert(core.timelines.observed(
+            assert(core.timelines_spec().events_spec()@[(self.timeline, ticket.sequence())]
+                == writer);
+            assert(core.timelines_spec().observed(
                 self.timeline,
                 ticket.sequence(),
                 core.node(),
@@ -109,8 +113,8 @@ impl HostBackend {
         let ghost cert;
         proof {
             lemma_observed_event_in_citations(
-                before_write.ledger@,
-                core.ledger@,
+                before_write.ledger_spec()@,
+                core.ledger_spec()@,
                 core.node(),
                 writer,
                 sub_val,
@@ -120,8 +124,8 @@ impl HostBackend {
             lemma_source_fresh_stepped(
                 before_ctx.source@,
                 self.ctx.source@,
-                before_write.ledger@,
-                core.ledger@,
+                before_write.ledger_spec()@,
+                core.ledger_spec()@,
                 writer,
             );
             lemma_slab_bound_same_frames(
@@ -134,8 +138,8 @@ impl HostBackend {
             );
             cert =
             lemma_certify_host_write(
-                before_write.ledger@,
-                core.ledger@,
+                before_write.ledger_spec()@,
+                core.ledger_spec()@,
                 core.node(),
                 writer,
                 slot,
@@ -161,33 +165,41 @@ impl HostBackend {
         ensures
             final(core).well_formed(),
             final(self).well_formed(final(core)),
-            final(self).buffer == old(self).buffer,
-            final(self).tier == old(self).tier,
-            final(self).timeline == old(self).timeline,
-            final(self).first_frame == old(self).first_frame,
-            final(self).num_frames == old(self).num_frames,
-            final(core).node_id == old(core).node_id,
-            final(core).tiers == old(core).tiers,
-            old(core).spec@.versions_monotonic(final(core).spec@),
+            final(self).buffer_spec() == old(self).buffer_spec(),
+            final(self).tier_spec() == old(self).tier_spec(),
+            final(self).timeline_spec() == old(self).timeline_spec(),
+            final(self).first_frame_spec() == old(self).first_frame_spec(),
+            final(self).num_frames_spec() == old(self).num_frames_spec(),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            old(core).spec_spec()@.versions_monotonic(final(core).spec_spec()@),
             match r {
-                Err(_) => final(core).spec == old(core).spec,
+                Err(_) => final(core).spec_spec() == old(core).spec_spec(),
                 Ok((ver, frame)) => {
                     &&& final(self).owns(frame)
-                    &&& final(core).spec@.versions == old(core).spec@.versions.insert(ver, data@)
-                    &&& final(core).spec@.catalog == old(core).spec@.catalog.insert(key, ver)
-                    &&& final(core).catalog.slot(key, old(self).tier.index() as int) == Some(frame)
-                    &&& final(core).frames.meta(frame).state == STATE_PUBLISHED
+                    &&& final(core).spec_spec()@.versions == old(core).spec_spec()@.versions.insert(
+                        ver,
+                        data@,
+                    )
+                    &&& final(core).spec_spec()@.catalog == old(core).spec_spec()@.catalog.insert(
+                        key,
+                        ver,
+                    )
+                    &&& final(core).catalog_spec().slot(key, old(self).tier_spec().index() as int)
+                        == Some(frame)
+                    &&& final(core).frames_spec().meta(frame).state == STATE_PUBLISHED
                 },
             },
     {
         hide(CacheCore::well_formed);
         hide(replica_valid);
         hide(complete_receipts);
-        if data.len() != core.tier_frame_size(self.tier) {
+        if data.len() != core.registered_tier_frame_size(self.tier) {
             return Err(CoreError::InvalidArgument);
         }
         let (handle, Tracked(mut tok)) = core.begin_write(self.tier, key)?;
         proof {
+            lemma_core_wf_facts(core);
             lemma_slab_bound_same_directory(
                 old(core),
                 core,
@@ -205,7 +217,7 @@ impl HostBackend {
                 handle.frame,
             );
         }
-        if core.timelines.next_seq[self.timeline as usize] > MAX_TICKET_SEQ {
+        if core.timelines().next_sequences()[self.timeline as usize] > MAX_TICKET_SEQ {
             core.abort_write(handle, Tracked(tok));
             proof {
                 lemma_slab_bound_same_directory(
@@ -268,22 +280,24 @@ impl HostBackend {
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
             final(dst)@.len() == old(dst)@.len(),
-            final(self).buffer == old(self).buffer,
-            final(self).tier == old(self).tier,
-            final(self).timeline == old(self).timeline,
-            final(self).first_frame == old(self).first_frame,
-            final(self).num_frames == old(self).num_frames,
-            final(core).node_id == old(core).node_id,
-            final(core).tiers == old(core).tiers,
-            final(core).spec == old(core).spec,
-            final(core).frames.same_directory(&old(core).frames),
-            r matches Ok(ver) ==> final(self).owns(frame) && old(core).frames.meta(frame).state
-                == STATE_PUBLISHED && old(core).frames.frame(frame).bound_version == Some(ver),
+            final(self).buffer_spec() == old(self).buffer_spec(),
+            final(self).tier_spec() == old(self).tier_spec(),
+            final(self).timeline_spec() == old(self).timeline_spec(),
+            final(self).first_frame_spec() == old(self).first_frame_spec(),
+            final(self).num_frames_spec() == old(self).num_frames_spec(),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).frames_spec().same_directory(&old(core).frames_spec()),
+            r matches Ok(ver) ==> final(self).owns(frame) && old(core).frames_spec().meta(
+                frame,
+            ).state == STATE_PUBLISHED && old(core).frames_spec().frame(frame).bound_version
+                == Some(ver),
     {
         hide(CacheCore::well_formed);
         hide(replica_valid);
         hide(complete_receipts);
-        if dst.len() != core.tier_frame_size(self.tier) {
+        if dst.len() != core.registered_tier_frame_size(self.tier) {
             return Err(CoreError::InvalidArgument);
         }
         if !self.owns_frame(frame) {
@@ -302,7 +316,9 @@ impl HostBackend {
         let tracked mut perm = ReadPerm::Shared(cap);
         proof {
             lemma_published_frame_slot_valid(old(core), frame);
-            assert(before_read_core.frames.published(frame) == old(core).frames.published(frame));
+            assert(before_read_core.frames_spec().published(frame) == old(
+                core,
+            ).frames_spec().published(frame));
             lemma_core_wf_facts(core);
             lemma_slab_bound_same_directory(
                 old(core),
@@ -320,7 +336,7 @@ impl HostBackend {
                 self.buffer.space(),
                 frame,
             );
-            assert(src.slot_ref() == core.frames.frame(frame).slot);
+            assert(src.slot_ref() == core.frames_spec().frame(frame).slot);
             lemma_citations_closure(core);
             core.lemma_citations_admit_closure(perm.frontier(), ISet::empty());
             assert(ISet::empty().union(core.citations()) =~= core.citations());
@@ -331,8 +347,8 @@ impl HostBackend {
             &src,
             dst,
             Tracked(&mut perm),
-            Tracked(&core.ledger.borrow().submitted),
-            Tracked(&core.ledger.borrow().knows),
+            Tracked(&core.borrow_ledger().submitted),
+            Tracked(&core.borrow_ledger().knows),
             Ghost(core.citations()),
         );
         let tracked cap = perm.into_shared();
@@ -348,11 +364,11 @@ impl HostBackend {
             lemma_source_fresh_stepped(
                 before_ctx.source@,
                 self.ctx.source@,
-                before_read_core.ledger@,
-                core.ledger@,
+                before_read_core.ledger_spec()@,
+                core.ledger_spec()@,
                 reader,
             );
-            assert(core.ledger@.knows.set().contains((core.node(), reader))) by {
+            assert(core.ledger_spec()@.knows.set().contains((core.node(), reader))) by {
                 assert(completion.knows.set().contains((core.node(), reader)));
             }
             assert(core.citations().contains(reader));
@@ -377,10 +393,10 @@ impl HostBackend {
                 self.num_frames,
                 self.buffer.space(),
             );
-            assert(core.frames.same_directory(&old(core).frames)) by {
-                assert(before_read_core.frames.same_directory(&old(core).frames));
-                assert(before_release.frames == before_read_core.frames);
-                assert(core.frames.same_directory(&before_release.frames));
+            assert(core.frames_spec().same_directory(&old(core).frames_spec())) by {
+                assert(before_read_core.frames_spec().same_directory(&old(core).frames_spec()));
+                assert(before_release.frames_spec() == before_read_core.frames_spec());
+                assert(core.frames_spec().same_directory(&before_release.frames_spec()));
             }
         }
         Ok(version)
@@ -400,37 +416,39 @@ impl HostBackend {
             old(self).well_formed(old(core)),
             dst_backend.well_formed(old(core)),
             instance.id() == old(core).instance_id(),
-            old(core).timelines.next_seq[old(self).timeline as int] <= MAX_TICKET_SEQ,
+            old(core).timelines_spec().next_seq_spec()[old(self).timeline as int] <= MAX_TICKET_SEQ,
             old(self).owns(hop.src_frame),
             dst_backend.owns(hop.dst_frame),
             hop.src_frame != hop.dst_frame,
-            hop.src_frame.0 < old(core).frames.metas.len(),
-            hop.dst_frame.0 < old(core).frames.metas.len(),
-            hop.src_slot@ == old(core).frames.frame(hop.src_frame).slot,
-            hop.dst_slot@ == old(core).frames.frame(hop.dst_frame).slot,
+            hop.src_frame.0 < old(core).frames_spec().metas_spec().len(),
+            hop.dst_frame.0 < old(core).frames_spec().metas_spec().len(),
+            hop.src_slot@ == old(core).frames_spec().frame(hop.src_frame).slot,
+            hop.dst_slot@ == old(core).frames_spec().frame(hop.dst_frame).slot,
             hop.src_slot@.loc != hop.dst_slot@.loc,
-            old(core).frames.meta(hop.src_frame).state == STATE_PUBLISHED,
-            old(core).frames.frame(hop.src_frame).tier == old(self).tier,
-            old(core).frames.frame(hop.src_frame).bound_version == Some(hop.version),
-            old(core).frames.frame(hop.src_frame).cert == Some(hop.src_cert@),
-            replica_valid(old(core).ledger@, old(core).node(), hop.src_cert@),
+            old(core).frames_spec().meta(hop.src_frame).state == STATE_PUBLISHED,
+            old(core).frames_spec().frame(hop.src_frame).tier == old(self).tier,
+            old(core).frames_spec().frame(hop.src_frame).bound_version == Some(hop.version),
+            old(core).frames_spec().frame(hop.src_frame).cert == Some(hop.src_cert@),
+            replica_valid(old(core).ledger_spec()@, old(core).node(), hop.src_cert@),
             old(core).citations().contains(hop.src_cert@.writer),
-            old(core).frames.versions@.contains_key(hop.version),
-            old(core).frames.versions@[hop.version] == hop.src_cert@.bytes,
-            hop.version.origin_node != old(core).node_id || hop.version.seq < old(
+            old(core).frames_spec().versions_spec()@.contains_key(hop.version),
+            old(core).frames_spec().versions_spec()@[hop.version] == hop.src_cert@.bytes,
+            hop.version.origin_node != old(core).node_id_spec() || hop.version.seq < old(
                 core,
-            ).next_version_seq || hop.version.seq >= old(core).version_seq_limit,
-            hop.src_lease.frame == hop.src_frame,
+            ).next_version_seq_spec() || hop.version.seq >= old(core).version_seq_limit_spec(),
+            hop.src_lease.frame_spec() == hop.src_frame,
             old(core).active_lease_matches(hop.src_lease),
-            src_cap.share() == old(core).active_leases[hop.src_lease.slot as int]->Some_0.share@,
-            old(core).frames.meta(hop.dst_frame).state == STATE_INITIALIZING,
-            !old(core).frames.meta(hop.dst_frame).queued(),
-            old(core).frames.frame(hop.dst_frame).tier == dst_backend.tier,
-            old(core).frames.frame(hop.dst_frame).bound_key == Some(hop.key),
-            old(core).frames.frame(hop.dst_frame).bound_version == Some(hop.version),
-            old(core).frames.frame(hop.dst_frame).token is None,
+            src_cap.share() == old(
+                core,
+            ).active_leases_spec()[hop.src_lease.slot_spec() as int]->Some_0.share@,
+            old(core).frames_spec().meta(hop.dst_frame).state == STATE_INITIALIZING,
+            !old(core).frames_spec().meta(hop.dst_frame).queued(),
+            old(core).frames_spec().frame(hop.dst_frame).tier == dst_backend.tier,
+            old(core).frames_spec().frame(hop.dst_frame).bound_key == Some(hop.key),
+            old(core).frames_spec().frame(hop.dst_frame).bound_version == Some(hop.version),
+            old(core).frames_spec().frame(hop.dst_frame).token is None,
             hop.src_slot@.slot_len == hop.dst_slot@.slot_len,
-            src_cap.is_local(),
+            src_cap.is_cooperative(),
             src_cap.instance_id() == old(core).instance_id(),
             src_cap.loc() == hop.src_slot@.loc,
             read_admitted(src_cap.frontier(), old(core).citations()),
@@ -445,12 +463,12 @@ impl HostBackend {
             final(self).timeline == old(self).timeline,
             final(self).first_frame == old(self).first_frame,
             final(self).num_frames == old(self).num_frames,
-            final(core).node_id == old(core).node_id,
-            final(core).tiers == old(core).tiers,
-            old(core).spec@.versions_monotonic(final(core).spec@),
-            final(core).frames.meta(hop.dst_frame).state == STATE_PUBLISHED,
-            final(core).frames.frame(hop.dst_frame).tier == dst_backend.tier,
-            final(core).catalog.slot(hop.key, dst_backend.tier.index() as int) == Some(
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            old(core).spec_spec()@.versions_monotonic(final(core).spec_spec()@),
+            final(core).frames_spec().meta(hop.dst_frame).state == STATE_PUBLISHED,
+            final(core).frames_spec().frame(hop.dst_frame).tier == dst_backend.tier,
+            final(core).catalog_spec().slot(hop.key, dst_backend.tier.index() as int) == Some(
                 hop.dst_frame,
             ),
     {
@@ -487,7 +505,7 @@ impl HostBackend {
             assert(src_slice.slot_ref() == hop.src_slot@);
             assert(dst_slice.slot_ref() == hop.dst_slot@);
             lemma_citations_closure(core);
-            lemma_fresh_source_event_absent(self.ctx.source@, core.ledger@);
+            lemma_fresh_source_event_absent(self.ctx.source@, core.ledger_spec()@);
             core.lemma_citations_admit_closure(src_perm.frontier(), ISet::empty());
             core.lemma_citations_admit_closure(slot_frontier(dst_tok), ISet::empty());
             assert(ISet::empty().union(core.citations()) =~= core.citations());
@@ -499,8 +517,8 @@ impl HostBackend {
             &src_slice,
             Tracked(&mut src_perm),
             Tracked(&mut dst_tok),
-            Tracked(&core.ledger.borrow().submitted),
-            Tracked(&core.ledger.borrow().knows),
+            Tracked(&core.borrow_ledger().submitted),
+            Tracked(&core.borrow_ledger().knows),
             Ghost(core.citations()),
         );
         let tracked src_cap = src_perm.into_shared();
@@ -516,8 +534,9 @@ impl HostBackend {
         let ghost copy_preds = sub_val.preds;
         let ticket = core.issue_ticket(self.timeline, Tracked(completion.submitted)).unwrap();
         proof {
-            assert(core.timelines.events@[(self.timeline, ticket.sequence())] == writer);
-            assert(core.timelines.observed(
+            assert(core.timelines_spec().events_spec()@[(self.timeline, ticket.sequence())]
+                == writer);
+            assert(core.timelines_spec().observed(
                 self.timeline,
                 ticket.sequence(),
                 core.node(),
@@ -528,8 +547,8 @@ impl HostBackend {
         let ghost dst_cert;
         proof {
             lemma_observed_event_in_citations(
-                before_copy.ledger@,
-                core.ledger@,
+                before_copy.ledger_spec()@,
+                core.ledger_spec()@,
                 core.node(),
                 writer,
                 sub_val,
@@ -539,16 +558,16 @@ impl HostBackend {
             lemma_source_fresh_stepped(
                 before_ctx.source@,
                 self.ctx.source@,
-                before_copy.ledger@,
-                core.ledger@,
+                before_copy.ledger_spec()@,
+                core.ledger_spec()@,
                 writer,
             );
             assert(writer.source.succeeds_on_observe());
-            assert(event_succeeded(core.ledger@, core.node(), writer));
+            assert(event_succeeded(core.ledger_spec()@, core.node(), writer));
             dst_cert =
             lemma_certify_single_copy(
-                before_copy.ledger@,
-                core.ledger@,
+                before_copy.ledger_spec()@,
+                core.ledger_spec()@,
                 core.node(),
                 hop.src_cert@,
                 hop.src_slot@,
@@ -611,18 +630,18 @@ impl HostBackend {
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
-            final(self).buffer == old(self).buffer,
-            final(self).tier == old(self).tier,
-            final(self).timeline == old(self).timeline,
-            final(self).first_frame == old(self).first_frame,
-            final(self).num_frames == old(self).num_frames,
-            final(core).node_id == old(core).node_id,
-            final(core).tiers == old(core).tiers,
-            old(core).spec@.versions_monotonic(final(core).spec@),
+            final(self).buffer_spec() == old(self).buffer_spec(),
+            final(self).tier_spec() == old(self).tier_spec(),
+            final(self).timeline_spec() == old(self).timeline_spec(),
+            final(self).first_frame_spec() == old(self).first_frame_spec(),
+            final(self).num_frames_spec() == old(self).num_frames_spec(),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            old(core).spec_spec()@.versions_monotonic(final(core).spec_spec()@),
             r matches Ok(dst_frame) ==> {
                 &&& dst_backend.owns(dst_frame)
-                &&& final(core).frames.meta(dst_frame).state == STATE_PUBLISHED
-                &&& final(core).frames.frame(dst_frame).tier == dst_backend.tier
+                &&& final(core).frames_spec().meta(dst_frame).state == STATE_PUBLISHED
+                &&& final(core).frames_spec().frame(dst_frame).tier == dst_backend.tier_spec()
             },
     {
         hide(CacheCore::well_formed);
@@ -631,7 +650,10 @@ impl HostBackend {
         if !self.owns_frame(src_frame) {
             return Err(CoreError::UnsupportedTier);
         }
-        if core.timelines.next_seq[self.timeline as usize] > MAX_TICKET_SEQ {
+        proof {
+            lemma_core_wf_facts(core);
+        }
+        if core.timelines().next_sequences()[self.timeline as usize] > MAX_TICKET_SEQ {
             return Err(CoreError::SequenceExhausted);
         }
         let (hop, src_cap, dst_tok) = match core.begin_copy_hop(

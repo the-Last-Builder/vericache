@@ -6,7 +6,6 @@ mod ring;
 
 use crate::context::*;
 use crate::domain::*;
-use crate::host::{self, HostContext, HostSlice};
 use foundation::space::{Access, Effect};
 #[cfg(verus_only)]
 use foundation::{
@@ -94,7 +93,7 @@ impl NvmeFile {
     }
 
     pub closed spec fn well_formed(&self) -> bool {
-        &&& self.space@ is NvmeFile
+        &&& self.space@.is_nvme()
         &&& self.num_slots >= 1
         &&& self.slot_len > 0 && self.slot_len % DIRECT_IO_ALIGNMENT == 0
         &&& self.len == (self.num_slots as nat) * (self.slot_len as nat)
@@ -117,14 +116,14 @@ impl NvmeFile {
             result.0.num_slots() == 1,
             result.0.slot_len() == len,
             result.0.node() == old(source).node(),
-            result.0.space() == old(source).nvme_space(),
-            result.0.slot_ref(0) == old(source).nvme_slot_ref(len),
+            result.0.space() == old(source).space_for(SPACE_NVME, 0),
+            result.0.slot_ref(0) == old(source).slot_ref_for(SPACE_NVME, 0, len),
             final(source).allocated_slot(*old(source), result.0.slot_loc(0), result.1@),
     {
         let fd = ffi::NvmeFdGuard::new(fd);
         let ghost node = source.node();
-        let ghost space = source.nvme_space();
-        let tracked tok = source.allocate_nvme_slot();
+        let ghost space = MemorySpace::nvme(source.next_alloc_id());
+        let tracked tok = source.allocate_slot_in(space);
         (
             Self {
                 fd,
@@ -182,13 +181,13 @@ impl NvmeFile {
             result.0.num_slots() == num_slots,
             result.0.slot_len() == slot_len,
             result.0.node() == old(source).node(),
-            result.0.space() == old(source).nvme_space(),
+            result.0.space() == old(source).space_for(SPACE_NVME, 0),
             final(source).allocated_slab(*old(source), result.0.space(), num_slots, result.1@),
     {
         let fd = ffi::NvmeFdGuard::new(fd);
         let ghost node = source.node();
-        let ghost space = source.nvme_space();
-        let tracked tokens = source.allocate_nvme_slab_slots(num_slots);
+        let ghost space = MemorySpace::nvme(source.next_alloc_id());
+        let tracked tokens = source.allocate_slab_in(space, num_slots);
         (
             Self {
                 fd,
@@ -204,7 +203,7 @@ impl NvmeFile {
     }
 
     pub fn create_temp(
-        _ctx: &HostContext,
+        _ctx: &SyncContext,
         Tracked(instance): Tracked<&TransferInstance>,
         Tracked(source): Tracked<&mut AllocSource>,
         dir: &str,
@@ -221,10 +220,11 @@ impl NvmeFile {
                 Ok((file, tok)) => {
                     &&& file.well_formed() && file.instance_id() == instance.id()
                     &&& file.num_slots() == 1 && file.slot_len() == len
-                    &&& file.node() == old(source).node() && file.space() == old(
-                        source,
-                    ).nvme_space()
-                    &&& file.slot_ref(0) == old(source).nvme_slot_ref(len)
+                    &&& file.node() == old(source).node() && file.space() == old(source).space_for(
+                        SPACE_NVME,
+                        0,
+                    )
+                    &&& file.slot_ref(0) == old(source).slot_ref_for(SPACE_NVME, 0, len)
                     &&& final(source).allocated_slot(*old(source), file.slot_loc(0), tok@)
                 },
             },
@@ -237,7 +237,7 @@ impl NvmeFile {
     }
 
     pub fn open_path(
-        _ctx: &HostContext,
+        _ctx: &SyncContext,
         Tracked(instance): Tracked<&TransferInstance>,
         Tracked(source): Tracked<&mut AllocSource>,
         path: &str,
@@ -255,10 +255,11 @@ impl NvmeFile {
                 Ok((file, tok)) => {
                     &&& file.well_formed() && file.instance_id() == instance.id()
                     &&& file.num_slots() == 1 && file.slot_len() == len
-                    &&& file.node() == old(source).node() && file.space() == old(
-                        source,
-                    ).nvme_space()
-                    &&& file.slot_ref(0) == old(source).nvme_slot_ref(len)
+                    &&& file.node() == old(source).node() && file.space() == old(source).space_for(
+                        SPACE_NVME,
+                        0,
+                    )
+                    &&& file.slot_ref(0) == old(source).slot_ref_for(SPACE_NVME, 0, len)
                     &&& final(source).allocated_slot(*old(source), file.slot_loc(0), tok@)
                 },
             },
@@ -271,7 +272,7 @@ impl NvmeFile {
     }
 
     pub fn create_temp_slab(
-        _ctx: &HostContext,
+        _ctx: &SyncContext,
         Tracked(instance): Tracked<&TransferInstance>,
         Tracked(source): Tracked<&mut AllocSource>,
         dir: &str,
@@ -291,9 +292,10 @@ impl NvmeFile {
                 Ok((file, tokens)) => {
                     &&& file.well_formed() && file.instance_id() == instance.id()
                     &&& file.num_slots() == num_slots && file.slot_len() == slot_len
-                    &&& file.node() == old(source).node() && file.space() == old(
-                        source,
-                    ).nvme_space()
+                    &&& file.node() == old(source).node() && file.space() == old(source).space_for(
+                        SPACE_NVME,
+                        0,
+                    )
                     &&& final(source).allocated_slab(*old(source), file.space(), num_slots, tokens@)
                 },
             },
@@ -304,7 +306,7 @@ impl NvmeFile {
     }
 
     pub fn open_path_slab(
-        _ctx: &HostContext,
+        _ctx: &SyncContext,
         Tracked(instance): Tracked<&TransferInstance>,
         Tracked(source): Tracked<&mut AllocSource>,
         path: &str,
@@ -325,9 +327,10 @@ impl NvmeFile {
                 Ok((file, tokens)) => {
                     &&& file.well_formed() && file.instance_id() == instance.id()
                     &&& file.num_slots() == num_slots && file.slot_len() == slot_len
-                    &&& file.node() == old(source).node() && file.space() == old(
-                        source,
-                    ).nvme_space()
+                    &&& file.node() == old(source).node() && file.space() == old(source).space_for(
+                        SPACE_NVME,
+                        0,
+                    )
                     &&& final(source).allocated_slab(*old(source), file.space(), num_slots, tokens@)
                 },
             },
@@ -401,20 +404,20 @@ impl NvmeFile {
     }
 
     pub fn close(
-        _ctx: &mut HostContext,
+        _ctx: &mut SyncContext,
         Tracked(instance): Tracked<&TransferInstance>,
         file: NvmeFile,
         Tracked(tok): Tracked<SlotToken>,
         Tracked(infos): Tracked<&SubmittedMap>,
         Tracked(knows): Tracked<&Knows>,
         Ghost(cited): Ghost<ISet<TransferEvent>>,
-    ) -> (result: Tracked<host::Completion>)
+    ) -> (result: Tracked<Completion>)
         requires
             old(_ctx).ready(instance.id(), file.node()),
             file.well_formed(),
             file.num_slots() == 1,
             file.instance_id() == instance.id(),
-            host::can_reclaim_slot(instance.id(), file.slot_loc(0), tok, *infos, *knows, cited),
+            can_reclaim_slot(instance.id(), file.slot_loc(0), tok, *infos, *knows, cited),
         ensures
             final(_ctx).stepped(*old(_ctx)),
             result@.records(
@@ -431,10 +434,10 @@ impl NvmeFile {
         let Tracked(completed) = ffi::close(file);
         proof {
             assert(slab_locs(loc.node, loc.space, 1nat) =~= ISet::empty().insert(loc));
-            assert(completed.access == reclaim_access(loc));
+            assert(completed.access() == reclaim_access(loc));
         }
         Tracked(
-            host::finish_owned(
+            finish_owned(
                 _ctx.source.borrow_mut(),
                 instance,
                 completed,
@@ -447,19 +450,19 @@ impl NvmeFile {
     }
 
     pub fn close_slab(
-        _ctx: &mut HostContext,
+        _ctx: &mut SyncContext,
         Tracked(instance): Tracked<&TransferInstance>,
         file: NvmeFile,
         Tracked(tokens): Tracked<Map<usize, SlotToken>>,
         Tracked(infos): Tracked<&SubmittedMap>,
         Tracked(knows): Tracked<&Knows>,
         Ghost(cited): Ghost<ISet<TransferEvent>>,
-    ) -> (result: Tracked<host::Completion>)
+    ) -> (result: Tracked<Completion>)
         requires
             old(_ctx).ready(instance.id(), file.node()),
             file.well_formed(),
             file.instance_id() == instance.id(),
-            host::can_reclaim_slab(
+            can_reclaim_slab(
                 instance.id(),
                 file.node(),
                 file.space(),
@@ -484,7 +487,7 @@ impl NvmeFile {
         let ghost space = file.space();
         let ghost count = file.num_slots();
         let Tracked(completed) = ffi::close(file);
-        let tracked (completion, _) = host::finish_slab_owned(
+        let tracked (completion, _) = finish_slab_owned(
             _ctx.source.borrow_mut(),
             instance,
             node,

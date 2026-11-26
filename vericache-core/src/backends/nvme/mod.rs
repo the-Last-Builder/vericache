@@ -1,8 +1,10 @@
 use super::*;
 #[cfg(verus_only)]
 use foundation::tracked::Frontier;
-use transfer::host::HostContext;
-use transfer::nvme::{self, IoUring, NvmeFile, NvmeSlice, DIRECT_IO_ALIGNMENT, MAX_IO_LEN};
+use transfer::context::SyncContext;
+use transfer::nvme::{
+    self, IoUring, NvmeError, NvmeFile, NvmeSlice, DIRECT_IO_ALIGNMENT, MAX_IO_LEN,
+};
 
 mod poll;
 #[cfg(verus_only)]
@@ -17,7 +19,19 @@ use proofs::*;
 #[cfg(verus_only)]
 use window_proofs::*;
 
+#[cfg(verus_only)]
+mod preserve;
+#[cfg(verus_only)]
+pub use preserve::*;
+
 verus! {
+
+pub fn nvme_error(e: NvmeError) -> (r: CoreError)
+    ensures
+        r == (CoreError::Backend { kind: BACKEND_NVME, code: e.0 }),
+{
+    CoreError::Backend { kind: BACKEND_NVME, code: e.0 }
+}
 
 /// Non-dropping NVMe completion progress counters (M8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,35 +88,40 @@ pub open spec fn nvme_copy_retained(copy: ReplicaCopy, l: KnowledgeLedger, node:
 }
 
 impl InFlightNvmeOp {
-    pub open spec fn valid(&self, core: &CacheCore, timeline: u8, slot_idx: int) -> bool {
+    pub open(crate) spec fn valid(
+        &self,
+        core: &CacheCore,
+        timeline: TimelineId,
+        slot_idx: int,
+    ) -> bool {
         let s = self.ticket.sequence();
         &&& self.ticket != Ticket::NONE
         &&& self.ticket.timeline_id() == timeline
         &&& (s % BITMAP_CAPACITY) as int == slot_idx
-        &&& core.timelines.issued(timeline, s)
-        &&& core.timelines.events@[(timeline, s)] == self.copy@.writer
+        &&& core.timelines_spec().issued(timeline, s)
+        &&& core.timelines_spec().events_spec()@[(timeline, s)] == self.copy@.writer
         &&& self.hop.src_frame != self.hop.dst_frame
-        &&& self.hop.src_frame.0 < core.frames.metas.len()
-        &&& self.hop.dst_frame.0 < core.frames.metas.len()
-        &&& self.hop.src_slot@ == core.frames.frame(self.hop.src_frame).slot
-        &&& self.hop.dst_slot@ == core.frames.frame(self.hop.dst_frame).slot
+        &&& self.hop.src_frame.0 < core.frames_spec().metas_spec().len()
+        &&& self.hop.dst_frame.0 < core.frames_spec().metas_spec().len()
+        &&& self.hop.src_slot@ == core.frames_spec().frame(self.hop.src_frame).slot
+        &&& self.hop.dst_slot@ == core.frames_spec().frame(self.hop.dst_frame).slot
         &&& self.hop.src_slot@.loc != self.hop.dst_slot@.loc
-        &&& core.frames.meta(self.hop.dst_frame).state == STATE_INITIALIZING
-        &&& !core.frames.meta(self.hop.dst_frame).queued()
-        &&& core.frames.frame(self.hop.dst_frame).tier == self.hop.dst_tier
-        &&& core.frames.frame(self.hop.dst_frame).bound_key == Some(self.hop.key)
-        &&& core.frames.frame(self.hop.dst_frame).bound_version == Some(self.hop.version)
-        &&& core.frames.frame(self.hop.dst_frame).token is None
-        &&& core.frames.versions@.contains_key(self.hop.version)
-        &&& core.frames.versions@[self.hop.version] == self.hop.src_cert@.bytes
-        &&& (self.hop.version.origin_node != core.node_id || self.hop.version.seq
-            < core.next_version_seq || self.hop.version.seq >= core.version_seq_limit)
-        &&& self.hop.src_lease.frame == self.hop.src_frame
+        &&& core.frames_spec().meta(self.hop.dst_frame).state == STATE_INITIALIZING
+        &&& !core.frames_spec().meta(self.hop.dst_frame).queued()
+        &&& core.frames_spec().frame(self.hop.dst_frame).tier == self.hop.dst_tier
+        &&& core.frames_spec().frame(self.hop.dst_frame).bound_key == Some(self.hop.key)
+        &&& core.frames_spec().frame(self.hop.dst_frame).bound_version == Some(self.hop.version)
+        &&& core.frames_spec().frame(self.hop.dst_frame).token is None
+        &&& core.frames_spec().versions_spec()@.contains_key(self.hop.version)
+        &&& core.frames_spec().versions_spec()@[self.hop.version] == self.hop.src_cert@.bytes
+        &&& (self.hop.version.origin_node != core.node_id_spec() || self.hop.version.seq
+            < core.next_version_seq_spec() || self.hop.version.seq >= core.version_seq_limit_spec())
+        &&& self.hop.src_lease.frame_spec() == self.hop.src_frame
         &&& core.active_lease_matches(self.hop.src_lease)
-        &&& core.active_leases[self.hop.src_lease.slot as int]->Some_0.internal
+        &&& core.active_leases_spec()[self.hop.src_lease.slot_spec() as int]->Some_0.internal
         &&& self.src_cap@.share()
-            == core.active_leases[self.hop.src_lease.slot as int]->Some_0.share@
-        &&& self.src_cap@.is_local()
+            == core.active_leases_spec()[self.hop.src_lease.slot_spec() as int]->Some_0.share@
+        &&& self.src_cap@.is_cooperative()
         &&& self.src_cap@.instance_id() == core.instance_id()
         &&& self.src_cap@.loc() == self.hop.src_slot@.loc
         &&& self.src_cap@.frontier().readers == ISet::empty().insert(self.copy@.writer)
@@ -118,22 +137,23 @@ impl InFlightNvmeOp {
         &&& self.copy@.source.slot == self.copy@.source_slot
         &&& self.copy@.source.bytes.len() == self.copy@.destination.slot_len
         &&& self.copy@.source.bytes.len() == self.copy@.source_slot.sub_len
-        &&& nvme_copy_retained(self.copy@, core.ledger@, core.node())
+        &&& nvme_copy_retained(self.copy@, core.ledger_spec()@, core.node())
     }
 }
 
 /// Local NVMe storage backend owning an `O_DIRECT` `NvmeFile` slab (4KB aligned)
 /// and an `io_uring` submission/completion ring.
 pub struct NvmeBackend {
-    pub file: NvmeFile,
-    pub ring: IoUring,
-    pub tier: TierId,
-    pub timeline: u8,
-    pub first_frame: FrameId,
-    pub num_frames: u32,
-    pub bitmap: SlidingBitmap,
-    pub in_flight_ops: [Option<PendingOperation>; BITMAP_SLOTS],
-    pub pending_transfers: Vec<Option<InFlightNvmeOp>>,
+    pub(crate) core_id: Option<u64>,
+    pub(crate) file: NvmeFile,
+    pub(crate) ring: IoUring,
+    pub(crate) tier: TierId,
+    pub(crate) timeline: TimelineId,
+    pub(crate) first_frame: FrameId,
+    pub(crate) num_frames: u32,
+    pub(crate) bitmap: SlidingBitmap,
+    pub(crate) in_flight_ops: [Option<PendingOperation>; BITMAP_SLOTS],
+    pub(crate) pending_transfers: Vec<Option<InFlightNvmeOp>>,
 }
 
 #[verifier::opaque]
@@ -145,7 +165,8 @@ pub open spec fn nvme_pending_disjoint(pending_transfers: Seq<Option<InFlightNvm
             #[trigger] pending_transfers[j],
         ) {
             (Some(a), Some(b)) => a.hop.dst_frame != b.hop.dst_frame && a.hop.dst_slot@.loc
-                != b.hop.dst_slot@.loc && a.hop.src_lease.slot != b.hop.src_lease.slot,
+                != b.hop.dst_slot@.loc && a.hop.src_lease.slot_spec()
+                != b.hop.src_lease.slot_spec(),
             _ => true,
         }
 }
@@ -156,7 +177,7 @@ pub open spec fn nvme_pending_valid(
     in_flight_ops: [Option<PendingOperation>; BITMAP_SLOTS],
     ring: IoUring,
     core: &CacheCore,
-    timeline: u8,
+    timeline: TimelineId,
 ) -> bool {
     &&& pending_transfers.len() == BITMAP_CAPACITY
     &&& nvme_pending_disjoint(pending_transfers)
@@ -176,36 +197,66 @@ pub open spec fn ring_event_map(ring: IoUring) -> Map<u64, TransferEvent> {
 }
 
 #[verifier::opaque]
-pub open spec fn nvme_window_wf(
+pub open(crate) spec fn nvme_window_wf(
     bitmap: SlidingBitmap,
     in_flight_ops: [Option<PendingOperation>; BITMAP_SLOTS],
     ring: IoUring,
     core: &CacheCore,
-    timeline: u8,
+    timeline: TimelineId,
 ) -> bool {
     &&& bitmap.well_formed()
-    &&& bitmap.observations(&core.timelines, timeline, core.node(), &core.ledger@)
-    &&& window_matches(in_flight_ops, bitmap, &core.timelines, timeline, ring_event_map(ring))
+    &&& bitmap.observations(&core.timelines_spec(), timeline, core.node(), &core.ledger_spec()@)
+    &&& window_matches(
+        in_flight_ops,
+        bitmap,
+        &core.timelines_spec(),
+        timeline,
+        ring_event_map(ring),
+    )
 }
 
 impl NvmeBackend {
-    pub open spec fn well_formed(&self, core: &CacheCore) -> bool {
+    pub open(crate) spec fn first_frame_spec(&self) -> FrameId {
+        self.first_frame
+    }
+
+    pub open(crate) spec fn num_frames_spec(&self) -> u32 {
+        self.num_frames
+    }
+
+    pub open(crate) spec fn timeline_spec(&self) -> TimelineId {
+        self.timeline
+    }
+
+    pub open(crate) spec fn tier_spec(&self) -> TierId {
+        self.tier
+    }
+
+    pub open(crate) spec fn file_spec(&self) -> NvmeFile {
+        self.file
+    }
+
+    pub open(crate) spec fn ring_spec(&self) -> IoUring {
+        self.ring
+    }
+
+    pub open(crate) spec fn well_formed(&self, core: &CacheCore) -> bool {
         &&& self.file.well_formed()
         &&& self.file.instance_id() == core.instance_id()
         &&& self.file.node() == core.node()
         &&& self.file.num_slots() == self.num_frames as usize
-        &&& self.file.slot_len() == core.frames.tier_frame_size(self.tier) as u64
+        &&& self.file.slot_len() == core.frames_spec().tier_frame_size(self.tier) as u64
         &&& 0 < self.file.slot_len() <= MAX_IO_LEN
         &&& self.file.slot_len() % DIRECT_IO_ALIGNMENT == 0
         &&& self.ring.well_formed()
         &&& self.ring.instance_id() == core.instance_id()
         &&& self.ring.node() == core.node()
-        &&& self.ring.source().source() is IoUring
-        &&& self.tier.valid(core.tiers.len())
-        &&& core.tiers[self.tier.index() as int].kind == TierKind::LocalNvme
-        &&& self.timeline < core.timelines.count
-        &&& core.timelines.count <= MAX_TIMELINES
-        &&& core.timelines.kinds[self.timeline as int] == TimelineKind::IoUring
+        &&& self.ring.source().source().is_io_uring()
+        &&& self.tier.valid(core.tiers_spec().len())
+        &&& core.tiers_spec()[self.tier.index() as int].kind == TierKind::LocalNvme
+        &&& self.timeline < core.timelines_spec().count_spec()
+        &&& core.timelines_spec().count_spec() <= MAX_TIMELINES
+        &&& core.timelines_spec().kinds_spec()[self.timeline as int] == TimelineKind::IoUring
         &&& slab_bound_to_core(
             core,
             self.tier,
@@ -224,7 +275,7 @@ impl NvmeBackend {
         )
     }
 
-    pub open spec fn owns(&self, frame: FrameId) -> bool {
+    pub open(crate) spec fn owns(&self, frame: FrameId) -> bool {
         self.first_frame.0 <= frame.0 && frame.0 < self.first_frame.0 + self.num_frames
     }
 
@@ -240,9 +291,9 @@ impl NvmeBackend {
                 &&& 0 < slot_len <= MAX_IO_LEN
                 &&& slot_len % DIRECT_IO_ALIGNMENT == 0
                 &&& (count as nat) * (slot_len as nat) <= u64::MAX
-                &&& core.tiers.len() < MAX_TIERS
-                &&& core.timelines.count < MAX_TIMELINES
-                &&& core.frames.metas.len() + count <= u32::MAX
+                &&& core.tiers_spec().len() < MAX_TIERS
+                &&& core.timelines_spec().count_spec() < MAX_TIMELINES
+                &&& core.frames_spec().metas_spec().len() + count <= u32::MAX
             },
     {
         hide(CacheCore::well_formed);
@@ -258,8 +309,8 @@ impl NvmeBackend {
         if (count as u64) > u64::MAX / slot_len {
             return Err(CoreError::InvalidArgument);
         }
-        if core.tiers.len() >= MAX_TIERS || core.timelines.count >= MAX_TIMELINES || count > (
-        u32::MAX as usize) - core.frames.metas.len() {
+        if core.tier_count() >= MAX_TIERS || core.timeline_count() >= MAX_TIMELINES || count > (
+        u32::MAX as usize) - core.frame_count() {
             return Err(CoreError::CapacityExhausted);
         }
         proof {
@@ -309,24 +360,24 @@ impl NvmeBackend {
             ring.well_formed(),
             ring.instance_id() == old(core).instance_id(),
             ring.node() == old(core).node(),
-            ring.source().source() is IoUring,
+            ring.source().source().is_io_uring(),
             ring.pending() == Map::empty(),
             num_frames > 0,
-            old(core).tiers.len() < MAX_TIERS,
-            old(core).timelines.count < MAX_TIMELINES,
-            old(core).frames.metas.len() + (num_frames as usize) <= u32::MAX,
+            old(core).tiers_spec().len() < MAX_TIERS,
+            old(core).timelines_spec().count_spec() < MAX_TIMELINES,
+            old(core).frames_spec().metas_spec().len() + (num_frames as usize) <= u32::MAX,
         ensures
             final(core).well_formed(),
             alloc_fresh_for_core(*alloc, final(core)),
-            final(core).node_id == old(core).node_id,
-            final(core).ledger == old(core).ledger,
-            final(core).spec == old(core).spec,
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).ledger_spec() == old(core).ledger_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
             r.well_formed(final(core)),
             r.num_frames == num_frames,
-            r.tier == TierId(old(core).tiers.len() as u16),
-            r.first_frame.0 == old(core).frames.metas.len(),
-            r.timeline == old(core).timelines.count,
-            final(core).frames.tier_frame_size(r.tier) == frame_size,
+            r.tier == TierId(old(core).tiers_spec().len() as u16),
+            r.first_frame.0 == old(core).frames_spec().metas_spec().len(),
+            r.timeline == old(core).timelines_spec().count_spec(),
+            final(core).frames_spec().tier_frame_size(r.tier) == frame_size,
     {
         hide(CacheCore::well_formed);
         hide(replica_valid);
@@ -392,6 +443,7 @@ impl NvmeBackend {
             lemma_nvme_init_state(bitmap, in_flight_ops, pending_transfers@, ring, core, timeline);
         }
         Self {
+            core_id: core.runtime_id(),
             file,
             ring,
             tier,
@@ -409,7 +461,7 @@ impl NvmeBackend {
     /// `TimelineKind::IoUring` timeline in `core`.
     pub fn new(
         core: &mut CacheCore,
-        host_ctx: &HostContext,
+        host_ctx: &SyncContext,
         Tracked(instance): Tracked<&TransferInstance>,
         Tracked(alloc): Tracked<&mut AllocSource>,
         Tracked(ring_source): Tracked<EventSourceToken>,
@@ -428,29 +480,31 @@ impl NvmeBackend {
             ring_source.well_formed(),
             ring_source.id() == old(core).instance_id(),
             ring_source.node() == old(core).node(),
-            ring_source.source() is IoUring,
+            ring_source.source().is_io_uring(),
         ensures
             final(core).well_formed(),
             final(alloc).well_formed(),
             final(alloc).id() == old(alloc).id(),
             final(alloc).node() == old(alloc).node(),
             alloc_fresh_for_core(*final(alloc), final(core)),
-            final(core).node_id == old(core).node_id,
-            final(core).ledger == old(core).ledger,
-            final(core).spec == old(core).spec,
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).ledger_spec() == old(core).ledger_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
             match r {
                 Err(_) => *final(core) == *old(core) && *final(alloc) == *old(alloc),
                 Ok(b) => {
                     &&& b.well_formed(final(core))
-                    &&& b.num_frames == num_frames
-                    &&& b.tier == TierId(old(core).tiers.len() as u16)
-                    &&& b.first_frame.0 == old(core).frames.metas.len()
-                    &&& b.timeline == old(core).timelines.count
-                    &&& final(core).frames.tier_frame_size(b.tier) == old(core).frames.frame_size
+                    &&& b.num_frames_spec() == num_frames
+                    &&& b.tier_spec() == TierId(old(core).tiers_spec().len() as u16)
+                    &&& b.first_frame_spec().0 == old(core).frames_spec().metas_spec().len()
+                    &&& b.timeline_spec() == old(core).timelines_spec().count_spec()
+                    &&& final(core).frames_spec().tier_frame_size(b.tier_spec()) == old(
+                        core,
+                    ).frames_spec().frame_size_spec()
                 },
             },
     {
-        let frame_size = core.frames.frame_size;
+        let frame_size = core.frame_size();
         Self::new_with_frame_size(
             core,
             host_ctx,
@@ -468,7 +522,7 @@ impl NvmeBackend {
     /// `frame_size`, initialize its `io_uring`, and register its tier in `core`.
     pub fn new_with_frame_size(
         core: &mut CacheCore,
-        host_ctx: &HostContext,
+        host_ctx: &SyncContext,
         Tracked(instance): Tracked<&TransferInstance>,
         Tracked(alloc): Tracked<&mut AllocSource>,
         Tracked(ring_source): Tracked<EventSourceToken>,
@@ -488,25 +542,25 @@ impl NvmeBackend {
             ring_source.well_formed(),
             ring_source.id() == old(core).instance_id(),
             ring_source.node() == old(core).node(),
-            ring_source.source() is IoUring,
+            ring_source.source().is_io_uring(),
         ensures
             final(core).well_formed(),
             final(alloc).well_formed(),
             final(alloc).id() == old(alloc).id(),
             final(alloc).node() == old(alloc).node(),
             alloc_fresh_for_core(*final(alloc), final(core)),
-            final(core).node_id == old(core).node_id,
-            final(core).ledger == old(core).ledger,
-            final(core).spec == old(core).spec,
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).ledger_spec() == old(core).ledger_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
             match r {
                 Err(_) => *final(core) == *old(core) && *final(alloc) == *old(alloc),
                 Ok(b) => {
                     &&& b.well_formed(final(core))
-                    &&& b.num_frames == num_frames
-                    &&& b.tier == TierId(old(core).tiers.len() as u16)
-                    &&& b.first_frame.0 == old(core).frames.metas.len()
-                    &&& b.timeline == old(core).timelines.count
-                    &&& final(core).frames.tier_frame_size(b.tier) == frame_size
+                    &&& b.num_frames_spec() == num_frames
+                    &&& b.tier_spec() == TierId(old(core).tiers_spec().len() as u16)
+                    &&& b.first_frame_spec().0 == old(core).frames_spec().metas_spec().len()
+                    &&& b.timeline_spec() == old(core).timelines_spec().count_spec()
+                    &&& final(core).frames_spec().tier_frame_size(b.tier_spec()) == frame_size
                 },
             },
     {
@@ -550,7 +604,7 @@ impl NvmeBackend {
     /// with per-tier `frame_size`, initialize its `io_uring`, and register its tier in `core`.
     pub fn new_with_path(
         core: &mut CacheCore,
-        host_ctx: &HostContext,
+        host_ctx: &SyncContext,
         Tracked(instance): Tracked<&TransferInstance>,
         Tracked(alloc): Tracked<&mut AllocSource>,
         Tracked(ring_source): Tracked<EventSourceToken>,
@@ -571,25 +625,25 @@ impl NvmeBackend {
             ring_source.well_formed(),
             ring_source.id() == old(core).instance_id(),
             ring_source.node() == old(core).node(),
-            ring_source.source() is IoUring,
+            ring_source.source().is_io_uring(),
         ensures
             final(core).well_formed(),
             final(alloc).well_formed(),
             final(alloc).id() == old(alloc).id(),
             final(alloc).node() == old(alloc).node(),
             alloc_fresh_for_core(*final(alloc), final(core)),
-            final(core).node_id == old(core).node_id,
-            final(core).ledger == old(core).ledger,
-            final(core).spec == old(core).spec,
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).ledger_spec() == old(core).ledger_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
             match r {
                 Err(_) => *final(core) == *old(core) && *final(alloc) == *old(alloc),
                 Ok(b) => {
                     &&& b.well_formed(final(core))
-                    &&& b.num_frames == num_frames
-                    &&& b.tier == TierId(old(core).tiers.len() as u16)
-                    &&& b.first_frame.0 == old(core).frames.metas.len()
-                    &&& b.timeline == old(core).timelines.count
-                    &&& final(core).frames.tier_frame_size(b.tier) == frame_size
+                    &&& b.num_frames_spec() == num_frames
+                    &&& b.tier_spec() == TierId(old(core).tiers_spec().len() as u16)
+                    &&& b.first_frame_spec().0 == old(core).frames_spec().metas_spec().len()
+                    &&& b.timeline_spec() == old(core).timelines_spec().count_spec()
+                    &&& final(core).frames_spec().tier_frame_size(b.tier_spec()) == frame_size
                 },
             },
     {
@@ -632,14 +686,14 @@ impl NvmeBackend {
 
     pub fn tier_id(&self) -> (t: TierId)
         ensures
-            t == self.tier,
+            t == self.tier_spec(),
     {
         self.tier
     }
 
-    pub fn timeline_id(&self) -> (t: u8)
+    pub fn timeline_id(&self) -> (t: TimelineId)
         ensures
-            t == self.timeline,
+            t == self.timeline_spec(),
     {
         self.timeline
     }
@@ -653,16 +707,16 @@ impl NvmeBackend {
 
     pub fn frame_slice(&self, frame: FrameId) -> (s: NvmeSlice<'_>)
         requires
-            self.file.well_formed(),
-            self.file.num_slots() == self.num_frames as usize,
+            self.file_spec().well_formed(),
+            self.file_spec().num_slots() == self.num_frames_spec() as usize,
             self.owns(frame),
         ensures
             s.well_formed(),
-            s.slot_ref() == self.file.slot_ref((frame.0 - self.first_frame.0) as nat),
-            s.file_offset() == ((frame.0 - self.first_frame.0) as nat) * (
-            self.file.slot_len() as nat),
+            s.slot_ref() == self.file_spec().slot_ref((frame.0 - self.first_frame_spec().0) as nat),
+            s.file_offset() == ((frame.0 - self.first_frame_spec().0) as nat) * (
+            self.file_spec().slot_len() as nat),
             s.file_offset() % DIRECT_IO_ALIGNMENT == 0,
-            s.instance_id() == self.file.instance_id(),
+            s.instance_id() == self.file_spec().instance_id(),
     {
         let idx = (frame.0 - self.first_frame.0) as usize;
         self.file.slot_slice(idx)
@@ -670,14 +724,14 @@ impl NvmeBackend {
 
     pub fn staged_len(&self) -> (n: usize)
         requires
-            self.ring.well_formed(),
+            self.ring_spec().well_formed(),
         ensures
-            n == self.ring.staged_count(),
+            n == self.ring_spec().staged_count(),
     {
         self.ring.staged_len()
     }
 
-    pub fn in_flight_len(&self) -> (n: usize)
+    pub(crate) fn in_flight_len(&self) -> (n: usize)
         requires
             self.ring.well_formed(),
         ensures
@@ -692,12 +746,15 @@ impl NvmeBackend {
             old(self).well_formed(core),
         ensures
             final(self).well_formed(core),
-            final(self).tier == old(self).tier,
-            final(self).timeline == old(self).timeline,
-            final(self).first_frame == old(self).first_frame,
-            final(self).num_frames == old(self).num_frames,
-            r matches Ok(n) ==> n <= old(self).ring.staged_count() && final(self).ring.staged()
-                == old(self).ring.staged().skip(n as int),
+            final(self).pending_transfers_spec() == old(self).pending_transfers_spec(),
+            final(self).tier_spec() == old(self).tier_spec(),
+            final(self).timeline_spec() == old(self).timeline_spec(),
+            final(self).first_frame_spec() == old(self).first_frame_spec(),
+            final(self).num_frames_spec() == old(self).num_frames_spec(),
+            r matches Ok(n) ==> n <= old(self).ring_spec().staged_count()
+                && final(self).ring_spec().staged() == old(self).ring_spec().staged().skip(
+                n as int,
+            ),
     {
         match self.ring.submit() {
             Ok(n) => {

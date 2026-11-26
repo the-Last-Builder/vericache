@@ -1,4 +1,3 @@
-use super::proofs::receive_read;
 use super::*;
 
 verus! {
@@ -11,7 +10,7 @@ broadcast use {
 // The example endpoints use a dedicated CQ, so the next completion belongs
 // to the one outstanding operation. Bound the poll loop for the executable test.
 
-pub(super) fn wait_one(
+pub(crate) fn wait_one(
     cq: &mut CompletionQueue,
     Tracked(instance): Tracked<&TransferInstance>,
 ) -> (r: Result<Completed, RdmaError>)
@@ -97,7 +96,7 @@ proof fn prepare_grant_statement(
         writer.submitted.instance_id() == id,
         writer.knows.instance_id() == id,
         writer.knows.set().contains((slot.loc.node, writer.submitted.key())),
-        share_cap.is_rdma_bound(),
+        share_cap.is_fenced(),
         share_cap.instance_id() == id,
         share_cap.loc() == slot.loc,
         share_cap.share() == share,
@@ -131,7 +130,8 @@ proof fn prepare_grant_statement(
     (Tracked(s), Tracked(prior))
 }
 
-fn grant_read_window<T: ByteTransport>(
+/// Bind and send a read grant, leaving its window and lent slot with the donor.
+pub fn grant_read_window<T: ByteTransport>(
     channel: &mut Channel<T>,
     qp: &QueuePair,
     cq: &mut CompletionQueue,
@@ -195,7 +195,7 @@ fn grant_read_window<T: ByteTransport>(
     let ghost share = names.next_share();
     let tracked fresh = names.allocate();
     let tracked (Tracked(lent), Tracked(mut share_cap)) = instance.lend_slot(owned, fresh);
-    let tracked right = share_cap.take_window_bind_right();
+    let tracked right = share_cap.take_fence_right();
     let key = mw.next_rkey();
     let slice = mr.as_slice();
     if let Err((e, _)) = post_bind_window(
@@ -256,7 +256,7 @@ pub fn read_lifecycle_donor<T: ByteTransport>(
     cq: &mut CompletionQueue,
     mr: MemoryRegion,
     mw: &mut MemoryWindow,
-    host: &mut HostContext,
+    host: &mut SyncContext,
     Tracked(instance): Tracked<&TransferInstance>,
     Tracked(owned): Tracked<SlotToken>,
     Tracked(writer): Tracked<Completion>,
@@ -374,281 +374,6 @@ pub fn read_lifecycle_donor<T: ByteTransport>(
         },
         Err((e, _, _)) => Err(e),
     }
-}
-
-/// Reclaim and overwrite the donor buffer without receiving a read release.
-pub fn fenced_revocation_donor<T: ByteTransport>(
-    channel: &mut Channel<T>,
-    qp: &QueuePair,
-    cq: &mut CompletionQueue,
-    mr: &MemoryRegion,
-    mut mw: MemoryWindow,
-    cpu: &crate::host::HostSlice,
-    host: &mut HostContext,
-    replacement: &[u8],
-    Tracked(instance): Tracked<&TransferInstance>,
-    Tracked(owned): Tracked<SlotToken>,
-    Tracked(writer): Tracked<Completion>,
-    Tracked(names): Tracked<&mut ShareSource>,
-    tag: u64,
-) -> (r: Result<(Tracked<Completion>, Tracked<SlotToken>), RdmaError>)
-    requires
-        can_grant_read_window(
-            *old(channel),
-            *qp,
-            *old(cq),
-            *mr,
-            mw,
-            instance.id(),
-            owned,
-            writer,
-            *old(names),
-            tag,
-        ),
-        old(host).ready(instance.id(), mr.node()),
-        cpu.well_formed(),
-        cpu.slot_ref() == mr.slot_ref(0),
-        cpu.instance_id() == instance.id(),
-        replacement@.len() == mr.slot_len(),
-    ensures
-        final(names).well_formed(),
-        final(names).id() == old(names).id(),
-        final(names).node() == old(names).node(),
-        r matches Ok((write, slot)) ==> {
-            let event = write@.submitted.key();
-            &&& write@.submitted.instance_id() == instance.id() && write@.knows.instance_id()
-                == instance.id()
-            &&& write@.knows.set().contains((mr.node(), event))
-            &&& write@.submitted.value().effect == splice_bytes(mr.slot_ref(0), replacement@)
-            &&& slot_owned(
-                slot@,
-                instance.id(),
-                mr.slot_loc(0),
-                Frontier { last_writer: Some(event), readers: ISet::empty() },
-            )
-            &&& final(cq).well_formed() && final(cq).pending().is_empty()
-                && final(channel).same_session(*old(channel))
-            &&& final(host).ready(instance.id(), mr.node())
-        },
-{
-    let ghost share = names.next_share();
-    let tracked original_write = writer.submitted;
-    let (Tracked(lent), Tracked(prior)) = grant_read_window(
-        channel,
-        qp,
-        cq,
-        mr,
-        &mut mw,
-        Tracked(instance),
-        Tracked(owned),
-        Tracked(writer),
-        Tracked(names),
-        tag,
-        &[],
-    )?;
-    post_local_invalidate(qp, cq, &mut mw, 2)?;
-    let Completed::WindowInvalidated { witness: inv_witness, .. } = wait_one(
-        cq,
-        Tracked(instance),
-    )? else {
-        return Err(RdmaError(71));
-    };
-    let ghost fence_event = host.source@.next_event();
-    let (Tracked(fence), _, Tracked(mut slot)) = match revoke_read_share_with_window(
-        host,
-        Tracked(instance),
-        mw,
-        inv_witness,
-        Tracked(lent),
-    ) {
-        Ok(rev) => rev,
-        Err((e, _, _, _)) => return Err(e),
-    };
-    let tracked mut infos = fence.infos();
-    let tracked mut known = fence.knows;
-    let ghost cited = ISet::empty().insert(writer.submitted.key()).insert(fence_event);
-    proof {
-        infos.insert(original_write);
-        known.insert(prior);
-        assert(ISet::empty().insert(share).remove(share) =~= ISet::<TransferShare>::empty());
-    }
-    let Tracked(write) = crate::host::write_slice(
-        host,
-        Tracked(instance),
-        cpu,
-        replacement,
-        Tracked(&mut slot),
-        Tracked(&infos),
-        Tracked(&known),
-        Ghost(cited),
-    );
-    let tracked written_infos = write.infos();
-    let ghost event = write.submitted.key();
-    let tracked mut known = write.knows;
-    let tracked fact = known.remove((mr.node(), event));
-    let tracked mut notice = Knows::empty(instance.id());
-    proof {
-        known.insert(fact);
-        notice.insert(fact);
-    }
-    let tracked statement = Statement {
-        succeeded: SucceededMap::empty(instance.id()),
-        submitted: written_infos,
-        facts: ISet::empty().insert(event),
-        knows: notice,
-    };
-    if channel.send_completion_notice(&[], Tracked(statement)).is_err() {
-        return Err(RdmaError(71));
-    }
-    assert(cq.pending() =~= Map::empty());
-    Ok((Tracked(Completion { submitted: write.submitted, knows: known }), Tracked(slot)))
-}
-
-pub open spec fn can_receive_read<T: ByteTransport>(
-    channel: Channel<T>,
-    qp: QueuePair,
-    cq: CompletionQueue,
-    local: MemoryRegionSlice,
-    cpu: crate::host::HostSlice,
-    host: HostContext,
-    len: nat,
-    instance: InstanceId,
-    owned: SlotToken,
-) -> bool {
-    &&& qp.can_post(cq, 1)
-    &&& qp.effective_max_rd_atomic() > 0
-    &&& cq.pending().is_empty()
-    &&& qp.source().id() == instance
-    &&& channel.local() == qp.source().node()
-    &&& channel.peer() == qp.peer()
-    &&& channel.local() != channel.peer()
-    &&& channel.id() == instance
-    &&& local.well_formed()
-    &&& local.slot_ref().sub_len <= MAX_RDMA_MSG_LEN
-    &&& local.registration().gpu_device_spec().is_none()
-    &&& local.slot_ref().loc.node == qp.source().node()
-    &&& local.registration().pd_id() == qp.pd_id()
-    &&& local.registration().access().local_write
-    &&& local.registration().instance_id() == instance
-    &&& cpu.well_formed()
-    &&& cpu.instance_id() == instance
-    &&& cpu.slot_ref() == local.slot_ref()
-    &&& host.ready(instance, local.slot_ref().loc.node)
-    &&& len == local.slot_ref().sub_len
-    &&& slot_owned(owned, instance, local.slot_ref().loc, untouched())
-}
-
-/// Initiator half. Polling proves the data receipt, which the release carries
-/// back to the donor. The application can inspect the copied bytes before release.
-pub fn read_lifecycle_initiator<T: ByteTransport>(
-    channel: &mut Channel<T>,
-    qp: &mut QueuePair,
-    cq: &mut CompletionQueue,
-    local: &MemoryRegionSlice,
-    cpu: &crate::host::HostSlice,
-    host: &mut HostContext,
-    out: &mut [u8],
-    expected: &[u8],
-    Tracked(instance): Tracked<&TransferInstance>,
-    Tracked(owned): Tracked<SlotToken>,
-) -> (r: Result<(Tracked<SlotToken>, Tracked<Completion>), RdmaError>)
-    requires
-        can_receive_read(
-            *old(channel),
-            *old(qp),
-            *old(cq),
-            *local,
-            *cpu,
-            *old(host),
-            old(out)@.len(),
-            instance.id(),
-            owned,
-        ),
-        expected@.len() == old(out)@.len(),
-    ensures
-        r matches Ok((slot, done)) ==> completed_slot(
-            instance.id(),
-            local.slot_ref(),
-            slot@,
-            done@,
-        ),
-        r.is_ok() ==> final(cq).same_queue(*old(cq)) && final(cq).well_formed()
-            && final(cq).pending().is_empty() && final(qp).cq_id() == old(qp).cq_id()
-            && final(qp).source().node() == old(qp).source().node() && final(channel).same_session(
-            *old(channel),
-        ) && final(host).ready(instance.id(), local.slot_ref().loc.node),
-        r.is_ok() ==> final(out)@ == expected@,
-{
-    let (_, slot, done) = receive_read(
-        channel,
-        qp,
-        cq,
-        local,
-        cpu,
-        host,
-        out,
-        expected,
-        Tracked(instance),
-        Tracked(owned),
-        false,
-    )?;
-    Ok((slot, done))
-}
-
-/// Wait for retirement, observe the rejected read, overwrite the destination and check its bytes.
-pub fn fenced_revocation_initiator<T: ByteTransport>(
-    channel: &mut Channel<T>,
-    qp: &mut QueuePair,
-    cq: &mut CompletionQueue,
-    local: &MemoryRegionSlice,
-    cpu: &crate::host::HostSlice,
-    host: &mut HostContext,
-    out: &mut [u8],
-    sentinel: &[u8],
-    Tracked(instance): Tracked<&TransferInstance>,
-    Tracked(owned): Tracked<SlotToken>,
-) -> (r: Result<(i32, Tracked<SlotToken>, Tracked<Completion>), RdmaError>)
-    requires
-        can_receive_read(
-            *old(channel),
-            *old(qp),
-            *old(cq),
-            *local,
-            *cpu,
-            *old(host),
-            old(out)@.len(),
-            instance.id(),
-            owned,
-        ),
-        sentinel@.len() == old(out)@.len(),
-    ensures
-        r.is_ok() ==> final(cq).same_queue(*old(cq)) && final(cq).well_formed()
-            && final(cq).pending().is_empty() && final(qp).cq_id() == old(qp).cq_id()
-            && final(qp).source().node() == old(qp).source().node() && final(channel).same_session(
-            *old(channel),
-        ) && final(host).ready(instance.id(), local.slot_ref().loc.node),
-        r.is_ok() ==> final(out)@ == sentinel@,
-        r matches Ok((_, slot, done)) ==> completed_slot(
-            instance.id(),
-            local.slot_ref(),
-            slot@,
-            done@,
-        ),
-        r matches Ok((status, _, _)) ==> status != 0,
-{
-    receive_read(
-        channel,
-        qp,
-        cq,
-        local,
-        cpu,
-        host,
-        out,
-        sentinel,
-        Tracked(instance),
-        Tracked(owned),
-        true,
-    )
 }
 
 } // verus!

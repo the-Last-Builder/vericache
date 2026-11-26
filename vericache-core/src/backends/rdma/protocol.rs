@@ -42,9 +42,11 @@ broadcast use {
 pub const PROTOCOL_MAGIC: u32 = 0x5643_4d33;
 
 /// Control-plane notice payloads carried inside `Channel` `NOTICE` (`op == 5`) frames.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(verus_only, verifier::allow(autoderive_clone_without_spec))]
 pub enum ControlPayload {
     FetchRequest { request_id: u64, key: ObjectKey },
+    FetchBatch { entries: Vec<(u64, ObjectKey)> },
     FetchMiss { request_id: u64 },
     RevokeNotice { grant_tag: u64 },
     RevokeAck { grant_tag: u64 },
@@ -76,6 +78,12 @@ pub const CONTROL_TAG_REVOKE_ACK: u8 = 4;
 
 pub const CONTROL_TAG_RECONNECT_BARRIER: u8 = 5;
 
+pub const CONTROL_TAG_FETCH_BATCH: u8 = 6;
+
+pub const MAX_FETCH_BATCH: usize = 64;
+
+const FETCH_ENTRY_LEN: usize = 40;
+
 pub const FETCH_REQUEST_LEN: usize = 41;
 
 pub const RECONNECT_BARRIER_LEN: usize = 9;
@@ -89,10 +97,67 @@ pub open spec fn encode_key_spec(k: ObjectKey) -> Seq<u8> {
         + spec_u64_to_le_bytes(k.0[3])
 }
 
+pub open spec fn encode_fetch_entry(entry: (u64, ObjectKey)) -> Seq<u8> {
+    spec_u64_to_le_bytes(entry.0) + encode_key_spec(entry.1)
+}
+
+pub open spec fn encode_fetch_entries(entries: Seq<(u64, ObjectKey)>) -> Seq<u8> {
+    Seq::new(40 * entries.len(), |i: int| encode_fetch_entry(entries[i / 40])[i % 40])
+}
+
+proof fn lemma_fetch_entry_chunk(entries: Seq<(u64, ObjectKey)>, i: int)
+    requires
+        0 <= i < entries.len(),
+    ensures
+        encode_fetch_entries(entries).subrange(40 * i, 40 * (i + 1)) == encode_fetch_entry(
+            entries[i],
+        ),
+{
+    lemma_auto_spec_u64_to_from_le_bytes();
+    let chunk = encode_fetch_entries(entries).subrange(40 * i, 40 * (i + 1));
+    let entry = encode_fetch_entry(entries[i]);
+    assert forall|j: int| 0 <= j < 40 implies chunk[j] == entry[j] by {
+        assert((40 * i + j) / 40 == i && (40 * i + j) % 40 == j) by (nonlinear_arith)
+            requires
+                0 <= j < 40,
+        ;
+    }
+    assert(chunk =~= entry);
+}
+
+proof fn lemma_fetch_entries_push(entries: Seq<(u64, ObjectKey)>, entry: (u64, ObjectKey))
+    ensures
+        encode_fetch_entries(entries.push(entry)) == encode_fetch_entries(entries)
+            + encode_fetch_entry(entry),
+{
+    lemma_auto_spec_u64_to_from_le_bytes();
+    let left = encode_fetch_entries(entries.push(entry));
+    let right = encode_fetch_entries(entries) + encode_fetch_entry(entry);
+    lemma_fetch_entry_chunk(entries.push(entry), entries.len() as int);
+    assert forall|i: int| 0 <= i < left.len() implies left[i] == right[i] by {
+        if i < 40 * entries.len() {
+            assert(0 <= i / 40 < entries.len()) by (nonlinear_arith)
+                requires
+                    0 <= i < 40 * entries.len(),
+            ;
+        } else {
+            let start = 40 * entries.len() as int;
+            assert(left[i] == left.subrange(start, start + 40)[i - start]);
+        }
+    }
+    assert(left =~= right);
+}
+
+pub open spec fn control_payload_valid(p: ControlPayload) -> bool {
+    p matches ControlPayload::FetchBatch { entries } ==> 0 < entries.len() <= MAX_FETCH_BATCH
+}
+
 pub open spec fn encode_control_payload_spec(p: ControlPayload) -> Seq<u8> {
     match p {
         ControlPayload::FetchRequest { request_id, key } => seq![CONTROL_TAG_FETCH_REQUEST]
             + spec_u64_to_le_bytes(request_id) + encode_key_spec(key),
+        ControlPayload::FetchBatch { entries } => seq![CONTROL_TAG_FETCH_BATCH]
+            + encode_fetch_entries(entries@),
         ControlPayload::FetchMiss { request_id } => seq![CONTROL_TAG_FETCH_MISS]
             + spec_u64_to_le_bytes(request_id),
         ControlPayload::RevokeNotice { grant_tag } => seq![CONTROL_TAG_REVOKE_NOTICE]
@@ -250,6 +315,31 @@ pub fn encode_control_payload(payload: ControlPayload) -> (out: Vec<u8>)
             push_u64_le(&mut out, request_id);
             push_key_le(&mut out, key);
         },
+        ControlPayload::FetchBatch { entries } => {
+            out.push(CONTROL_TAG_FETCH_BATCH);
+            let mut i = 0;
+            while i < entries.len()
+                invariant
+                    i <= entries.len(),
+                    out@ == seq![CONTROL_TAG_FETCH_BATCH] + encode_fetch_entries(
+                        entries@.take(i as int),
+                    ),
+                decreases entries.len() - i,
+            {
+                let entry = entries[i];
+                let ghost prefix = out@;
+                push_u64_le(&mut out, entry.0);
+                push_key_le(&mut out, entry.1);
+                proof {
+                    let prior = entries@.take(i as int);
+                    lemma_fetch_entries_push(prior, entry);
+                    assert(prior.push(entry) =~= entries@.take(i + 1));
+                    assert(out@ =~= prefix + encode_fetch_entry(entry));
+                }
+                i += 1;
+            }
+            assert(entries@.take(i as int) =~= entries@);
+        },
         ControlPayload::FetchMiss { request_id } => {
             out.push(CONTROL_TAG_FETCH_MISS);
             push_u64_le(&mut out, request_id);
@@ -273,11 +363,22 @@ pub fn encode_control_payload(payload: ControlPayload) -> (out: Vec<u8>)
     out
 }
 
+// A wire payload describes the vector elements. Allocation capacity is outside the codec.
+pub open spec fn control_payload_equivalent(a: ControlPayload, b: ControlPayload) -> bool {
+    match (a, b) {
+        (
+            ControlPayload::FetchBatch { entries: xs },
+            ControlPayload::FetchBatch { entries: ys },
+        ) => xs@ == ys@,
+        _ => a == b,
+    }
+}
+
 pub proof fn lemma_encode_control_payload_injective(a: ControlPayload, b: ControlPayload)
     requires
         encode_control_payload_spec(a) == encode_control_payload_spec(b),
     ensures
-        a == b,
+        control_payload_equivalent(a, b),
 {
     lemma_auto_spec_u64_to_from_le_bytes();
     assert(encode_control_payload_spec(a)[0] == encode_control_payload_spec(b)[0]);
@@ -291,6 +392,27 @@ pub proof fn lemma_encode_control_payload_injective(a: ControlPayload, b: Contro
             assert(encode_control_payload_spec(a).subrange(9, 41) =~= encode_key_spec(k1));
             assert(encode_control_payload_spec(b).subrange(9, 41) =~= encode_key_spec(k2));
             lemma_encode_key_injective(k1, k2);
+        },
+        (
+            ControlPayload::FetchBatch { entries: xs },
+            ControlPayload::FetchBatch { entries: ys },
+        ) => {
+            let wire = encode_control_payload_spec(a);
+            assert(wire.drop_first() =~= encode_fetch_entries(xs@));
+            assert(wire.drop_first() =~= encode_fetch_entries(ys@));
+            assert(xs.len() == ys.len());
+            assert forall|i: int| 0 <= i < xs.len() implies xs@[i] == ys@[i] by {
+                lemma_fetch_entry_chunk(xs@, i);
+                lemma_fetch_entry_chunk(ys@, i);
+                let x = encode_fetch_entry(xs@[i]);
+                let y = encode_fetch_entry(ys@[i]);
+                assert(x.subrange(0, 8) =~= spec_u64_to_le_bytes(xs@[i].0));
+                assert(y.subrange(0, 8) =~= spec_u64_to_le_bytes(ys@[i].0));
+                assert(x.subrange(8, 40) =~= encode_key_spec(xs@[i].1));
+                assert(y.subrange(8, 40) =~= encode_key_spec(ys@[i].1));
+                lemma_encode_key_injective(xs@[i].1, ys@[i].1);
+            }
+            assert(xs@ =~= ys@);
         },
         (
             ControlPayload::FetchMiss { request_id: r1 },
@@ -323,6 +445,7 @@ pub proof fn lemma_encode_control_payload_injective(a: ControlPayload, b: Contro
         _ => {
             assert(encode_control_payload_spec(a)[0] == match a {
                 ControlPayload::FetchRequest { .. } => CONTROL_TAG_FETCH_REQUEST,
+                ControlPayload::FetchBatch { .. } => CONTROL_TAG_FETCH_BATCH,
                 ControlPayload::FetchMiss { .. } => CONTROL_TAG_FETCH_MISS,
                 ControlPayload::RevokeNotice { .. } => CONTROL_TAG_REVOKE_NOTICE,
                 ControlPayload::RevokeAck { .. } => CONTROL_TAG_REVOKE_ACK,
@@ -330,6 +453,7 @@ pub proof fn lemma_encode_control_payload_injective(a: ControlPayload, b: Contro
             });
             assert(encode_control_payload_spec(b)[0] == match b {
                 ControlPayload::FetchRequest { .. } => CONTROL_TAG_FETCH_REQUEST,
+                ControlPayload::FetchBatch { .. } => CONTROL_TAG_FETCH_BATCH,
                 ControlPayload::FetchMiss { .. } => CONTROL_TAG_FETCH_MISS,
                 ControlPayload::RevokeNotice { .. } => CONTROL_TAG_REVOKE_NOTICE,
                 ControlPayload::RevokeAck { .. } => CONTROL_TAG_REVOKE_ACK,
@@ -339,26 +463,106 @@ pub proof fn lemma_encode_control_payload_injective(a: ControlPayload, b: Contro
     }
 }
 
+fn decode_fetch_entries(bytes: &[u8], count: usize) -> (entries: Vec<(u64, ObjectKey)>)
+    requires
+        bytes@.len() == 1 + FETCH_ENTRY_LEN * count,
+        count <= MAX_FETCH_BATCH,
+    ensures
+        entries.len() == count,
+        bytes@.drop_first() == encode_fetch_entries(entries@),
+{
+    let mut entries = Vec::with_capacity(count);
+    while entries.len() < count
+        invariant
+            entries.len() <= count <= MAX_FETCH_BATCH,
+            bytes@.len() == 1 + FETCH_ENTRY_LEN * count,
+            bytes@.subrange(1, 1 + 40 * entries.len()) == encode_fetch_entries(entries@),
+        decreases count - entries.len(),
+    {
+        let off = 1 + FETCH_ENTRY_LEN * entries.len();
+        let entry = (read_u64_le(bytes, off), read_key_le(bytes, off + 8));
+        let ghost prev = entries@;
+        entries.push(entry);
+        proof {
+            lemma_fetch_entries_push(prev, entry);
+            assert(encode_fetch_entry(entry) =~= bytes@.subrange(off as int, off + 40));
+            assert(bytes@.subrange(1, off + 40) =~= encode_fetch_entries(entries@));
+        }
+    }
+    assert(bytes@.drop_first() =~= bytes@.subrange(1, bytes@.len() as int));
+    entries
+}
+
+spec fn control_header_valid(bytes: Seq<u8>) -> bool {
+    let body_len = bytes.len() - 1;
+    let entry_len = FETCH_ENTRY_LEN as int;
+    let count = body_len / entry_len;
+    &&& bytes.len() > 0
+    &&& match bytes[0] {
+        CONTROL_TAG_FETCH_BATCH => 0 < count <= MAX_FETCH_BATCH && body_len % entry_len == 0,
+        CONTROL_TAG_FETCH_REQUEST => bytes.len() == FETCH_REQUEST_LEN,
+        CONTROL_TAG_FETCH_MISS | CONTROL_TAG_REVOKE_NOTICE | CONTROL_TAG_REVOKE_ACK => bytes.len()
+            == 9,
+        CONTROL_TAG_RECONNECT_BARRIER => bytes.len() == RECONNECT_BARRIER_LEN,
+        _ => false,
+    }
+}
+
+proof fn lemma_decode_control_payload_complete(bytes: Seq<u8>, result: Option<ControlPayload>)
+    requires
+        result.is_some() == control_header_valid(bytes),
+        result matches Some(q) ==> bytes == encode_control_payload_spec(q),
+    ensures
+        forall|p: ControlPayload|
+            control_payload_valid(p) && bytes == #[trigger] encode_control_payload_spec(p) ==> (
+            result matches Some(q) && control_payload_equivalent(p, q)),
+{
+    hide(encode_fetch_entries);
+    lemma_auto_spec_u64_to_from_le_bytes();
+    assert forall|p: ControlPayload|
+        control_payload_valid(p) && bytes == #[trigger] encode_control_payload_spec(
+            p,
+        ) implies result matches Some(q) && control_payload_equivalent(p, q) by {
+        if let Some(q) = result {
+            lemma_encode_control_payload_injective(p, q);
+        } else {
+            assert(control_header_valid(encode_control_payload_spec(p))) by {
+                if let ControlPayload::FetchBatch { entries } = p {
+                    assert(encode_fetch_entries(entries@).len() == FETCH_ENTRY_LEN * entries.len())
+                        by {
+                        reveal(encode_fetch_entries);
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn decode_control_payload(bytes: &[u8]) -> (r: Option<ControlPayload>)
     ensures
-        r matches Some(p) ==> bytes@ == encode_control_payload_spec(p),
+        r matches Some(p) ==> bytes@ == encode_control_payload_spec(p) && control_payload_valid(p),
         forall|p: ControlPayload|
-            bytes@ == #[trigger] encode_control_payload_spec(p) ==> r == Some(p),
+            control_payload_valid(p) && bytes@ == #[trigger] encode_control_payload_spec(p) ==> (
+            r matches Some(q) && control_payload_equivalent(p, q)),
 {
+    hide(encode_control_payload_spec);
+    hide(encode_fetch_entries);
     proof {
         lemma_auto_spec_u64_to_from_le_bytes();
     }
     if bytes.len() == 0 {
         proof {
-            assert forall|p: ControlPayload|
-                bytes@ == #[trigger] encode_control_payload_spec(p) implies false by {
-                assert(encode_control_payload_spec(p).len() > 0);
-            }
+            lemma_decode_control_payload_complete(bytes@, None);
         }
         return None;
     }
     let tag = bytes[0];
-    let res = if tag == CONTROL_TAG_FETCH_REQUEST && bytes.len() == FETCH_REQUEST_LEN {
+    let body_len = bytes.len() - 1;
+    let count = body_len / FETCH_ENTRY_LEN;
+    let res = if tag == CONTROL_TAG_FETCH_BATCH && 0 < count && count <= MAX_FETCH_BATCH && body_len
+        % FETCH_ENTRY_LEN == 0 {
+        Some(ControlPayload::FetchBatch { entries: decode_fetch_entries(bytes, count) })
+    } else if tag == CONTROL_TAG_FETCH_REQUEST && bytes.len() == FETCH_REQUEST_LEN {
         let request_id = read_u64_le(bytes, 1);
         let key = read_key_le(bytes, 9);
         Some(ControlPayload::FetchRequest { request_id, key })
@@ -378,21 +582,15 @@ pub fn decode_control_payload(bytes: &[u8]) -> (r: Option<ControlPayload>)
         None
     };
     proof {
-        if let Some(p) = res {
-            assert(bytes@ =~= encode_control_payload_spec(p));
-        }
-        assert forall|p: ControlPayload|
-            bytes@ == #[trigger] encode_control_payload_spec(p) implies res == Some(p) by {
-            match res {
-                Some(q) => {
-                    lemma_encode_control_payload_injective(p, q);
-                },
-                None => {
-                    assert(bytes@[0] == encode_control_payload_spec(p)[0]);
-                    assert(bytes@.len() == encode_control_payload_spec(p).len());
-                },
+        assert(res.is_some() == control_header_valid(bytes@));
+        assert(res matches Some(p) ==> bytes@ == encode_control_payload_spec(p)
+            && control_payload_valid(p)) by {
+            reveal(encode_control_payload_spec);
+            if let Some(ref p) = res {
+                assert(bytes@ =~= encode_control_payload_spec(*p));
             }
         }
+        lemma_decode_control_payload_complete(bytes@, res);
     }
     res
 }

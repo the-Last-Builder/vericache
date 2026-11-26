@@ -1,13 +1,303 @@
 use super::*;
-use transfer::context::{EventSourceToken, ReturnedShare, SlotToken, TransferInstance};
-use transfer::host::HostContext;
+use transfer::context::{
+    EventSourceToken, ReturnedShare, SlotToken, SyncContext, TransferInstance,
+};
 use transfer::rdma;
 
 verus! {
 
+#[derive(Clone, Copy)]
+pub struct WindowInvalidation {
+    pub slot: u32,
+    pub generation: u32,
+    pub wr_id: u64,
+}
+
+impl<'a> WindowPool<'a> {
+    /// Post local invalidations for distinct bound pool slots. Only the
+    /// accepted prefix changes state. Every window stays owned by the pool.
+    pub fn post_invalidate_batch(
+        &mut self,
+        qp: &rdma::QueuePair<'a>,
+        cq: &mut rdma::CompletionQueue<'a>,
+        entries: &[WindowInvalidation],
+    ) -> (r: (usize, Option<CoreError>))
+        requires
+            old(self).well_formed(),
+            old(cq).well_formed(),
+            qp.ready(),
+            qp.cq_id() == old(cq).id(),
+            qp.source().node() == old(cq).observer(),
+            qp.source().id() == old(cq).infos().instance_id(),
+            qp.pd_id() == old(self).pd(),
+            qp.source().node() == old(self).node(),
+            old(cq).in_flight().len() + entries.len() <= old(cq).capacity(),
+            forall|i: int|
+                0 <= i < entries.len() ==> {
+                    let e = #[trigger] entries@[i];
+                    &&& e.slot < old(self).slots_spec().len()
+                    &&& !old(cq).in_flight().contains_key(e.wr_id)
+                    &&& old(self).slots_spec()[e.slot as int].generation_spec() == e.generation
+                    &&& old(self).slots_spec()[e.slot as int].state_spec() is Bound
+                    &&& old(self).slot_window(e.slot as int) matches Some(w) && w.state() is Bound
+                        && w.state()->Bound_qp_id == qp.id()
+                },
+            forall|i: int, j: int|
+                0 <= i < j < entries.len() ==> {
+                    let a = #[trigger] entries@[i];
+                    let b = #[trigger] entries@[j];
+                    &&& a.slot != b.slot && a.wr_id != b.wr_id
+                },
+        ensures
+            final(self).well_formed(),
+            final(self).pd() == old(self).pd(),
+            final(self).node() == old(self).node(),
+            final(self).free_spec() == old(self).free_spec(),
+            final(self).len() == old(self).len(),
+            final(cq).well_formed(),
+            final(cq).same_queue(*old(cq)),
+            final(cq).in_flight().len() == old(cq).in_flight().len() + r.0,
+            old(cq).in_flight().submap_of(final(cq).in_flight()),
+            r.0 <= entries.len(),
+            r.1.is_none() ==> r.0 == entries.len(),
+            forall|i: int|
+                0 <= i < r.0 ==> {
+                    let e = #[trigger] entries@[i];
+                    let s = final(self).slots_spec()[e.slot as int];
+                    let prev = old(self).slots_spec()[e.slot as int];
+                    &&& s.state_spec() == MwSlotState::Invalidating(prev.state_spec()->Bound_0)
+                    &&& s.generation_spec() == e.generation
+                    &&& s.window_spec() matches Some(w) && w.id() == prev.window_spec()->Some_0.id()
+                        && w.state() is Invalidating && w.state()->Invalidating_wr_id == e.wr_id
+                    &&& final(cq).in_flight().contains_key(e.wr_id)
+                    &&& final(cq).in_flight()[e.wr_id].kind == (rdma::PendingKind::LocalInvalidate {
+                        qp_id: qp.id(),
+                        window_id: prev.window_spec()->Some_0.id(),
+                    })
+                },
+            forall|slot: int|
+                0 <= slot < final(self).slots_spec().len() && !(exists|i: int|
+                    0 <= i < r.0 && (#[trigger] entries@[i]).slot == slot) ==> (
+                #[trigger] final(self).slots_spec()[slot]) == old(self).slots_spec()[slot],
+    {
+        proof {
+            reveal(window_pool_slots_wf);
+        }
+        let mut requests = Vec::<rdma::InvalidateRequest<'a>>::with_capacity(entries.len());
+        let ghost mut cleared = Map::<u32, int>::empty();
+        while requests.len() < entries.len()
+            invariant
+                requests.len() <= entries.len(),
+                self.pd_id == old(self).pd_id,
+                self.node == old(self).node,
+                qp.pd_id() == old(self).pd(),
+                qp.source().node() == old(self).node(),
+                self.free == old(self).free,
+                self.slots.len() == old(self).slots.len(),
+                old(self).well_formed(),
+                old(self).slots.len() <= u32::MAX,
+                forall|i: int|
+                    0 <= i < entries.len() ==> {
+                        let e = #[trigger] entries@[i];
+                        &&& e.slot < old(self).slots.len()
+                        &&& !old(cq).in_flight().contains_key(e.wr_id)
+                        &&& old(self).slots[e.slot as int].generation == e.generation
+                        &&& old(self).slots[e.slot as int].state is Bound
+                        &&& old(self).slot_window(e.slot as int) matches Some(w)
+                            && w.state() is Bound && w.state()->Bound_qp_id == qp.id()
+                    },
+                forall|i: int, j: int|
+                    0 <= i < j < entries.len() ==> (#[trigger] entries@[i]).slot != (
+                    #[trigger] entries@[j]).slot && entries@[i].wr_id != entries@[j].wr_id,
+                forall|i: int|
+                    0 <= i < requests.len() ==> {
+                        let e = #[trigger] entries@[i];
+                        &&& cleared.contains_key(e.slot) && cleared[e.slot] == i
+                        &&& requests[i].wr_id == e.wr_id
+                        &&& old(self).slot_window(e.slot as int) == Some(requests[i].window)
+                        &&& requests[i].admissible(qp)
+                    },
+                forall|s: int|
+                    0 <= s < self.slots.len() ==> {
+                        let slot = #[trigger] self.slots[s];
+                        &&& if cleared.contains_key(s as u32) {
+                            let i = cleared[s as u32];
+                            &&& 0 <= i < requests.len() && entries@[i].slot == s
+                            &&& slot == (MwPoolSlot { window: None, ..old(self).slots[s] })
+                        } else {
+                            slot == old(self).slots[s]
+                        }
+                    },
+            decreases entries.len() - requests.len(),
+        {
+            let i = requests.len();
+            let e = entries[i];
+            let idx = e.slot as usize;
+            proof {
+                reveal(window_pool_slots_wf);
+                assert(idx < self.slots.len());
+                assert(self.slots@[idx as int] == self.slots@[e.slot as int]);
+                if cleared.contains_key(e.slot) {
+                    let j = cleared[e.slot];
+                    assert(0 <= j < i);
+                    assert(entries@[j].slot == e.slot);
+                    assert(entries@[j].slot != entries@[i as int].slot);
+                    assert(false);
+                }
+                let s = self.slots[idx as int];
+                assert(s == old(self).slots[e.slot as int]);
+                let w = s.window.unwrap();
+                assert(w.state() is Bound && w.state()->Bound_qp_id == qp.id());
+                assert(w.consistent() && w.pd_id() == qp.pd_id() && w.node() == qp.source().node());
+            }
+            let ghost prior = requests@;
+            let ghost before = cleared;
+            let window = self.slots[idx].window.take().unwrap();
+            requests.push(rdma::InvalidateRequest { window, wr_id: e.wr_id });
+            proof {
+                cleared = cleared.insert(e.slot, i as int);
+                assert(requests[i as int].admissible(qp));
+                assert forall|j: int| 0 <= j < i implies {
+                    let entry = #[trigger] entries@[j];
+                    &&& requests[j] == prior[j]
+                    &&& cleared.contains_key(entry.slot) && cleared[entry.slot] == j
+                } by {
+                    let entry = entries@[j];
+                    assert(entry.slot != e.slot);
+                    assert(before.contains_key(entry.slot));
+                }
+            }
+        }
+        let ghost planned = requests@;
+        assert forall|i: int| 0 <= i < requests.len() implies {
+            let r = #[trigger] requests[i];
+            &&& r.admissible(qp) && !old(cq).in_flight().contains_key(r.wr_id)
+        } by {
+            assert(requests[i].wr_id == entries@[i].wr_id);
+        }
+        assert forall|i: int, j: int| 0 <= i < j < requests.len() implies (
+        #[trigger] requests[i]).wr_id != (#[trigger] requests[j]).wr_id by {
+            assert(requests[i].wr_id == entries@[i].wr_id);
+            assert(requests[j].wr_id == entries@[j].wr_id);
+        }
+        let (posted, error) = rdma::post_invalidate_batch(qp, cq, &mut requests);
+        let ghost submitted = requests@;
+        while !requests.is_empty()
+            invariant
+                requests.len() <= entries.len() == submitted.len() == planned.len(),
+                posted <= entries.len(),
+                self.pd_id == old(self).pd_id,
+                self.node == old(self).node,
+                self.free == old(self).free,
+                self.slots.len() == old(self).slots.len(),
+                old(self).well_formed(),
+                old(self).slots.len() <= u32::MAX,
+                forall|i: int|
+                    0 <= i < entries.len() ==> {
+                        let e = #[trigger] entries@[i];
+                        &&& e.slot < old(self).slots.len()
+                        &&& !old(cq).in_flight().contains_key(e.wr_id)
+                        &&& old(self).slots[e.slot as int].generation == e.generation
+                        &&& old(self).slots[e.slot as int].state is Bound
+                        &&& old(self).slot_window(e.slot as int) matches Some(w)
+                            && w.state() is Bound && w.state()->Bound_qp_id == qp.id()
+                    },
+                forall|i: int, j: int|
+                    0 <= i < j < entries.len() ==> (#[trigger] entries@[i]).slot != (
+                    #[trigger] entries@[j]).slot && entries@[i].wr_id != entries@[j].wr_id,
+                requests@ == submitted.take(requests.len() as int),
+                forall|i: int|
+                    0 <= i < entries.len() ==> {
+                        let e = #[trigger] entries@[i];
+                        &&& planned[i].wr_id == e.wr_id
+                        &&& old(self).slot_window(e.slot as int) == Some(planned[i].window)
+                        &&& if i < posted {
+                            submitted[i].invalidates(planned[i], qp)
+                        } else {
+                            submitted[i] == planned[i]
+                        }
+                    },
+                forall|i: int|
+                    0 <= i < entries.len() ==> {
+                        let e = #[trigger] entries@[i];
+                        let slot = self.slots[e.slot as int];
+                        let prev = old(self).slots[e.slot as int];
+                        &&& cleared.contains_key(e.slot) && cleared[e.slot] == i
+                        &&& if i < requests.len() {
+                            slot == (MwPoolSlot { window: None, ..prev })
+                        } else if i < posted {
+                            slot == (MwPoolSlot {
+                                state: MwSlotState::Invalidating(prev.state->Bound_0),
+                                window: Some(submitted[i].window),
+                                ..prev
+                            })
+                        } else {
+                            slot == prev
+                        }
+                    },
+                forall|s: int|
+                    0 <= s < self.slots.len() ==> {
+                        let slot = #[trigger] self.slots[s];
+                        &&& if cleared.contains_key(s as u32) {
+                            let i = cleared[s as u32];
+                            0 <= i < entries.len() && entries@[i].slot == s
+                        } else {
+                            slot == old(self).slots[s]
+                        }
+                    },
+            decreases requests.len(),
+        {
+            let idx = requests.len() - 1;
+            let e = entries[idx];
+            let request = requests.pop().unwrap();
+            proof {
+                assert(self.slots[e.slot as int] == (MwPoolSlot {
+                    window: None,
+                    ..old(self).slots[e.slot as int]
+                }));
+            }
+            let s = &mut self.slots[e.slot as usize];
+            s.window = Some(request.window);
+            if idx < posted {
+                let tag = match s.state {
+                    MwSlotState::Bound(tag) => tag,
+                    _ => {
+                        assert(false);
+                        unreachable!()
+                    },
+                };
+                s.state = MwSlotState::Invalidating(tag);
+            }
+        }
+        proof {
+            reveal(window_pool_slots_wf);
+            assert forall|j: int| 0 <= j < self.slots.len() implies {
+                let s = #[trigger] self.slots[j];
+                &&& (s.state == MwSlotState::Vacant || s.state is Quarantined) == s.window.is_none()
+                &&& s.state == MwSlotState::Free ==> (s.window matches Some(w)
+                    && w.state() is Unbound && self.free@.contains(j as u32))
+                &&& s.window matches Some(w) ==> w.pd_id() == self.pd() && w.node() == self.node()
+                    && ((w.state() is Binding || w.state() is Bound || w.state() is Invalidating)
+                    ==> w.consistent())
+            } by {
+                if cleared.contains_key(j as u32) {
+                    let i = cleared[j as u32];
+                    assert(0 <= i < entries.len());
+                    assert(entries@[i].slot == j);
+                }
+            }
+        }
+        let error = match error {
+            Some(e) => Some(rdma_error(e)),
+            None => None,
+        };
+        (posted, error)
+    }
+}
+
 impl<'a> WindowPool<'a> {
     /// Post a local invalidate WR on a `Bound` MW slot.
-    pub fn post_invalidate(
+    pub(crate) fn post_invalidate(
         &mut self,
         i: u32,
         generation: u32,
@@ -102,13 +392,13 @@ impl<'a> WindowPool<'a> {
     )
         requires
             old(self).well_formed(),
-            (i as int) < old(self).slots.len(),
-            old(self).slots[i as int].generation == generation,
-            old(self).slots[i as int].state is Invalidating,
-            old(self).slots[i as int].window matches Some(w) && w.state() is Invalidating
-                && witness.matches(w) && (w.state()->Invalidating_share matches Some(s)
-                ==> returned matches Some(r) && r.share() == s && r.instance_id()
-                == w.state()->Invalidating_instance_id && r.loc()
+            (i as int) < old(self).slots_spec().len(),
+            old(self).slots_spec()[i as int].generation_spec() == generation,
+            old(self).slots_spec()[i as int].state_spec() is Invalidating,
+            old(self).slots_spec()[i as int].window_spec() matches Some(w)
+                && w.state() is Invalidating && witness.matches(w) && (
+            w.state()->Invalidating_share matches Some(s) ==> returned matches Some(r) && r.share()
+                == s && r.instance_id() == w.state()->Invalidating_instance_id && r.loc()
                 == w.state()->Invalidating_slot.loc),
         ensures
             final(self).well_formed(),
@@ -116,11 +406,11 @@ impl<'a> WindowPool<'a> {
             final(self).node() == old(self).node(),
             final(self).len() == old(self).len(),
             forall|j: int|
-                0 <= j < final(self).slots.len() && j != i as int
-                    ==> #[trigger] final(self).slots[j] == old(self).slots[j],
-            final(self).slots[i as int].state == MwSlotState::Free,
-            final(self).slots[i as int].generation == generation,
-            final(self).slots[i as int].window matches Some(w) && w.state()
+                0 <= j < final(self).slots_spec().len() && j != i as int
+                    ==> #[trigger] final(self).slots_spec()[j] == old(self).slots_spec()[j],
+            final(self).slots_spec()[i as int].state_spec() == MwSlotState::Free,
+            final(self).slots_spec()[i as int].generation_spec() == generation,
+            final(self).slots_spec()[i as int].window_spec() matches Some(w) && w.state()
                 == rdma::WindowState::Unbound,
     {
         proof {
@@ -141,11 +431,11 @@ impl<'a> WindowPool<'a> {
 
     /// Unilaterally fence and deallocate an `Invalidating` MW slot via
     /// `InvalidateWitness` (Option-A IBTA-strict revocation -> `Quarantined`).
-    pub fn revoke_with_invalidate(
+    pub(crate) fn revoke_with_invalidate(
         &mut self,
         i: u32,
         generation: u32,
-        host: &mut HostContext,
+        host: &mut SyncContext,
         Tracked(instance): Tracked<&TransferInstance>,
         Tracked(witness): Tracked<rdma::InvalidateWitness>,
         Tracked(lent): Tracked<SlotToken>,
@@ -226,11 +516,11 @@ impl<'a> WindowPool<'a> {
 
     /// Unilaterally fence and deallocate a `Binding`/`Bound`/`Invalidating` MW
     /// slot once its bound QP has been reset (`IBV_QPS_RESET`), leaving the slot `Vacant`.
-    pub fn revoke_on_qp_reset(
+    pub(crate) fn revoke_on_qp_reset(
         &mut self,
         i: u32,
         generation: u32,
-        host: &mut HostContext,
+        host: &mut SyncContext,
         Tracked(instance): Tracked<&TransferInstance>,
         Tracked(qp_reset): Tracked<&rdma::QpResetWitness>,
         Tracked(lent): Tracked<SlotToken>,
@@ -306,7 +596,7 @@ impl<'a> WindowPool<'a> {
 
     /// Deallocate a `Binding` or cooperative `Invalidating` MW slot once its
     /// bound QP has been reset (`IBV_QPS_RESET`), leaving the slot `Vacant`.
-    pub fn dealloc_on_qp_reset(
+    pub(crate) fn dealloc_on_qp_reset(
         &mut self,
         i: u32,
         generation: u32,
@@ -399,12 +689,12 @@ impl<'a> WindowPool<'a> {
     ) -> (r: Result<(), CoreError>)
         requires
             old(self).well_formed(),
-            (i as int) < old(self).slots.len(),
-            old(self).slots[i as int].state == MwSlotState::Vacant,
+            (i as int) < old(self).slots_spec().len(),
+            old(self).slots_spec()[i as int].state_spec() == MwSlotState::Vacant,
             pd.id() == old(self).pd(),
             pd.node() == old(self).node(),
             name.well_formed(),
-            name.source() is RdmaQueuePair,
+            name.source().is_rdma_qp(),
             name.node() == pd.node(),
         ensures
             final(self).well_formed(),
@@ -412,12 +702,13 @@ impl<'a> WindowPool<'a> {
             final(self).node() == old(self).node(),
             final(self).len() == old(self).len(),
             forall|j: int|
-                0 <= j < final(self).slots.len() && j != i as int
-                    ==> #[trigger] final(self).slots[j] == old(self).slots[j],
+                0 <= j < final(self).slots_spec().len() && j != i as int
+                    ==> #[trigger] final(self).slots_spec()[j] == old(self).slots_spec()[j],
             r.is_err() ==> *final(self) == *old(self),
-            r.is_ok() ==> final(self).slots[i as int].state == MwSlotState::Free
-                && final(self).slots[i as int].generation == old(self).slots[i as int].generation
-                + 1,
+            r.is_ok() ==> final(self).slots_spec()[i as int].state_spec() == MwSlotState::Free
+                && final(self).slots_spec()[i as int].generation_spec() == old(
+                self,
+            ).slots_spec()[i as int].generation_spec() + 1,
     {
         proof {
             reveal(window_pool_slots_wf);
@@ -444,7 +735,7 @@ impl<'a> WindowPool<'a> {
 
     /// Deallocate all `Free` windows and clear `Quarantined` slots during teardown
     /// (preserves any window whose `dealloc_window` call fails, leaving the pool well-formed).
-    pub fn dealloc_all(&mut self) -> (r: Result<(), CoreError>)
+    pub(crate) fn dealloc_all(&mut self) -> (r: Result<(), CoreError>)
         requires
             old(self).well_formed(),
             forall|j: int|

@@ -1,0 +1,22 @@
+id: no-transfer-rdma-dep
+valid:
+  - |
+    use super::*;
+    use crate::memory::HostSlice;
+    use transfer_core::transport::QueuePairEndpoint;
+  - |
+    // use crate::rdma;
+    mod rdma;
+invalid:
+  - |
+    use crate::rdma::Buffer;
+  - |
+    pub use crate::{memory::HostSlice, rdma as driver};
+  - |
+    use super::super::rdma::Buffer;
+  - |
+    verus! {
+        fn cross_driver(_: crate::rdma::Buffer) {}
+    }
+  - |
+    use crate::*;

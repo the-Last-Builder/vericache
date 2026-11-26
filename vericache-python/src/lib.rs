@@ -14,7 +14,9 @@
 //!   `cache.poll()` every ~100 us so inbound remote RDMA/GDR `FetchRequest`s are
 //!   served concurrently with Python/PyTorch forward passes without blocking on GIL.
 
+#[cfg(feature = "cuda")]
 mod cuda_copy;
+mod device_copy;
 
 use core::ffi::{CStr, c_char};
 use std::cell::RefCell;
@@ -32,6 +34,11 @@ use vericache::{
     BatchReadSource, CacheError, CacheStats, CascadeTiering, EvictionPolicy, FrameId, GpuConfig,
     HitLocation, LruEviction, NvmeConfig, ObjectKey, PeerLink, PeerRoutingPolicy, PolicySet,
     ProbeAllPeers, RdmaConfig, StorageConfig, TcpTransport, TierKind, TieringPolicy, VeriCache,
+};
+
+use crate::device_copy::{
+    BatchCopyBuf, BlockingEvent, BlockingEventHandle, CopyBatch, CopyDirection, DeviceCopyBackend,
+    ExternalDeviceCopy, PinnedHostBuf, PinnedHostBuffer,
 };
 
 thread_local! {
@@ -807,44 +814,87 @@ fn connect_peer_tcp(spec: &OwnedPeerSpec) -> Result<PeerLink<TcpTransport>, Cach
     })
 }
 
-fn flush_batch_with_event(
-    batch_buf: &mut cuda_copy::BatchCopyBuf,
-    sync_event: Option<&cuda_copy::BlockingCudaEvent>,
-    cuda_stream: usize,
+fn flush_store_batch(
+    batch: &mut BatchCopyBuf,
+    event: Option<&BlockingEventHandle>,
+    stream: usize,
 ) -> Result<(), CacheError> {
-    if batch_buf.is_empty() {
-        return Ok(());
-    }
-    let submit_res = batch_buf.submit_async(cuda_stream);
-    batch_buf.clear();
-    match submit_res {
+    let submitted = DeviceCopyBackend::memcpy_batch_async(batch, stream);
+    batch.clear();
+    match submitted {
         Ok(false) => Ok(()),
         Ok(true) => {
-            let sync_res = match sync_event {
-                Some(ev) => ev
-                    .record_and_sync(cuda_stream)
-                    .or_else(|_| cuda_copy::stream_synchronize(cuda_stream)),
-                None => cuda_copy::stream_synchronize(cuda_stream),
+            let completed = match event {
+                Some(event) => event
+                    .record_and_sync(stream)
+                    .or_else(|_| DeviceCopyBackend::stream_synchronize(stream)),
+                None => DeviceCopyBackend::stream_synchronize(stream),
             };
-            sync_res.map_err(|code| {
-                CacheError::Init(format!("DMA blocking sync failed with code {code}"))
-            })
+            completed.map_err(|code| CacheError::Init(format!("D2H sync failed with code {code}")))
         }
         Err((code, dirty)) => {
             if dirty {
-                let _ = cuda_copy::stream_synchronize(cuda_stream);
+                let _ = DeviceCopyBackend::stream_synchronize(stream);
             }
-            Err(CacheError::Init(format!(
-                "cudaMemcpyBatchAsync/cudaMemcpyAsync failed with code {code}"
-            )))
+            Err(CacheError::Init(format!("D2H DMA failed with code {code}")))
         }
     }
 }
 
+fn store_into_pinned_host<E, P, R>(
+    cache: &mut VeriCache<'_, TcpTransport, E, P, R>,
+    keys: &[ObjectKey],
+    batch: &RefCell<BatchCopyBuf>,
+    event: Option<&BlockingEventHandle>,
+    stream: usize,
+    mut append: impl FnMut(usize, usize, &mut BatchCopyBuf) -> Result<(), CacheError>,
+    mut drain_reads: impl FnMut(&mut VeriCache<'_, TcpTransport, E, P, R>),
+) -> Result<usize, String>
+where
+    E: EvictionPolicy,
+    P: TieringPolicy,
+    R: PeerRoutingPolicy,
+{
+    const CHUNK: usize = 32;
+    let mut written = 0;
+    let _ = cache.poll();
+    drain_reads(cache);
+    for (chunk, keys) in keys.chunks(CHUNK).enumerate() {
+        batch.borrow_mut().clear();
+        let completed = cache.with_host_write_batch(
+            keys,
+            |i, dst| {
+                let mut batch = batch.borrow_mut();
+                let appended = append(chunk * CHUNK + i, dst, &mut batch);
+                if appended.is_err() {
+                    batch.clear();
+                }
+                appended
+            },
+            || flush_store_batch(&mut batch.borrow_mut(), event, stream),
+        );
+        match completed {
+            Ok(n) => {
+                written += n;
+                if n < keys.len() {
+                    break;
+                }
+            }
+            Err(err) if written > 0 => {
+                eprintln!("vericache-python: pinned D2H stopped after {written} keys: {err}");
+                break;
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+        drain_reads(cache);
+    }
+    Ok(written)
+}
+
 fn emit_load_slot(
     slot: usize,
-    load_batch_bufs: &[RefCell<cuda_copy::BatchCopyBuf>; 2],
-    load_sync_events: &Option<[cuda_copy::BlockingCudaEvent; 2]>,
+    load_batch_bufs: &[RefCell<BatchCopyBuf>; 2],
+    load_sync_events: &Option<[BlockingEventHandle; 2]>,
     slot_dirty: &RefCell<[bool; 2]>,
     cuda_stream: usize,
 ) -> Result<(), CacheError> {
@@ -854,7 +904,7 @@ fn emit_load_slot(
         slot_dirty.borrow_mut()[s] = false;
         return Ok(());
     }
-    match batch.submit_async(cuda_stream) {
+    match DeviceCopyBackend::memcpy_batch_async(&batch, cuda_stream) {
         Ok(false) => {
             slot_dirty.borrow_mut()[s] = false;
             Ok(())
@@ -862,7 +912,7 @@ fn emit_load_slot(
         Ok(true) => {
             if let Some(evts) = load_sync_events.as_ref() {
                 if let Err(code) = evts[s].record(cuda_stream) {
-                    let _ = cuda_copy::stream_synchronize(cuda_stream);
+                    let _ = DeviceCopyBackend::stream_synchronize(cuda_stream);
                     slot_dirty.borrow_mut()[s] = false;
                     return Err(CacheError::Init(format!(
                         "cudaEventRecord(load slot {s}) failed with code {code}"
@@ -874,7 +924,7 @@ fn emit_load_slot(
         }
         Err((code, dirty)) => {
             if dirty {
-                let _ = cuda_copy::stream_synchronize(cuda_stream);
+                let _ = DeviceCopyBackend::stream_synchronize(cuda_stream);
             }
             slot_dirty.borrow_mut()[s] = false;
             Err(CacheError::Init(format!(
@@ -886,8 +936,8 @@ fn emit_load_slot(
 
 fn sync_load_slot(
     slot: usize,
-    load_batch_bufs: &[RefCell<cuda_copy::BatchCopyBuf>; 2],
-    load_sync_events: &Option<[cuda_copy::BlockingCudaEvent; 2]>,
+    load_batch_bufs: &[RefCell<BatchCopyBuf>; 2],
+    load_sync_events: &Option<[BlockingEventHandle; 2]>,
     slot_dirty: &RefCell<[bool; 2]>,
     cuda_stream: usize,
 ) -> Result<(), CacheError> {
@@ -905,8 +955,8 @@ fn sync_load_slot(
     let sync_res = match load_sync_events.as_ref() {
         Some(evts) => evts[s]
             .synchronize()
-            .or_else(|_| cuda_copy::stream_synchronize(cuda_stream)),
-        None => cuda_copy::stream_synchronize(cuda_stream),
+            .or_else(|_| DeviceCopyBackend::stream_synchronize(cuda_stream)),
+        None => DeviceCopyBackend::stream_synchronize(cuda_stream),
     };
     sync_res.map_err(|code| {
         CacheError::Init(format!(
@@ -915,13 +965,13 @@ fn sync_load_slot(
     })
 }
 
-fn ensure_load_sync_events(load_sync_events: &mut Option<[cuda_copy::BlockingCudaEvent; 2]>) {
-    if load_sync_events.is_none() {
+fn ensure_sync_events(events: &mut Option<[BlockingEventHandle; 2]>) {
+    if events.is_none() {
         if let (Ok(e0), Ok(e1)) = (
-            cuda_copy::BlockingCudaEvent::new(),
-            cuda_copy::BlockingCudaEvent::new(),
+            BlockingEventHandle::new(),
+            BlockingEventHandle::new(),
         ) {
-            *load_sync_events = Some([e0, e1]);
+            *events = Some([e0, e1]);
         }
     }
 }
@@ -929,8 +979,8 @@ fn ensure_load_sync_events(load_sync_events: &mut Option<[cuda_copy::BlockingCud
 fn exec_high_cmd<E, P, R>(
     cache: &mut VeriCache<'_, TcpTransport, E, P, R>,
     cmd: HighCommand,
-    load_sync_events: &mut Option<[cuda_copy::BlockingCudaEvent; 2]>,
-    load_batch_bufs: &[RefCell<cuda_copy::BatchCopyBuf>; 2],
+    load_sync_events: &mut Option<[BlockingEventHandle; 2]>,
+    load_batch_bufs: &[RefCell<BatchCopyBuf>; 2],
 ) where
     E: EvictionPolicy,
     P: TieringPolicy,
@@ -973,7 +1023,7 @@ fn exec_high_cmd<E, P, R>(
                         let loc = lease.location();
                         let ver = lease.version();
                         match lease.device_addr() {
-                            Some(src_addr) => match cuda_copy::memcpy_d2d_sync(
+                            Some(src_addr) => match DeviceCopyBackend::memcpy_d2d_sync(
                                 dst_dev_ptr,
                                 src_addr,
                                 len,
@@ -1012,7 +1062,7 @@ fn exec_high_cmd<E, P, R>(
                     cache.frame_size()
                 ))
             } else {
-                ensure_load_sync_events(load_sync_events);
+                ensure_sync_events(load_sync_events);
                 load_batch_bufs[0].borrow_mut().clear();
                 load_batch_bufs[1].borrow_mut().clear();
                 let slot_dirty = RefCell::new([false, false]);
@@ -1027,10 +1077,10 @@ fn exec_high_cmd<E, P, R>(
                                 let dst_ptr = dst_dev_ptrs[gi];
                                 let (src_addr, kind) = match src {
                                     BatchReadSource::GpuDevice(addr) => {
-                                        (addr, cuda_copy::CUDA_MEMCPY_DEVICE_TO_DEVICE)
+                                        (addr, CopyDirection::DeviceToDevice)
                                     }
                                     BatchReadSource::PinnedHost(addr) => {
-                                        (addr, cuda_copy::CUDA_MEMCPY_HOST_TO_DEVICE)
+                                        (addr, CopyDirection::HostToDevice)
                                     }
                                 };
                                 if let Err(code) = batch.push(dst_ptr, src_addr, len, kind) {
@@ -1060,7 +1110,7 @@ fn exec_high_cmd<E, P, R>(
                     },
                 );
                 if slot_dirty.borrow()[0] || slot_dirty.borrow()[1] {
-                    let _ = cuda_copy::stream_synchronize(cuda_stream);
+                    let _ = DeviceCopyBackend::stream_synchronize(cuda_stream);
                 }
                 load_batch_bufs[0].borrow_mut().clear();
                 load_batch_bufs[1].borrow_mut().clear();
@@ -1097,7 +1147,7 @@ fn exec_high_cmd<E, P, R>(
             let res = if let Err(msg) = regions.validate_bounds(frame_size) {
                 Err(msg)
             } else {
-                ensure_load_sync_events(load_sync_events);
+                ensure_sync_events(load_sync_events);
                 let num_regions = regions.len();
                 load_batch_bufs[0].borrow_mut().clear();
                 load_batch_bufs[1].borrow_mut().clear();
@@ -1112,10 +1162,10 @@ fn exec_high_cmd<E, P, R>(
                             for &(gi, src) in entries {
                                 let (src_base, kind) = match src {
                                     BatchReadSource::GpuDevice(addr) => {
-                                        (addr, cuda_copy::CUDA_MEMCPY_DEVICE_TO_DEVICE)
+                                        (addr, CopyDirection::DeviceToDevice)
                                     }
                                     BatchReadSource::PinnedHost(addr) => {
-                                        (addr, cuda_copy::CUDA_MEMCPY_HOST_TO_DEVICE)
+                                        (addr, CopyDirection::HostToDevice)
                                     }
                                 };
                                 let block_id = gpu_block_ids[gi];
@@ -1179,7 +1229,7 @@ fn exec_high_cmd<E, P, R>(
                     },
                 );
                 if slot_dirty.borrow()[0] || slot_dirty.borrow()[1] {
-                    let _ = cuda_copy::stream_synchronize(cuda_stream);
+                    let _ = DeviceCopyBackend::stream_synchronize(cuda_stream);
                 }
                 load_batch_bufs[0].borrow_mut().clear();
                 load_batch_bufs[1].borrow_mut().clear();
@@ -1214,8 +1264,8 @@ fn drain_high_pri<E, P, R>(
     cache: &mut VeriCache<'_, TcpTransport, E, P, R>,
     queue: &WorkQueue,
     stats_mirror: &AtomicCacheStats,
-    load_sync_events: &mut Option<[cuda_copy::BlockingCudaEvent; 2]>,
-    load_batch_bufs: &[RefCell<cuda_copy::BatchCopyBuf>; 2],
+    load_sync_events: &mut Option<[BlockingEventHandle; 2]>,
+    load_batch_bufs: &[RefCell<BatchCopyBuf>; 2],
 ) where
     E: EvictionPolicy,
     P: TieringPolicy,
@@ -1243,7 +1293,7 @@ fn worker_loop(
     // GPU HBM tiering is disabled (`hbm_frames == 0`), so BlockingCudaEvent and
     // PinnedHostBuf match the caller's `cuda_stream` device (e.g. GPU 4).
     if cfg.gpu_device_id >= 0 && cfg.storage.gpu.is_none() {
-        if let Err(code) = cuda_copy::set_device(cfg.gpu_device_id) {
+        if let Err(code) = DeviceCopyBackend::set_device(cfg.gpu_device_id) {
             let _ = ready_tx.send(Err(format!(
                 "cudaSetDevice({}) failed with code {code}",
                 cfg.gpu_device_id
@@ -1282,6 +1332,7 @@ fn worker_loop(
         peer_links,
         policy,
         |cache| {
+            #[cfg(feature = "cuda")]
             let mut gpu_io = if cache.engine().gpu_tier().is_some() {
                 let stream = cache.create_gpu_stream()?;
                 let slot = cache.alloc_gpu_slot()?;
@@ -1293,16 +1344,16 @@ fn worker_loop(
             // Strictly separated SAVE vs LOAD DMA resources so high-priority LOADs
             // preempting mid-SAVE never alias events, streams, or scratch buffers.
             let mut pinned_d2h = [
-                cuda_copy::PinnedHostBuf::new(),
-                cuda_copy::PinnedHostBuf::new(),
+                PinnedHostBuf::new(),
+                PinnedHostBuf::new(),
             ];
-            let mut store_sync_events: Option<[cuda_copy::BlockingCudaEvent; 2]> = None;
-            let store_batch_buf = RefCell::new(cuda_copy::BatchCopyBuf::new());
+            let mut store_sync_events: Option<[BlockingEventHandle; 2]> = None;
+            let store_batch_buf = RefCell::new(BatchCopyBuf::new());
 
-            let mut load_sync_events: Option<[cuda_copy::BlockingCudaEvent; 2]> = None;
+            let mut load_sync_events: Option<[BlockingEventHandle; 2]> = None;
             let load_batch_bufs = [
-                RefCell::new(cuda_copy::BatchCopyBuf::new()),
-                RefCell::new(cuda_copy::BatchCopyBuf::new()),
+                RefCell::new(BatchCopyBuf::new()),
+                RefCell::new(BatchCopyBuf::new()),
             ];
 
             if let Some(tx) = ready_tx.take() {
@@ -1333,6 +1384,7 @@ fn worker_loop(
                             cuda_stream,
                             reply,
                         } => {
+                            #[cfg(feature = "cuda")]
                             let res = match gpu_io.as_mut() {
                                 None => Err("GPU tier is not enabled".into()),
                                 Some((stream, slot)) => {
@@ -1342,7 +1394,7 @@ fn worker_loop(
                                             slot.len()
                                         ))
                                     } else {
-                                        match cuda_copy::memcpy_d2d_sync(
+                                        match DeviceCopyBackend::memcpy_d2d_sync(
                                             slot.device_addr(),
                                             src_dev_ptr,
                                             len,
@@ -1359,6 +1411,11 @@ fn worker_loop(
                                     }
                                 }
                             };
+                            #[cfg(not(feature = "cuda"))]
+                            let res = {
+                                let _ = (key, src_dev_ptr, len, cuda_stream);
+                                Err("GPU tier is not enabled".into())
+                            };
                             let _ = reply.send(res);
                         }
                         LowCommand::PutGpuBatch {
@@ -1368,6 +1425,7 @@ fn worker_loop(
                             cuda_stream,
                             reply,
                         } => {
+                            #[cfg(feature = "cuda")]
                             let res = match gpu_io.as_mut() {
                                 None => Err("GPU tier is not enabled".into()),
                                 Some((stream, slot)) => {
@@ -1400,7 +1458,7 @@ fn worker_loop(
                                                 count += 1;
                                                 continue;
                                             }
-                                            if let Err(code) = cuda_copy::memcpy_d2d_sync(
+                                            if let Err(code) = DeviceCopyBackend::memcpy_d2d_sync(
                                                 slot.device_addr(),
                                                 src_ptr,
                                                 len,
@@ -1431,6 +1489,11 @@ fn worker_loop(
                                     }
                                 }
                             };
+                            #[cfg(not(feature = "cuda"))]
+                            let res = {
+                                let _ = (keys, src_dev_ptrs, len, cuda_stream);
+                                Err("GPU tier is not enabled".into())
+                            };
                             let _ = reply.send(res);
                         }
                         LowCommand::PutGpuToDramBatch {
@@ -1446,11 +1509,32 @@ fn worker_loop(
                                 Err(format!(
                                     "length mismatch: got {len}, expected {frame_size}"
                                 ))
+                            } else if cache.is_host_pinned() {
+                                ensure_sync_events(&mut store_sync_events);
+                                store_into_pinned_host(
+                                    cache,
+                                    &keys,
+                                    &store_batch_buf,
+                                    store_sync_events.as_ref().map(|ev| &ev[0]),
+                                    cuda_stream,
+                                    |i, dst, batch| {
+                                        batch.push(
+                                            dst, src_dev_ptrs[i], len,
+                                            CopyDirection::DeviceToHost,
+                                        ).map_err(|code| CacheError::Init(format!(
+                                            "invalid D2H DMA descriptor (code {code})"
+                                        )))
+                                    },
+                                    |cache| drain_high_pri(
+                                        cache, &queue, &stats_mirror,
+                                        &mut load_sync_events, &load_batch_bufs,
+                                    ),
+                                )
                             } else {
                                 if store_sync_events.is_none() {
                                     if let (Ok(e0), Ok(e1)) = (
-                                        cuda_copy::BlockingCudaEvent::new(),
-                                        cuda_copy::BlockingCudaEvent::new(),
+                                        BlockingEventHandle::new(),
+                                        BlockingEventHandle::new(),
                                     ) {
                                         store_sync_events = Some([e0, e1]);
                                     }
@@ -1469,67 +1553,299 @@ fn worker_loop(
                                     );
                                 }
 
-                                if cache.is_host_pinned() {
-                                    // Zero-copy 1-hop D2H DMA directly into VeriCache's CUDA-pinned
-                                    // HostBackend slab in 16-block chunks (preemptible in <1ms).
-                                    let mut cs = 0usize;
-                                    while cs < total_keys {
-                                        let ce = (cs + CHUNK).min(total_keys);
-                                        store_batch_buf.borrow_mut().clear();
-                                        let chunk_res = cache.with_host_write_batch(
-                                            &keys[cs..ce],
-                                            |li, dst_host_addr| {
-                                                let orig_i = cs + li;
-                                                let push_res = store_batch_buf.borrow_mut().push(
-                                                    dst_host_addr,
+                                struct PreparedChunk {
+                                    start: usize,
+                                    end: usize,
+                                    unc: Vec<(usize, ObjectKey)>,
+                                    buf_idx: usize,
+                                }
+
+                                let mut stream_dirty = false;
+
+                                let launch_chunk = |cs: usize,
+                                                    ce: usize,
+                                                    buf_idx: usize,
+                                                    cache_ref: &mut VeriCache<'_, _, _, _, _>,
+                                                    pinned: &mut [PinnedHostBuf; 2],
+                                                    evts: &Option<[BlockingEventHandle; 2]>,
+                                                    batch_buf: &RefCell<BatchCopyBuf>,
+                                                    dirty: &mut bool|
+                                 -> Result<PreparedChunk, String> {
+                                    let mut unc = Vec::with_capacity(ce - cs);
+                                    for i in cs..ce {
+                                        let key = keys[i];
+                                        if cache_ref.contains_local(key).is_none() {
+                                            unc.push((i, key));
+                                        }
+                                    }
+                                    if !unc.is_empty() {
+                                        pinned[buf_idx]
+                                            .ensure_capacity(unc.len() * len)
+                                            .map_err(|code| {
+                                                format!(
+                                                    "cudaHostAlloc({} bytes) failed with code {code}",
+                                                    unc.len() * len
+                                                )
+                                            })?;
+                                        let host_base = pinned[buf_idx].addr();
+                                        let mut batch = batch_buf.borrow_mut();
+                                        batch.clear();
+                                        for (j, &(orig_i, _key)) in unc.iter().enumerate() {
+                                            batch
+                                                .push(
+                                                    host_base + j * len,
                                                     src_dev_ptrs[orig_i],
                                                     len,
-                                                    cuda_copy::CUDA_MEMCPY_DEVICE_TO_HOST,
-                                                );
-                                                if let Err(code) = push_res {
-                                                    store_batch_buf.borrow_mut().clear();
-                                                    return Err(CacheError::Init(format!(
-                                                        "invalid D2H DMA descriptor (code {code})"
-                                                    )));
-                                                }
-                                                Ok(())
-                                            },
-                                            || {
-                                                flush_batch_with_event(
-                                                    &mut store_batch_buf.borrow_mut(),
-                                                    store_sync_events.as_ref().map(|ev| &ev[0]),
-                                                    cuda_stream,
+                                                    CopyDirection::DeviceToHost,
                                                 )
-                                            },
-                                        );
-                                        store_batch_buf.borrow_mut().clear();
-                                        match chunk_res {
-                                            Ok(n) => {
-                                                count += n;
-                                                if n < ce - cs {
-                                                    break;
+                                                .map_err(|code| {
+                                                    format!(
+                                                        "invalid D2H DMA descriptor (code {code})"
+                                                    )
+                                                })?;
+                                        }
+                                        let submit_res = DeviceCopyBackend::memcpy_batch_async(&batch, cuda_stream);
+                                        batch.clear();
+                                        match submit_res {
+                                            Ok(submitted) => {
+                                                if submitted {
+                                                    *dirty = true;
                                                 }
                                             }
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "vericache-python: PutGpuToDramBatch partial stop at {count}/{total_keys}: {e}"
-                                                );
-                                                err = Some(e.to_string());
-                                                break;
+                                            Err((code, submitted)) => {
+                                                if submitted {
+                                                    *dirty = true;
+                                                }
+                                                return Err(format!(
+                                                    "cudaMemcpyBatchAsync/cudaMemcpyAsync(D2H) failed with code {code}"
+                                                ));
                                             }
                                         }
-                                        cs = ce;
-                                        if queue.has_high_pri() {
-                                            drain_high_pri(
-                                                cache,
-                                                &queue,
-                                                &stats_mirror,
-                                                &mut load_sync_events,
-                                                &load_batch_bufs,
-                                            );
+                                        if let Some(ev) = evts.as_ref() {
+                                            ev[buf_idx].record(cuda_stream).map_err(|code| {
+                                                format!(
+                                                    "cudaEventRecord failed with code {code}"
+                                                )
+                                            })?;
+                                        }
+                                    }
+                                    Ok(PreparedChunk {
+                                        start: cs,
+                                        end: ce,
+                                        unc,
+                                        buf_idx,
+                                    })
+                                };
+
+                                let mut next_start = 0usize;
+                                let mut cur_opt = if next_start < total_keys {
+                                    let ce = (next_start + CHUNK).min(total_keys);
+                                    next_start = ce;
+                                    match launch_chunk(
+                                        0,
+                                        ce,
+                                        0,
+                                        cache,
+                                        &mut pinned_d2h,
+                                        &store_sync_events,
+                                        &store_batch_buf,
+                                        &mut stream_dirty,
+                                    ) {
+                                        Ok(pc) => Some(pc),
+                                        Err(e) => {
+                                            err = Some(e);
+                                            None
                                         }
                                     }
                                 } else {
+                                    None
+                                };
+
+                                while let Some(cur) = cur_opt.take() {
+                                    if !cur.unc.is_empty() {
+                                        let sync_res = match store_sync_events.as_ref() {
+                                            Some(ev) => ev[cur.buf_idx].synchronize().or_else(
+                                                |_| DeviceCopyBackend::stream_synchronize(cuda_stream),
+                                            ),
+                                            None => DeviceCopyBackend::stream_synchronize(cuda_stream),
+                                        };
+                                        if let Err(code) = sync_res {
+                                            err = Some(format!(
+                                                "D2H sync failed with code {code}"
+                                            ));
+                                            break;
+                                        }
+                                    }
+
+                                    // Kick off next chunk's D2H on the alternate pinned buffer so
+                                    // PCIe DMA overlaps with `cache.put_host` below.
+                                    if next_start < total_keys {
+                                        let cs = next_start;
+                                        let ce = (cs + CHUNK).min(total_keys);
+                                        next_start = ce;
+                                        let next_buf = 1 - cur.buf_idx;
+                                        match launch_chunk(
+                                            cs,
+                                            ce,
+                                            next_buf,
+                                            cache,
+                                            &mut pinned_d2h,
+                                            &store_sync_events,
+                                            &store_batch_buf,
+                                            &mut stream_dirty,
+                                        ) {
+                                            Ok(pc) => {
+                                                cur_opt = Some(pc);
+                                            }
+                                            Err(e) => {
+                                                err = Some(e);
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    let mut chunk_failed = false;
+                                    if !cur.unc.is_empty() {
+                                        let host_bytes = pinned_d2h[cur.buf_idx]
+                                            .as_slice(cur.unc.len() * len);
+                                        for (j, &(orig_i, key)) in cur.unc.iter().enumerate() {
+                                            if j > 0 && j % 8 == 0 {
+                                                let _ = cache.poll();
+                                            }
+                                            if cache.contains_local(key).is_some() {
+                                                continue;
+                                            }
+                                            let slice = &host_bytes[j * len..(j + 1) * len];
+                                            if let Err(e) = cache.put_host(key, slice) {
+                                                eprintln!(
+                                                    "vericache-python: PutGpuToDramBatch partial stop at {orig_i}/{total_keys}: {e}"
+                                                );
+                                                err = Some(e.to_string());
+                                                count = orig_i;
+                                                chunk_failed = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if !chunk_failed {
+                                        let mut verified_end = cur.end;
+                                        for idx in cur.start..cur.end {
+                                            if cache.contains_local(keys[idx]).is_none() {
+                                                verified_end = idx;
+                                                err = Some(format!(
+                                                    "prescanned key at {idx}/{total_keys} evicted before commit"
+                                                ));
+                                                break;
+                                            }
+                                        }
+                                        count = verified_end;
+                                    }
+                                    let _ = cache.poll();
+                                    if err.is_some() {
+                                        break;
+                                    }
+                                    if queue.has_high_pri() {
+                                        drain_high_pri(
+                                            cache,
+                                            &queue,
+                                            &stats_mirror,
+                                            &mut load_sync_events,
+                                            &load_batch_bufs,
+                                        );
+                                    }
+                                }
+                                if err.is_some() && stream_dirty {
+                                    let _ = DeviceCopyBackend::stream_synchronize(cuda_stream);
+                                }
+                                match err {
+                                    Some(_) if count > 0 => Ok(count),
+                                    Some(e) => Err(e),
+                                    None => Ok(count),
+                                }
+                            };
+                            let _ = reply.send(res);
+                        }
+                        LowCommand::PutGpuPagedDramBatch {
+                            keys,
+                            gpu_block_ids,
+                            regions,
+                            cuda_stream,
+                            reply,
+                        } => {
+                            const CHUNK: usize = 32;
+                            let frame_size = cache.frame_size();
+                            let res = match regions.validate_and_zero_gaps(frame_size) {
+                                Err(msg) => Err(msg),
+                                Ok(zero_gaps) if cache.is_host_pinned() => {
+                                    ensure_sync_events(&mut store_sync_events);
+                                    store_into_pinned_host(
+                                        cache,
+                                        &keys,
+                                        &store_batch_buf,
+                                        store_sync_events.as_ref().map(|ev| &ev[0]),
+                                        cuda_stream,
+                                        |i, dst, batch| {
+                                            // The reservation owns this frame through the flush.
+                                            if !zero_gaps.is_empty() {
+                                                let frame = unsafe {
+                                                    core::slice::from_raw_parts_mut(
+                                                        dst as *mut u8, frame_size,
+                                                    )
+                                                };
+                                                for &(start, end) in &zero_gaps {
+                                                    frame[start..end].fill(0);
+                                                }
+                                            }
+                                            for r in 0..regions.len() {
+                                                let size = regions.sizes[r];
+                                                if size == 0 {
+                                                    continue;
+                                                }
+                                                let src = gpu_block_ids[i]
+                                                    .checked_mul(regions.block_strides[r])
+                                                    .and_then(|off| regions.base_ptrs[r].checked_add(off))
+                                                    .ok_or_else(|| CacheError::Init(
+                                                        "paged region src address overflow".into(),
+                                                    ))?;
+                                                batch.push(
+                                                    dst + regions.offsets[r], src, size,
+                                                    CopyDirection::DeviceToHost,
+                                                ).map_err(|code| CacheError::Init(format!(
+                                                    "invalid paged D2H DMA descriptor (code {code})"
+                                                )))?;
+                                            }
+                                            Ok(())
+                                        },
+                                        |cache| drain_high_pri(
+                                            cache, &queue, &stats_mirror,
+                                            &mut load_sync_events, &load_batch_bufs,
+                                        ),
+                                    )
+                                }
+                                Ok(zero_gaps) => {
+                                    if store_sync_events.is_none() {
+                                        if let (Ok(e0), Ok(e1)) = (
+                                            BlockingEventHandle::new(),
+                                            BlockingEventHandle::new(),
+                                        ) {
+                                            store_sync_events = Some([e0, e1]);
+                                        }
+                                    }
+                                    let total_keys = keys.len();
+                                    let num_regions = regions.len();
+                                    let mut count = 0usize;
+                                    let mut err: Option<String> = None;
+                                    let _ = cache.poll();
+                                    if queue.has_high_pri() {
+                                        drain_high_pri(
+                                            cache,
+                                            &queue,
+                                            &stats_mirror,
+                                            &mut load_sync_events,
+                                            &load_batch_bufs,
+                                        );
+                                    }
+
                                     struct PreparedChunk {
                                         start: usize,
                                         end: usize,
@@ -1543,9 +1859,13 @@ fn worker_loop(
                                                         ce: usize,
                                                         buf_idx: usize,
                                                         cache_ref: &mut VeriCache<'_, _, _, _, _>,
-                                                        pinned: &mut [cuda_copy::PinnedHostBuf; 2],
-                                                        evts: &Option<[cuda_copy::BlockingCudaEvent; 2]>,
-                                                        batch_buf: &RefCell<cuda_copy::BatchCopyBuf>,
+                                                        pinned: &mut [PinnedHostBuf; 2],
+                                                        evts: &Option<
+                                        [BlockingEventHandle; 2],
+                                    >,
+                                                        batch_buf: &RefCell<
+                                        BatchCopyBuf,
+                                    >,
                                                         dirty: &mut bool|
                                      -> Result<PreparedChunk, String> {
                                         let mut unc = Vec::with_capacity(ce - cs);
@@ -1557,31 +1877,53 @@ fn worker_loop(
                                         }
                                         if !unc.is_empty() {
                                             pinned[buf_idx]
-                                                .ensure_capacity(unc.len() * len)
+                                                .ensure_capacity(unc.len() * frame_size)
                                                 .map_err(|code| {
                                                     format!(
                                                         "cudaHostAlloc({} bytes) failed with code {code}",
-                                                        unc.len() * len
+                                                        unc.len() * frame_size
                                                     )
                                                 })?;
                                             let host_base = pinned[buf_idx].addr();
                                             let mut batch = batch_buf.borrow_mut();
                                             batch.clear();
                                             for (j, &(orig_i, _key)) in unc.iter().enumerate() {
-                                                batch
-                                                    .push(
-                                                        host_base + j * len,
-                                                        src_dev_ptrs[orig_i],
-                                                        len,
-                                                        cuda_copy::CUDA_MEMCPY_DEVICE_TO_HOST,
-                                                    )
-                                                    .map_err(|code| {
-                                                        format!(
-                                                            "invalid D2H DMA descriptor (code {code})"
+                                                let block_id = gpu_block_ids[orig_i];
+                                                let dst_block_base = host_base + j * frame_size;
+                                                for r in 0..num_regions {
+                                                    let sz = regions.sizes[r];
+                                                    if sz == 0 {
+                                                        continue;
+                                                    }
+                                                    let src_off = block_id
+                                                        .checked_mul(regions.block_strides[r])
+                                                        .ok_or_else(|| {
+                                                            "gpu_block_id * block_stride overflow"
+                                                                .to_string()
+                                                        })?;
+                                                    let src_addr = regions.base_ptrs[r]
+                                                        .checked_add(src_off)
+                                                        .ok_or_else(|| {
+                                                            "paged region src address overflow"
+                                                                .to_string()
+                                                        })?;
+                                                    let dst_addr =
+                                                        dst_block_base + regions.offsets[r];
+                                                    batch
+                                                        .push(
+                                                            dst_addr,
+                                                            src_addr,
+                                                            sz,
+                                                            CopyDirection::DeviceToHost,
                                                         )
-                                                    })?;
+                                                        .map_err(|code| {
+                                                            format!(
+                                                                "invalid paged D2H DMA descriptor (code {code})"
+                                                            )
+                                                        })?;
+                                                }
                                             }
-                                            let submit_res = batch.submit_async(cuda_stream);
+                                            let submit_res = DeviceCopyBackend::memcpy_batch_async(&batch, cuda_stream);
                                             batch.clear();
                                             match submit_res {
                                                 Ok(submitted) => {
@@ -1594,16 +1936,18 @@ fn worker_loop(
                                                         *dirty = true;
                                                     }
                                                     return Err(format!(
-                                                        "cudaMemcpyBatchAsync/cudaMemcpyAsync(D2H) failed with code {code}"
+                                                        "paged D2H DMA submit failed with code {code}"
                                                     ));
                                                 }
                                             }
                                             if let Some(ev) = evts.as_ref() {
-                                                ev[buf_idx].record(cuda_stream).map_err(|code| {
-                                                    format!(
-                                                        "cudaEventRecord failed with code {code}"
-                                                    )
-                                                })?;
+                                                ev[buf_idx].record(cuda_stream).map_err(
+                                                    |code| {
+                                                        format!(
+                                                            "cudaEventRecord failed with code {code}"
+                                                        )
+                                                    },
+                                                )?;
                                             }
                                         }
                                         Ok(PreparedChunk {
@@ -1641,21 +1985,27 @@ fn worker_loop(
                                     while let Some(cur) = cur_opt.take() {
                                         if !cur.unc.is_empty() {
                                             let sync_res = match store_sync_events.as_ref() {
-                                                Some(ev) => ev[cur.buf_idx].synchronize().or_else(
-                                                    |_| cuda_copy::stream_synchronize(cuda_stream),
-                                                ),
-                                                None => cuda_copy::stream_synchronize(cuda_stream),
+                                                Some(ev) => ev[cur.buf_idx]
+                                                    .synchronize()
+                                                    .or_else(|_| {
+                                                        DeviceCopyBackend::stream_synchronize(
+                                                            cuda_stream,
+                                                        )
+                                                    }),
+                                                None => {
+                                                    DeviceCopyBackend::stream_synchronize(cuda_stream)
+                                                }
                                             };
                                             if let Err(code) = sync_res {
                                                 err = Some(format!(
-                                                    "D2H sync failed with code {code}"
+                                                    "paged D2H sync failed with code {code}"
                                                 ));
                                                 break;
                                             }
                                         }
 
-                                        // Kick off next chunk's D2H on the alternate pinned buffer so
-                                        // PCIe DMA overlaps with `cache.put_host` below.
+                                        // Kick off next chunk's D2H on the alternate pinned buffer
+                                        // so PCIe DMA overlaps with zero-pad + `cache.put_host`.
                                         if next_start < total_keys {
                                             let cs = next_start;
                                             let ce = (cs + CHUNK).min(total_keys);
@@ -1681,21 +2031,37 @@ fn worker_loop(
                                             }
                                         }
 
+                                        // Zero-pad uncovered gap/tail bytes in `pinned_d2h[cur.buf_idx]`
+                                        // after D2H sync completed on this buffer.
+                                        if !cur.unc.is_empty() && !zero_gaps.is_empty() {
+                                            let buf = pinned_d2h[cur.buf_idx]
+                                                .as_mut_slice(cur.unc.len() * frame_size);
+                                            for j in 0..cur.unc.len() {
+                                                let base = j * frame_size;
+                                                for &(gs, ge) in &zero_gaps {
+                                                    buf[base + gs..base + ge].fill(0);
+                                                }
+                                            }
+                                        }
+
                                         let mut chunk_failed = false;
                                         if !cur.unc.is_empty() {
                                             let host_bytes = pinned_d2h[cur.buf_idx]
-                                                .as_slice(cur.unc.len() * len);
-                                            for (j, &(orig_i, key)) in cur.unc.iter().enumerate() {
+                                                .as_slice(cur.unc.len() * frame_size);
+                                            for (j, &(orig_i, key)) in
+                                                cur.unc.iter().enumerate()
+                                            {
                                                 if j > 0 && j % 8 == 0 {
                                                     let _ = cache.poll();
                                                 }
                                                 if cache.contains_local(key).is_some() {
                                                     continue;
                                                 }
-                                                let slice = &host_bytes[j * len..(j + 1) * len];
+                                                let slice = &host_bytes
+                                                    [j * frame_size..(j + 1) * frame_size];
                                                 if let Err(e) = cache.put_host(key, slice) {
                                                     eprintln!(
-                                                        "vericache-python: PutGpuToDramBatch partial stop at {orig_i}/{total_keys}: {e}"
+                                                        "vericache-python: PutGpuPagedDramBatch partial stop at {orig_i}/{total_keys}: {e}"
                                                     );
                                                     err = Some(e.to_string());
                                                     count = orig_i;
@@ -1704,6 +2070,7 @@ fn worker_loop(
                                                 }
                                             }
                                         }
+
                                         if !chunk_failed {
                                             let mut verified_end = cur.end;
                                             for idx in cur.start..cur.end {
@@ -1732,413 +2099,7 @@ fn worker_loop(
                                         }
                                     }
                                     if err.is_some() && stream_dirty {
-                                        let _ = cuda_copy::stream_synchronize(cuda_stream);
-                                    }
-                                }
-                                match err {
-                                    Some(_) if count > 0 => Ok(count),
-                                    Some(e) => Err(e),
-                                    None => Ok(count),
-                                }
-                            };
-                            let _ = reply.send(res);
-                        }
-                        LowCommand::PutGpuPagedDramBatch {
-                            keys,
-                            gpu_block_ids,
-                            regions,
-                            cuda_stream,
-                            reply,
-                        } => {
-                            const CHUNK: usize = 32;
-                            let frame_size = cache.frame_size();
-                            let res = match regions.validate_and_zero_gaps(frame_size) {
-                                Err(msg) => Err(msg),
-                                Ok(zero_gaps) => {
-                                    if store_sync_events.is_none() {
-                                        if let (Ok(e0), Ok(e1)) = (
-                                            cuda_copy::BlockingCudaEvent::new(),
-                                            cuda_copy::BlockingCudaEvent::new(),
-                                        ) {
-                                            store_sync_events = Some([e0, e1]);
-                                        }
-                                    }
-                                    let total_keys = keys.len();
-                                    let num_regions = regions.len();
-                                    let mut count = 0usize;
-                                    let mut err: Option<String> = None;
-                                    let _ = cache.poll();
-                                    if queue.has_high_pri() {
-                                        drain_high_pri(
-                                            cache,
-                                            &queue,
-                                            &stats_mirror,
-                                            &mut load_sync_events,
-                                            &load_batch_bufs,
-                                        );
-                                    }
-
-                                    if cache.is_host_pinned() {
-                                        // Zero-copy 1-hop paged D2H DMA directly from vLLM's KV
-                                        // layer tensors into VeriCache's CUDA-pinned HostBackend
-                                        // slab in 16-block chunks (preemptible in <1ms).
-                                        let mut cs = 0usize;
-                                        while cs < total_keys {
-                                            let ce = (cs + CHUNK).min(total_keys);
-                                            store_batch_buf.borrow_mut().clear();
-                                            let chunk_res = cache.with_host_write_batch(
-                                                &keys[cs..ce],
-                                                |li, dst_host_addr| {
-                                                    let orig_i = cs + li;
-                                                    let block_id = gpu_block_ids[orig_i];
-                                                    // Zero-pad uncovered gap/tail bytes BEFORE
-                                                    // D2H DMA is submitted in `on_flush`.
-                                                    if !zero_gaps.is_empty() {
-                                                        let dst_slice = unsafe {
-                                                            core::slice::from_raw_parts_mut(
-                                                                dst_host_addr as *mut u8,
-                                                                frame_size,
-                                                            )
-                                                        };
-                                                        for &(gs, ge) in &zero_gaps {
-                                                            dst_slice[gs..ge].fill(0);
-                                                        }
-                                                    }
-                                                    let mut batch = store_batch_buf.borrow_mut();
-                                                    for r in 0..num_regions {
-                                                        let sz = regions.sizes[r];
-                                                        if sz == 0 {
-                                                            continue;
-                                                        }
-                                                        let src_off = match block_id
-                                                            .checked_mul(regions.block_strides[r])
-                                                        {
-                                                            Some(v) => v,
-                                                            None => {
-                                                                batch.clear();
-                                                                return Err(CacheError::Init(
-                                                                    "gpu_block_id * block_stride overflow".into(),
-                                                                ));
-                                                            }
-                                                        };
-                                                        let src_addr = match regions.base_ptrs[r]
-                                                            .checked_add(src_off)
-                                                        {
-                                                            Some(v) => v,
-                                                            None => {
-                                                                batch.clear();
-                                                                return Err(CacheError::Init(
-                                                                    "paged region src address overflow".into(),
-                                                                ));
-                                                            }
-                                                        };
-                                                        let dst_addr =
-                                                            dst_host_addr + regions.offsets[r];
-                                                        if let Err(code) = batch.push(
-                                                            dst_addr,
-                                                            src_addr,
-                                                            sz,
-                                                            cuda_copy::CUDA_MEMCPY_DEVICE_TO_HOST,
-                                                        ) {
-                                                            batch.clear();
-                                                            return Err(CacheError::Init(format!(
-                                                                "invalid paged D2H DMA descriptor (code {code})"
-                                                            )));
-                                                        }
-                                                    }
-                                                    Ok(())
-                                                },
-                                                || {
-                                                    flush_batch_with_event(
-                                                        &mut store_batch_buf.borrow_mut(),
-                                                        store_sync_events.as_ref().map(|ev| &ev[0]),
-                                                        cuda_stream,
-                                                    )
-                                                },
-                                            );
-                                            store_batch_buf.borrow_mut().clear();
-                                            match chunk_res {
-                                                Ok(n) => {
-                                                    count += n;
-                                                    if n < ce - cs {
-                                                        break;
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    eprintln!(
-                                                        "vericache-python: PutGpuPagedDramBatch partial stop at {count}/{total_keys}: {e}"
-                                                    );
-                                                    err = Some(e.to_string());
-                                                    break;
-                                                }
-                                            }
-                                            cs = ce;
-                                            if queue.has_high_pri() {
-                                                drain_high_pri(
-                                                    cache,
-                                                    &queue,
-                                                    &stats_mirror,
-                                                    &mut load_sync_events,
-                                                    &load_batch_bufs,
-                                                );
-                                            }
-                                        }
-                                    } else {
-                                        struct PreparedChunk {
-                                            start: usize,
-                                            end: usize,
-                                            unc: Vec<(usize, ObjectKey)>,
-                                            buf_idx: usize,
-                                        }
-
-                                        let mut stream_dirty = false;
-
-                                        let launch_chunk = |cs: usize,
-                                                            ce: usize,
-                                                            buf_idx: usize,
-                                                            cache_ref: &mut VeriCache<'_, _, _, _, _>,
-                                                            pinned: &mut [cuda_copy::PinnedHostBuf; 2],
-                                                            evts: &Option<
-                                            [cuda_copy::BlockingCudaEvent; 2],
-                                        >,
-                                                            batch_buf: &RefCell<
-                                            cuda_copy::BatchCopyBuf,
-                                        >,
-                                                            dirty: &mut bool|
-                                         -> Result<PreparedChunk, String> {
-                                            let mut unc = Vec::with_capacity(ce - cs);
-                                            for i in cs..ce {
-                                                let key = keys[i];
-                                                if cache_ref.contains_local(key).is_none() {
-                                                    unc.push((i, key));
-                                                }
-                                            }
-                                            if !unc.is_empty() {
-                                                pinned[buf_idx]
-                                                    .ensure_capacity(unc.len() * frame_size)
-                                                    .map_err(|code| {
-                                                        format!(
-                                                            "cudaHostAlloc({} bytes) failed with code {code}",
-                                                            unc.len() * frame_size
-                                                        )
-                                                    })?;
-                                                let host_base = pinned[buf_idx].addr();
-                                                let mut batch = batch_buf.borrow_mut();
-                                                batch.clear();
-                                                for (j, &(orig_i, _key)) in unc.iter().enumerate() {
-                                                    let block_id = gpu_block_ids[orig_i];
-                                                    let dst_block_base = host_base + j * frame_size;
-                                                    for r in 0..num_regions {
-                                                        let sz = regions.sizes[r];
-                                                        if sz == 0 {
-                                                            continue;
-                                                        }
-                                                        let src_off = block_id
-                                                            .checked_mul(regions.block_strides[r])
-                                                            .ok_or_else(|| {
-                                                                "gpu_block_id * block_stride overflow"
-                                                                    .to_string()
-                                                            })?;
-                                                        let src_addr = regions.base_ptrs[r]
-                                                            .checked_add(src_off)
-                                                            .ok_or_else(|| {
-                                                                "paged region src address overflow"
-                                                                    .to_string()
-                                                            })?;
-                                                        let dst_addr =
-                                                            dst_block_base + regions.offsets[r];
-                                                        batch
-                                                            .push(
-                                                                dst_addr,
-                                                                src_addr,
-                                                                sz,
-                                                                cuda_copy::CUDA_MEMCPY_DEVICE_TO_HOST,
-                                                            )
-                                                            .map_err(|code| {
-                                                                format!(
-                                                                    "invalid paged D2H DMA descriptor (code {code})"
-                                                                )
-                                                            })?;
-                                                    }
-                                                }
-                                                let submit_res = batch.submit_async(cuda_stream);
-                                                batch.clear();
-                                                match submit_res {
-                                                    Ok(submitted) => {
-                                                        if submitted {
-                                                            *dirty = true;
-                                                        }
-                                                    }
-                                                    Err((code, submitted)) => {
-                                                        if submitted {
-                                                            *dirty = true;
-                                                        }
-                                                        return Err(format!(
-                                                            "paged D2H DMA submit failed with code {code}"
-                                                        ));
-                                                    }
-                                                }
-                                                if let Some(ev) = evts.as_ref() {
-                                                    ev[buf_idx].record(cuda_stream).map_err(
-                                                        |code| {
-                                                            format!(
-                                                                "cudaEventRecord failed with code {code}"
-                                                            )
-                                                        },
-                                                    )?;
-                                                }
-                                            }
-                                            Ok(PreparedChunk {
-                                                start: cs,
-                                                end: ce,
-                                                unc,
-                                                buf_idx,
-                                            })
-                                        };
-
-                                        let mut next_start = 0usize;
-                                        let mut cur_opt = if next_start < total_keys {
-                                            let ce = (next_start + CHUNK).min(total_keys);
-                                            next_start = ce;
-                                            match launch_chunk(
-                                                0,
-                                                ce,
-                                                0,
-                                                cache,
-                                                &mut pinned_d2h,
-                                                &store_sync_events,
-                                                &store_batch_buf,
-                                                &mut stream_dirty,
-                                            ) {
-                                                Ok(pc) => Some(pc),
-                                                Err(e) => {
-                                                    err = Some(e);
-                                                    None
-                                                }
-                                            }
-                                        } else {
-                                            None
-                                        };
-
-                                        while let Some(cur) = cur_opt.take() {
-                                            if !cur.unc.is_empty() {
-                                                let sync_res = match store_sync_events.as_ref() {
-                                                    Some(ev) => ev[cur.buf_idx]
-                                                        .synchronize()
-                                                        .or_else(|_| {
-                                                            cuda_copy::stream_synchronize(
-                                                                cuda_stream,
-                                                            )
-                                                        }),
-                                                    None => {
-                                                        cuda_copy::stream_synchronize(cuda_stream)
-                                                    }
-                                                };
-                                                if let Err(code) = sync_res {
-                                                    err = Some(format!(
-                                                        "paged D2H sync failed with code {code}"
-                                                    ));
-                                                    break;
-                                                }
-                                            }
-
-                                            // Kick off next chunk's D2H on the alternate pinned buffer
-                                            // so PCIe DMA overlaps with zero-pad + `cache.put_host`.
-                                            if next_start < total_keys {
-                                                let cs = next_start;
-                                                let ce = (cs + CHUNK).min(total_keys);
-                                                next_start = ce;
-                                                let next_buf = 1 - cur.buf_idx;
-                                                match launch_chunk(
-                                                    cs,
-                                                    ce,
-                                                    next_buf,
-                                                    cache,
-                                                    &mut pinned_d2h,
-                                                    &store_sync_events,
-                                                    &store_batch_buf,
-                                                    &mut stream_dirty,
-                                                ) {
-                                                    Ok(pc) => {
-                                                        cur_opt = Some(pc);
-                                                    }
-                                                    Err(e) => {
-                                                        err = Some(e);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-
-                                            // Zero-pad uncovered gap/tail bytes in `pinned_d2h[cur.buf_idx]`
-                                            // after D2H sync completed on this buffer.
-                                            if !cur.unc.is_empty() && !zero_gaps.is_empty() {
-                                                let buf = pinned_d2h[cur.buf_idx]
-                                                    .as_mut_slice(cur.unc.len() * frame_size);
-                                                for j in 0..cur.unc.len() {
-                                                    let base = j * frame_size;
-                                                    for &(gs, ge) in &zero_gaps {
-                                                        buf[base + gs..base + ge].fill(0);
-                                                    }
-                                                }
-                                            }
-
-                                            let mut chunk_failed = false;
-                                            if !cur.unc.is_empty() {
-                                                let host_bytes = pinned_d2h[cur.buf_idx]
-                                                    .as_slice(cur.unc.len() * frame_size);
-                                                for (j, &(orig_i, key)) in
-                                                    cur.unc.iter().enumerate()
-                                                {
-                                                    if j > 0 && j % 8 == 0 {
-                                                        let _ = cache.poll();
-                                                    }
-                                                    if cache.contains_local(key).is_some() {
-                                                        continue;
-                                                    }
-                                                    let slice = &host_bytes
-                                                        [j * frame_size..(j + 1) * frame_size];
-                                                    if let Err(e) = cache.put_host(key, slice) {
-                                                        eprintln!(
-                                                            "vericache-python: PutGpuPagedDramBatch partial stop at {orig_i}/{total_keys}: {e}"
-                                                        );
-                                                        err = Some(e.to_string());
-                                                        count = orig_i;
-                                                        chunk_failed = true;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-
-                                            if !chunk_failed {
-                                                let mut verified_end = cur.end;
-                                                for idx in cur.start..cur.end {
-                                                    if cache.contains_local(keys[idx]).is_none() {
-                                                        verified_end = idx;
-                                                        err = Some(format!(
-                                                            "prescanned key at {idx}/{total_keys} evicted before commit"
-                                                        ));
-                                                        break;
-                                                    }
-                                                }
-                                                count = verified_end;
-                                            }
-                                            let _ = cache.poll();
-                                            if err.is_some() {
-                                                break;
-                                            }
-                                            if queue.has_high_pri() {
-                                                drain_high_pri(
-                                                    cache,
-                                                    &queue,
-                                                    &stats_mirror,
-                                                    &mut load_sync_events,
-                                                    &load_batch_bufs,
-                                                );
-                                            }
-                                        }
-                                        if err.is_some() && stream_dirty {
-                                            let _ = cuda_copy::stream_synchronize(cuda_stream);
-                                        }
+                                        let _ = DeviceCopyBackend::stream_synchronize(cuda_stream);
                                     }
                                     match err {
                                         Some(_) if count > 0 => Ok(count),
@@ -2246,6 +2207,11 @@ pub unsafe extern "C" fn vericache_create(cfg: *const VeriCacheConfigC) -> *mut 
         return core::ptr::null_mut();
     }
     let c = unsafe { &*cfg };
+    #[cfg(not(feature = "cuda"))]
+    if c.gpu_device_id >= 0 {
+        set_last_error("CUDA device support is disabled");
+        return core::ptr::null_mut();
+    }
     let mut storage = StorageConfig::new(c.node_id, c.frame_size, c.dram_frames);
     storage.max_leases = 256;
     if c.gpu_device_id >= 0 && c.hbm_frames > 0 {

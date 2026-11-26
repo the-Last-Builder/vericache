@@ -2,7 +2,9 @@
 resolver = "3"
 members = [
     "vericache-foundation",
+    "vericache-transfer-core",
     "vericache-transfer",
+    "vericache-kernel",
     "vericache-core",
 ]
 exclude = ["vericache-bench", "vericache", "vericache-python"]
@@ -13,7 +15,9 @@ edition = "2024"
 
 [workspace.dependencies]
 foundation = { package = "vericache-foundation", path = "vericache-foundation" }
-transfer = { package = "vericache-transfer", path = "vericache-transfer" }
+transfer_core = { package = "vericache-transfer-core", path = "vericache-transfer-core" }
+transfer = { package = "vericache-transfer", path = "vericache-transfer", default-features = false }
+vericache_kernel = { package = "vericache-kernel", path = "vericache-kernel" }
 # Pinned Verus source baked into the container image (/opt/vericache).
 vstd = { path = "/opt/vericache/verus/source/vstd" }
 verus_state_machines_macros = { path = "/opt/vericache/verus/source/state_machines_macros" }

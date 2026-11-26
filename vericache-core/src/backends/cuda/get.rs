@@ -19,15 +19,20 @@ impl<'a> CudaBackend<'a> {
         Tracked(shares): Tracked<&mut ShareSource>,
         frame: FrameId,
         dst_stream: &mut CudaStream,
-        dst_timeline: u8,
+        dst_timeline: TimelineId,
         dst: &CudaSlice,
         Tracked(dst_tok): Tracked<&mut SlotToken>,
     ) -> (r: BackendResult<(VersionId, Ticket, Ghost<TransferEvent>)>)
         requires
             old(core).well_formed(),
             self.well_formed(old(core)),
-            caller_stream_valid(*old(dst_stream), old(core), dst_timeline, self.timeline.stream),
-            dst_timeline != self.timeline.timeline_id,
+            caller_stream_valid(
+                *old(dst_stream),
+                old(core),
+                dst_timeline,
+                self.timeline_spec().stream_spec(),
+            ),
+            dst_timeline != self.timeline_spec().timeline_id_spec(),
             instance.id() == old(core).instance_id(),
             old(shares).well_formed(),
             old(shares).id() == old(core).instance_id(),
@@ -35,16 +40,15 @@ impl<'a> CudaBackend<'a> {
             dst.well_formed(),
             dst.instance_id() == old(core).instance_id(),
             dst.slot_ref().loc.node == old(core).node(),
-            dst.slot_ref().sub_len == old(core).frames.tier_frame_size(self.gpu_tier),
-            dst.slot_ref().loc.space is GpuAlloc ==> dst.slot_ref().loc.space->GpuAlloc_device
-                == self.device,
+            dst.slot_ref().sub_len == old(core).frames_spec().tier_frame_size(self.gpu_tier_spec()),
+            dst.slot_ref().loc.space.is_gpu() ==> dst.slot_ref().loc.space.gpu_device()
+                == self.device_spec(),
             slot_is_owned(*old(dst_tok), old(core).instance_id(), dst.slot_ref().loc),
             write_admitted(slot_frontier(*old(dst_tok)), old(core).citations()),
             old(core).disjoint_from_published(ISet::empty().insert(dst.slot_ref().loc)),
             forall|f: FrameId|
-                f.0 < old(core).frames.metas.len() ==> dst.slot_ref().loc != (#[trigger] old(
-                    core,
-                ).frames.frame(f)).slot.loc,
+                f.0 < old(core).frames_spec().metas_spec().len() ==> dst.slot_ref().loc != (
+                #[trigger] old(core).frames_spec().frame(f)).slot.loc,
         ensures
             final(core).well_formed(),
             self.well_formed(final(core)),
@@ -52,27 +56,28 @@ impl<'a> CudaBackend<'a> {
                 *final(dst_stream),
                 final(core),
                 dst_timeline,
-                self.timeline.stream,
+                self.timeline_spec().stream_spec(),
             ),
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
-            final(core).node_id == old(core).node_id,
-            final(core).tiers == old(core).tiers,
-            final(core).spec == old(core).spec,
-            final(core).version_registry == old(core).version_registry,
-            final(core).frames.versions@ == old(core).frames.versions@,
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
             core_transition(
                 old(core),
                 final(core),
-                Some(dst_timeline),
-                Some(old(dst_stream).source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(dst_timeline),
+                    Some(old(dst_stream).source().source()),
+                ),
             ),
             r matches Ok((version, ticket, ev)) ==> {
                 &&& ticket != Ticket::NONE
                 &&& ticket.timeline_id() == dst_timeline
-                &&& final(core).spec@.versions.contains_key(version)
+                &&& final(core).spec_spec()@.versions.contains_key(version)
                 &&& slot_owned(
                     *final(dst_tok),
                     old(core).instance_id(),
@@ -90,9 +95,10 @@ impl<'a> CudaBackend<'a> {
             proof {
                 lemma_core_transition_refl(
                     core,
-                    Some(dst_timeline),
-                    Some(dst_stream.source().source()),
-                    FrameTouchMode::PreserveAllInit,
+                    CoreFootprint::preserve_all(
+                        Some(dst_timeline),
+                        Some(dst_stream.source().source()),
+                    ),
                 );
             }
             return Err(CoreError::UnsupportedTier);
@@ -109,9 +115,10 @@ impl<'a> CudaBackend<'a> {
                 proof {
                     lemma_core_transition_refl(
                         core,
-                        Some(dst_timeline),
-                        Some(dst_stream.source().source()),
-                        FrameTouchMode::PreserveAllInit,
+                        CoreFootprint::preserve_all(
+                            Some(dst_timeline),
+                            Some(dst_stream.source().source()),
+                        ),
                     );
                 }
                 return Err(e);
@@ -194,11 +201,11 @@ impl<'a> CudaBackend<'a> {
                 }
                 lemma_cuda_timeline_preserved(&self.timeline, &before_core, core);
                 lemma_cuda_events_preserved_same(
-                    core.timelines.events@,
+                    core.timelines_spec().events_spec()@,
                     self.timeline.timeline_id,
-                    before_core.timelines.next_seq[self.timeline.timeline_id as int],
+                    before_core.timelines_spec().next_seq_spec()[self.timeline.timeline_id as int],
                 );
-                lemma_cuda_ledger_writes_only_same(core.ledger@, None);
+                lemma_cuda_ledger_writes_only_same(core.ledger_spec()@, None);
                 lemma_cuda_puts_after_disjoint_step(
                     self.active_gpu_puts@,
                     &before_core,
@@ -214,7 +221,7 @@ impl<'a> CudaBackend<'a> {
                     Some(dst_timeline),
                     Some(dst_stream.source().source()),
                     None,
-                    Some(lease.slot),
+                    Some(lease.slot_spec()),
                 );
             }
             return Err(e);
@@ -262,11 +269,11 @@ impl<'a> CudaBackend<'a> {
                     }
                     lemma_cuda_timeline_preserved(&self.timeline, &before_core, core);
                     lemma_cuda_events_preserved_same(
-                        core.timelines.events@,
+                        core.timelines_spec().events_spec()@,
                         self.timeline.timeline_id,
-                        before_core.timelines.next_seq[self.timeline.timeline_id as int],
+                        before_core.timelines_spec().next_seq_spec()[self.timeline.timeline_id as int],
                     );
-                    lemma_cuda_ledger_writes_only_same(core.ledger@, None);
+                    lemma_cuda_ledger_writes_only_same(core.ledger_spec()@, None);
                     lemma_cuda_puts_after_disjoint_step(
                         self.active_gpu_puts@,
                         &before_core,
@@ -282,7 +289,7 @@ impl<'a> CudaBackend<'a> {
                         Some(dst_timeline),
                         Some(dst_stream.source().source()),
                         None,
-                        Some(lease.slot),
+                        Some(lease.slot_spec()),
                     );
                 }
                 Err(e)
@@ -292,8 +299,8 @@ impl<'a> CudaBackend<'a> {
                 proof {
                     assert(src_cap.frontier().readers =~= ISet::empty().insert(ev@));
                     lemma_returned_reads_by_ticket(core, frame, src_cap, ticket);
-                    assert(core.ledger@.submitted.dom()
-                        =~= after_acq_core.ledger@.submitted.dom().insert(ev@));
+                    assert(core.ledger_spec()@.submitted.dom()
+                        =~= after_acq_core.ledger_spec()@.submitted.dom().insert(ev@));
                     lemma_core_transition_step_single_event(
                         &before_core,
                         &after_acq_core,
@@ -332,19 +339,19 @@ impl<'a> CudaBackend<'a> {
                     }
                     lemma_cuda_timeline_preserved(&self.timeline, &before_core, core);
                     lemma_cuda_events_preserved_insert(
-                        before_core.timelines.events@,
-                        core.timelines.events@,
+                        before_core.timelines_spec().events_spec()@,
+                        core.timelines_spec().events_spec()@,
                         self.timeline.timeline_id,
-                        before_core.timelines.next_seq[self.timeline.timeline_id as int],
+                        before_core.timelines_spec().next_seq_spec()[self.timeline.timeline_id as int],
                         dst_timeline,
                         ticket.sequence(),
                         ev@,
                     );
                     lemma_cuda_ledger_writes_only_insert(
-                        before_core.ledger@,
-                        core.ledger@,
+                        before_core.ledger_spec()@,
+                        core.ledger_spec()@,
                         ev@,
-                        core.ledger@.submitted.map()[ev@],
+                        core.ledger_spec()@.submitted.map()[ev@],
                         dst.slot_ref().loc,
                     );
                     lemma_cuda_puts_after_disjoint_step(
@@ -362,7 +369,7 @@ impl<'a> CudaBackend<'a> {
                         Some(dst_timeline),
                         Some(dst_stream.source().source()),
                         None,
-                        Some(lease.slot),
+                        Some(lease.slot_spec()),
                     );
                 }
                 Ok((version, ticket, ev))

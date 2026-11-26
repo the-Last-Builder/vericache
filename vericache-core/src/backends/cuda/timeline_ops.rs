@@ -8,7 +8,7 @@ verus! {
 impl CudaTimeline {
     /// Enqueue an async `cuda::memcpy_async` on this timeline's stream, issue
     /// its FIFO ticket on `core`, and preserve `CudaTimeline::well_formed`.
-    pub fn enqueue_memcpy(
+    pub(crate) fn enqueue_memcpy(
         &mut self,
         core: &mut CacheCore,
         Tracked(instance): Tracked<&TransferInstance>,
@@ -19,7 +19,11 @@ impl CudaTimeline {
     ) -> (r: BackendResult<(Ghost<TransferEvent>, Ticket)>)
         requires
             old(core).well_formed(),
-            old(self).well_formed(&old(core).timelines, old(core).node(), &old(core).ledger@),
+            old(self).well_formed(
+                &old(core).timelines_spec(),
+                old(core).node(),
+                &old(core).ledger_spec()@,
+            ),
             instance.id() == old(core).instance_id(),
             dst.well_formed(),
             src.well_formed(),
@@ -29,100 +33,105 @@ impl CudaTimeline {
             src.slot_ref().loc.node == old(core).node(),
             dst.slot_ref().loc.node == old(core).node(),
             src.slot_ref().loc != dst.slot_ref().loc,
-            old(src_perm).valid_local(old(core).instance_id(), src.slot_ref().loc),
+            old(src_perm).valid_cooperative(old(core).instance_id(), src.slot_ref().loc),
             slot_is_owned(*old(dst_tok), old(core).instance_id(), dst.slot_ref().loc),
             read_admitted(
                 old(src_perm).frontier(),
                 closure_from(
-                    old(core).ledger@.submitted.map(),
+                    old(core).ledger_spec()@.submitted.map(),
                     old(self).stream.tail().union(old(core).citations()),
                 ),
             ),
             write_admitted(
                 slot_frontier(*old(dst_tok)),
                 closure_from(
-                    old(core).ledger@.submitted.map(),
+                    old(core).ledger_spec()@.submitted.map(),
                     old(self).stream.tail().union(old(core).citations()),
                 ),
             ),
             old(core).disjoint_from_published(ISet::empty().insert(dst.slot_ref().loc)),
-            src.slot_ref().loc.space is GpuAlloc && dst.slot_ref().loc.space is GpuAlloc
-                && src.slot_ref().loc.space->GpuAlloc_device
-                != dst.slot_ref().loc.space->GpuAlloc_device ==> (old(
-                src_perm,
-            ).frontier().last_writer matches Some(w) ==> !(w.source is RdmaQueuePair)),
+            src.slot_ref().loc.space.is_gpu() && dst.slot_ref().loc.space.is_gpu()
+                && src.slot_ref().loc.space.gpu_device() != dst.slot_ref().loc.space.gpu_device()
+                ==> (old(src_perm).frontier().last_writer matches Some(w) ==> !(
+            w.source.is_rdma_qp())),
         ensures
             final(core).well_formed(),
             final(self).well_formed(
-                &final(core).timelines,
+                &final(core).timelines_spec(),
                 final(core).node(),
-                &final(core).ledger@,
+                &final(core).ledger_spec()@,
             ),
             final(self).timeline_id == old(self).timeline_id,
             final(self).device == old(self).device,
             final(self).stream.source().source() == old(self).stream.source().source(),
             final(self).event_ring == old(self).event_ring,
-            final(core).node_id == old(core).node_id,
-            final(core).tiers == old(core).tiers,
-            final(core).frames == old(core).frames,
-            final(core).catalog == old(core).catalog,
-            final(core).spec == old(core).spec,
-            final(core).version_seq_start == old(core).version_seq_start,
-            final(core).next_version_seq == old(core).next_version_seq,
-            final(core).version_seq_limit == old(core).version_seq_limit,
-            final(core).active_leases == old(core).active_leases,
-            final(core).free_lease_slots == old(core).free_lease_slots,
-            final(core).lease_generation == old(core).lease_generation,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines.count == old(core).timelines.count,
-            final(core).timelines.kinds == old(core).timelines.kinds,
-            final(core).timelines.confirmed_seq == old(core).timelines.confirmed_seq,
-            final(core).ledger@.knows == old(core).ledger@.knows,
-            final(core).ledger@.succeeded == old(core).ledger@.succeeded,
-            final(core).ledger@.revoked == old(core).ledger@.revoked,
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec() == old(core).frames_spec(),
+            final(core).catalog_spec() == old(core).catalog_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).version_seq_start_spec() == old(core).version_seq_start_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            final(core).version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+            final(core).active_leases_spec() == old(core).active_leases_spec(),
+            final(core).free_lease_slots_spec() == old(core).free_lease_slots_spec(),
+            final(core).lease_generation_spec() == old(core).lease_generation_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().confirmed_seq_spec() == old(
+                core,
+            ).timelines_spec().confirmed_seq_spec(),
+            final(core).ledger_spec()@.knows == old(core).ledger_spec()@.knows,
+            final(core).ledger_spec()@.succeeded == old(core).ledger_spec()@.succeeded,
+            final(core).ledger_spec()@.revoked == old(core).ledger_spec()@.revoked,
             match r {
                 Err(_) => *final(core) == *old(core) && *final(self) == *old(self)
                     && *final(src_perm) == *old(src_perm) && *final(dst_tok) == *old(dst_tok),
                 Ok((ev, ticket)) => {
-                    let s = old(core).timelines.next_seq[old(self).timeline_id as int];
+                    let s = old(core).timelines_spec().next_seq_spec()[old(
+                        self,
+                    ).timeline_id as int];
                     &&& ev@ == old(self).stream.source().next_event()
-                    &&& !old(core).ledger@.submitted.dom().contains(ev@)
+                    &&& !old(core).ledger_spec()@.submitted.dom().contains(ev@)
                     &&& ticket != Ticket::NONE
                     &&& ticket.timeline_id() == old(self).timeline_id
                     &&& ticket.sequence() == s
-                    &&& final(core).timelines.issued(old(self).timeline_id, s)
-                    &&& final(core).timelines.events@ == old(core).timelines.events@.insert(
-                        (old(self).timeline_id, s),
-                        ev@,
-                    )
-                    &&& final(core).timelines.events@[(old(self).timeline_id, s)] == ev@
-                    &&& final(core).timelines.next_seq@ == old(core).timelines.next_seq@.update(
+                    &&& final(core).timelines_spec().issued(old(self).timeline_id, s)
+                    &&& final(core).timelines_spec().events_spec()@ == old(
+                        core,
+                    ).timelines_spec().events_spec()@.insert((old(self).timeline_id, s), ev@)
+                    &&& final(core).timelines_spec().events_spec()@[(old(self).timeline_id, s)]
+                        == ev@
+                    &&& final(core).timelines_spec().next_seq_spec()@ == old(
+                        core,
+                    ).timelines_spec().next_seq_spec()@.update(
                         old(self).timeline_id as int,
                         (s + 1) as u64,
                     )
-                    &&& final(core).ledger@.submitted.instance_id() == old(
+                    &&& final(core).ledger_spec()@.submitted.instance_id() == old(
                         core,
-                    ).ledger@.submitted.instance_id()
-                    &&& final(core).ledger@.submitted.dom().contains(ev@)
-                    &&& final(core).ledger@.submitted.map() == old(
+                    ).ledger_spec()@.submitted.instance_id()
+                    &&& final(core).ledger_spec()@.submitted.dom().contains(ev@)
+                    &&& final(core).ledger_spec()@.submitted.map() == old(
                         core,
-                    ).ledger@.submitted.map().insert(
+                    ).ledger_spec()@.submitted.map().insert(
                         ev@,
                         EventInfo {
                             access: copy_access(src.slot_ref(), dst.slot_ref()),
                             read_guards: old(src_perm).read_guards(),
                             effect: copy_effect(src.slot_ref(), dst.slot_ref()),
                             preds: closure_from(
-                                old(core).ledger@.submitted.map(),
+                                old(core).ledger_spec()@.submitted.map(),
                                 old(self).stream.tail().union(old(core).citations()),
                             ),
                         },
                     )
-                    &&& final(core).ledger@.submitted.map()[ev@].preds.subset_of(
-                        old(core).ledger@.submitted.dom(),
+                    &&& final(core).ledger_spec()@.submitted.map()[ev@].preds.subset_of(
+                        old(core).ledger_spec()@.submitted.dom(),
                     )
-                    &&& old(core).ledger@.submitted.map().submap_of(
-                        final(core).ledger@.submitted.map(),
+                    &&& old(core).ledger_spec()@.submitted.map().submap_of(
+                        final(core).ledger_spec()@.submitted.map(),
                     )
                     &&& final(self).stream.tail() == ISet::empty().insert(ev@)
                     &&& final(src_perm).advanced_read(*old(src_perm), ev@)
@@ -143,7 +152,7 @@ impl CudaTimeline {
         proof {
             lemma_core_wf_facts(core);
         }
-        if core.timelines.next_seq[t as usize] > MAX_TICKET_SEQ {
+        if core.timelines().next_sequences()[t as usize] > MAX_TICKET_SEQ {
             return Err(CoreError::SequenceExhausted);
         }
         let ghost before_core = *core;
@@ -153,7 +162,7 @@ impl CudaTimeline {
             lemma_cuda_memcpy_admitted(before_stream, *src_perm, *dst_tok, &before_core);
         }
         let copy_res = {
-            let tracked ledger_ref = core.ledger.borrow_mut();
+            let tracked ledger_ref = core.borrow_ledger_mut();
             cuda::memcpy_async(
                 &mut self.stream,
                 Tracked(instance),
@@ -205,7 +214,7 @@ impl CudaTimeline {
     }
 
     /// Block until all work previously enqueued on this CUDA stream completes
-    /// on the device, advancing `core.timelines.confirmed_seq[self.timeline_id]`
+    /// on the device, advancing `core.timelines_spec().confirmed_seq_spec()[self.timeline_id]`
     /// to `next_seq - 1`.
     pub fn synchronize(
         &self,
@@ -214,40 +223,49 @@ impl CudaTimeline {
     ) -> (r: BackendResult<()>)
         requires
             old(core).well_formed(),
-            self.well_formed(&old(core).timelines, old(core).node(), &old(core).ledger@),
+            self.well_formed(
+                &old(core).timelines_spec(),
+                old(core).node(),
+                &old(core).ledger_spec()@,
+            ),
             instance.id() == old(core).instance_id(),
         ensures
             final(core).well_formed(),
-            self.well_formed(&final(core).timelines, final(core).node(), &final(core).ledger@),
-            final(core).node_id == old(core).node_id,
-            final(core).tiers == old(core).tiers,
-            final(core).frames == old(core).frames,
-            final(core).catalog == old(core).catalog,
-            final(core).spec == old(core).spec,
-            final(core).version_seq_start == old(core).version_seq_start,
-            final(core).next_version_seq == old(core).next_version_seq,
-            final(core).version_seq_limit == old(core).version_seq_limit,
-            final(core).active_leases == old(core).active_leases,
-            final(core).free_lease_slots == old(core).free_lease_slots,
-            final(core).lease_generation == old(core).lease_generation,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines.count == old(core).timelines.count,
-            final(core).timelines.kinds == old(core).timelines.kinds,
-            final(core).timelines.events == old(core).timelines.events,
-            final(core).timelines.next_seq == old(core).timelines.next_seq,
-            forall|u: u8|
-                u < old(core).timelines.count && u != self.timeline_id
-                    ==> #[trigger] final(core).timelines.confirmed_seq[u as int] == old(
-                    core,
-                ).timelines.confirmed_seq[u as int],
-            final(core).ledger@.submitted == old(core).ledger@.submitted,
-            final(core).ledger@.succeeded == old(core).ledger@.succeeded,
-            final(core).ledger@.revoked == old(core).ledger@.revoked,
-            old(core).ledger@.knows.set().subset_of(final(core).ledger@.knows.set()),
-            final(core).kernel_view().extends(old(core).kernel_view()),
-            r.is_ok() ==> final(core).timelines.confirmed_seq[self.timeline_id as int] == old(
+            self.well_formed(
+                &final(core).timelines_spec(),
+                final(core).node(),
+                &final(core).ledger_spec()@,
+            ),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec() == old(core).frames_spec(),
+            final(core).catalog_spec() == old(core).catalog_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).version_seq_start_spec() == old(core).version_seq_start_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            final(core).version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+            final(core).active_leases_spec() == old(core).active_leases_spec(),
+            final(core).free_lease_slots_spec() == old(core).free_lease_slots_spec(),
+            final(core).lease_generation_spec() == old(core).lease_generation_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
                 core,
-            ).timelines.next_seq[self.timeline_id as int] - 1,
+            ).timelines_spec().next_seq_spec(),
+            forall|u: TimelineId|
+                u < old(core).timelines_spec().count_spec() && u != self.timeline_id_spec()
+                    ==> #[trigger] final(core).timelines_spec().confirmed_seq_spec()[u as int]
+                    == old(core).timelines_spec().confirmed_seq_spec()[u as int],
+            final(core).ledger_spec()@.submitted == old(core).ledger_spec()@.submitted,
+            final(core).ledger_spec()@.succeeded == old(core).ledger_spec()@.succeeded,
+            final(core).ledger_spec()@.revoked == old(core).ledger_spec()@.revoked,
+            old(core).ledger_spec()@.knows.set().subset_of(final(core).ledger_spec()@.knows.set()),
+            final(core).kernel_view().extends(old(core).kernel_view()),
+            r.is_ok()
+                ==> final(core).timelines_spec().confirmed_seq_spec()[self.timeline_id_spec() as int]
+                == old(core).timelines_spec().next_seq_spec()[self.timeline_id_spec() as int] - 1,
     {
         hide(CacheCore::well_formed);
         hide(replica_valid);
@@ -267,16 +285,16 @@ impl CudaTimeline {
                 return Err(cuda_error(e));
             },
         };
-        let target = core.timelines.next_seq[t as usize] - 1;
+        let target = core.timelines().next_sequences()[t as usize] - 1;
         proof {
-            assert forall|s: u64| 1 <= s <= target implies core.timelines.observed(
+            assert forall|s: u64| 1 <= s <= target implies core.timelines_spec().observed(
                 t,
                 s,
                 node,
                 k,
             ) by {
-                assert(self.closure().contains(core.timelines.events@[(t, s)]));
-                assert(k.set().contains((node, core.timelines.events@[(t, s)])));
+                assert(self.closure().contains(core.timelines_spec().events_spec()@[(t, s)]));
+                assert(k.set().contains((node, core.timelines_spec().events_spec()@[(t, s)])));
             }
         }
         core.mark_timeline_complete(t, target, Tracked(k));

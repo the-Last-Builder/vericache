@@ -19,24 +19,25 @@ pub(super) proof fn lemma_empty_imap_submap(m: IMap<TransferEvent, EventInfo<Tra
 pub(super) proof fn lemma_core_wf_same_submitted_map(before: &CacheCore, after: &CacheCore)
     requires
         before.well_formed(),
-        after.node_id == before.node_id,
-        after.tiers == before.tiers,
-        after.timelines == before.timelines,
-        after.frames == before.frames,
-        after.catalog == before.catalog,
-        after.version_seq_start == before.version_seq_start,
-        after.next_version_seq == before.next_version_seq,
-        after.version_seq_limit == before.version_seq_limit,
-        after.active_leases == before.active_leases,
-        after.free_lease_slots == before.free_lease_slots,
-        after.lease_generation == before.lease_generation,
-        after.spec == before.spec,
-        after.version_registry == before.version_registry,
-        after.ledger@.submitted.instance_id() == before.ledger@.submitted.instance_id(),
-        after.ledger@.submitted.map() == before.ledger@.submitted.map(),
-        after.ledger@.knows == before.ledger@.knows,
-        after.ledger@.succeeded == before.ledger@.succeeded,
-        after.ledger@.revoked == before.ledger@.revoked,
+        after.node_id_spec() == before.node_id_spec(),
+        after.tiers_spec() == before.tiers_spec(),
+        after.timelines_spec() == before.timelines_spec(),
+        after.frames_spec() == before.frames_spec(),
+        after.catalog_spec() == before.catalog_spec(),
+        after.version_seq_start_spec() == before.version_seq_start_spec(),
+        after.next_version_seq_spec() == before.next_version_seq_spec(),
+        after.version_seq_limit_spec() == before.version_seq_limit_spec(),
+        after.active_leases_spec() == before.active_leases_spec(),
+        after.free_lease_slots_spec() == before.free_lease_slots_spec(),
+        after.lease_generation_spec() == before.lease_generation_spec(),
+        after.spec_spec() == before.spec_spec(),
+        after.version_registry_spec() == before.version_registry_spec(),
+        after.ledger_spec()@.submitted.instance_id()
+            == before.ledger_spec()@.submitted.instance_id(),
+        after.ledger_spec()@.submitted.map() == before.ledger_spec()@.submitted.map(),
+        after.ledger_spec()@.knows == before.ledger_spec()@.knows,
+        after.ledger_spec()@.succeeded == before.ledger_spec()@.succeeded,
+        after.ledger_spec()@.revoked == before.ledger_spec()@.revoked,
     ensures
         after.well_formed(),
         after.citations() == before.citations(),
@@ -48,43 +49,53 @@ pub(super) proof fn lemma_core_wf_same_submitted_map(before: &CacheCore, after: 
     };
 
     assert(after.citations() =~= before.citations());
-    assert(after.ledger@.valid(after.instance_id(), after.node()));
-    assert(complete_receipts(after.ledger@));
-    assert(after.timelines.well_formed(after.instance_id(), after.node(), &after.ledger@));
+    assert(after.ledger_spec()@.valid(after.instance_id(), after.node()));
+    assert(complete_receipts(after.ledger_spec()@));
+    assert(after.timelines_spec().well_formed(
+        after.instance_id(),
+        after.node(),
+        &after.ledger_spec()@,
+    ));
     assert(after.kernel_view().extends(before.kernel_view()));
-    after.frames.lemma_timeline_progress(before.kernel_view(), after.kernel_view());
+    after.frames_spec().lemma_timeline_progress(before.kernel_view(), after.kernel_view());
     assert forall|f: FrameId|
-        f.0 < after.frames.metas.len() && (#[trigger] after.frames.meta(f)).state
-            == STATE_PUBLISHED implies {
-        let g = after.frames.frame(f);
+        f.0 < after.frames_spec().metas_spec().len() && (#[trigger] after.frames_spec().meta(
+            f,
+        )).state == STATE_PUBLISHED implies {
+        let g = after.frames_spec().frame(f);
         g.cert matches Some(cert) && {
-            &&& replica_valid(after.ledger@, after.node(), cert)
-            &&& event_succeeded(after.ledger@, after.node(), cert.writer)
-            &&& after.ledger@.citations(after.node()).contains(cert.writer)
+            &&& replica_valid(after.ledger_spec()@, after.node(), cert)
+            &&& event_succeeded(after.ledger_spec()@, after.node(), cert.writer)
+            &&& after.ledger_spec()@.citations(after.node()).contains(cert.writer)
             &&& g.bound_version matches Some(ver)
-            &&& after.frames.versions@.contains_key(ver)
-            &&& after.frames.versions@[ver] == cert.bytes
+            &&& after.frames_spec().versions_spec()@.contains_key(ver)
+            &&& after.frames_spec().versions_spec()@[ver] == cert.bytes
         }
     } by {
-        assert(before.frames.valid_frame(f, before.kernel_view()));
-        let cert = before.frames.frame(f).cert.unwrap();
-        replica_survives_disjoint_writes(before.ledger@, after.ledger@, after.node(), cert);
+        assert(before.frames_spec().valid_frame(f, before.kernel_view()));
+        let cert = before.frames_spec().frame(f).cert.unwrap();
+        replica_survives_disjoint_writes(
+            before.ledger_spec()@,
+            after.ledger_spec()@,
+            after.node(),
+            cert,
+        );
     }
 }
 
 pub(super) proof fn lemma_cuda_timeline_init_wf(
     ring: &Seq<EventSlot>,
     table: &TimelineTable,
-    t: u8,
+    t: TimelineId,
     device: DeviceId,
     node: NodeId,
     ledger: &KnowledgeLedger,
     newest: int,
 )
     requires
-        t < table.count <= MAX_TIMELINES,
-        table.next_seq[t as int] == 1,
-        table.confirmed_seq[t as int] == 0,
+        t < table.count_spec() <= MAX_TIMELINES,
+        table.next_seq_spec()[t as int] == 1,
+        table.confirmed_seq_spec()[t as int] == 0,
         0 < ring.len() <= u32::MAX,
         0 <= newest < ring.len(),
         forall|j: int|
@@ -112,7 +123,7 @@ pub(super) proof fn lemma_cuda_timeline_init_wf(
 pub(super) proof fn lemma_event_ring_index(
     ring: Seq<EventSlot>,
     table: &TimelineTable,
-    t: u8,
+    t: TimelineId,
     device: DeviceId,
     node: NodeId,
     ledger: &KnowledgeLedger,
@@ -131,7 +142,7 @@ pub(super) proof fn lemma_event_ring_after_record(
     old_ring: Seq<EventSlot>,
     new_ring: Seq<EventSlot>,
     table: &TimelineTable,
-    t: u8,
+    t: TimelineId,
     device: DeviceId,
     node: NodeId,
     ledger: &KnowledgeLedger,
@@ -143,7 +154,7 @@ pub(super) proof fn lemma_event_ring_after_record(
         new_ring.len() == old_ring.len(),
         forall|j: int| 0 <= j < old_ring.len() && j != idx ==> new_ring[j] == old_ring[j],
         new_ring[idx].valid(table, t, device, node, ledger),
-        new_ring[idx].recorded_seq == table.next_seq[t as int] - 1,
+        new_ring[idx].recorded_seq == table.next_seq_spec()[t as int] - 1,
     ensures
         event_ring_valid(new_ring, table, t, device, node, ledger),
         ring_latest_covers(new_ring, idx),
@@ -195,7 +206,7 @@ pub(super) proof fn lemma_stream_wait_preserves_submap(
 pub(super) proof fn lemma_event_ready_observes_prefix(
     slot: &EventSlot,
     table: &TimelineTable,
-    t: u8,
+    t: TimelineId,
     device: DeviceId,
     node: NodeId,
     ledger: &KnowledgeLedger,
@@ -205,33 +216,37 @@ pub(super) proof fn lemma_event_ready_observes_prefix(
     requires
         table.bounds(),
         slot.valid(table, t, device, node, ledger),
-        t < table.count <= MAX_TIMELINES,
+        t < table.count_spec() <= MAX_TIMELINES,
         k.set() == knowledge_of(
             node,
             closure_from(slot.event.infos().map(), slot.event.recorded()),
         ),
-        prefix == if slot.recorded_seq > table.confirmed_seq[t as int] {
+        prefix == if slot.recorded_seq > table.confirmed_seq_spec()[t as int] {
             slot.recorded_seq
         } else {
-            table.confirmed_seq[t as int]
+            table.confirmed_seq_spec()[t as int]
         },
     ensures
-        table.confirmed_seq[t as int] <= prefix < table.next_seq[t as int],
+        table.confirmed_seq_spec()[t as int] <= prefix < table.next_seq_spec()[t as int],
         forall|s: u64|
-            table.confirmed_seq[t as int] < s <= prefix ==> #[trigger] table.observed(t, s, node, k)
-                || table.observed(t, s, node, ledger.knows),
+            table.confirmed_seq_spec()[t as int] < s <= prefix ==> #[trigger] table.observed(
+                t,
+                s,
+                node,
+                k,
+            ) || table.observed(t, s, node, ledger.knows),
 {
     broadcast use vstd::iset::group_iset_lemmas;
 
     assert forall|s: u64|
-        table.confirmed_seq[t as int] < s <= prefix implies #[trigger] table.observed(
+        table.confirmed_seq_spec()[t as int] < s <= prefix implies #[trigger] table.observed(
         t,
         s,
         node,
         k,
     ) by {
         assert(closure_from(slot.event.infos().map(), slot.event.recorded()).contains(
-            table.events@[(t, s)],
+            table.events_spec()@[(t, s)],
         ));
     }
 }
@@ -242,7 +257,7 @@ pub(super) proof fn lemma_event_ring_after_poll(
     newest: int,
     old_table: &TimelineTable,
     new_table: &TimelineTable,
-    t: u8,
+    t: TimelineId,
     device: DeviceId,
     node: NodeId,
     old_ledger: &KnowledgeLedger,
@@ -259,11 +274,11 @@ pub(super) proof fn lemma_event_ring_after_poll(
         new_ring[idx].generation == old_ring[idx].generation,
         new_ring[idx].recorded_seq == old_ring[idx].recorded_seq,
         !new_ring[idx].in_use,
-        new_ring[idx].recorded_seq <= new_table.confirmed_seq[t as int],
-        new_table.count == old_table.count,
-        new_table.next_seq == old_table.next_seq,
-        new_table.events == old_table.events,
-        new_table.confirmed_seq[t as int] >= old_table.confirmed_seq[t as int],
+        new_ring[idx].recorded_seq <= new_table.confirmed_seq_spec()[t as int],
+        new_table.count_spec() == old_table.count_spec(),
+        new_table.next_seq_spec() == old_table.next_seq_spec(),
+        new_table.events_spec() == old_table.events_spec(),
+        new_table.confirmed_seq_spec()[t as int] >= old_table.confirmed_seq_spec()[t as int],
         new_ledger.submitted == old_ledger.submitted,
     ensures
         event_ring_valid(new_ring, new_table, t, device, node, new_ledger),
@@ -287,7 +302,7 @@ pub(super) proof fn lemma_cuda_extends_refl(core: &CacheCore)
         core.well_formed(),
     ensures
         core.kernel_view().extends(core.kernel_view()),
-        core.ledger@.knows.set().subset_of(core.ledger@.knows.set()),
+        core.ledger_spec()@.knows.set().subset_of(core.ledger_spec()@.knows.set()),
 {
     broadcast use {vstd::imap::group_imap_lemmas, vstd::iset::group_iset_lemmas};
 
@@ -329,25 +344,31 @@ pub(super) proof fn lemma_cuda_memcpy_admitted(
         stream.well_formed(),
         stream.source().id() == core.instance_id(),
         stream.source().node() == core.node(),
-        stream.infos().map().submap_of(core.ledger@.submitted.map()),
+        stream.infos().map().submap_of(core.ledger_spec()@.submitted.map()),
         stream.tail().subset_of(stream.infos().dom()),
         read_admitted(
             src_perm.frontier(),
-            closure_from(core.ledger@.submitted.map(), stream.tail().union(core.citations())),
+            closure_from(
+                core.ledger_spec()@.submitted.map(),
+                stream.tail().union(core.citations()),
+            ),
         ),
         write_admitted(
             slot_frontier(dst_tok),
-            closure_from(core.ledger@.submitted.map(), stream.tail().union(core.citations())),
+            closure_from(
+                core.ledger_spec()@.submitted.map(),
+                stream.tail().union(core.citations()),
+            ),
         ),
     ensures
-        stream.infos().map().union_prefer_right(core.ledger@.submitted.map())
-            == core.ledger@.submitted.map(),
+        stream.infos().map().union_prefer_right(core.ledger_spec()@.submitted.map())
+            == core.ledger_spec()@.submitted.map(),
         cuda::copy_admitted(
             stream,
             src_perm,
             dst_tok,
-            core.ledger@.submitted,
-            core.ledger@.knows,
+            core.ledger_spec()@.submitted,
+            core.ledger_spec()@.knows,
             core.citations(),
         ),
 {
@@ -357,18 +378,18 @@ pub(super) proof fn lemma_cuda_memcpy_admitted(
     broadcast use {vstd::imap::group_imap_lemmas, vstd::iset::group_iset_lemmas};
 
     lemma_core_wf_facts(core);
-    let merged = stream.infos().map().union_prefer_right(core.ledger@.submitted.map());
-    assert(merged =~= core.ledger@.submitted.map()) by {
+    let merged = stream.infos().map().union_prefer_right(core.ledger_spec()@.submitted.map());
+    assert(merged =~= core.ledger_spec()@.submitted.map()) by {
         assert forall|k: TransferEvent| #[trigger]
-            merged.dom().contains(k) implies core.ledger@.submitted.dom().contains(k) && merged[k]
-            == core.ledger@.submitted.map()[k] by {
-            if !core.ledger@.submitted.dom().contains(k) {
+            merged.dom().contains(k) implies core.ledger_spec()@.submitted.dom().contains(k)
+            && merged[k] == core.ledger_spec()@.submitted.map()[k] by {
+            if !core.ledger_spec()@.submitted.dom().contains(k) {
                 assert(stream.infos().dom().contains(k));
             }
         }
     }
-    assert(core.citations().subset_of(core.ledger@.submitted.dom()));
-    assert(knowledge_of(core.node(), core.citations()).subset_of(core.ledger@.knows.set()));
+    assert(core.citations().subset_of(core.ledger_spec()@.submitted.dom()));
+    assert(knowledge_of(core.node(), core.citations()).subset_of(core.ledger_spec()@.knows.set()));
 }
 
 pub(super) proof fn lemma_cuda_memcpy_receipt_wf(
@@ -385,28 +406,30 @@ pub(super) proof fn lemma_cuda_memcpy_receipt_wf(
         before_stream.well_formed(),
         before_stream.source().id() == before_core.instance_id(),
         before_stream.source().node() == before_core.node(),
-        before_stream.infos().map().submap_of(before_core.ledger@.submitted.map()),
+        before_stream.infos().map().submap_of(before_core.ledger_spec()@.submitted.map()),
         before_stream.tail().subset_of(before_stream.infos().dom()),
-        source_fresh_for_ledger(before_stream.source(), before_core.ledger@),
+        source_fresh_for_ledger(before_stream.source(), before_core.ledger_spec()@),
         ev == before_stream.source().next_event(),
         receipt.key() == ev,
         receipt.instance_id() == before_core.instance_id(),
         receipt.value().access == copy_access(src_slot, dst_slot),
         receipt.value().preds == closure_from(
-            before_stream.infos().map().union_prefer_right(before_core.ledger@.submitted.map()),
+            before_stream.infos().map().union_prefer_right(
+                before_core.ledger_spec()@.submitted.map(),
+            ),
             before_stream.tail().union(before_core.citations()),
         ),
         before_core.disjoint_from_published(ISet::empty().insert(dst_slot.loc)),
         after_stream.tail() == ISet::empty().insert(ev),
         after_stream.infos().map() == IMap::empty().insert(ev, receipt.value()),
     ensures
-        !before_core.ledger@.submitted.dom().contains(ev),
+        !before_core.ledger_spec()@.submitted.dom().contains(ev),
         receipt.key().observer == before_core.node(),
         receipt.value().preds == closure_from(
-            before_core.ledger@.submitted.map(),
+            before_core.ledger_spec()@.submitted.map(),
             before_stream.tail().union(before_core.citations()),
         ),
-        receipt.value().preds.subset_of(before_core.ledger@.submitted.dom()),
+        receipt.value().preds.subset_of(before_core.ledger_spec()@.submitted.dom()),
         before_core.disjoint_from_published(receipt.value().access.writes),
 {
     hide(CacheCore::well_formed);
@@ -414,24 +437,24 @@ pub(super) proof fn lemma_cuda_memcpy_receipt_wf(
     broadcast use {vstd::imap::group_imap_lemmas, vstd::iset::group_iset_lemmas};
 
     lemma_core_wf_facts(before_core);
-    lemma_fresh_source_event_absent(before_stream.source(), before_core.ledger@);
+    lemma_fresh_source_event_absent(before_stream.source(), before_core.ledger_spec()@);
     let merged = before_stream.infos().map().union_prefer_right(
-        before_core.ledger@.submitted.map(),
+        before_core.ledger_spec()@.submitted.map(),
     );
-    assert(merged =~= before_core.ledger@.submitted.map());
+    assert(merged =~= before_core.ledger_spec()@.submitted.map());
     let waits = before_stream.tail().union(before_core.citations());
-    assert(waits.subset_of(before_core.ledger@.submitted.dom()));
+    assert(waits.subset_of(before_core.ledger_spec()@.submitted.dom()));
     assert forall|e: TransferEvent| #[trigger]
-        receipt.value().preds.contains(e) implies before_core.ledger@.submitted.dom().contains(
-        e,
-    ) by {
+        receipt.value().preds.contains(
+            e,
+        ) implies before_core.ledger_spec()@.submitted.dom().contains(e) by {
         if !waits.contains(e) {
             let s = choose|s: TransferEvent|
                 waits.contains(s)
-                    && #[trigger] before_core.ledger@.submitted.map()[s].preds.contains(e);
-            assert(before_core.ledger@.submitted.dom().contains(s));
-            assert(before_core.ledger@.submitted.map()[s].preds.subset_of(
-                before_core.ledger@.submitted.dom(),
+                    && #[trigger] before_core.ledger_spec()@.submitted.map()[s].preds.contains(e);
+            assert(before_core.ledger_spec()@.submitted.dom().contains(s));
+            assert(before_core.ledger_spec()@.submitted.map()[s].preds.subset_of(
+                before_core.ledger_spec()@.submitted.dom(),
             ));
         }
     }
@@ -444,7 +467,7 @@ pub(super) proof fn lemma_cuda_timeline_after_memcpy(
     ring: Seq<EventSlot>,
     before_core: &CacheCore,
     after_core: &CacheCore,
-    t: u8,
+    t: TimelineId,
     device: DeviceId,
     ev: TransferEvent,
     receipt: Submitted,
@@ -459,67 +482,71 @@ pub(super) proof fn lemma_cuda_timeline_after_memcpy(
         after_stream.source().node() == before_stream.source().node(),
         after_stream.source().id() == before_core.instance_id(),
         after_stream.source().next_seq() == before_stream.source().next_seq() + 1,
-        source_fresh_for_ledger(before_stream.source(), before_core.ledger@),
+        source_fresh_for_ledger(before_stream.source(), before_core.ledger_spec()@),
         before_stream.source().node() == before_core.node(),
-        before_stream.infos().map().submap_of(before_core.ledger@.submitted.map()),
+        before_stream.infos().map().submap_of(before_core.ledger_spec()@.submitted.map()),
         before_stream.tail().subset_of(before_stream.infos().dom()),
-        before_core.timelines.prefix_in(
+        t < before_core.timelines_spec().count_spec() <= MAX_TIMELINES,
+        before_core.timelines_spec().prefix_in(
             t,
-            (before_core.timelines.next_seq[t as int] - 1) as u64,
+            (before_core.timelines_spec().next_seq_spec()[t as int] - 1) as u64,
             closure_from(before_stream.infos().map(), before_stream.tail()),
         ),
         event_ring_valid(
             ring,
-            &before_core.timelines,
+            &before_core.timelines_spec(),
             t,
             device,
             before_core.node(),
-            &before_core.ledger@,
+            &before_core.ledger_spec()@,
         ),
-        t < before_core.timelines.count <= MAX_TIMELINES,
-        before_core.timelines.next_seq[t as int] <= MAX_TICKET_SEQ,
+        before_core.timelines_spec().next_seq_spec()[t as int] <= MAX_TICKET_SEQ,
         ev == before_stream.source().next_event(),
         receipt.key() == ev,
         receipt.value().preds == closure_from(
-            before_core.ledger@.submitted.map(),
+            before_core.ledger_spec()@.submitted.map(),
             before_stream.tail().union(before_core.citations()),
         ),
         after_stream.tail() == ISet::empty().insert(ev),
         after_stream.infos().map() == IMap::empty().insert(ev, receipt.value()),
-        after_core.node_id == before_core.node_id,
-        after_core.timelines.count == before_core.timelines.count,
-        after_core.timelines.kinds == before_core.timelines.kinds,
-        after_core.timelines.confirmed_seq == before_core.timelines.confirmed_seq,
-        after_core.timelines.next_seq@ == before_core.timelines.next_seq@.update(
+        after_core.node_id_spec() == before_core.node_id_spec(),
+        after_core.timelines_spec().count_spec() == before_core.timelines_spec().count_spec(),
+        after_core.timelines_spec().kinds_spec() == before_core.timelines_spec().kinds_spec(),
+        after_core.timelines_spec().confirmed_seq_spec()
+            == before_core.timelines_spec().confirmed_seq_spec(),
+        after_core.timelines_spec().next_seq_spec()@
+            == before_core.timelines_spec().next_seq_spec()@.update(
             t as int,
-            (before_core.timelines.next_seq[t as int] + 1) as u64,
+            (before_core.timelines_spec().next_seq_spec()[t as int] + 1) as u64,
         ),
-        after_core.timelines.events@ == before_core.timelines.events@.insert(
-            (t, before_core.timelines.next_seq[t as int]),
+        after_core.timelines_spec().events_spec()@
+            == before_core.timelines_spec().events_spec()@.insert(
+            (t, before_core.timelines_spec().next_seq_spec()[t as int]),
             ev,
         ),
-        after_core.ledger@.submitted.instance_id() == before_core.ledger@.submitted.instance_id(),
-        after_core.ledger@.submitted.map() == before_core.ledger@.submitted.map().insert(
-            ev,
-            receipt.value(),
+        after_core.ledger_spec()@.submitted.instance_id()
+            == before_core.ledger_spec()@.submitted.instance_id(),
+        after_core.ledger_spec()@.submitted.map()
+            == before_core.ledger_spec()@.submitted.map().insert(ev, receipt.value()),
+        before_core.ledger_spec()@.submitted.map().submap_of(
+            after_core.ledger_spec()@.submitted.map(),
         ),
-        before_core.ledger@.submitted.map().submap_of(after_core.ledger@.submitted.map()),
     ensures
-        source_fresh_for_ledger(after_stream.source(), after_core.ledger@),
-        after_stream.infos().map().submap_of(after_core.ledger@.submitted.map()),
+        source_fresh_for_ledger(after_stream.source(), after_core.ledger_spec()@),
+        after_stream.infos().map().submap_of(after_core.ledger_spec()@.submitted.map()),
         after_stream.tail().subset_of(after_stream.infos().dom()),
-        after_core.timelines.prefix_in(
+        after_core.timelines_spec().prefix_in(
             t,
-            (after_core.timelines.next_seq[t as int] - 1) as u64,
+            (after_core.timelines_spec().next_seq_spec()[t as int] - 1) as u64,
             closure_from(after_stream.infos().map(), after_stream.tail()),
         ),
         event_ring_valid(
             ring,
-            &after_core.timelines,
+            &after_core.timelines_spec(),
             t,
             device,
             after_core.node(),
-            &after_core.ledger@,
+            &after_core.ledger_spec()@,
         ),
 {
     hide(CacheCore::well_formed);
@@ -531,11 +558,13 @@ pub(super) proof fn lemma_cuda_timeline_after_memcpy(
         vstd::iset::group_iset_lemmas,
     };
 
+    lemma_core_wf_facts(before_core);
+    lemma_core_wf_facts(after_core);
     lemma_source_fresh_stepped(
         before_stream.source(),
         after_stream.source(),
-        before_core.ledger@,
-        after_core.ledger@,
+        before_core.ledger_spec()@,
+        after_core.ledger_spec()@,
         ev,
     );
     let old_closure = closure_from(before_stream.infos().map(), before_stream.tail());
@@ -544,15 +573,15 @@ pub(super) proof fn lemma_cuda_timeline_after_memcpy(
         assert forall|s: TransferEvent|
             before_stream.tail().contains(
                 s,
-            ) implies #[trigger] before_core.ledger@.submitted.map()[s]
+            ) implies #[trigger] before_core.ledger_spec()@.submitted.map()[s]
             == before_stream.infos().map()[s] by {
             assert(before_stream.infos().map().dom().contains(s));
-            assert(before_core.ledger@.submitted.map().dom().contains(s));
+            assert(before_core.ledger_spec()@.submitted.map().dom().contains(s));
         }
         crate::provenance::closure_monotonic(
             before_stream.infos().map(),
             before_stream.tail(),
-            before_core.ledger@.submitted.map(),
+            before_core.ledger_spec()@.submitted.map(),
             before_stream.tail().union(before_core.citations()),
         );
     }
@@ -560,50 +589,53 @@ pub(super) proof fn lemma_cuda_timeline_after_memcpy(
         assert(after_stream.tail().contains(ev));
         assert(after_stream.infos().map()[ev] == receipt.value());
     }
-    let s_new = before_core.timelines.next_seq[t as int];
+    let s_new = before_core.timelines_spec().next_seq_spec()[t as int];
+    assert(after_core.timelines_spec().next_seq_spec()[t as int] == s_new + 1);
     assert forall|q: u64| 1 <= q <= s_new implies #[trigger] new_closure.contains(
-        after_core.timelines.events@[(t, q)],
+        after_core.timelines_spec().events_spec()@[(t, q)],
     ) by {
         if q == s_new {
-            assert(after_core.timelines.events@[(t, q)] == ev);
+            assert(after_core.timelines_spec().events_spec()@[(t, q)] == ev);
             assert(after_stream.tail().contains(ev));
         } else {
             assert(q <= s_new - 1);
-            assert(after_core.timelines.events@[(t, q)] == before_core.timelines.events@[(t, q)]);
-            assert(old_closure.contains(before_core.timelines.events@[(t, q)]));
+            assert(after_core.timelines_spec().events_spec()@[(t, q)]
+                == before_core.timelines_spec().events_spec()@[(t, q)]);
+            assert(old_closure.contains(before_core.timelines_spec().events_spec()@[(t, q)]));
         }
     }
     reveal(event_ring_valid);
     assert forall|j: int| 0 <= j < ring.len() implies #[trigger] ring[j].valid(
-        &after_core.timelines,
+        &after_core.timelines_spec(),
         t,
         device,
         after_core.node(),
-        &after_core.ledger@,
+        &after_core.ledger_spec()@,
     ) by {
         assert(ring[j].valid(
-            &before_core.timelines,
+            &before_core.timelines_spec(),
             t,
             device,
             before_core.node(),
-            &before_core.ledger@,
+            &before_core.ledger_spec()@,
         ));
         vstd::imap_lib::lemma_submap_of_trans(
             ring[j].event.infos().map(),
-            before_core.ledger@.submitted.map(),
-            after_core.ledger@.submitted.map(),
+            before_core.ledger_spec()@.submitted.map(),
+            after_core.ledger_spec()@.submitted.map(),
         );
         assert forall|q: u64| 1 <= q <= ring[j].recorded_seq implies closure_from(
             ring[j].event.infos().map(),
             ring[j].event.recorded(),
-        ).contains(#[trigger] after_core.timelines.events@[(t, q)]) by {
+        ).contains(#[trigger] after_core.timelines_spec().events_spec()@[(t, q)]) by {
             assert(q < s_new);
-            assert(after_core.timelines.events@[(t, q)] == before_core.timelines.events@[(t, q)]);
+            assert(after_core.timelines_spec().events_spec()@[(t, q)]
+                == before_core.timelines_spec().events_spec()@[(t, q)]);
             assert(closure_from(ring[j].event.infos().map(), ring[j].event.recorded()).contains(
-                before_core.timelines.events@[(t, q)],
+                before_core.timelines_spec().events_spec()@[(t, q)],
             ));
         }
-        assert(after_core.timelines.prefix_in(
+        assert(after_core.timelines_spec().prefix_in(
             t,
             ring[j].recorded_seq,
             closure_from(ring[j].event.infos().map(), ring[j].event.recorded()),

@@ -1,4 +1,5 @@
 use super::*;
+use crate::memory::{HostDmaSlice, HostSlice};
 
 verus! {
 
@@ -164,7 +165,7 @@ impl IoUring {
     }
 
     pub closed spec fn well_formed(&self) -> bool {
-        &&& self.source@.well_formed() && self.source@.source() is IoUring
+        &&& self.source@.well_formed() && self.source@.source().is_io_uring()
         &&& self.pending_submitted@.instance_id() == self.instance_id()
         &&& 0 < self.sq_capacity <= self.max_in_flight <= u32::MAX
         &&& self.staged_count == self.staged().len() && self.pending_count == self.pending().len()
@@ -199,7 +200,7 @@ impl IoUring {
     >)
         requires
             source.well_formed(),
-            source.source() is IoUring,
+            source.source().is_io_uring(),
             entries > 0,
         ensures
             match r {
@@ -234,7 +235,7 @@ impl IoUring {
         ensures
             s@ == self.source(),
             s@.well_formed(),
-            s@.source() is IoUring,
+            s@.source().is_io_uring(),
     {
         ffi::destroy(self.raw);
         self.source
@@ -265,7 +266,7 @@ impl IoUring {
         &&& knows.instance_id() == self.instance_id()
         &&& cited.subset_of(infos.dom())
         &&& knowledge_of(self.node(), cited).subset_of(knows.set())
-        &&& src_perm.valid_local(self.instance_id(), src.loc)
+        &&& src_perm.valid_cooperative(self.instance_id(), src.loc)
         &&& slot_is_owned(dst_tok, self.instance_id(), dst.loc)
         &&& read_admitted(src_perm.frontier(), ordered)
         &&& write_admitted(slot_frontier(dst_tok), ordered)
@@ -488,7 +489,7 @@ impl IoUring {
                 result,
             ),
     {
-        let (ptr, len) = host.raw_parts();
+        let (ptr, len) = host.dma_raw_parts();
         let ghost (src, dst) = Self::endpoints(host.slot_ref(), file.slot_ref(), write);
         if let Err(e) = ffi::stage(self, file, ptr, len as u32, user_data, write) {
             return Err(e);
@@ -576,11 +577,16 @@ impl IoUring {
         if self.pending_count == self.staged_count {
             return None;
         }
-        let (id, len, res) = ffi::poll(self)?;
+        let (id, len, res, Tracked(evidence)) = ffi::poll(self)?;
         let ghost io = self.pending()[id];
         let ghost ev = io.event;
         let ghost one = ISet::empty().insert(ev);
-        let tracked knows = instance.observe(self.node(), one, self.pending_submitted.borrow());
+        let tracked knows = instance.observe_completed(
+            self.node(),
+            one,
+            self.pending_submitted.borrow(),
+            &evidence,
+        );
         proof {
             assert forall|e: TransferEvent| #[trigger] io.preds.contains(e) implies closure_from(
                 self.pending_submitted@.map(),
@@ -601,7 +607,7 @@ impl IoUring {
                     event: Ghost(ev),
                     submitted: Tracked(submitted),
                     knows: Tracked(knows),
-                    succeeded: Tracked(Succeeded::mint(instance.id(), ev)),
+                    succeeded: Tracked(evidence.success(instance.id(), ev)),
                 },
             )
         } else {

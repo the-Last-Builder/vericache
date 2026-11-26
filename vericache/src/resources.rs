@@ -1,42 +1,40 @@
-//! Zero-`unsafe` two-step storage lifecycle (`NodeStorage` -> `AttachedStorage` -> `VeriCache`)
-//! and ergonomic GPU buffer/stream wrappers (`GpuSlot`, `GpuStream`) hiding all Verus
-//! `Tracked`/`Ghost` tokens from callers.
+//! Storage initialization from `NodeStorage` through `AttachedStorage` to `VeriCache`.
 
+use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 #[cfg_attr(not(verus_only), allow(unused_imports))]
 use transfer::context::{
     AllocSource, EventSourceAllocator, EventSourceKind, EventSourceToken, NodeContext,
-    ShardAllocator, ShardSources, ShareSource, SlotToken, TransferInstance, VersionInstance,
+    ShardAllocator, ShardSources, ShareSource, TransferInstance, VersionInstance,
     VersionSource,
 };
-use transfer::cuda::{self, CudaBuffer, CudaHostBuffer, CudaStream};
 use transfer::domain::DeviceId;
-use transfer::host::{self, HostContext};
+use transfer::host::HostContext;
 use transfer::rdma::{
     AccessFlags, CompletionQueue, DeviceContext, ProtectionDomain, RdmaError,
     UnconnectedQueuePair, alloc_window, connect_rc, dealloc_window,
 };
 use transfer::transport::{ByteTransport, Channel};
-use vericache_core::backends::cuda::CudaBackend;
+use vericache_core::backends::DeviceAttachment;
 use vericache_core::backends::host::HostBackend;
+#[cfg(feature = "nvme")]
 use vericache_core::backends::nvme::NvmeBackend;
 use vericache_core::backends::rdma::RdmaBackend;
 use vericache_core::backends::rdma::peer::PeerSession;
 use vericache_core::backends::rdma::protocol::VeriCacheAttachment;
-use vericache_core::engine::{CudaAttachment, DistributedEngine};
+use vericache_core::catalog::Catalog;
+use vericache_core::engine::DistributedEngine;
 use vericache_core::kernel::CacheCore;
-use vericache_core::provenance::ValueCertificate;
-#[cfg(verus_only)]
-use vericache_core::provenance::ValueProof;
-use vericache_core::spec::CoreError;
-use vericache_core::timeline::TimelineKind;
 #[cfg_attr(not(verus_only), allow(unused_imports))]
 use vstd::prelude::{Ghost, Tracked, verus};
 
-use crate::CacheError;
 use crate::cache::VeriCache;
+#[cfg(feature = "cuda")]
+pub use crate::cuda_runtime::{CudaRuntime, GpuSlot, GpuStream};
+use crate::device::DeviceRuntime;
 use crate::policy::{EvictionPolicy, PeerMeta, PeerRoutingPolicy, PolicySet, TieringPolicy};
+use crate::{CacheError, DefaultDeviceRuntime};
 
 /// Default per-shard version sequence budget (`2^40` versions per shard).
 pub const DEFAULT_SHARD_VERSION_QUOTA: u64 = 1u64 << 40;
@@ -66,13 +64,12 @@ fn take_shard_sources(node_id: u64, version_quota: u64) -> Result<ShardSources, 
 
 verus! {
 
-/// Per-instance linear capability bundle carved from the process `ShardAllocator`
-/// with zero `assume_new`.
+/// Per-shard capabilities used to initialize backends and allocate caller resources.
 #[cfg_attr(not(verus_only), allow(dead_code))]
-pub(crate) struct ShardCaps {
+pub struct ShardCaps {
     pub(crate) node: u64,
-    pub(crate) instance: Tracked<TransferInstance>,
-    pub(crate) alloc: Tracked<AllocSource>,
+    pub instance: Tracked<TransferInstance>,
+    pub alloc: Tracked<AllocSource>,
     pub(crate) events: Tracked<EventSourceAllocator>,
     pub(crate) shares: Tracked<ShareSource>,
     pub(crate) version_instance: Tracked<VersionInstance>,
@@ -97,20 +94,22 @@ impl ShardCaps {
         })
     }
 
-    pub(crate) fn mint_host(&mut self) -> Tracked<EventSourceToken> {
-        Tracked(self.events.borrow_mut().mint(EventSourceKind::Host))
+    /// Mint an event source for this shard's runtime or driver.
+    pub fn mint_event(&mut self, Ghost(kind): Ghost<EventSourceKind>) -> Tracked<EventSourceToken> {
+        Tracked(self.events.borrow_mut().mint(kind))
     }
 
-    pub(crate) fn mint_cuda(&mut self) -> Tracked<EventSourceToken> {
-        Tracked(self.events.borrow_mut().mint(EventSourceKind::CudaStream))
+    pub fn mint_host(&mut self) -> Tracked<EventSourceToken> {
+        self.mint_event(Ghost(EventSourceKind::host()))
     }
 
+    #[cfg(feature = "nvme")]
     pub(crate) fn mint_nvme(&mut self) -> Tracked<EventSourceToken> {
-        Tracked(self.events.borrow_mut().mint(EventSourceKind::IoUring))
+        Tracked(self.events.borrow_mut().mint(EventSourceKind::io_uring()))
     }
 
     pub(crate) fn mint_rdma(&mut self) -> Tracked<EventSourceToken> {
-        Tracked(self.events.borrow_mut().mint(EventSourceKind::RdmaQueuePair))
+        Tracked(self.events.borrow_mut().mint(EventSourceKind::rdma_qp()))
     }
 
     pub(crate) fn make_versioned_core(
@@ -130,81 +129,11 @@ impl ShardCaps {
             max_leases,
             self.version_start,
             self.version_limit,
-            catalog_buckets.max(vericache_core::catalog::DEFAULT_BUCKETS),
+            catalog_buckets,
             Tracked(self.instance.borrow()),
             Tracked(self.version_instance.borrow()),
             ver_src,
         ))
-    }
-}
-
-/// Caller-owned GPU buffer slot managed by `VeriCache`, hiding `SlotToken` and
-/// `ValueCertificate` provenance from ergonomic callers.
-#[cfg_attr(not(verus_only), allow(dead_code))]
-pub struct GpuSlot {
-    pub(crate) buffer: CudaBuffer,
-    pub(crate) token: Tracked<SlotToken>,
-    pub(crate) cert: Option<Ghost<ValueCertificate>>,
-    pub(crate) frame_size: usize,
-    pub(crate) device_id: DeviceId,
-}
-
-impl GpuSlot {
-    pub fn len(&self) -> usize {
-        self.frame_size
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.frame_size == 0
-    }
-
-    pub fn device_id(&self) -> DeviceId {
-        self.device_id
-    }
-
-    /// Raw CUDA device address of this slot (for external CUDA interop such as
-    /// PyTorch/vLLM `cudaMemcpyAsync` into/out of a managed `GpuSlot`).
-    pub fn device_addr(&self) -> usize {
-        self.buffer.slot_slice(0).device_addr()
-    }
-}
-
-verus! {
-
-/// Record external GPU-producer provenance for a `GpuSlot` populated via an
-/// external CUDA stream (e.g., PyTorch/vLLM tensor D2D copy into `slot.device_addr()`).
-#[cfg_attr(not(verus_only), allow(unused_variables))]
-pub(crate) fn mark_gpu_slot_external_write(slot: &mut GpuSlot) {
-    let slice = slot.buffer.slot_slice(0);
-    let ghost cert = ValueCertificate {
-        slot: slice.slot_ref(),
-        writer: transfer::domain::TransferEvent {
-            source: transfer::domain::EventSource::Host { id: 0 },
-            observer: 0,
-            seq: 0,
-        },
-        bytes: vstd::prelude::Seq::empty(),
-        proof: ValueProof::HostWrite,
-    };
-    slot.cert = Some(Ghost(cert));
-}
-
-} // verus!
-
-/// Caller-owned CUDA stream paired with its registered `CacheCore` timeline id.
-pub struct GpuStream {
-    pub(crate) stream: CudaStream,
-    pub(crate) timeline: u8,
-    pub(crate) device_id: DeviceId,
-}
-
-impl GpuStream {
-    pub fn device_id(&self) -> DeviceId {
-        self.device_id
-    }
-
-    pub fn timeline_id(&self) -> u8 {
-        self.timeline
     }
 }
 
@@ -252,175 +181,6 @@ pub(crate) fn select_type2_rdma_device(
         "no usable Type-2B RDMA device matching {}",
         requested.unwrap_or("any")
     )))
-}
-
-#[cfg_attr(not(verus_only), allow(unused_variables))]
-pub(crate) fn alloc_gpu_slot_internal(
-    caps: &mut ShardCaps,
-    device_id: DeviceId,
-    frame_size: usize,
-) -> Result<GpuSlot, CacheError> {
-    let (buffer, token) = cuda::alloc_device(
-        Tracked(caps.alloc.borrow_mut()),
-        device_id,
-        frame_size,
-    )
-    .map_err(|e| CacheError::Core(CoreError::Backend { kind: 1, code: e.0 }))?;
-    Ok(GpuSlot {
-        buffer,
-        token,
-        cert: None,
-        frame_size,
-        device_id,
-    })
-}
-
-#[cfg_attr(not(verus_only), allow(unused_variables))]
-pub(crate) fn upload_gpu_slot_internal(
-    core: &mut CacheCore,
-    host_tl: u8,
-    caps: &mut ShardCaps,
-    staging: &CudaHostBuffer,
-    staging_tok: &mut Tracked<SlotToken>,
-    staging_ctx: &mut HostContext,
-    stream: &mut GpuStream,
-    slot: &mut GpuSlot,
-    data: &[u8],
-) -> Result<(), CacheError> {
-    if data.len() != slot.frame_size {
-        return Err(CacheError::Core(CoreError::InvalidArgument));
-    }
-    let host_slice = staging.as_host_slice();
-    let Tracked(w_comp) = host::write_slice(
-        staging_ctx,
-        Tracked(caps.instance.borrow()),
-        &host_slice,
-        data,
-        Tracked(staging_tok.borrow_mut()),
-        Tracked(&core.ledger.borrow().submitted),
-        Tracked(&core.ledger.borrow().knows),
-        Ghost(core.citations()),
-    );
-    let ghost w_ev = w_comp.submitted.key();
-    let t_w = core
-        .issue_ticket(host_tl, Tracked(w_comp.submitted))
-        .map_err(CacheError::Core)?;
-    core.mark_timeline_complete(host_tl, t_w.seq(), Tracked(w_comp.knows));
-
-    let src_cuda = staging.as_cuda_slice();
-    let dst_cuda = slot.buffer.slot_slice(0);
-    let tracked mut tmp_tok = SlotToken::empty(caps.instance.borrow().id());
-    proof {
-        vstd::modes::tracked_swap(staging_tok.borrow_mut(), &mut tmp_tok);
-    }
-    let tracked mut src_perm = transfer::context::ReadPerm::Owned(tmp_tok);
-    let copy_res = {
-        let tracked ledger_ref = core.ledger.borrow_mut();
-        cuda::memcpy_async(
-            &mut stream.stream,
-            Tracked(caps.instance.borrow()),
-            &dst_cuda,
-            &src_cuda,
-            Tracked(&mut src_perm),
-            Tracked(slot.token.borrow_mut()),
-            Tracked(&mut ledger_ref.submitted),
-            Tracked(&ledger_ref.knows),
-            Ghost(core.citations()),
-        )
-    };
-    proof {
-        *staging_tok.borrow_mut() = src_perm.into_owned();
-    }
-    let (Ghost(_copy_ev), Tracked(receipt)) =
-        copy_res.map_err(|e| CacheError::Core(CoreError::Backend { kind: 1, code: e.0 }))?;
-    let t_copy = core
-        .issue_ticket(stream.timeline, Tracked(receipt))
-        .map_err(CacheError::Core)?;
-    let knows = cuda::stream_synchronize(&stream.stream, Tracked(caps.instance.borrow()))
-        .map_err(|e| CacheError::Core(CoreError::Backend { kind: 1, code: e.0 }))?;
-    core.mark_timeline_complete(stream.timeline, t_copy.seq(), knows);
-    let ghost slot_cert = ValueCertificate {
-        slot: dst_cuda.slot_ref(),
-        writer: w_ev,
-        bytes: data@,
-        proof: ValueProof::HostWrite,
-    };
-    slot.cert = Some(Ghost(slot_cert));
-    Ok(())
-}
-
-#[cfg_attr(not(verus_only), allow(unused_variables))]
-pub(crate) fn download_gpu_slot_internal(
-    core: &mut CacheCore,
-    host_tl: u8,
-    caps: &mut ShardCaps,
-    staging: &CudaHostBuffer,
-    staging_tok: &mut Tracked<SlotToken>,
-    staging_ctx: &mut HostContext,
-    stream: &mut GpuStream,
-    slot: &mut GpuSlot,
-    dst: &mut [u8],
-) -> Result<(), CacheError> {
-    if dst.len() != slot.frame_size {
-        return Err(CacheError::Core(CoreError::InvalidArgument));
-    }
-    let src_cuda = slot.buffer.slot_slice(0);
-    let dst_cuda = staging.as_cuda_slice();
-    let tracked mut tmp_tok = SlotToken::empty(caps.instance.borrow().id());
-    proof {
-        vstd::modes::tracked_swap(slot.token.borrow_mut(), &mut tmp_tok);
-    }
-    let tracked mut src_perm = transfer::context::ReadPerm::Owned(tmp_tok);
-    let copy_res = {
-        let tracked ledger_ref = core.ledger.borrow_mut();
-        cuda::memcpy_async(
-            &mut stream.stream,
-            Tracked(caps.instance.borrow()),
-            &dst_cuda,
-            &src_cuda,
-            Tracked(&mut src_perm),
-            Tracked(staging_tok.borrow_mut()),
-            Tracked(&mut ledger_ref.submitted),
-            Tracked(&ledger_ref.knows),
-            Ghost(core.citations()),
-        )
-    };
-    proof {
-        *slot.token.borrow_mut() = src_perm.into_owned();
-    }
-    let (_, Tracked(receipt)) =
-        copy_res.map_err(|e| CacheError::Core(CoreError::Backend { kind: 1, code: e.0 }))?;
-    let t_copy = core
-        .issue_ticket(stream.timeline, Tracked(receipt))
-        .map_err(CacheError::Core)?;
-    let knows = cuda::stream_synchronize(&stream.stream, Tracked(caps.instance.borrow()))
-        .map_err(|e| CacheError::Core(CoreError::Backend { kind: 1, code: e.0 }))?;
-    core.mark_timeline_complete(stream.timeline, t_copy.seq(), knows);
-
-    let host_slice = staging.as_host_slice();
-    let tracked mut tmp_stage = SlotToken::empty(caps.instance.borrow().id());
-    proof {
-        vstd::modes::tracked_swap(staging_tok.borrow_mut(), &mut tmp_stage);
-    }
-    let tracked mut stage_perm = transfer::context::ReadPerm::Owned(tmp_stage);
-    let Tracked(r_comp) = host::read_slice(
-        staging_ctx,
-        Tracked(caps.instance.borrow()),
-        &host_slice,
-        dst,
-        Tracked(&mut stage_perm),
-        Tracked(&core.ledger.borrow().submitted),
-        Tracked(&core.ledger.borrow().knows),
-        Ghost(core.citations()),
-    );
-    proof {
-        *staging_tok.borrow_mut() = stage_perm.into_owned();
-    }
-    let t_r = core
-        .issue_ticket(host_tl, Tracked(r_comp.submitted))
-        .map_err(CacheError::Core)?;
-    core.mark_timeline_complete(host_tl, t_r.seq(), Tracked(r_comp.knows));
-    Ok(())
 }
 
 } // verus!
@@ -545,31 +305,38 @@ impl<T: ByteTransport> PeerLink<T> {
 
 /// Step 1 of zero-`unsafe` initialization: owns the base Host DRAM slab and
 /// optional RDMA `DeviceContext`.
-pub struct NodeStorage {
+pub struct NodeStorage<RT: DeviceRuntime = DefaultDeviceRuntime> {
     pub(crate) config: StorageConfig,
     pub(crate) host: Box<HostBackend>,
     pub(crate) rdma_device: Option<DeviceContext>,
     pub(crate) pending_core: Option<Box<CacheCore>>,
     pub(crate) pending_caps: Option<ShardCaps>,
+    runtime: PhantomData<fn() -> RT>,
+}
+
+impl NodeStorage<DefaultDeviceRuntime> {
+    pub fn new(config: StorageConfig) -> Result<Self, CacheError> {
+        Self::new_with_runtime(config)
+    }
 }
 
 verus! {
 
-impl NodeStorage {
-    pub fn new(config: StorageConfig) -> Result<Self, CacheError> {
+impl<RT: DeviceRuntime> NodeStorage<RT> {
+    /// Allocate storage for the selected runtime. Device resources attach in `attach_tiers`.
+    pub fn new_with_runtime(config: StorageConfig) -> Result<Self, CacheError> {
+        #[cfg(not(feature = "nvme"))]
+        if config.nvme.is_some() {
+            return Err(vericache_core::spec::CoreError::UnsupportedTier.into());
+        }
         let mut caps = ShardCaps::take(config.node_id)?;
         let total_frames = (config.dram_frames as usize)
             .saturating_add(config.gpu.as_ref().map_or(0, |g| g.hbm_frames as usize))
             .saturating_add(config.nvme.as_ref().map_or(0, |n| n.nvme_frames as usize));
-        let catalog_buckets = total_frames
-            .checked_next_power_of_two()
-            .unwrap_or(usize::MAX)
-            .max(vericache_core::catalog::DEFAULT_BUCKETS)
-            .min(4 * 1024 * 1024);
         let mut core = Box::new(caps.make_versioned_core(
             config.frame_size,
             config.max_leases,
-            catalog_buckets,
+            Catalog::recommended_buckets(total_frames),
         )?);
         let host = Box::new(
             HostBackend::new(
@@ -595,6 +362,7 @@ impl NodeStorage {
             rdma_device,
             pending_core: Some(core),
             pending_caps: Some(caps),
+            runtime: PhantomData,
         })
     }
 
@@ -606,9 +374,8 @@ impl NodeStorage {
         self.config.frame_size
     }
 
-    /// Step 2 of zero-`unsafe` initialization: attach optional CUDA (pinning the
-    /// Host DRAM slab for 1-hop DMA) and RDMA `ProtectionDomain`.
-    pub fn attach_tiers(&mut self) -> Result<AttachedStorage<'_>, CacheError> {
+    /// Attach the optional device tier, pinned Host DRAM, and RDMA protection domain.
+    pub fn attach_tiers(&mut self) -> Result<AttachedStorage<'_, RT>, CacheError> {
         let mut core = self
             .pending_core
             .take()
@@ -618,26 +385,13 @@ impl NodeStorage {
             .take()
             .ok_or_else(|| CacheError::Init("NodeStorage::attach_tiers already called".into()))?;
 
-        let cuda = match &self.config.gpu {
+        let device = match &self.config.gpu {
             Some(gcfg) => {
-                let mut cb = Box::new(
-                    CudaBackend::new(
-                        &mut core,
-                        Tracked(caps.instance.borrow()),
-                        Tracked(caps.alloc.borrow_mut()),
-                        caps.mint_cuda(),
-                        gcfg.device_id,
-                        gcfg.hbm_frames,
-                        gcfg.event_ring_size,
-                        gcfg.pin_host_dram,
-                    )
-                    .map_err(CacheError::Core)?,
-                );
+                let mut backend = Box::new(RT::new_backend(&mut core, &mut caps, gcfg)?);
                 if gcfg.pin_host_dram {
-                    cb.attach_pinned_host(&core, &self.host)
-                        .map_err(CacheError::Core)?;
+                    RT::attach_pinned_host(&mut backend, &core, &self.host)?;
                 }
-                Some(cb)
+                Some(backend)
             }
             None => None,
         };
@@ -653,7 +407,7 @@ impl NodeStorage {
         Ok(AttachedStorage {
             config: self.config.clone(),
             host: &self.host,
-            cuda,
+            device,
             rdma_device: self.rdma_device.as_ref(),
             pd,
             pending_core: Some(core),
@@ -662,29 +416,28 @@ impl NodeStorage {
     }
 }
 
-/// Step 2 of zero-`unsafe` initialization: borrows `&'s HostBackend` / `&'s DeviceContext`
-/// and owns optional `CudaBackend<'s>` and `ProtectionDomain<'s>`.
-pub struct AttachedStorage<'s> {
+/// Borrows node storage and owns the optional device backend and RDMA protection domain.
+pub struct AttachedStorage<'s, RT: DeviceRuntime = DefaultDeviceRuntime> {
     pub(crate) config: StorageConfig,
     pub(crate) host: &'s HostBackend,
-    pub(crate) cuda: Option<Box<CudaBackend<'s>>>,
+    pub(crate) device: Option<Box<RT::Backend<'s>>>,
     pub(crate) rdma_device: Option<&'s DeviceContext>,
     pub(crate) pd: Option<ProtectionDomain<'s>>,
     pub(crate) pending_core: Option<Box<CacheCore>>,
     pub(crate) pending_caps: Option<ShardCaps>,
 }
 
-impl<'s> AttachedStorage<'s> {
+impl<'s, RT: DeviceRuntime> AttachedStorage<'s, RT> {
     /// Step 3: connect optional NVMe and `0..N` RDMA/GDR peers and open a
     /// location-transparent [`VeriCache`] handle governed by `policy`.
     pub fn open_cache<'a, T, E, P, R>(
         &'a mut self,
         peers: Vec<PeerLink<T>>,
         policy: PolicySet<E, P, R>,
-    ) -> Result<VeriCache<'a, T, E, P, R>, CacheError>
+    ) -> Result<VeriCache<'a, T, E, P, R, RT>, CacheError>
     where
         's: 'a,
-        T: ByteTransport + 'static,
+        T: ByteTransport,
         E: EvictionPolicy,
         P: TieringPolicy,
         R: PeerRoutingPolicy,
@@ -698,6 +451,7 @@ impl<'s> AttachedStorage<'s> {
             .take()
             .ok_or_else(|| CacheError::Init("AttachedStorage::open_cache already called".into()))?;
 
+        #[cfg(feature = "nvme")]
         let nvme = match &self.config.nvme {
             Some(ncfg) => {
                 let dir_str = ncfg
@@ -707,7 +461,7 @@ impl<'s> AttachedStorage<'s> {
                 Some(
                     NvmeBackend::new(
                         &mut core,
-                        &self.host.ctx,
+                        self.host.context(),
                         Tracked(caps.instance.borrow()),
                         Tracked(caps.alloc.borrow_mut()),
                         caps.mint_nvme(),
@@ -720,10 +474,12 @@ impl<'s> AttachedStorage<'s> {
             }
             None => None,
         };
+        #[cfg(not(feature = "nvme"))]
+        let nvme = None;
 
+        let device = self.device.as_deref().map(RT::borrow_backend);
         let mut peer_sessions = Vec::with_capacity(peers.len());
         let mut peer_metas = Vec::with_capacity(peers.len());
-        let mut peer_recv_paused = Vec::with_capacity(peers.len());
         if !peers.is_empty() {
             let rcfg = self.config.rdma.as_ref().ok_or_else(|| {
                 CacheError::Init("peers supplied without RdmaConfig in StorageConfig".into())
@@ -737,10 +493,6 @@ impl<'s> AttachedStorage<'s> {
                 .ok_or_else(|| CacheError::Init("RDMA ProtectionDomain not initialized".into()))?;
 
             for (idx, link) in peers.into_iter().enumerate() {
-                let pause_handle = (&link.transport as &dyn std::any::Any)
-                    .downcast_ref::<crate::transport::TcpTransport>()
-                    .map(|t| t.recv_pause_handle());
-                peer_recv_paused.push(pause_handle);
                 let cq = CompletionQueue::new(dev, rcfg.cq_depth as i32, caps.mint_rdma())
                     .map_err(|e| CacheError::Init(format!("CompletionQueue::new failed: {e:?}")))?;
                 let psn = link
@@ -790,27 +542,16 @@ impl<'s> AttachedStorage<'s> {
                 rdma.register_host_slab(
                     &core,
                     pd,
-                    &self.host.buffer,
-                    self.host.tier,
-                    self.host.first_frame,
-                    self.host.num_frames,
+                    self.host.buffer(),
+                    self.host.tier_id(),
+                    self.host.first_frame(),
+                    self.host.num_frames(),
                     flags,
                 )
                 .map_err(CacheError::Core)?;
 
-                let mut supports_gdr = false;
-                if let Some(ref c) = self.cuda {
-                    rdma.register_gpu_slab(
-                        &core,
-                        pd,
-                        &c.gpu_buffer,
-                        c.gpu_tier,
-                        c.gpu_first_frame,
-                        c.gpu_num_frames,
-                        flags,
-                    )
-                    .map_err(CacheError::Core)?;
-                    supports_gdr = true;
+                if let Some(backend) = device {
+                    RT::register_device_slab(backend, &mut rdma, &core, pd, flags)?;
                 }
 
                 let session = PeerSession::new(rdma, channel, &core);
@@ -818,50 +559,31 @@ impl<'s> AttachedStorage<'s> {
                 peer_metas.push(PeerMeta {
                     index: idx,
                     node_id: link.peer_node_id,
-                    supports_gdr,
+                    supports_gdr: device.is_some(),
                     supports_host_rdma: true,
                 });
             }
         }
 
-        // Internal CUDA stream + staging buffer when GPU is enabled, so HBM<->DRAM
-        // transparent hops and GpuSlot upload/download require zero extra user setup.
-        let (internal_gpu_stream, gpu_staging) = match &self.cuda {
-            Some(c) => {
-                let dev = c.device;
-                let tl = core
-                    .register_timeline(TimelineKind::CudaStream { device: dev })
-                    .map_err(CacheError::Core)?;
-                let stream = CudaStream::new(dev, caps.mint_cuda())
-                    .map_err(|e| CacheError::Init(format!("internal CudaStream failed: {e:?}")))?;
-                let (buf, tok) =
-                    cuda::alloc_host(Tracked(caps.alloc.borrow_mut()), self.config.frame_size)
-                        .map_err(|e| {
-                            CacheError::Init(format!("alloc pinned staging failed: {e:?}"))
-                        })?;
-                let hctx = HostContext::new(caps.mint_host());
-                (
-                    Some(GpuStream {
-                        stream,
-                        timeline: tl,
-                        device_id: dev,
-                    }),
-                    Some((buf, tok, hctx)),
-                )
-            }
-            None => (None, None),
-        };
-
         let eng_ctx = HostContext::new(caps.mint_host());
-        let cuda_att = CudaAttachment::from_option_borrowed(self.cuda.as_deref());
-        let engine = Box::new(DistributedEngine::new_multi_peer(
+        let mut engine = Box::new(DistributedEngine::new_multi_peer(
             *core,
             self.host,
             eng_ctx,
-            cuda_att,
+            DeviceAttachment::from_option_borrowed(device),
             nvme,
             peer_sessions,
-        ));
+        ).map_err(CacheError::Core)?);
+
+        // Provision resources for internal cross-tier hops and caller slot transfers.
+        let (internal_device_stream, device_staging) = if device.is_some() {
+            (
+                Some(RT::new_stream(&mut engine, &mut caps)?),
+                Some(RT::new_staging(&mut caps, self.config.frame_size)?),
+            )
+        } else {
+            (None, None)
+        };
 
         Ok(VeriCache::from_parts(
             self.config.node_id,
@@ -870,10 +592,9 @@ impl<'s> AttachedStorage<'s> {
             caps,
             self.pd.as_ref(),
             peer_metas,
-            peer_recv_paused,
             policy,
-            internal_gpu_stream,
-            gpu_staging,
+            internal_device_stream,
+            device_staging,
         ))
     }
 }

@@ -25,7 +25,7 @@ pub enum PendingKind {
 impl PendingKind {
     pub open spec fn qp_id(self) -> nat {
         match self {
-            Self::DataTransfer { event } => event.source->RdmaQueuePair_id,
+            Self::DataTransfer { event } => event.source.id(),
             Self::BindWindow { qp_id, .. } | Self::LocalInvalidate { qp_id, .. } => qp_id,
         }
     }
@@ -110,13 +110,13 @@ impl<'a> CompletionQueue<'a> {
     ) -> (r: Result<Self, RdmaError>)
         requires
             depth > 0,
-            name.source() is RdmaQueuePair,
+            name.source().is_rdma_qp(),
             name.well_formed(),
             name.node() == device.node(),
         ensures
             r matches Ok(c) ==> c.well_formed() && c.pending() == Map::empty() && c.capacity()
                 == depth as nat && c.infos().instance_id() == name.id() && c.observer()
-                == device.node() && c.id() == name.source()->RdmaQueuePair_id,
+                == device.node() && c.id() == name.source().id(),
     {
         if depth <= 0 {
             return Err(RdmaError(22));
@@ -127,7 +127,7 @@ impl<'a> CompletionQueue<'a> {
                 device,
                 capacity: depth as usize,
                 in_flight_count: 0,
-                cq_id: Ghost(name.source()->RdmaQueuePair_id),
+                cq_id: Ghost(name.source().id()),
                 in_flight: Ghost(Map::empty()),
                 in_flight_infos: Tracked(SubmittedMap::empty(name.id())),
             },
@@ -142,60 +142,10 @@ impl<'a> CompletionQueue<'a> {
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct QueuePairEndpoint {
-    pub(super) number: u32,
-    pub(super) psn: u32,
-    pub(super) lid: u16,
-    pub(super) gid: [u8; 16],
-    pub(super) mtu: u8,
-    pub(super) responder_resources: u8,
-    #[cfg_attr(not(verus_only), allow(dead_code))]
-    origin: Ghost<NodeId>,
-}
-
-impl QueuePairEndpoint {
-    pub closed spec fn node(&self) -> NodeId {
-        self.origin@
-    }
-
-    pub closed spec fn responder_resources_spec(&self) -> u8 {
-        self.responder_resources
-    }
-
-    pub(crate) closed spec fn fields(&self) -> (u32, u32, u16, Seq<u8>, u8, u8) {
-        (self.number, self.psn, self.lid, self.gid@, self.mtu, self.responder_resources)
-    }
-
-    pub(crate) fn components(&self) -> (r: (u32, u32, u16, [u8; 16], u8, u8))
-        ensures
-            self.fields() == (r.0, r.1, r.2, r.3@, r.4, r.5),
-    {
-        (self.number, self.psn, self.lid, self.gid, self.mtu, self.responder_resources)
-    }
-
-    pub(crate) fn restore(
-        number: u32,
-        psn: u32,
-        lid: u16,
-        gid: [u8; 16],
-        mtu: u8,
-        responder_resources: u8,
-        Ghost(sent): Ghost<Self>,
-    ) -> (r: Self)
-        requires
-            sent.fields() == (number, psn, lid, gid@, mtu, responder_resources),
-        ensures
-            r == sent,
-    {
-        assert(gid == sent.gid);
-        Self { number, psn, lid, gid, mtu, responder_resources, origin: Ghost(sent.node()) }
-    }
-}
-
 pub struct UnconnectedQueuePair<'a> {
     pub(super) raw: ffi::RawQpGuard,
     pub(super) pd: &'a ProtectionDomain<'a>,
+    pub(super) cq_address: usize,
     #[cfg_attr(not(verus_only), allow(dead_code))]
     pub(super) cq_id: Ghost<nat>,
     #[cfg_attr(not(verus_only), allow(dead_code))]
@@ -216,10 +166,8 @@ pub enum QueuePairState {
 pub struct QueuePair<'a> {
     pub(super) connection: UnconnectedQueuePair<'a>,
     pub(super) effective_max_rd_atomic: u8,
-    #[cfg_attr(not(verus_only), allow(dead_code))]
-    pub(super) state: Ghost<QueuePairState>,
-    #[cfg_attr(not(verus_only), allow(dead_code))]
-    pub(super) peer_node: Ghost<NodeId>,
+    pub(super) state: QueuePairState,
+    pub(super) peer_node: NodeId,
     #[cfg_attr(not(verus_only), allow(dead_code))]
     pub(super) pending_reads: Ghost<ISet<TransferEvent>>,
     #[cfg_attr(not(verus_only), allow(dead_code))]
@@ -229,7 +177,8 @@ pub struct QueuePair<'a> {
 impl<'a> UnconnectedQueuePair<'a> {
     #[verifier::type_invariant]
     pub(super) open spec fn configured(&self) -> bool {
-        self.config.send_depth > 0 && self.config.max_send_sge > 0
+        self.config.send_depth > 0 && self.config.max_send_sge > 0 && self.pd.node()
+            == self.source@.node()
     }
 
     pub open(super) spec fn source(&self) -> EventSourceToken {
@@ -259,7 +208,7 @@ impl<'a> UnconnectedQueuePair<'a> {
     ) -> (r: Result<Self, RdmaError>)
         requires
             source.well_formed(),
-            source.source() is RdmaQueuePair,
+            source.source().is_rdma_qp(),
             source.node() == pd.node(),
             source.node() == cq.observer(),
             source.id() == cq.infos().instance_id(),
@@ -294,7 +243,7 @@ impl<'a> UnconnectedQueuePair<'a> {
     ) -> (r: Result<Self, RdmaError>)
         requires
             source.well_formed(),
-            source.source() is RdmaQueuePair,
+            source.source().is_rdma_qp(),
             source.node() == pd.node(),
             source.node() == cq.observer(),
             source.id() == cq.infos().instance_id(),
@@ -320,17 +269,18 @@ impl<'a> UnconnectedQueuePair<'a> {
             Self {
                 raw,
                 pd,
+                cq_address: cq.raw.as_ptr().addr(),
                 cq_id: Ghost(cq.id()),
                 source: Tracked(source),
-                endpoint: QueuePairEndpoint {
+                endpoint: QueuePairEndpoint::new(
                     number,
                     psn,
                     lid,
                     gid,
                     mtu,
-                    responder_resources: config.max_dest_rd_atomic,
-                    origin: Ghost(source.node()),
-                },
+                    config.max_dest_rd_atomic,
+                    Ghost(source.node()),
+                ),
                 port,
                 gid_index,
                 global,
@@ -344,11 +294,7 @@ impl<'a> UnconnectedQueuePair<'a> {
             r.node() == self.source().node(),
             r.responder_resources_spec() == self.configuration().max_dest_rd_atomic,
     {
-        QueuePairEndpoint {
-            responder_resources: self.config.max_dest_rd_atomic,
-            origin: Ghost(self.source().node()),
-            ..self.endpoint
-        }
+        self.endpoint.with_resources(self.config.max_dest_rd_atomic, Ghost(self.source().node()))
     }
 }
 
@@ -359,7 +305,7 @@ pub fn connect_rc<'a>(
 ) -> (r: Result<QueuePair<'a>, RdmaError>)
     requires
         qp.source().well_formed(),
-        qp.source().source() is RdmaQueuePair,
+        qp.source().source().is_rdma_qp(),
         qp.source().node() != _peer_node,
         peer.node() == _peer_node,
     ensures
@@ -380,18 +326,18 @@ pub fn connect_rc<'a>(
         let _ = ffi::destroy_qp(qp.raw.into_raw());
         return Err(e);
     }
-    let eff = if qp.config.max_rd_atomic <= peer.responder_resources {
+    let eff = if qp.config.max_rd_atomic <= peer.responder_resources() {
         qp.config.max_rd_atomic
     } else {
-        peer.responder_resources
+        peer.responder_resources()
     };
     let tracked infos = SubmittedMap::empty(qp.source().id());
     Ok(
         QueuePair {
             connection: qp,
             effective_max_rd_atomic: eff,
-            state: Ghost(QueuePairState::ReadyToSend),
-            peer_node: Ghost(_peer_node),
+            state: QueuePairState::ReadyToSend,
+            peer_node: _peer_node,
             pending_reads: Ghost(ISet::empty()),
             pending_read_infos: Tracked(infos),
         },
@@ -400,11 +346,29 @@ pub fn connect_rc<'a>(
 
 impl<'a> QueuePair<'a> {
     pub open spec fn id(&self) -> nat {
-        self.source().source()->RdmaQueuePair_id
+        self.source().source().id()
     }
 
     pub open(super) spec fn state(&self) -> QueuePairState {
-        self.state@
+        self.state
+    }
+
+    pub fn is_ready_to_send(&self) -> (ready: bool)
+        ensures
+            ready == (self.state() is ReadyToSend),
+    {
+        matches!(self.state, QueuePairState::ReadyToSend)
+    }
+
+    pub fn peer_node(&self) -> (node: NodeId)
+        ensures
+            node == self.peer(),
+    {
+        self.peer_node
+    }
+
+    pub fn uses_completion_queue(&self, cq: &CompletionQueue<'_>) -> bool {
+        self.connection.cq_address == cq.raw.as_ptr().addr()
     }
 
     pub open(super) spec fn configuration(&self) -> QueuePairConfig {
@@ -437,6 +401,17 @@ impl<'a> QueuePair<'a> {
         self.connection.config
     }
 
+    pub fn protection_domain(&self) -> (pd: &'a ProtectionDomain<'a>)
+        ensures
+            pd.id() == self.pd_id(),
+            pd.node() == self.source().node(),
+    {
+        proof {
+            use_type_invariant(&self.connection);
+        }
+        self.connection.pd
+    }
+
     pub fn reset_endpoint(&self, psn: u32) -> (r: QueuePairEndpoint)
         requires
             psn <= 0xffffff,
@@ -444,17 +419,15 @@ impl<'a> QueuePair<'a> {
             r.node() == self.source().node(),
             r.responder_resources_spec() == self.configuration().max_dest_rd_atomic,
     {
-        QueuePairEndpoint {
-            psn,
-            responder_resources: self.connection.config.max_dest_rd_atomic,
-            origin: Ghost(self.source().node()),
-            ..self.connection.endpoint
-        }
+        self.connection.endpoint.with_psn(psn).with_resources(
+            self.connection.config.max_dest_rd_atomic,
+            Ghost(self.source().node()),
+        )
     }
 
     pub open(super) spec fn ready(&self) -> bool {
-        self.max_send_sge() >= 1 && self.send_depth() >= 1 && self.state@ is ReadyToSend
-            && self.source().well_formed() && self.source().source() is RdmaQueuePair
+        self.max_send_sge() >= 1 && self.send_depth() >= 1 && self.state is ReadyToSend
+            && self.source().well_formed() && self.source().source().is_rdma_qp()
             && self.read_infos().instance_id() == self.source().id() && self.reads()
             == self.read_infos().dom()
     }
@@ -490,7 +463,7 @@ impl<'a> QueuePair<'a> {
     }
 
     pub open(super) spec fn peer(&self) -> NodeId {
-        self.peer_node@
+        self.peer_node
     }
 
     pub open(super) spec fn reads(&self) -> ISet<TransferEvent> {
@@ -555,9 +528,7 @@ pub fn modify_queue_pair_error(qp: &mut QueuePair) -> (r: Result<
         ),
 {
     ffi::error(qp.connection.raw.as_ptr())?;
-    proof {
-        qp.state = Ghost(QueuePairState::Error);
-    }
+    qp.state = QueuePairState::Error;
     Ok(Tracked(QpErrorWitness { qp_id: qp.id(), node: qp.source().node() }))
 }
 
@@ -602,8 +573,8 @@ pub fn reset_queue_pair(qp: &mut QueuePair, _cq: &CompletionQueue) -> (r: Result
     proof {
         qp.pending_reads = Ghost(ISet::empty());
         qp.pending_read_infos = Tracked(SubmittedMap::empty(qp.source().id()));
-        qp.state = Ghost(QueuePairState::Reset);
     }
+    qp.state = QueuePairState::Reset;
     Ok(Tracked(QpResetWitness { qp_id: qp.id(), node: qp.source().node() }))
 }
 
@@ -616,7 +587,7 @@ pub fn reconnect_rc(qp: &mut QueuePair, psn: u32, peer: QueuePairEndpoint) -> (r
         psn <= 0xffffff,
         peer.node() == old(qp).peer(),
         old(qp).source().well_formed(),
-        old(qp).source().source() is RdmaQueuePair,
+        old(qp).source().source().is_rdma_qp(),
         old(qp).source().node() != old(qp).peer(),
     ensures
         r.is_err() ==> *final(qp) == *old(qp),
@@ -638,18 +609,18 @@ pub fn reconnect_rc(qp: &mut QueuePair, psn: u32, peer: QueuePairEndpoint) -> (r
         use_type_invariant(&qp.connection);
     }
     ffi::reconnect(&qp.connection, psn, peer)?;
-    let eff = if qp.connection.config.max_rd_atomic <= peer.responder_resources {
+    let eff = if qp.connection.config.max_rd_atomic <= peer.responder_resources() {
         qp.connection.config.max_rd_atomic
     } else {
-        peer.responder_resources
+        peer.responder_resources()
     };
-    qp.connection.endpoint.psn = psn;
+    qp.connection.endpoint = qp.connection.endpoint.with_psn(psn);
     qp.effective_max_rd_atomic = eff;
     proof {
         qp.pending_reads = Ghost(ISet::empty());
         qp.pending_read_infos = Tracked(SubmittedMap::empty(qp.source().id()));
-        qp.state = Ghost(QueuePairState::ReadyToSend);
     }
+    qp.state = QueuePairState::ReadyToSend;
     Ok(())
 }
 

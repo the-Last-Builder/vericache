@@ -120,7 +120,7 @@ pub open spec fn owned_map_valid(owned: Map<SlotLoc, SlotToken>, id: InstanceId)
 
 pub open spec fn shares_map_valid(shares: Map<SlotLoc, ShareCap>, id: InstanceId) -> bool {
     forall|l: SlotLoc| #[trigger]
-        shares.contains_key(l) ==> shares[l].is_rdma_bound() && shares[l].instance_id() == id
+        shares.contains_key(l) ==> shares[l].is_fenced() && shares[l].instance_id() == id
             && shares[l].loc() == l
 }
 
@@ -210,7 +210,7 @@ impl<'a> QueuePair<'a> {
         &&& remote.slot_ref().loc.node != local.slot_ref().loc.node
         &&& local.slot_ref().sub_len == remote.slot_ref().sub_len
         &&& local.slot_ref().sub_len <= MAX_RDMA_MSG_LEN
-        &&& remote_perm.valid_rdma(instance, remote.slot_ref().loc)
+        &&& remote_perm.valid_fenced(instance, remote.slot_ref().loc)
         &&& remote_perm.share_opt() == remote.share()
         &&& slot_is_owned(local_tok, instance, local.slot_ref().loc)
         &&& infos.instance_id() == instance && knows.instance_id() == instance
@@ -245,7 +245,7 @@ impl<'a> QueuePair<'a> {
         &&& remote.slot_ref().loc.node != local.slot_ref().loc.node
         &&& local.slot_ref().sub_len == remote.slot_ref().sub_len
         &&& local.slot_ref().sub_len <= MAX_RDMA_MSG_LEN
-        &&& local_perm.valid_local(instance, local.slot_ref().loc)
+        &&& local_perm.valid_cooperative(instance, local.slot_ref().loc)
         &&& slot_is_owned(remote_tok, instance, remote.slot_ref().loc)
         &&& infos.instance_id() == instance && knows.instance_id() == instance
         &&& cited.subset_of(infos.dom())
@@ -301,7 +301,7 @@ impl<'a> QueuePair<'a> {
         &&& infos.instance_id() == instance && knows.instance_id() == instance
         &&& cited.subset_of(infos.dom())
         &&& knowledge_of(self.source().node(), cited).subset_of(knows.set())
-        &&& remote_perm.valid_rdma(instance, remote.slot_ref().loc)
+        &&& remote_perm.valid_fenced(instance, remote.slot_ref().loc)
         &&& remote_perm.share_opt() == remote.share()
         &&& read_admitted(remote_perm.frontier(), ordered)
         &&& owned_map_valid(local_tokens, instance)

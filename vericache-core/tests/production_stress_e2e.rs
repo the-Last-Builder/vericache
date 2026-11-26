@@ -23,6 +23,7 @@ use vericache_core::backends::rdma::peer::{FetchOutcome, PeerSession, ServeOutco
 use vericache_core::backends::rdma::protocol::{ControlPayload, VeriCacheAttachment};
 use vericache_core::backends::rdma::pull::PullTarget;
 use vericache_core::backends::rdma::{RdmaBackend, RegisteredSlab};
+use vericache_core::backends::NoDevice;
 use vericache_core::engine::{CudaAttachment, DistributedEngine, DistributedEvent, LocalEngine};
 use vericache_core::frame::{STATE_DRAINING, STATE_EMPTY};
 use vericache_core::kernel::CacheCore;
@@ -259,15 +260,15 @@ impl NodeEnv {
     }
 
     fn mint_rdma(&mut self) -> Tracked<EventSourceToken> {
-        Tracked(self.events.borrow_mut().mint(EventSourceKind::RdmaQueuePair))
+        Tracked(self.events.borrow_mut().mint(EventSourceKind::rdma_qp()))
     }
 
     fn mint_host(&mut self) -> Tracked<EventSourceToken> {
-        Tracked(self.events.borrow_mut().mint(EventSourceKind::Host))
+        Tracked(self.events.borrow_mut().mint(EventSourceKind::host()))
     }
 
     fn mint_cuda(&mut self) -> Tracked<EventSourceToken> {
-        Tracked(self.events.borrow_mut().mint(EventSourceKind::CudaStream))
+        Tracked(self.events.borrow_mut().mint(EventSourceKind::cuda_stream()))
     }
 
     fn make_core_with_leases(&mut self, max_leases: usize) -> CacheCore {
@@ -381,10 +382,10 @@ fn connect_peer_dedicated_mr<'a>(
     rdma.register_host_slab(
         core,
         pd,
-        &host.buffer,
-        host.tier,
-        host.first_frame,
-        host.num_frames,
+        host.buffer(),
+        host.tier_id(),
+        host.first_frame(),
+        host.num_frames(),
         flags,
     ).expect("register host slab MR");
     PeerSession::new(rdma, channel, core)
@@ -452,7 +453,7 @@ fn run_shard_worker(
     let tracked vi = shard.version_instance.borrow().clone();
     core.enable_version_registry(Tracked(vi), shard.versions);
 
-    let host_src = Tracked(shard.events.borrow_mut().mint(EventSourceKind::Host));
+    let host_src = Tracked(shard.events.borrow_mut().mint(EventSourceKind::host()));
     let host = HostBackend::new(
         &mut core,
         Tracked(shard.instance.borrow()),
@@ -461,9 +462,13 @@ fn run_shard_worker(
         4,
         4096,
     ).unwrap();
-    let eng_ctx = HostContext::new(Tracked(shard.events.borrow_mut().mint(EventSourceKind::Host)));
-    let mut engine = LocalEngine::new(core, &host, eng_ctx, None, None);
-    let host_tier = engine.host.tier;
+    let eng_ctx = HostContext::new(
+        Tracked(shard.events.borrow_mut().mint(EventSourceKind::host())),
+    );
+    let mut engine = LocalEngine::<NoDevice>::new(core, &host, eng_ctx, None, None).expect(
+        "assemble local engine",
+    );
+    let host_tier = engine.host().tier_id();
 
     let mut minted = Vec::new();
     let mut round = 0usize;
@@ -493,7 +498,7 @@ fn run_shard_worker(
         assert!(lease_a.version == ver && lease_b.version == ver);
 
         let mut read_ctx = HostContext::new(
-            Tracked(shard.events.borrow_mut().mint(EventSourceKind::Host)),
+            Tracked(shard.events.borrow_mut().mint(EventSourceKind::host())),
         );
         let tracked mut perm_a = ReadPerm::Shared(lease_a.cap.get());
         let mut out = vec![0u8; FRAME_4K];
@@ -503,9 +508,9 @@ fn run_shard_worker(
             &lease_a.slice,
             &mut out,
             Tracked(&mut perm_a),
-            Tracked(&engine.core.ledger.borrow().submitted),
-            Tracked(&engine.core.ledger.borrow().knows),
-            Ghost(engine.core.citations()),
+            Tracked(&engine.core().ledger().borrow().submitted),
+            Tracked(&engine.core().ledger().borrow().knows),
+            Ghost(engine.core().citations()),
         );
         assert!(out == payload);
         let tracked cap_a = match perm_a {
@@ -527,8 +532,8 @@ fn run_shard_worker(
         ).unwrap();
 
         engine.evict_frame(frame).unwrap();
-        assert!(engine.reclaim_draining(host_tier, 4) == 1);
-        assert!(engine.core.frames.metas[frame.0 as usize].state == STATE_EMPTY);
+        assert!(engine.reclaim_draining(host_tier, 4).unwrap() == 1);
+        assert!(engine.core().frame_state(frame).unwrap() == STATE_EMPTY);
         round += 1;
     }
     minted
@@ -562,7 +567,7 @@ fn run_multi_size_tiers_and_overflow_leases(shard: ShardSources) {
         4096,
         FRAME_64K,
     ).unwrap();
-    assert!(tier_4k.tier != tier_64k.tier);
+    assert!(tier_4k.tier_id() != tier_64k.tier_id());
 
     let mut ctx_4k = HostContext::new(node.mint_host());
     let mut ctx_64k = HostContext::new(node.mint_host());
@@ -623,12 +628,12 @@ fn run_multi_size_tiers_and_overflow_leases(shard: ShardSources) {
         held.push((h, cap));
         i += 1;
     }
-    assert!(core.frames.metas[f_64k.0 as usize].active_local_reads == 72);
+    assert!(core.frame_meta(f_64k).unwrap().active_local_reads == 72);
 
     // Evict transitions to Draining, but cannot reclaim while 72 leases are active.
     core.evict_frame(f_64k).unwrap();
-    assert!(core.frames.metas[f_64k.0 as usize].state == STATE_DRAINING);
-    assert!(core.reclaim_draining(tier_64k.tier, 4) == 0);
+    assert!(core.frame_state(f_64k).unwrap() == STATE_DRAINING);
+    assert!(core.reclaim_draining(tier_64k.tier_id(), 4) == 0);
 
     // Release out of order: odd indices (popped from back) vs front to exercise overflow_seqs.
     let mut evens = Vec::new();
@@ -645,13 +650,13 @@ fn run_multi_size_tiers_and_overflow_leases(shard: ShardSources) {
     while let Some((h, cap)) = odds.pop() {
         core.release_local_lease(h, cap, Ticket::NONE, Tracked(node.instance.borrow())).unwrap();
     }
-    assert!(core.reclaim_draining(tier_64k.tier, 4) == 0);
+    assert!(core.reclaim_draining(tier_64k.tier_id(), 4) == 0);
     while let Some((h, cap)) = evens.pop() {
         core.release_local_lease(h, cap, Ticket::NONE, Tracked(node.instance.borrow())).unwrap();
     }
-    assert!(core.frames.metas[f_64k.0 as usize].active_local_reads == 0);
-    assert!(core.reclaim_draining(tier_64k.tier, 4) == 1);
-    assert!(core.frames.metas[f_64k.0 as usize].state == STATE_EMPTY);
+    assert!(core.frame_meta(f_64k).unwrap().active_local_reads == 0);
+    assert!(core.reclaim_draining(tier_64k.tier_id(), 4) == 1);
+    assert!(core.frame_state(f_64k).unwrap() == STATE_EMPTY);
 }
 
 fn run_owned_async_cuda_roundtrip(shard: ShardSources, gpu_dev: DeviceId) {
@@ -686,7 +691,7 @@ fn run_owned_async_cuda_roundtrip(shard: ShardSources, gpu_dev: DeviceId) {
         cuda,
         None,
         Vec::new(),
-    );
+    ).expect("assemble distributed engine");
     let gpu_tier = engine.gpu_tier().unwrap();
     let key = ObjectKey([9, 9, 9, 1]);
     let expected = pattern_sized(0x5A, FRAME_4K);
@@ -703,16 +708,12 @@ fn run_owned_async_cuda_roundtrip(shard: ShardSources, gpu_dev: DeviceId) {
         &stage_host_slice,
         &expected,
         Tracked(&mut stage_tok),
-        Tracked(&engine.core.ledger.borrow().submitted),
-        Tracked(&engine.core.ledger.borrow().knows),
-        Ghost(engine.core.citations()),
+        Tracked(&engine.core().ledger().borrow().submitted),
+        Tracked(&engine.core().ledger().borrow().knows),
+        Ghost(engine.core().citations()),
     );
     let ghost w_ev = w_comp.submitted.key();
-    let t_w = engine.core.issue_ticket(
-        engine.host.timeline_id(),
-        Tracked(w_comp.submitted),
-    ).unwrap();
-    engine.core.mark_timeline_complete(engine.host.timeline_id(), t_w.seq(), Tracked(w_comp.knows));
+    engine.record_host_completion(Tracked(w_comp));
     let stage_cuda = stage_buf.as_cuda_slice();
     let tracked mut stage_perm = ReadPerm::Owned(stage_tok);
     let ghost stage_cert = ValueCertificate {
@@ -760,11 +761,12 @@ fn run_owned_async_cuda_roundtrip(shard: ShardSources, gpu_dev: DeviceId) {
         Tracked(&mut rb_tok),
     ).unwrap().unwrap();
     assert!(got_ver == ver_async);
-    let Tracked(k_d2h) = cuda::stream_synchronize(
+    engine.synchronize_caller_stream(
         &caller_stream,
+        caller_tl,
+        t_d2h,
         Tracked(node.instance.borrow()),
     ).unwrap();
-    engine.core.mark_timeline_complete(caller_tl, t_d2h.seq(), Tracked(k_d2h));
 
     let mut rb_ctx = HostContext::new(node.mint_host());
     let rb_host = rb_buf.as_host_slice();
@@ -776,9 +778,9 @@ fn run_owned_async_cuda_roundtrip(shard: ShardSources, gpu_dev: DeviceId) {
         &rb_host,
         &mut out,
         Tracked(&mut rb_perm),
-        Tracked(&engine.core.ledger.borrow().submitted),
-        Tracked(&engine.core.ledger.borrow().knows),
-        Ghost(engine.core.citations()),
+        Tracked(&engine.core().ledger().borrow().submitted),
+        Tracked(&engine.core().ledger().borrow().knows),
+        Ghost(engine.core().citations()),
     );
     assert!(out == expected);
     let _ = caller_stream.destroy();
@@ -814,7 +816,14 @@ fn run_stress3_bidirectional_duplex(
         0x300 + node.id as u32,
     );
     let eng_ctx = HostContext::new(node.mint_host());
-    let mut engine = DistributedEngine::new(core, &host, eng_ctx, None, peer);
+    let mut engine = DistributedEngine::new_multi_peer(
+        core,
+        &host,
+        eng_ctx,
+        vericache_core::engine::CudaAttachment::None,
+        None,
+        vec![peer],
+    ).expect("assemble distributed engine");
     let host_tier = engine.host_tier();
 
     let key_0 = ObjectKey([30, 0, 1, 1]);
@@ -835,18 +844,19 @@ fn run_stress3_bidirectional_duplex(
     ).unwrap();
 
     // Ready barrier so both keys are published before simultaneous duplex fetches start.
-    engine.send_control(
+    engine.send_control_to(
+        0,
         ControlPayload::RevokeAck { grant_tag: 0xAA00 + node.id },
         Tracked(node.instance.borrow()),
     ).unwrap();
-    match engine.poll_peer_event(Tracked(node.instance.borrow())).unwrap() {
+    match engine.poll_peer_event_from(0, Tracked(node.instance.borrow())).unwrap() {
         DistributedEvent::Control(ControlPayload::RevokeAck { grant_tag }) => {
             assert!(grant_tag == 0xAA00 + peer_id);
         },
         _ => panic!("expected ready barrier ack"),
     }
 
-    let init_grant_tag = engine.peers[0].next_grant_tag;
+    let init_grant_tag = engine.peer_next_grant_tag(0).unwrap();
     let mut rdma_tokens = Vec::new();
     let mut k = 0usize;
     while k < 4 {
@@ -881,10 +891,10 @@ fn run_stress3_bidirectional_duplex(
 
     // Keep servicing peer progress until our outbound grant has been served, released, and unbound.
     let deadline = Instant::now() + Duration::from_secs(15);
-    while !(engine.peers[0].next_grant_tag > init_grant_tag
-        && engine.peers[0].pending_outbound_grants.is_empty()
-        && engine.peers[0].active_grants.is_empty() && engine.peers[0].rdma.active_lease_count()
-        == 0) {
+    while !(engine.peer_next_grant_tag(0).unwrap() > init_grant_tag
+        && engine.peer_pending_grant_count(0).unwrap() == 0 && engine.peer_active_lease_count(
+        0,
+    ).unwrap() == 0) {
         assert!(Instant::now() < deadline, "duplex drain timed out");
         let _ = engine.poll_peer_progress(
             0,
@@ -898,9 +908,149 @@ fn run_stress3_bidirectional_duplex(
     }
 
     engine.evict_frame(f_own).unwrap();
-    assert!(engine.reclaim_draining(host_tier, 4) == 1);
+    assert!(engine.reclaim_draining(host_tier, 4).unwrap() == 1);
     engine.shutdown_all_peers(Tracked(node.instance.borrow())).unwrap();
     assert!(engine.peer_count() == 0);
+}
+
+fn run_peer_removal_and_reattach(node: &mut NodeEnv, device: &DeviceContext, test_name: &str) {
+    let pd = ProtectionDomain::new(device, node.mint_rdma()).unwrap();
+    let mut core = node.make_core_with_leases(8);
+    let host = HostBackend::new(
+        &mut core,
+        Tracked(node.instance.borrow()),
+        Tracked(node.alloc.borrow_mut()),
+        node.mint_host(),
+        4,
+        4096,
+    ).unwrap();
+    if node.id == 0 {
+        for _ in 0..256 {
+            core.register_timeline(TimelineKind::Custom(0)).unwrap();
+        }
+    }
+    let mut candidates = Vec::new();
+    if node.id != 0 {
+        let peer = connect_peer_dedicated_mr(
+            node,
+            0,
+            &mut core,
+            &pd,
+            device,
+            connect_to_coordinator(),
+            &host,
+            0x700 + node.id as u32,
+        );
+        candidates.push((peer, None));
+    } else {
+        for (peer_id, role) in [(1, "first"), (2, "replacement")] {
+            let (transport, child) = start_peer_process(test_name, role);
+            let next_timeline = core.timeline_count();
+            let peer = connect_peer_dedicated_mr(
+                node,
+                peer_id,
+                &mut core,
+                &pd,
+                device,
+                transport,
+                &host,
+                0x700,
+            );
+            let timeline = peer.rdma().timeline_id();
+            assert!(timeline as usize == next_timeline && timeline > u8::MAX as TimelineId);
+            candidates.push((peer, Some(child)));
+        }
+    }
+    let ctx = HostContext::new(node.mint_host());
+    let mut engine = DistributedEngine::new_multi_peer(
+        core,
+        &host,
+        ctx,
+        CudaAttachment::None,
+        None,
+        Vec::new(),
+    ).expect("assemble distributed engine");
+    let tier = engine.host_tier();
+    let key = ObjectKey([70, 0, 0, 1]);
+    let data = pattern_sized(0x70, FRAME_4K);
+
+    if node.id != 0 {
+        let (peer, _) = candidates.pop().unwrap();
+        engine.add_peer(peer).unwrap();
+        engine.send_fetch_request_to(0, key, Tracked(node.instance.borrow())).unwrap();
+        let grant = match engine.poll_peer_event_from(0, Tracked(node.instance.borrow())).unwrap() {
+            DistributedEvent::ReadGrant(grant) => grant,
+            _ => panic!("expected ReadGrant from coordinator"),
+        };
+        let FetchOutcome::Hit { version: fetched_version, .. } = engine.pull_with_grant_from(
+            0,
+            key,
+            tier,
+            PullTarget::Host,
+            grant,
+            Tracked(node.instance.borrow()),
+        ).unwrap() else {
+            panic!("expected a remote cache hit");
+        };
+        let mut out = vec![0; FRAME_4K];
+        let found = engine.get_into_host(
+            Tracked(node.instance.borrow()),
+            Tracked(node.shares.borrow_mut()),
+            key,
+            &mut out,
+        ).unwrap();
+        assert!(found == Some(fetched_version) && out == data);
+        engine.shutdown_all_peers(Tracked(node.instance.borrow())).unwrap();
+        return;
+    }
+    let (version, frame) = engine.put_host(Tracked(node.instance.borrow()), key, &data).unwrap();
+    assert!(matches!(engine.remove_peer(0), Err(CoreError::InvalidArgument)));
+    let timeline_count = engine.core().timeline_count();
+    for (peer, child) in candidates {
+        let mut child = child.unwrap();
+        let timeline = peer.rdma().timeline_id();
+        engine.add_peer(peer).unwrap();
+        assert!(engine.peer_count() == 1);
+
+        let request_id = match engine.poll_peer_event_from(
+            0,
+            Tracked(node.instance.borrow()),
+        ).unwrap() {
+            DistributedEvent::Control(
+                ControlPayload::FetchRequest { request_id, key: requested },
+            ) => {
+                assert!(requested == key);
+                request_id
+            },
+            _ => panic!("expected FetchRequest from peer"),
+        };
+        let ServeOutcome::Granted { grant_tag: served_tag, .. } =
+            engine.serve_fetch_request_for_peer(
+            0,
+            tier,
+            request_id,
+            key,
+            Tracked(node.shares.borrow_mut()),
+            Tracked(node.instance.borrow()),
+        ).unwrap() else {
+            panic!("expected the coordinator to grant the fetch");
+        };
+        assert!(matches!(engine.remove_peer(0), Err(CoreError::WouldConflict)));
+        assert!(engine.peer_count() == 1);
+        match engine.poll_peer_event_from(0, Tracked(node.instance.borrow())).unwrap() {
+            DistributedEvent::ReadReleased { tag, was_active, .. } => {
+                assert!(was_active && tag == served_tag);
+            },
+            _ => panic!("expected the peer to release its remote lease"),
+        }
+        let removed = engine.remove_peer(0).unwrap();
+        assert!(removed.rdma().timeline_id() == timeline && removed.rdma().active_lease_count() == 0);
+        assert!(engine.peer_count() == 0);
+        assert!(engine.core().timeline_count() == timeline_count);
+        assert!(engine.lookup_tier(key, tier) == Some((frame, version)));
+        drop(removed);
+        assert!(child.wait().unwrap().success());
+    }
 }
 
 // =========================================================================
@@ -927,10 +1077,10 @@ fn run_stress4_coordinator_node0(
     let shared_slab = RegisteredSlab::register_host(
         &core,
         &pd,
-        &host.buffer,
-        host.tier,
-        host.first_frame,
-        host.num_frames,
+        host.buffer(),
+        host.tier_id(),
+        host.first_frame(),
+        host.num_frames(),
         flags,
     ).expect("register single shared host slab MR");
 
@@ -964,8 +1114,8 @@ fn run_stress4_coordinator_node0(
         CudaAttachment::None,
         None,
         peers,
-    );
-    engine.add_peer(peer2);
+    ).expect("assemble distributed engine");
+    engine.add_peer(peer2).unwrap();
     assert!(engine.peer_count() == 2);
     assert!(engine.find_peer_index(1) == Some(0));
     assert!(engine.find_peer_index(2) == Some(1));
@@ -1002,7 +1152,7 @@ fn run_stress4_coordinator_node0(
         }
         idx += 1;
     }
-    assert!(engine.core.frames.metas[f_donor.0 as usize].active_remote_leases == 2);
+    assert!(engine.core().frame_meta(f_donor).unwrap().active_fenced_leases == 2);
 
     // Drain and cooperatively-first revoke across both peers, transitioning `f_donor` to Draining.
     let evicted_grants = engine.drain_and_evict_frame_across_peers(
@@ -1011,12 +1161,12 @@ fn run_stress4_coordinator_node0(
         Tracked(node.instance.borrow()),
     ).unwrap();
     assert!(evicted_grants == 2);
-    assert!(engine.core.frames.metas[f_donor.0 as usize].state == STATE_DRAINING);
-    assert!(engine.core.frames.metas[f_donor.0 as usize].active_remote_leases == 0);
-    assert!(engine.peers[0].rdma.active_lease_count() == 0);
-    assert!(engine.peers[1].rdma.active_lease_count() == 0);
-    assert!(engine.reclaim_draining(host_tier, 4) == 1);
-    assert!(engine.core.frames.metas[f_donor.0 as usize].state == STATE_EMPTY);
+    assert!(engine.core().frame_state(f_donor).unwrap() == STATE_DRAINING);
+    assert!(engine.core().frame_meta(f_donor).unwrap().active_fenced_leases == 0);
+    assert!(engine.peer_active_lease_count(0).unwrap() == 0);
+    assert!(engine.peer_active_lease_count(1).unwrap() == 0);
+    assert!(engine.reclaim_draining(host_tier, 4).unwrap() == 1);
+    assert!(engine.core().frame_state(f_donor).unwrap() == STATE_EMPTY);
 
     // Notify both peers that cross-peer reclaim succeeded, then run shutdown_all_peers.
     engine.send_control_to(
@@ -1055,27 +1205,35 @@ fn run_stress4_leaf_peer(node: &mut NodeEnv, device: &DeviceContext, transport: 
         0x400 + node.id as u32,
     );
     let eng_ctx = HostContext::new(node.mint_host());
-    let mut engine = DistributedEngine::new(core, &host, eng_ctx, None, peer);
+    let mut engine = DistributedEngine::new_multi_peer(
+        core,
+        &host,
+        eng_ctx,
+        vericache_core::engine::CudaAttachment::None,
+        None,
+        vec![peer],
+    ).expect("assemble distributed engine");
     let host_tier = engine.host_tier();
     let key = ObjectKey([44, 0, 0, 1]);
     let expected = pattern_sized(0x6D, FRAME_4K);
 
-    let _req_id = engine.send_fetch_request(key, Tracked(node.instance.borrow())).unwrap();
-    let grant = match engine.poll_peer_event(Tracked(node.instance.borrow())).unwrap() {
+    let _req_id = engine.send_fetch_request_to(0, key, Tracked(node.instance.borrow())).unwrap();
+    let grant = match engine.poll_peer_event_from(0, Tracked(node.instance.borrow())).unwrap() {
         DistributedEvent::ReadGrant(g) => g,
         _ => panic!("leaf peer expected ReadGrant"),
     };
 
     // Hold the grant open until coordinator initiates cooperative-first cross-peer drain.
-    match engine.poll_peer_event(Tracked(node.instance.borrow())).unwrap() {
+    match engine.poll_peer_event_from(0, Tracked(node.instance.borrow())).unwrap() {
         DistributedEvent::Control(ControlPayload::RevokeNotice { grant_tag }) => {
-            assert!(grant_tag == grant.tag);
+            assert!(grant_tag == grant.tag());
         },
         _ => panic!("leaf peer expected cooperative RevokeNotice"),
     }
 
     // Pull payload over RDMA and send cooperative ReadRelease promptly.
-    let FetchOutcome::Hit { frame: _pulled_frame, version: ver_got } = engine.pull_with_grant(
+    let FetchOutcome::Hit { frame: _pulled_frame, version: ver_got } = engine.pull_with_grant_from(
+        0,
         key,
         host_tier,
         PullTarget::Host,
@@ -1094,7 +1252,7 @@ fn run_stress4_leaf_peer(node: &mut NodeEnv, device: &DeviceContext, transport: 
     assert!(got == Some(ver_got));
     assert!(out == expected);
 
-    match engine.poll_peer_event(Tracked(node.instance.borrow())).unwrap() {
+    match engine.poll_peer_event_from(0, Tracked(node.instance.borrow())).unwrap() {
         DistributedEvent::Control(ControlPayload::RevokeAck { grant_tag: seq }) => {
             assert!(seq == ver_got.seq);
         },
@@ -1135,7 +1293,14 @@ fn run_stress5_cooperative_first_revocation(
         0x500 + node.id as u32,
     );
     let eng_ctx = HostContext::new(node.mint_host());
-    let mut engine = DistributedEngine::new(core, &host, eng_ctx, None, peer);
+    let mut engine = DistributedEngine::new_multi_peer(
+        core,
+        &host,
+        eng_ctx,
+        vericache_core::engine::CudaAttachment::None,
+        None,
+        vec![peer],
+    ).expect("assemble distributed engine");
     let host_tier = engine.host_tier();
 
     let key_fast = ObjectKey([55, 1, 0, 1]);
@@ -1184,9 +1349,9 @@ fn run_stress5_cooperative_first_revocation(
             Tracked(node.instance.borrow()),
         ).unwrap();
         assert!(fast_revoke.is_none());
-        assert!(engine.peers[0].rdma.active_lease_count() == 0);
+        assert!(engine.peer_active_lease_count(0).unwrap() == 0);
         engine.evict_frame(f_fast).unwrap();
-        assert!(engine.reclaim_draining(host_tier, 4) == 1);
+        assert!(engine.reclaim_draining(host_tier, 4).unwrap() == 1);
 
         // --- Phase B: Timeout Fallback (Ok(Some(mw_slot))) + QP Recovery ---
         let req_slow = match engine.poll_peer_event_from(
@@ -1217,7 +1382,7 @@ fn run_stress5_cooperative_first_revocation(
             Tracked(node.instance.borrow()),
         ).unwrap();
         let mw_slot = slow_revoke.expect("timeout fallback must quarantine MW slot");
-        assert!(engine.peers[0].rdma.active_lease_count() == 0);
+        assert!(engine.peer_active_lease_count(0).unwrap() == 0);
 
         match engine.poll_peer_event_from(0, Tracked(node.instance.borrow())).unwrap() {
             DistributedEvent::ReadReleased { tag, was_active, .. } => {
@@ -1259,7 +1424,7 @@ fn run_stress5_cooperative_first_revocation(
             _ => panic!("donor expected cooperative ReadReleased after reconnect"),
         }
         engine.evict_frame(f_slow).unwrap();
-        assert!(engine.reclaim_draining(host_tier, 4) == 1);
+        assert!(engine.reclaim_draining(host_tier, 4).unwrap() == 1);
         engine.send_control_to(
             0,
             ControlPayload::RevokeAck { grant_tag: ver_slow.seq },
@@ -1281,7 +1446,7 @@ fn run_stress5_cooperative_first_revocation(
         };
         match engine.poll_peer_event_from(0, Tracked(node.instance.borrow())).unwrap() {
             DistributedEvent::Control(ControlPayload::RevokeNotice { grant_tag }) => {
-                assert!(grant_tag == grant_fast.tag);
+                assert!(grant_tag == grant_fast.tag());
             },
             _ => panic!("initiator expected cooperative RevokeNotice for key_fast"),
         }
@@ -1319,13 +1484,13 @@ fn run_stress5_cooperative_first_revocation(
         };
         match engine.poll_peer_event_from(0, Tracked(node.instance.borrow())).unwrap() {
             DistributedEvent::Control(ControlPayload::RevokeNotice { grant_tag }) => {
-                assert!(grant_tag == grant_slow.tag);
+                assert!(grant_tag == grant_slow.tag());
             },
             _ => panic!("initiator expected cooperative advisory RevokeNotice for key_slow"),
         }
         match engine.poll_peer_event_from(0, Tracked(node.instance.borrow())).unwrap() {
             DistributedEvent::Control(ControlPayload::RevokeNotice { grant_tag }) => {
-                assert!(grant_tag == grant_slow.tag);
+                assert!(grant_tag == grant_slow.tag());
             },
             _ => panic!("initiator expected unilateral RevokeNotice fallback"),
         }
@@ -1378,6 +1543,200 @@ fn run_stress5_cooperative_first_revocation(
     }
     engine.shutdown_all_peers(Tracked(node.instance.borrow())).unwrap();
     assert!(engine.peer_count() == 0);
+}
+
+fn run_explicit_peer_admission(
+    node: &mut NodeEnv,
+    device: &DeviceContext,
+    transport: TcpTransport,
+) {
+    let pd = ProtectionDomain::new(device, node.mint_rdma()).unwrap();
+    let mut core = node.make_core_with_leases(16);
+    let host = HostBackend::new(
+        &mut core,
+        Tracked(node.instance.borrow()),
+        Tracked(node.alloc.borrow_mut()),
+        node.mint_host(),
+        4,
+        FRAME_4K,
+    ).unwrap();
+    let peer = connect_peer_dedicated_mr(
+        node,
+        1 - node.id,
+        &mut core,
+        &pd,
+        device,
+        transport,
+        &host,
+        0x600 + node.id as u32,
+    );
+    let host_ctx = HostContext::new(node.mint_host());
+    let mut engine = DistributedEngine::new_multi_peer(
+        core,
+        &host,
+        host_ctx,
+        vericache_core::engine::CudaAttachment::None,
+        None,
+        vec![peer],
+    ).expect("assemble distributed engine");
+    let host_tier = engine.host_tier();
+    let deferred_key = ObjectKey([66, 1, 0, 0]);
+    let rejected_key = ObjectKey([66, 2, 0, 0]);
+    let expected = pattern_sized(0x7A, FRAME_4K);
+    let mut tokens = Vec::new();
+
+    if node.id == 0 {
+        // A published hit also stays queued until the caller admits or rejects it.
+        let (_, unrelated_frame) = engine.put_host(
+            Tracked(node.instance.borrow()),
+            rejected_key,
+            &expected,
+        ).unwrap();
+        let initial_budget = engine.peer_bind_budget(0).unwrap();
+        assert!(initial_budget > 0);
+        assert_eq!(engine.peer_bind_budget(1), Err(CoreError::InvalidArgument));
+        assert!(matches!(engine.take_inbound_fetches(1), Err(CoreError::InvalidArgument)));
+        let invalid_pump = engine.pump_peer_nonblocking(
+            1,
+            None,
+            &mut tokens,
+            Tracked(node.instance.borrow()),
+        );
+        assert_eq!(invalid_pump, Err(CoreError::InvalidArgument));
+        let invalid_reject = engine.reject_fetch_request(1, 0, Tracked(node.instance.borrow()));
+        assert_eq!(invalid_reject, Err(CoreError::InvalidArgument));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut requests = Vec::new();
+        while requests.len() < 2 {
+            assert!(Instant::now() < deadline, "fetch requests never queued");
+            let p = engine.pump_all_peers_nonblocking(
+                Some(&pd),
+                &mut tokens,
+                Tracked(node.instance.borrow()),
+            ).unwrap();
+            assert_eq!(p.grants_completed, 0);
+            requests.extend(engine.take_inbound_fetches(0).unwrap());
+        }
+        assert_eq!(requests.len(), 2);
+        let (deferred_id, first_key) = requests[0];
+        let (rejected_id, second_key) = requests[1];
+        assert!(first_key == deferred_key && second_key == rejected_key);
+        let early_grant = engine.grant_fetch_from_frame(
+            0,
+            deferred_id,
+            deferred_key,
+            unrelated_frame,
+            Tracked(node.shares.borrow_mut()),
+            Tracked(node.instance.borrow()),
+        );
+        assert_eq!(early_grant, Err(CoreError::StaleReplica));
+        engine.pump_all_peers_nonblocking(
+            Some(&pd),
+            &mut tokens,
+            Tracked(node.instance.borrow()),
+        ).unwrap();
+        assert!(engine.take_inbound_fetches(0).unwrap().is_empty());
+        assert_eq!(engine.peer_bind_budget(0).unwrap(), initial_budget);
+        // This marker must be the first frame the requester receives.
+        engine.send_control_to(
+            0,
+            ControlPayload::ReconnectBarrier { epoch: 1 },
+            Tracked(node.instance.borrow()),
+        ).unwrap();
+
+        // Publish the donor copy after deferring the request.
+        let (_, frame) = engine.put_host(
+            Tracked(node.instance.borrow()),
+            deferred_key,
+            &expected,
+        ).unwrap();
+        let invalid_grant = engine.grant_fetch_from_frame(
+            1,
+            deferred_id,
+            deferred_key,
+            frame,
+            Tracked(node.shares.borrow_mut()),
+            Tracked(node.instance.borrow()),
+        );
+        assert_eq!(invalid_grant, Err(CoreError::InvalidArgument));
+        engine.grant_fetch_from_frame(
+            0,
+            deferred_id,
+            deferred_key,
+            frame,
+            Tracked(node.shares.borrow_mut()),
+            Tracked(node.instance.borrow()),
+        ).unwrap();
+        assert_eq!(engine.peer_bind_budget(0).unwrap(), initial_budget - 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "grant never completed");
+            let p = engine.pump_all_peers_nonblocking(
+                Some(&pd),
+                &mut tokens,
+                Tracked(node.instance.borrow()),
+            ).unwrap();
+            if p.grants_completed > 0 {
+                break;
+            }
+        }
+        engine.reject_fetch_request(0, rejected_id, Tracked(node.instance.borrow())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.peer_bind_budget(0).unwrap() < initial_budget {
+            assert!(Instant::now() < deadline, "ReadRelease never returned the window");
+            engine.pump_all_peers_nonblocking(
+                Some(&pd),
+                &mut tokens,
+                Tracked(node.instance.borrow()),
+            ).unwrap();
+        }
+        assert_eq!(engine.peer_active_lease_count(0).unwrap(), 0);
+    } else {
+        let deferred_id = engine.send_fetch_request_to(
+            0,
+            deferred_key,
+            Tracked(node.instance.borrow()),
+        ).unwrap();
+        let rejected_id = engine.send_fetch_request_to(
+            0,
+            rejected_key,
+            Tracked(node.instance.borrow()),
+        ).unwrap();
+        let event = engine.poll_peer_event_from(0, Tracked(node.instance.borrow())).unwrap();
+        assert!(matches!(
+            event,
+            DistributedEvent::Control(ControlPayload::ReconnectBarrier { epoch: 1 }),
+        ));
+        let grant = match engine.poll_peer_event_from(0, Tracked(node.instance.borrow())).unwrap() {
+            DistributedEvent::ReadGrant(grant) => grant,
+            _ => panic!("expected a grant for the deferred request"),
+        };
+        assert_eq!(grant.meta().request_id, deferred_id);
+        let FetchOutcome::Hit { version: pulled_version, .. } = engine.pull_with_grant_from(
+            0,
+            deferred_key,
+            host_tier,
+            PullTarget::Host,
+            grant,
+            Tracked(node.instance.borrow()),
+        ).unwrap() else {
+            panic!("expected deferred pull to succeed");
+        };
+        let mut out = vec![0; FRAME_4K];
+        let got = engine.get_into_host(
+            Tracked(node.instance.borrow()),
+            Tracked(node.shares.borrow_mut()),
+            deferred_key,
+            &mut out,
+        ).unwrap();
+        assert!(got == Some(pulled_version) && out == expected);
+        let event = engine.poll_peer_event_from(0, Tracked(node.instance.borrow())).unwrap();
+        assert!(matches!(
+            event,
+            DistributedEvent::Control(ControlPayload::FetchMiss { request_id }) if request_id == rejected_id,
+        ));
+    }
 }
 
 } // verus!
@@ -1468,6 +1827,35 @@ fn stress_3_bidirectional_duplex_fetch_over_blocking_tcp() {
 }
 
 #[test]
+fn peer_remove_after_draining_and_reattach() {
+    let test_name = "peer_remove_after_draining_and_reattach";
+    let node_id = match std::env::var(ROLE).as_deref() {
+        Ok("coordinator") => 0,
+        Ok("first") => 1,
+        Ok("replacement") => 2,
+        _ => {
+            let status = spawn_role(test_name, "coordinator").status().unwrap();
+            assert!(status.success(), "{test_name} coordinator failed: {status}");
+            return;
+        }
+    };
+    // Debug builds of the RDMA paths need more stack than the default test thread.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let mut node = NodeEnv::new(node_id);
+            let Some(device) = open_rdma_device(&mut node, test_name) else {
+                assert_eq!(node_id, 0);
+                return;
+            };
+            run_peer_removal_and_reattach(&mut node, &device, test_name);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn stress_4_three_node_shared_mr_mesh_and_cross_peer_evict() {
     let test_name = "stress_4_three_node_shared_mr_mesh_and_cross_peer_evict";
     match std::env::var(ROLE).as_deref() {
@@ -1525,4 +1913,36 @@ fn stress_5_cooperative_first_revocation_fast_and_timeout_fallback() {
             assert!(status.success(), "{test_name} donor failed: {status}");
         }
     }
+}
+
+#[test]
+fn peer_pump_queues_fetches_for_explicit_admission() {
+    let test_name = "peer_pump_queues_fetches_for_explicit_admission";
+    let node_id = match std::env::var(ROLE).as_deref() {
+        Ok("donor") => 0,
+        Ok("initiator") => 1,
+        _ => {
+            assert!(spawn_role(test_name, "donor").status().unwrap().success());
+            return;
+        }
+    };
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let mut node = NodeEnv::new(node_id);
+            let Some(device) = open_rdma_device(&mut node, test_name) else {
+                assert_eq!(node_id, 0);
+                return;
+            };
+            if node_id == 0 {
+                let (transport, mut child) = start_peer_process(test_name, "initiator");
+                run_explicit_peer_admission(&mut node, &device, transport);
+                assert!(child.wait().unwrap().success());
+            } else {
+                run_explicit_peer_admission(&mut node, &device, connect_to_coordinator());
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }

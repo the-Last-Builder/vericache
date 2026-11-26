@@ -6,9 +6,13 @@ use core::ffi::{c_char, c_int, c_uint, c_void};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub(crate) const CUDA_MEMCPY_HOST_TO_DEVICE: c_int = 1;
-pub(crate) const CUDA_MEMCPY_DEVICE_TO_HOST: c_int = 2;
-pub(crate) const CUDA_MEMCPY_DEVICE_TO_DEVICE: c_int = 3;
+use crate::device_copy::{
+    BlockingEvent, CopyBatch, CopyDirection, ExternalDeviceCopy, PinnedHostBuffer,
+};
+
+const CUDA_MEMCPY_HOST_TO_DEVICE: c_int = 1;
+const CUDA_MEMCPY_DEVICE_TO_HOST: c_int = 2;
+const CUDA_MEMCPY_DEVICE_TO_DEVICE: c_int = 3;
 
 const CUDA_EVENT_BLOCKING_SYNC: c_uint = 0x01;
 const CUDA_EVENT_DISABLE_TIMING: c_uint = 0x02;
@@ -71,11 +75,6 @@ unsafe extern "C" {
     fn cudaSetDevice(device: c_int) -> c_int;
 }
 
-pub(crate) fn set_device(device_id: i32) -> Result<(), i32> {
-    let rc = unsafe { cudaSetDevice(device_id as c_int) };
-    if rc != 0 { Err(rc) } else { Ok(()) }
-}
-
 unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 }
@@ -110,11 +109,14 @@ pub(crate) struct BlockingCudaEvent {
     ev: *mut c_void,
 }
 
-impl BlockingCudaEvent {
-    pub(crate) fn new() -> Result<Self, i32> {
+impl BlockingEvent for BlockingCudaEvent {
+    fn new() -> Result<Self, i32> {
         let mut ev: *mut c_void = core::ptr::null_mut();
         let rc = unsafe {
-            cudaEventCreateWithFlags(&mut ev, CUDA_EVENT_BLOCKING_SYNC | CUDA_EVENT_DISABLE_TIMING)
+            cudaEventCreateWithFlags(
+                &mut ev,
+                CUDA_EVENT_BLOCKING_SYNC | CUDA_EVENT_DISABLE_TIMING,
+            )
         };
         if rc != 0 || ev.is_null() {
             return Err(if rc != 0 { rc } else { -1 });
@@ -122,7 +124,18 @@ impl BlockingCudaEvent {
         Ok(Self { ev })
     }
 
-    pub(crate) fn record_and_sync(&self, cuda_stream_ptr: usize) -> Result<(), i32> {
+    fn record(&self, cuda_stream_ptr: usize) -> Result<(), i32> {
+        let stream = cuda_stream_ptr as *mut c_void;
+        let rc = unsafe { cudaEventRecord(self.ev, stream) };
+        if rc != 0 { Err(rc) } else { Ok(()) }
+    }
+
+    fn synchronize(&self) -> Result<(), i32> {
+        let rc = unsafe { cudaEventSynchronize(self.ev) };
+        if rc != 0 { Err(rc) } else { Ok(()) }
+    }
+
+    fn record_and_sync(&self, cuda_stream_ptr: usize) -> Result<(), i32> {
         let stream = cuda_stream_ptr as *mut c_void;
         let rc = unsafe { cudaEventRecord(self.ev, stream) };
         if rc != 0 {
@@ -133,17 +146,6 @@ impl BlockingCudaEvent {
             return Err(rc2);
         }
         Ok(())
-    }
-
-    pub(crate) fn record(&self, cuda_stream_ptr: usize) -> Result<(), i32> {
-        let stream = cuda_stream_ptr as *mut c_void;
-        let rc = unsafe { cudaEventRecord(self.ev, stream) };
-        if rc != 0 { Err(rc) } else { Ok(()) }
-    }
-
-    pub(crate) fn synchronize(&self) -> Result<(), i32> {
-        let rc = unsafe { cudaEventSynchronize(self.ev) };
-        if rc != 0 { Err(rc) } else { Ok(()) }
     }
 }
 
@@ -164,15 +166,15 @@ pub(crate) struct PinnedHostBuf {
     cap: usize,
 }
 
-impl PinnedHostBuf {
-    pub(crate) fn new() -> Self {
+impl PinnedHostBuffer for PinnedHostBuf {
+    fn new() -> Self {
         Self {
             ptr: core::ptr::null_mut(),
             cap: 0,
         }
     }
 
-    pub(crate) fn ensure_capacity(&mut self, bytes: usize) -> Result<(), i32> {
+    fn ensure_capacity(&mut self, bytes: usize) -> Result<(), i32> {
         if bytes <= self.cap {
             return Ok(());
         }
@@ -187,20 +189,22 @@ impl PinnedHostBuf {
         Ok(())
     }
 
-    pub(crate) fn addr(&self) -> usize {
+    fn addr(&self) -> usize {
         self.ptr as usize
     }
 
-    pub(crate) fn as_slice(&self, len: usize) -> &[u8] {
+    fn as_slice(&self, len: usize) -> &[u8] {
         debug_assert!(len <= self.cap);
         unsafe { core::slice::from_raw_parts(self.ptr, len) }
     }
 
-    pub(crate) fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
+    fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
         debug_assert!(len <= self.cap);
         unsafe { core::slice::from_raw_parts_mut(self.ptr, len) }
     }
+}
 
+impl PinnedHostBuf {
     fn free(&mut self) {
         if !self.ptr.is_null() {
             unsafe {
@@ -231,8 +235,8 @@ pub(crate) struct BatchCopyBuf {
     all_h2d: bool,
 }
 
-impl BatchCopyBuf {
-    pub(crate) fn new() -> Self {
+impl CopyBatch for BatchCopyBuf {
+    fn new() -> Self {
         Self {
             dsts: Vec::new(),
             srcs: Vec::new(),
@@ -242,7 +246,7 @@ impl BatchCopyBuf {
         }
     }
 
-    pub(crate) fn clear(&mut self) {
+    fn clear(&mut self) {
         self.dsts.clear();
         self.srcs.clear();
         self.sizes.clear();
@@ -250,16 +254,16 @@ impl BatchCopyBuf {
         self.all_h2d = true;
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.sizes.is_empty()
     }
 
-    pub(crate) fn push(
+    fn push(
         &mut self,
         dst_addr: usize,
         src_addr: usize,
         len: usize,
-        kind: c_int,
+        direction: CopyDirection,
     ) -> Result<(), i32> {
         if len == 0 {
             return Ok(());
@@ -270,21 +274,70 @@ impl BatchCopyBuf {
         self.dsts.push(dst_addr as *mut c_void);
         self.srcs.push(src_addr as *const c_void);
         self.sizes.push(len);
+        let kind = cuda_memcpy_kind(direction);
         self.kinds.push(kind);
         if kind != CUDA_MEMCPY_HOST_TO_DEVICE {
             self.all_h2d = false;
         }
         Ok(())
     }
+}
 
-    /// Submit all queued copies asynchronously on `cuda_stream_ptr`.
-    ///
-    /// Returns `Ok(submitted)` where `submitted` is true if at least one async copy
-    /// was enqueued on `cuda_stream_ptr`. On error returns `Err((cuda_code, dirty))`,
-    /// where `dirty` indicates whether the caller must drain `cuda_stream_ptr` before
-    /// releasing any referenced buffers or leases.
-    pub(crate) fn submit_async(&self, cuda_stream_ptr: usize) -> Result<bool, (i32, bool)> {
-        let count = self.sizes.len();
+#[inline]
+fn cuda_memcpy_kind(direction: CopyDirection) -> c_int {
+    match direction {
+        CopyDirection::HostToDevice => CUDA_MEMCPY_HOST_TO_DEVICE,
+        CopyDirection::DeviceToHost => CUDA_MEMCPY_DEVICE_TO_HOST,
+        CopyDirection::DeviceToDevice => CUDA_MEMCPY_DEVICE_TO_DEVICE,
+    }
+}
+
+pub(crate) struct CudaDeviceCopy;
+
+impl ExternalDeviceCopy for CudaDeviceCopy {
+    type Batch = BatchCopyBuf;
+    type Event = BlockingCudaEvent;
+    type Staging = PinnedHostBuf;
+
+    fn set_device(device_id: i32) -> Result<(), i32> {
+        let rc = unsafe { cudaSetDevice(device_id as c_int) };
+        if rc != 0 { Err(rc) } else { Ok(()) }
+    }
+
+    fn memcpy_async(
+        dst_addr: usize,
+        src_addr: usize,
+        len: usize,
+        direction: CopyDirection,
+        cuda_stream_ptr: usize,
+    ) -> Result<(), i32> {
+        if len == 0 {
+            return Ok(());
+        }
+        if dst_addr == 0 || src_addr == 0 {
+            return Err(-1);
+        }
+        let stream = cuda_stream_ptr as *mut c_void;
+        let rc = unsafe {
+            cudaMemcpyAsync(
+                dst_addr as *mut c_void,
+                src_addr as *const c_void,
+                len,
+                cuda_memcpy_kind(direction),
+                stream,
+            )
+        };
+        if rc != 0 {
+            return Err(rc);
+        }
+        Ok(())
+    }
+
+    fn memcpy_batch_async(
+        batch: &BatchCopyBuf,
+        cuda_stream_ptr: usize,
+    ) -> Result<bool, (i32, bool)> {
+        let count = batch.sizes.len();
         if count == 0 {
             return Ok(false);
         }
@@ -292,16 +345,13 @@ impl BatchCopyBuf {
 
         // CUDA 13.0 `cudaMemcpyBatchAsync` requires a non-NULL stream and amortizes
         // launch overhead when submitting multiple copies in one driver call.
-        if count > 1
-            && cuda_stream_ptr != 0
-            && !BATCH_COPY_UNSUPPORTED.load(Ordering::Relaxed)
-        {
+        if count > 1 && cuda_stream_ptr != 0 && !BATCH_COPY_UNSUPPORTED.load(Ordering::Relaxed) {
             if let Some(batch_fn) = resolve_batch_copy_fn() {
                 // Pure H2D LOAD from verified read-leased PinnedHost frames has no prior
                 // GPU writers on `stream`, so `Any` lets CUDA 13.0 relax source ordering.
                 // SAVE (D2H) and any batch containing GPU HBM/GDR sources (D2D) MUST stay
                 // strictly `Stream`-ordered.
-                let src_access_order = if self.all_h2d {
+                let src_access_order = if batch.all_h2d {
                     CUDA_MEMCPY_SRC_ACCESS_ORDER_ANY
                 } else {
                     CUDA_MEMCPY_SRC_ACCESS_ORDER_STREAM
@@ -321,9 +371,9 @@ impl BatchCopyBuf {
                 let mut attr_idx: usize = 0;
                 let rc = unsafe {
                     batch_fn(
-                        self.dsts.as_ptr(),
-                        self.srcs.as_ptr(),
-                        self.sizes.as_ptr(),
+                        batch.dsts.as_ptr(),
+                        batch.srcs.as_ptr(),
+                        batch.sizes.as_ptr(),
                         count,
                         &mut attr,
                         &mut attr_idx,
@@ -346,10 +396,10 @@ impl BatchCopyBuf {
         for i in 0..count {
             let rc = unsafe {
                 cudaMemcpyAsync(
-                    self.dsts[i],
-                    self.srcs[i],
-                    self.sizes[i],
-                    self.kinds[i],
+                    batch.dsts[i],
+                    batch.srcs[i],
+                    batch.sizes[i],
+                    batch.kinds[i],
                     stream,
                 )
             };
@@ -360,69 +410,13 @@ impl BatchCopyBuf {
         }
         Ok(submitted)
     }
-}
 
-fn memcpy_async_kind(
-    dst_addr: usize,
-    src_addr: usize,
-    len: usize,
-    kind: c_int,
-    cuda_stream_ptr: usize,
-) -> Result<(), i32> {
-    if len == 0 {
-        return Ok(());
+    fn stream_synchronize(cuda_stream_ptr: usize) -> Result<(), i32> {
+        let stream = cuda_stream_ptr as *mut c_void;
+        let rc = unsafe { cudaStreamSynchronize(stream) };
+        if rc != 0 {
+            return Err(rc);
+        }
+        Ok(())
     }
-    if dst_addr == 0 || src_addr == 0 {
-        return Err(-1);
-    }
-    let stream = cuda_stream_ptr as *mut c_void;
-    let rc = unsafe {
-        cudaMemcpyAsync(
-            dst_addr as *mut c_void,
-            src_addr as *const c_void,
-            len,
-            kind,
-            stream,
-        )
-    };
-    if rc != 0 {
-        return Err(rc);
-    }
-    Ok(())
-}
-
-pub(crate) fn memcpy_d2d_async(
-    dst_addr: usize,
-    src_addr: usize,
-    len: usize,
-    cuda_stream_ptr: usize,
-) -> Result<(), i32> {
-    memcpy_async_kind(
-        dst_addr,
-        src_addr,
-        len,
-        CUDA_MEMCPY_DEVICE_TO_DEVICE,
-        cuda_stream_ptr,
-    )
-}
-
-pub(crate) fn stream_synchronize(cuda_stream_ptr: usize) -> Result<(), i32> {
-    let stream = cuda_stream_ptr as *mut c_void;
-    let rc = unsafe { cudaStreamSynchronize(stream) };
-    if rc != 0 {
-        return Err(rc);
-    }
-    Ok(())
-}
-
-/// Synchronously copy `len` bytes from `src_addr` to `dst_addr` in GPU HBM on
-/// `cuda_stream_ptr` (or default stream 0 if null).
-pub(crate) fn memcpy_d2d_sync(
-    dst_addr: usize,
-    src_addr: usize,
-    len: usize,
-    cuda_stream_ptr: usize,
-) -> Result<(), i32> {
-    memcpy_d2d_async(dst_addr, src_addr, len, cuda_stream_ptr)?;
-    stream_synchronize(cuda_stream_ptr)
 }

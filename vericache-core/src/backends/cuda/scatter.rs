@@ -1,5 +1,7 @@
 #[cfg(verus_only)]
 use super::put::scatter_offsets_valid;
+#[cfg(verus_only)]
+use super::scatter_ops::scatter_readable;
 use super::*;
 #[cfg(verus_only)]
 use foundation::tracked::Frontier;
@@ -32,25 +34,25 @@ impl<'a> CudaBackend<'a> {
             scatter_offsets_valid(
                 srcs@,
                 offsets,
-                old(core).frames.tier_frame_size(old(self).gpu_tier),
+                old(core).frames_spec().tier_frame_size(old(self).gpu_tier_spec()),
             ),
-            bytes.len() == old(core).frames.tier_frame_size(old(self).gpu_tier),
+            bytes.len() == old(core).frames_spec().tier_frame_size(old(self).gpu_tier_spec()),
             src_certs.len() == srcs@.len(),
             forall|i: int|
                 0 <= i < srcs@.len() ==> {
                     &&& (#[trigger] srcs@[i]).instance_id() == old(core).instance_id()
                     &&& srcs@[i].slot_ref().loc.node == old(core).node()
                     &&& old(src_perms).dom().contains(i)
-                    &&& old(src_perms)[i].valid_local(
+                    &&& old(src_perms)[i].valid_cooperative(
                         old(core).instance_id(),
                         srcs@[i].slot_ref().loc,
                     )
                     &&& read_admitted(old(src_perms)[i].frontier(), old(core).citations())
-                    &&& (srcs@[i].slot_ref().loc.space is GpuAlloc
-                        && srcs@[i].slot_ref().loc.space->GpuAlloc_device != old(self).device ==> (
-                    old(src_perms)[i].frontier().last_writer matches Some(w) ==> !(
-                    w.source is RdmaQueuePair)))
-                    &&& replica_valid(old(core).ledger@, old(core).node(), src_certs[i])
+                    &&& (srcs@[i].slot_ref().loc.space.is_gpu()
+                        && srcs@[i].slot_ref().loc.space.gpu_device() != old(self).device_spec()
+                        ==> (old(src_perms)[i].frontier().last_writer matches Some(w) ==> !(
+                    w.source.is_rdma_qp())))
+                    &&& replica_valid(old(core).ledger_spec()@, old(core).node(), src_certs[i])
                     &&& source_slice_valid(src_certs[i], srcs@[i].slot_ref())
                     &&& src_certs[i].slot.well_formed()
                     &&& src_certs[i].bytes.len() == src_certs[i].slot.sub_len
@@ -59,37 +61,39 @@ impl<'a> CudaBackend<'a> {
                         offsets[i + 1] as int,
                     )
                     &&& forall|f: FrameId|
-                        f.0 < old(core).frames.metas.len() && (#[trigger] old(core).frames.meta(
-                            f,
-                        )).state == STATE_EMPTY ==> srcs@[i].slot_ref().loc != old(
+                        f.0 < old(core).frames_spec().metas_spec().len() && (#[trigger] old(
                             core,
-                        ).frames.frame(f).slot.loc
+                        ).frames_spec().meta(f)).state == STATE_EMPTY ==> srcs@[i].slot_ref().loc
+                            != old(core).frames_spec().frame(f).slot.loc
                 },
         ensures
             final(core).well_formed(),
             final(self).well_formed(final(core)),
-            final(self).device == old(self).device,
-            final(self).gpu_tier == old(self).gpu_tier,
-            final(self).gpu_first_frame == old(self).gpu_first_frame,
-            final(self).gpu_num_frames == old(self).gpu_num_frames,
+            final(self).device_spec() == old(self).device_spec(),
+            final(self).gpu_tier_spec() == old(self).gpu_tier_spec(),
+            final(self).gpu_first_frame_spec() == old(self).gpu_first_frame_spec(),
+            final(self).gpu_num_frames_spec() == old(self).gpu_num_frames_spec(),
             final(self).same_pinned_layout(old(self)),
-            final(self).timeline.timeline_id == old(self).timeline.timeline_id,
-            final(core).node_id == old(core).node_id,
+            final(self).timeline_spec().timeline_id_spec() == old(
+                self,
+            ).timeline_spec().timeline_id_spec(),
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).spec == old(core).spec,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
             core_transition(
                 old(core),
                 final(core),
-                Some(old(self).timeline.timeline_id),
-                Some(old(self).timeline.stream.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(old(self).timeline_spec().timeline_id_spec()),
+                    Some(old(self).timeline_spec().stream_spec().source().source()),
+                ),
             ),
             r matches Ok((version, frame, ticket, _)) ==> {
                 &&& ticket != Ticket::NONE
-                &&& ticket.timeline_id() == old(self).timeline.timeline_id
-                &&& version.origin_node == old(core).node_id
-                &&& version.seq == old(core).next_version_seq
+                &&& ticket.timeline_id() == old(self).timeline_spec().timeline_id_spec()
+                &&& version.origin_node == old(core).node_id_spec()
+                &&& version.seq == old(core).next_version_seq_spec()
                 &&& final(self).owns_gpu(frame)
             },
     {
@@ -110,9 +114,10 @@ impl<'a> CudaBackend<'a> {
                 proof {
                     lemma_core_transition_refl(
                         core,
-                        Some(self.timeline.timeline_id),
-                        Some(self.timeline.stream.source().source()),
-                        FrameTouchMode::PreserveAllInit,
+                        CoreFootprint::preserve_all(
+                            Some(self.timeline.timeline_id),
+                            Some(self.timeline.stream.source().source()),
+                        ),
                     );
                 }
                 return Err(e);
@@ -122,7 +127,7 @@ impl<'a> CudaBackend<'a> {
             lemma_core_wf_facts(&before_core);
             lemma_core_wf_facts(core);
             lemma_initializing_frame_slot_valid(core, handle.frame);
-            assert(before_core.frames.frame(handle.frame).slot == handle.slot@) by {
+            assert(before_core.frames_spec().frame(handle.frame).slot == handle.slot@) by {
                 reveal(FrameTable::same_directory);
             }
             lemma_core_transition_no_event(
@@ -132,9 +137,9 @@ impl<'a> CudaBackend<'a> {
                 Some(self.timeline.stream.source().source()),
             );
             lemma_cuda_slabs_same_directory(self, &before_core, core);
-            assert(before_core.frames.meta(handle.frame).state == STATE_EMPTY);
+            assert(before_core.frames_spec().meta(handle.frame).state == STATE_EMPTY);
             assert(cuda_scatter_srcs_valid(
-                before_core.ledger@,
+                before_core.ledger_spec()@,
                 core.instance_id(),
                 core.node(),
                 handle.slot@.loc,
@@ -146,7 +151,7 @@ impl<'a> CudaBackend<'a> {
                 reveal(cuda_scatter_srcs_valid);
                 assert forall|k: int| 0 <= k < srcs@.len() implies (
                 #[trigger] srcs@[k]).slot_ref().loc != handle.slot@.loc by {
-                    assert(srcs@[k].slot_ref().loc != before_core.frames.frame(
+                    assert(srcs@[k].slot_ref().loc != before_core.frames_spec().frame(
                         handle.frame,
                     ).slot.loc);
                 }
@@ -172,6 +177,21 @@ impl<'a> CudaBackend<'a> {
                 handle.frame,
                 ISet::empty().insert(handle.slot@.loc),
             );
+            assert(scatter_readable(srcs@, *src_perms, 0, core, self.device)) by {
+                reveal(scatter_readable);
+                assert forall|k: int| 0 <= k < srcs@.len() implies {
+                    let loc = srcs@[k].slot_ref().loc;
+                    let perm = #[trigger] src_perms[k];
+                    &&& src_perms.contains_key(k)
+                    &&& perm.valid_cooperative(core.instance_id(), loc)
+                    &&& read_admitted(perm.frontier(), core.citations())
+                    &&& (loc.space.is_gpu() && loc.space.gpu_device() != self.device ==> (
+                    perm.frontier().last_writer matches Some(w) ==> !w.source.is_rdma_qp()))
+                } by {
+                    assert(srcs@[k].instance_id() == before_core.instance_id());
+                    assert(core.citations() == before_core.citations());
+                }
+            }
         }
         self.execute_put_gpu_scatter(
             core,
@@ -208,46 +228,46 @@ impl<'a> CudaBackend<'a> {
             scatter_offsets_valid(
                 srcs@,
                 offsets,
-                old(core).frames.tier_frame_size(old(self).gpu_tier),
+                old(core).frames_spec().tier_frame_size(old(self).gpu_tier),
             ),
-            bytes.len() == old(core).frames.tier_frame_size(old(self).gpu_tier),
+            bytes.len() == old(core).frames_spec().tier_frame_size(old(self).gpu_tier),
             src_certs.len() == srcs@.len(),
             old(self).owns_gpu(handle.frame),
             old(self).gpu_buffer.slot_ref((handle.frame.0 - old(self).gpu_first_frame.0) as nat)
                 == handle.slot@,
-            old(core).node_id == before_core.node_id,
+            old(core).node_id_spec() == before_core.node_id_spec(),
             old(core).instance_id() == before_core.instance_id(),
-            old(core).tiers == before_core.tiers,
-            old(core).spec == before_core.spec,
-            old(core).next_version_seq == before_core.next_version_seq + 1,
-            old(core).version_seq_limit == before_core.version_seq_limit,
-            old(core).timelines == before_core.timelines,
-            old(core).ledger == before_core.ledger,
-            old(core).frames.same_directory(&before_core.frames),
-            old(core).frames.preserves_initializing(&before_core.frames, None),
-            handle.frame.0 < before_core.frames.metas.len(),
-            before_core.frames.meta(handle.frame).state == STATE_EMPTY,
-            handle.frame.0 < old(core).frames.metas.len(),
-            old(core).frames.meta(handle.frame).state == STATE_INITIALIZING,
-            !old(core).frames.meta(handle.frame).queued(),
-            old(core).frames.frame(handle.frame).token is None,
-            old(core).frames.frame(handle.frame).tier == handle.tier,
-            old(core).frames.frame(handle.frame).slot == handle.slot@,
-            old(core).frames.frame(handle.frame).bound_key == Some(handle.key),
-            old(core).frames.frame(handle.frame).bound_version == Some(handle.version),
+            old(core).tiers_spec() == before_core.tiers_spec(),
+            old(core).spec_spec() == before_core.spec_spec(),
+            old(core).next_version_seq_spec() == before_core.next_version_seq_spec() + 1,
+            old(core).version_seq_limit_spec() == before_core.version_seq_limit_spec(),
+            old(core).timelines_spec() == before_core.timelines_spec(),
+            old(core).ledger_spec() == before_core.ledger_spec(),
+            old(core).frames_spec().same_directory(&before_core.frames_spec()),
+            old(core).frames_spec().preserves_initializing(&before_core.frames_spec(), None),
+            handle.frame.0 < before_core.frames_spec().metas_spec().len(),
+            before_core.frames_spec().meta(handle.frame).state == STATE_EMPTY,
+            handle.frame.0 < old(core).frames_spec().metas_spec().len(),
+            old(core).frames_spec().meta(handle.frame).state == STATE_INITIALIZING,
+            !old(core).frames_spec().meta(handle.frame).queued(),
+            old(core).frames_spec().frame(handle.frame).token is None,
+            old(core).frames_spec().frame(handle.frame).tier == handle.tier,
+            old(core).frames_spec().frame(handle.frame).slot == handle.slot@,
+            old(core).frames_spec().frame(handle.frame).bound_key == Some(handle.key),
+            old(core).frames_spec().frame(handle.frame).bound_version == Some(handle.version),
             handle.version == (VersionId {
-                origin_node: before_core.node_id,
-                seq: before_core.next_version_seq,
+                origin_node: before_core.node_id_spec(),
+                seq: before_core.next_version_seq_spec(),
             }),
             handle.version.well_formed() && handle.version != VersionId::NONE,
-            !before_core.frames.versions@.contains_key(handle.version),
+            !before_core.frames_spec().versions_spec()@.contains_key(handle.version),
             handle.slot@.is_full(),
-            handle.slot@.slot_len == old(core).frames.tier_frame_size(old(self).gpu_tier),
+            handle.slot@.slot_len == old(core).frames_spec().tier_frame_size(old(self).gpu_tier),
             handle.slot@.loc.node == old(core).node(),
             slot_is_owned(dst_tok, old(core).instance_id(), handle.slot@.loc),
             write_admitted(slot_frontier(dst_tok), old(core).citations()),
             cuda_scatter_srcs_valid(
-                before_core.ledger@,
+                before_core.ledger_spec()@,
                 old(core).instance_id(),
                 old(core).node(),
                 handle.slot@.loc,
@@ -256,25 +276,14 @@ impl<'a> CudaBackend<'a> {
                 offsets,
                 bytes,
             ),
-            forall|k: int|
-                0 <= k < srcs@.len() ==> {
-                    &&& old(src_perms).dom().contains(k)
-                    &&& old(src_perms)[k].valid_local(
-                        old(core).instance_id(),
-                        (#[trigger] srcs@[k]).slot_ref().loc,
-                    )
-                    &&& read_admitted(old(src_perms)[k].frontier(), old(core).citations())
-                    &&& (srcs@[k].slot_ref().loc.space is GpuAlloc
-                        && srcs@[k].slot_ref().loc.space->GpuAlloc_device != old(self).device ==> (
-                    old(src_perms)[k].frontier().last_writer matches Some(w) ==> !(
-                    w.source is RdmaQueuePair)))
-                },
+            scatter_readable(srcs@, *old(src_perms), 0, old(core), old(self).device),
             core_transition(
                 &before_core,
                 old(core),
-                Some(old(self).timeline.timeline_id),
-                Some(old(self).timeline.stream.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(old(self).timeline.timeline_id),
+                    Some(old(self).timeline.stream.source().source()),
+                ),
             ),
         ensures
             final(core).well_formed(),
@@ -285,22 +294,23 @@ impl<'a> CudaBackend<'a> {
             final(self).gpu_num_frames == old(self).gpu_num_frames,
             final(self).same_pinned_layout(old(self)),
             final(self).timeline.timeline_id == old(self).timeline.timeline_id,
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).spec == old(core).spec,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
             core_transition(
                 &before_core,
                 final(core),
-                Some(old(self).timeline.timeline_id),
-                Some(old(self).timeline.stream.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(old(self).timeline.timeline_id),
+                    Some(old(self).timeline.stream.source().source()),
+                ),
             ),
             r matches Ok((version, frame, ticket, _)) ==> {
                 &&& ticket != Ticket::NONE
                 &&& ticket.timeline_id() == old(self).timeline.timeline_id
-                &&& version.origin_node == before_core.node_id
-                &&& version.seq == before_core.next_version_seq
+                &&& version.origin_node == before_core.node_id_spec()
+                &&& version.seq == before_core.next_version_seq_spec()
                 &&& final(self).owns_gpu(frame)
             },
     {
@@ -316,7 +326,7 @@ impl<'a> CudaBackend<'a> {
         hide(TimelineTable::ticket_covers);
         let tracked mut dst_tok = dst_tok;
         proof {
-            assert(before_core.frames.frame(handle.frame).slot == handle.slot@) by {
+            assert(before_core.frames_spec().frame(handle.frame).slot == handle.slot@) by {
                 reveal(FrameTable::same_directory);
             }
         }
@@ -387,29 +397,29 @@ impl<'a> CudaBackend<'a> {
             scatter_offsets_valid(
                 srcs@,
                 offsets,
-                old(core).frames.tier_frame_size(old(self).gpu_tier),
+                old(core).frames_spec().tier_frame_size(old(self).gpu_tier),
             ),
-            bytes.len() == old(core).frames.tier_frame_size(old(self).gpu_tier),
+            bytes.len() == old(core).frames_spec().tier_frame_size(old(self).gpu_tier),
             src_certs.len() == srcs@.len(),
             old(self).owns_gpu(dst_frame),
             old(self).gpu_buffer.slot_ref((dst_frame.0 - old(self).gpu_first_frame.0) as nat)
                 == dst_slot,
-            dst_frame.0 < old(core).frames.metas.len(),
-            old(core).frames.meta(dst_frame).state == STATE_INITIALIZING,
-            old(core).frames.frame(dst_frame).slot == dst_slot,
+            dst_frame.0 < old(core).frames_spec().metas_spec().len(),
+            old(core).frames_spec().meta(dst_frame).state == STATE_INITIALIZING,
+            old(core).frames_spec().frame(dst_frame).slot == dst_slot,
             dst_slot.is_full(),
-            dst_slot.slot_len == old(core).frames.tier_frame_size(old(self).gpu_tier),
+            dst_slot.slot_len == old(core).frames_spec().tier_frame_size(old(self).gpu_tier),
             dst_slot.loc.node == old(core).node(),
-            old(core).node_id == before_core.node_id,
+            old(core).node_id_spec() == before_core.node_id_spec(),
             old(core).instance_id() == before_core.instance_id(),
-            old(core).tiers == before_core.tiers,
-            old(core).spec == before_core.spec,
-            old(core).timelines == before_core.timelines,
-            old(core).ledger == before_core.ledger,
+            old(core).tiers_spec() == before_core.tiers_spec(),
+            old(core).spec_spec() == before_core.spec_spec(),
+            old(core).timelines_spec() == before_core.timelines_spec(),
+            old(core).ledger_spec() == before_core.ledger_spec(),
             slot_is_owned(*old(dst_tok), old(core).instance_id(), dst_slot.loc),
             write_admitted(slot_frontier(*old(dst_tok)), old(core).citations()),
             cuda_scatter_srcs_valid(
-                before_core.ledger@,
+                before_core.ledger_spec()@,
                 old(core).instance_id(),
                 old(core).node(),
                 dst_slot.loc,
@@ -418,28 +428,17 @@ impl<'a> CudaBackend<'a> {
                 offsets,
                 bytes,
             ),
-            forall|k: int|
-                0 <= k < srcs@.len() ==> {
-                    &&& old(src_perms).dom().contains(k)
-                    &&& old(src_perms)[k].valid_local(
-                        old(core).instance_id(),
-                        (#[trigger] srcs@[k]).slot_ref().loc,
-                    )
-                    &&& read_admitted(old(src_perms)[k].frontier(), old(core).citations())
-                    &&& (srcs@[k].slot_ref().loc.space is GpuAlloc
-                        && srcs@[k].slot_ref().loc.space->GpuAlloc_device != old(self).device ==> (
-                    old(src_perms)[k].frontier().last_writer matches Some(w) ==> !(
-                    w.source is RdmaQueuePair)))
-                },
-            dst_frame.0 < before_core.frames.metas.len(),
-            before_core.frames.meta(dst_frame).state == STATE_EMPTY,
-            before_core.frames.frame(dst_frame).slot == dst_slot,
+            scatter_readable(srcs@, *old(src_perms), 0, old(core), old(self).device),
+            dst_frame.0 < before_core.frames_spec().metas_spec().len(),
+            before_core.frames_spec().meta(dst_frame).state == STATE_EMPTY,
+            before_core.frames_spec().frame(dst_frame).slot == dst_slot,
             core_transition(
                 &before_core,
                 old(core),
-                Some(old(self).timeline.timeline_id),
-                Some(old(self).timeline.stream.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(old(self).timeline.timeline_id),
+                    Some(old(self).timeline.stream.source().source()),
+                ),
             ),
         ensures
             final(core).well_formed(),
@@ -447,9 +446,10 @@ impl<'a> CudaBackend<'a> {
             core_transition(
                 &before_core,
                 final(core),
-                Some(old(self).timeline.timeline_id),
-                Some(old(self).timeline.stream.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(old(self).timeline.timeline_id),
+                    Some(old(self).timeline.stream.source().source()),
+                ),
             ),
             final(self).device == old(self).device,
             final(self).gpu_tier == old(self).gpu_tier,
@@ -461,26 +461,26 @@ impl<'a> CudaBackend<'a> {
                 self,
             ).timeline.stream.source().source(),
             final(self).active_gpu_puts == old(self).active_gpu_puts,
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames == old(core).frames,
-            final(core).catalog == old(core).catalog,
-            final(core).spec == old(core).spec,
-            final(core).next_version_seq == old(core).next_version_seq,
-            final(core).version_seq_limit == old(core).version_seq_limit,
-            final(core).timelines.count == before_core.timelines.count,
-            final(core).timelines.next_seq[final(self).timeline.timeline_id as int]
-                >= before_core.timelines.next_seq[final(self).timeline.timeline_id as int],
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec() == old(core).frames_spec(),
+            final(core).catalog_spec() == old(core).catalog_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            final(core).version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+            final(core).timelines_spec().count_spec() == before_core.timelines_spec().count_spec(),
+            final(core).timelines_spec().next_seq_spec()[final(self).timeline.timeline_id as int]
+                >= before_core.timelines_spec().next_seq_spec()[final(self).timeline.timeline_id as int],
             cuda_timeline_events_preserved(
-                before_core.timelines.events@,
-                final(core).timelines.events@,
+                before_core.timelines_spec().events_spec()@,
+                final(core).timelines_spec().events_spec()@,
                 final(self).timeline.timeline_id,
-                before_core.timelines.next_seq[final(self).timeline.timeline_id as int],
+                before_core.timelines_spec().next_seq_spec()[final(self).timeline.timeline_id as int],
             ),
-            final(core).ledger@.knows == before_core.ledger@.knows,
-            final(core).ledger@.succeeded == before_core.ledger@.succeeded,
-            final(core).ledger@.revoked == before_core.ledger@.revoked,
+            final(core).ledger_spec()@.knows == before_core.ledger_spec()@.knows,
+            final(core).ledger_spec()@.succeeded == before_core.ledger_spec()@.succeeded,
+            final(core).ledger_spec()@.revoked == before_core.ledger_spec()@.revoked,
             ({
                 let (done, last_ticket, err_opt, pieces, piece_seqs) = r;
                 let tl = final(self).timeline.timeline_id;
@@ -492,10 +492,10 @@ impl<'a> CudaBackend<'a> {
                 &&& slot_is_owned(*final(dst_tok), final(core).instance_id(), dst_slot.loc)
                 &&& slot_frontier(*final(dst_tok)).readers.subset_of(final(core).citations())
                 &&& cuda_scatter_pieces_wf(
-                    before_core.ledger@,
-                    final(core).ledger@,
+                    before_core.ledger_spec()@,
+                    final(core).ledger_spec()@,
                     final(core).node(),
-                    &final(core).timelines,
+                    &final(core).timelines_spec(),
                     tl,
                     dst_slot,
                     srcs@,
@@ -506,19 +506,20 @@ impl<'a> CudaBackend<'a> {
                     last_ticket,
                     done as int,
                 )
-                &&& (done == 0 ==> final(core).ledger@ == before_core.ledger@ && write_admitted(
-                    slot_frontier(*final(dst_tok)),
-                    final(core).citations(),
-                ))
+                &&& (done == 0 ==> final(core).ledger_spec()@ == before_core.ledger_spec()@
+                    && write_admitted(slot_frontier(*final(dst_tok)), final(core).citations()))
                 &&& (done > 0 ==> {
                     &&& last_ticket != Ticket::NONE
                     &&& last_ticket.timeline_id() == tl
                     &&& last_ticket.sequence() == piece_seqs@[done - 1]
-                    &&& final(core).timelines.issued(tl, last_ticket.sequence())
-                    &&& final(core).timelines.valid_ticket(last_ticket)
-                    &&& final(core).timelines.events@[(tl, last_ticket.sequence())] == pieces@[done
-                        - 1].writer
-                    &&& final(core).timelines.ticket_covers(last_ticket, pieces@[done - 1].writer)
+                    &&& final(core).timelines_spec().issued(tl, last_ticket.sequence())
+                    &&& final(core).timelines_spec().valid_ticket(last_ticket)
+                    &&& final(core).timelines_spec().events_spec()@[(tl, last_ticket.sequence())]
+                        == pieces@[done - 1].writer
+                    &&& final(core).timelines_spec().ticket_covers(
+                        last_ticket,
+                        pieces@[done - 1].writer,
+                    )
                     &&& slot_owned(
                         *final(dst_tok),
                         final(core).instance_id(),
@@ -544,14 +545,14 @@ impl<'a> CudaBackend<'a> {
         let ghost tl = self.timeline.timeline_id;
         proof {
             lemma_cuda_events_preserved_same(
-                core.timelines.events@,
+                core.timelines_spec().events_spec()@,
                 tl,
-                before_core.timelines.next_seq[tl as int],
+                before_core.timelines_spec().next_seq_spec()[tl as int],
             );
             lemma_cuda_scatter_pieces_init(
-                before_core.ledger@,
+                before_core.ledger_spec()@,
                 core.node(),
-                &core.timelines,
+                &core.timelines_spec(),
                 tl,
                 dst_slot,
                 srcs@,
@@ -568,26 +569,18 @@ impl<'a> CudaBackend<'a> {
         while i < srcs.len()
             invariant_except_break
                 err_opt.is_none(),
-                forall|k: int|
-                    i <= k < srcs.len() ==> {
-                        &&& src_perms.dom().contains(k)
-                        &&& src_perms[k].valid_local(
-                            core.instance_id(),
-                            (#[trigger] srcs@[k]).slot_ref().loc,
-                        )
-                        &&& read_admitted(src_perms[k].frontier(), core.citations())
-                        &&& (srcs@[k].slot_ref().loc.space is GpuAlloc
-                            && srcs@[k].slot_ref().loc.space->GpuAlloc_device != self.device ==> (
-                        src_perms[k].frontier().last_writer matches Some(w) ==> !(
-                        w.source is RdmaQueuePair)))
-                    },
+                scatter_readable(srcs@, *src_perms, i as int, core, self.device),
             invariant
                 i <= srcs.len(),
                 offset == offsets[i as int],
                 pieces.len() == i,
                 piece_seqs.len() == i,
-                scatter_offsets_valid(srcs@, offsets, core.frames.tier_frame_size(self.gpu_tier)),
-                bytes.len() == core.frames.tier_frame_size(self.gpu_tier),
+                scatter_offsets_valid(
+                    srcs@,
+                    offsets,
+                    core.frames_spec().tier_frame_size(self.gpu_tier),
+                ),
+                bytes.len() == core.frames_spec().tier_frame_size(self.gpu_tier),
                 src_certs.len() == srcs@.len(),
                 tl == self.timeline.timeline_id == old(self).timeline.timeline_id,
                 self.device == old(self).device,
@@ -602,54 +595,56 @@ impl<'a> CudaBackend<'a> {
                 before_core.well_formed(),
                 core.well_formed(),
                 cuda_backend_pre_park_wf(self, core, &before_core),
-                dst_frame.0 < before_core.frames.metas.len(),
-                before_core.frames.meta(dst_frame).state == STATE_EMPTY,
-                before_core.frames.frame(dst_frame).slot == dst_slot,
+                dst_frame.0 < before_core.frames_spec().metas_spec().len(),
+                before_core.frames_spec().meta(dst_frame).state == STATE_EMPTY,
+                before_core.frames_spec().frame(dst_frame).slot == dst_slot,
                 self.timeline.stream.source().source() == old(
                     self,
                 ).timeline.stream.source().source(),
                 core_transition(
                     &before_core,
                     core,
-                    Some(tl),
-                    Some(old(self).timeline.stream.source().source()),
-                    FrameTouchMode::PreserveAllInit,
+                    CoreFootprint::preserve_all(
+                        Some(tl),
+                        Some(old(self).timeline.stream.source().source()),
+                    ),
                 ),
                 instance.id() == core.instance_id(),
-                before_core.node_id == core.node_id,
+                before_core.node_id_spec() == core.node_id_spec(),
                 before_core.instance_id() == core.instance_id(),
-                before_core.tiers == core.tiers,
-                before_core.spec == core.spec,
-                core.node_id == old(core).node_id,
+                before_core.tiers_spec() == core.tiers_spec(),
+                before_core.spec_spec() == core.spec_spec(),
+                core.node_id_spec() == old(core).node_id_spec(),
                 core.instance_id() == old(core).instance_id(),
-                core.tiers == old(core).tiers,
-                core.frames == old(core).frames,
-                core.catalog == old(core).catalog,
-                core.spec == old(core).spec,
-                core.next_version_seq == old(core).next_version_seq,
-                core.version_seq_limit == old(core).version_seq_limit,
-                dst_frame.0 < core.frames.metas.len(),
-                core.frames.meta(dst_frame).state == STATE_INITIALIZING,
-                core.frames.frame(dst_frame).slot == dst_slot,
+                core.tiers_spec() == old(core).tiers_spec(),
+                core.frames_spec() == old(core).frames_spec(),
+                core.catalog_spec() == old(core).catalog_spec(),
+                core.spec_spec() == old(core).spec_spec(),
+                core.next_version_seq_spec() == old(core).next_version_seq_spec(),
+                core.version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+                dst_frame.0 < core.frames_spec().metas_spec().len(),
+                core.frames_spec().meta(dst_frame).state == STATE_INITIALIZING,
+                core.frames_spec().frame(dst_frame).slot == dst_slot,
                 dst_slot.is_full(),
-                dst_slot.slot_len == core.frames.tier_frame_size(self.gpu_tier),
+                dst_slot.slot_len == core.frames_spec().tier_frame_size(self.gpu_tier),
                 dst_slot.loc.node == core.node(),
-                core.timelines.count == before_core.timelines.count,
-                core.timelines.next_seq[tl as int] >= before_core.timelines.next_seq[tl as int],
+                core.timelines_spec().count_spec() == before_core.timelines_spec().count_spec(),
+                core.timelines_spec().next_seq_spec()[tl as int]
+                    >= before_core.timelines_spec().next_seq_spec()[tl as int],
                 cuda_timeline_events_preserved(
-                    before_core.timelines.events@,
-                    core.timelines.events@,
+                    before_core.timelines_spec().events_spec()@,
+                    core.timelines_spec().events_spec()@,
                     tl,
-                    before_core.timelines.next_seq[tl as int],
+                    before_core.timelines_spec().next_seq_spec()[tl as int],
                 ),
-                core.ledger@.knows == before_core.ledger@.knows,
-                core.ledger@.succeeded == before_core.ledger@.succeeded,
-                core.ledger@.revoked == before_core.ledger@.revoked,
+                core.ledger_spec()@.knows == before_core.ledger_spec()@.knows,
+                core.ledger_spec()@.succeeded == before_core.ledger_spec()@.succeeded,
+                core.ledger_spec()@.revoked == before_core.ledger_spec()@.revoked,
                 cuda_scatter_pieces_wf(
-                    before_core.ledger@,
-                    core.ledger@,
+                    before_core.ledger_spec()@,
+                    core.ledger_spec()@,
                     core.node(),
-                    &core.timelines,
+                    &core.timelines_spec(),
                     tl,
                     dst_slot,
                     srcs@,
@@ -661,7 +656,7 @@ impl<'a> CudaBackend<'a> {
                     i as int,
                 ),
                 cuda_scatter_srcs_valid(
-                    before_core.ledger@,
+                    before_core.ledger_spec()@,
                     core.instance_id(),
                     core.node(),
                     dst_slot.loc,
@@ -673,14 +668,15 @@ impl<'a> CudaBackend<'a> {
                 slot_is_owned(*dst_tok, core.instance_id(), dst_slot.loc),
                 slot_frontier(*dst_tok).readers.subset_of(core.citations()),
                 i == 0 ==> write_admitted(slot_frontier(*dst_tok), core.citations()) && last_ticket
-                    == Ticket::NONE && core.ledger@ == before_core.ledger@,
+                    == Ticket::NONE && core.ledger_spec()@ == before_core.ledger_spec()@,
                 i > 0 ==> {
                     &&& last_ticket != Ticket::NONE
                     &&& last_ticket.timeline_id() == tl
                     &&& last_ticket.sequence() == piece_seqs[i - 1]
-                    &&& core.timelines.issued(tl, last_ticket.sequence())
-                    &&& core.timelines.events@[(tl, last_ticket.sequence())] == pieces[i - 1].writer
-                    &&& core.timelines.ticket_covers(last_ticket, pieces[i - 1].writer)
+                    &&& core.timelines_spec().issued(tl, last_ticket.sequence())
+                    &&& core.timelines_spec().events_spec()@[(tl, last_ticket.sequence())]
+                        == pieces[i - 1].writer
+                    &&& core.timelines_spec().ticket_covers(last_ticket, pieces[i - 1].writer)
                     &&& slot_frontier(*dst_tok) == (Frontier {
                         last_writer: Some(pieces[i - 1].writer),
                         readers: ISet::empty(),
@@ -696,7 +692,7 @@ impl<'a> CudaBackend<'a> {
                 lemma_scatter_offsets_bounded(
                     srcs@,
                     offsets,
-                    core.frames.tier_frame_size(self.gpu_tier),
+                    core.frames_spec().tier_frame_size(self.gpu_tier),
                     (i + 1) as int,
                 );
                 lemma_slab_frame_slot(

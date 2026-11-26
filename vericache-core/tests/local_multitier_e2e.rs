@@ -1,18 +1,28 @@
 use std::sync::{Mutex, OnceLock};
+#[cfg(feature = "cuda")]
+use transfer::cuda;
+#[cfg(feature = "cuda")]
 use transfer::domain::DeviceId;
 #[cfg(verus_only)]
 use transfer::domain::*;
-use transfer::{context::*, cuda, host};
+use transfer::{context::*, host};
+#[cfg(feature = "cuda")]
 use vericache_core::backends::cuda::CudaBackend;
 use vericache_core::backends::host::HostBackend;
+#[cfg(feature = "nvme")]
 use vericache_core::backends::nvme::NvmeBackend;
+use vericache_core::backends::NoDevice;
 use vericache_core::engine::LocalEngine;
-use vericache_core::frame::{STATE_DRAINING, STATE_EMPTY};
+#[cfg(feature = "cuda")]
+use vericache_core::frame::STATE_DRAINING;
+use vericache_core::frame::STATE_EMPTY;
 use vericache_core::kernel::CacheCore;
+#[cfg(feature = "cuda")]
 use vericache_core::provenance::ValueCertificate;
 #[cfg(verus_only)]
 use vericache_core::provenance::*;
 use vericache_core::spec::*;
+#[cfg(feature = "cuda")]
 use vericache_core::timeline::TimelineKind;
 use vstd::prelude::*;
 
@@ -42,10 +52,12 @@ fn sources() -> std::sync::MutexGuard<'static, Sources> {
         .unwrap()
 }
 
+#[cfg(any(feature = "cuda", feature = "nvme"))]
 fn require_hw() -> bool {
     std::env::var_os("VERICACHE_REQUIRE_HW").is_some()
 }
 
+#[cfg(feature = "cuda")]
 fn has_cuda_device() -> bool {
     match cuda::device_count() {
         Ok(n) if n > 0 => true,
@@ -63,7 +75,7 @@ verus! {
 
 fn run_host_put_get_concurrent_lease_evict_reclaim(_src: &mut Sources) {
     let mut core = CacheCore::new(0, FRAME_SIZE, Vec::new(), 4, Tracked(_src.instance.borrow()));
-    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let host = HostBackend::new(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -72,9 +84,11 @@ fn run_host_put_get_concurrent_lease_evict_reclaim(_src: &mut Sources) {
         2,
         4096,
     ).unwrap();
-    let tracked eng_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked eng_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let eng_ctx = host::HostContext::new(Tracked(eng_src));
-    let mut engine = LocalEngine::new(core, &host, eng_ctx, None, None);
+    let mut engine = LocalEngine::<NoDevice>::new(core, &host, eng_ctx, None, None).expect(
+        "assemble local engine",
+    );
 
     let k1 = ObjectKey([1, 2, 3, 4]);
     let data1 = pattern(0x21);
@@ -105,7 +119,7 @@ fn run_host_put_get_concurrent_lease_evict_reclaim(_src: &mut Sources) {
     assert!(lease_a.version == v1 && lease_b.version == v1);
 
     // Verify zero-copy read through lease_a.slice using a separate HostContext.
-    let tracked read_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked read_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let mut read_ctx = host::HostContext::new(Tracked(read_src));
     let tracked mut perm_a = ReadPerm::Shared(lease_a.cap.get());
     let mut lease_buf = vec![0u8; FRAME_SIZE];
@@ -115,9 +129,9 @@ fn run_host_put_get_concurrent_lease_evict_reclaim(_src: &mut Sources) {
         &lease_a.slice,
         &mut lease_buf,
         Tracked(&mut perm_a),
-        Tracked(&engine.core.ledger.borrow().submitted),
-        Tracked(&engine.core.ledger.borrow().knows),
-        Ghost(engine.core.citations()),
+        Tracked(&engine.core().ledger().borrow().submitted),
+        Tracked(&engine.core().ledger().borrow().knows),
+        Ghost(engine.core().citations()),
     );
     assert!(lease_buf == data1);
     let tracked cap_a = perm_a.into_shared();
@@ -131,7 +145,7 @@ fn run_host_put_get_concurrent_lease_evict_reclaim(_src: &mut Sources) {
         &mut out,
     ).unwrap();
     assert!(miss_after_evict.is_none());
-    assert!(engine.reclaim_draining(engine.host_tier(), 4) == 0);
+    assert!(engine.reclaim_draining(engine.host_tier(), 4).unwrap() == 0);
 
     // Release lease_a; still blocked by lease_b.
     engine.release_lease(
@@ -140,7 +154,7 @@ fn run_host_put_get_concurrent_lease_evict_reclaim(_src: &mut Sources) {
         Tracked(cap_a),
         Ticket::NONE,
     ).unwrap();
-    assert!(engine.reclaim_draining(engine.host_tier(), 4) == 0);
+    assert!(engine.reclaim_draining(engine.host_tier(), 4).unwrap() == 0);
 
     // Release lease_b; poll_progress reclaims f1 back to ready_queue!
     engine.release_lease(
@@ -151,7 +165,7 @@ fn run_host_put_get_concurrent_lease_evict_reclaim(_src: &mut Sources) {
     ).unwrap();
     let rep = engine.poll_progress(Tracked(_src.instance.borrow())).unwrap();
     assert!(rep.reclaimed_frames == 1);
-    assert!(engine.core.frames.metas[f1.0 as usize].state == STATE_EMPTY);
+    assert!(engine.core().frame_state(f1).unwrap() == STATE_EMPTY);
 
     // Reuse reclaimed frame for a new key.
     let k2 = ObjectKey([5, 6, 7, 8]);
@@ -179,7 +193,7 @@ fn run_version_range_exhaustion(_src: &mut Sources) {
         102,
         Tracked(_src.instance.borrow()),
     );
-    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let host = HostBackend::new(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -188,9 +202,11 @@ fn run_version_range_exhaustion(_src: &mut Sources) {
         4,
         4096,
     ).unwrap();
-    let tracked eng_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked eng_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let eng_ctx = host::HostContext::new(Tracked(eng_src));
-    let mut engine = LocalEngine::new(core, &host, eng_ctx, None, None);
+    let mut engine = LocalEngine::<NoDevice>::new(core, &host, eng_ctx, None, None).expect(
+        "assemble local engine",
+    );
 
     let p = pattern(0x42);
     let (v0, _) = engine.put_host(
@@ -208,12 +224,13 @@ fn run_version_range_exhaustion(_src: &mut Sources) {
     let err = engine.put_host(Tracked(_src.instance.borrow()), ObjectKey([3, 0, 0, 0]), &p);
     assert!(err == Err(CoreError::SequenceExhausted));
     // Verify no frame was leaked by the rejected write (2 of 4 frames still ready).
-    assert!(engine.core.frames.ready_queue[engine.host_tier().as_index()].len() == 2);
+    assert!(engine.core().tier_ready_count(engine.host_tier()).unwrap() == 2);
 }
 
+#[cfg(feature = "nvme")]
 fn run_dram_nvme_two_hop_tier_and_reload(_src: &mut Sources) {
     let mut core = CacheCore::new(0, FRAME_SIZE, Vec::new(), 4, Tracked(_src.instance.borrow()));
-    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let host = HostBackend::new(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -222,10 +239,10 @@ fn run_dram_nvme_two_hop_tier_and_reload(_src: &mut Sources) {
         2,
         4096,
     ).unwrap();
-    let tracked ring_src = _src.events.borrow_mut().mint(EventSourceKind::IoUring);
+    let tracked ring_src = _src.events.borrow_mut().mint(EventSourceKind::io_uring());
     let nvme = match NvmeBackend::new(
         &mut core,
-        &host.ctx,
+        host.context(),
         Tracked(_src.instance.borrow()),
         Tracked(_src.allocations.borrow_mut()),
         Tracked(ring_src),
@@ -242,9 +259,11 @@ fn run_dram_nvme_two_hop_tier_and_reload(_src: &mut Sources) {
         },
         Err(e) => panic!("unexpected NvmeBackend::new error: {e:?}"),
     };
-    let tracked eng_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked eng_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let eng_ctx = host::HostContext::new(Tracked(eng_src));
-    let mut engine = LocalEngine::new(core, &host, eng_ctx, None, Some(nvme));
+    let mut engine = LocalEngine::<NoDevice>::new(core, &host, eng_ctx, None, Some(nvme)).expect(
+        "assemble local engine",
+    );
 
     let key = ObjectKey([10, 20, 30, 40]);
     let data = pattern(0xB3);
@@ -261,7 +280,7 @@ fn run_dram_nvme_two_hop_tier_and_reload(_src: &mut Sources) {
 
     // Evict DRAM, overwrite all DRAM frames with noise, then evict noise so only NVMe holds `key`.
     engine.evict_frame(dram_f).unwrap();
-    assert!(engine.reclaim_draining(engine.host_tier(), 4) == 1);
+    assert!(engine.reclaim_draining(engine.host_tier(), 4).unwrap() == 1);
     let (_, nf1) = engine.put_host(
         Tracked(_src.instance.borrow()),
         ObjectKey([91, 0, 0, 0]),
@@ -274,8 +293,8 @@ fn run_dram_nvme_two_hop_tier_and_reload(_src: &mut Sources) {
     ).unwrap();
     engine.evict_frame(nf1).unwrap();
     engine.evict_frame(nf2).unwrap();
-    assert!(engine.reclaim_draining(engine.host_tier(), 4) == 2);
-    assert!(engine.core.lookup_tier(key, engine.host_tier()).is_none());
+    assert!(engine.reclaim_draining(engine.host_tier(), 4).unwrap() == 2);
+    assert!(engine.core().lookup_tier(key, engine.host_tier()).is_none());
 
     // 2-hop get_into_host: automatically warms Host DRAM from Local NVMe and returns exact bytes!
     let mut out = vec![0u8; FRAME_SIZE];
@@ -287,9 +306,10 @@ fn run_dram_nvme_two_hop_tier_and_reload(_src: &mut Sources) {
     ).unwrap();
     assert!(got == Some(ver));
     assert!(out == data);
-    assert!(engine.core.lookup_tier(key, engine.host_tier()).is_some());
+    assert!(engine.core().lookup_tier(key, engine.host_tier()).is_some());
 }
 
+#[cfg(feature = "cuda")]
 fn run_gpu_ordered_handoff_put_gpu_and_section_5_3_hazard(_src: &mut Sources) {
     if !has_cuda_device() {
         if require_hw() {
@@ -299,7 +319,7 @@ fn run_gpu_ordered_handoff_put_gpu_and_section_5_3_hazard(_src: &mut Sources) {
     }
     let dev: DeviceId = 0;
     let mut core = CacheCore::new(0, FRAME_SIZE, Vec::new(), 4, Tracked(_src.instance.borrow()));
-    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let host = HostBackend::new(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -308,7 +328,7 @@ fn run_gpu_ordered_handoff_put_gpu_and_section_5_3_hazard(_src: &mut Sources) {
         2,
         4096,
     ).unwrap();
-    let tracked gpu_src = _src.events.borrow_mut().mint(EventSourceKind::CudaStream);
+    let tracked gpu_src = _src.events.borrow_mut().mint(EventSourceKind::cuda_stream());
     let mut cuda = CudaBackend::new(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -321,13 +341,15 @@ fn run_gpu_ordered_handoff_put_gpu_and_section_5_3_hazard(_src: &mut Sources) {
     ).unwrap();
     cuda.attach_pinned_host(&core, &host).unwrap();
 
-    let tracked caller_src = _src.events.borrow_mut().mint(EventSourceKind::CudaStream);
+    let tracked caller_src = _src.events.borrow_mut().mint(EventSourceKind::cuda_stream());
     let mut caller_stream = cuda::CudaStream::new(dev, Tracked(caller_src)).unwrap();
     let caller_tl = core.register_timeline(TimelineKind::CudaStream { device: dev }).unwrap();
 
-    let tracked eng_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked eng_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let eng_ctx = host::HostContext::new(Tracked(eng_src));
-    let mut engine = LocalEngine::new(core, &host, eng_ctx, Some(cuda), None);
+    let mut engine = LocalEngine::new(core, &host, eng_ctx, Some(cuda), None).expect(
+        "assemble local engine",
+    );
 
     // 1. put_host -> get_into_gpu (Ordered Handoff H2D).
     let k_host = ObjectKey([100, 101, 102, 103]);
@@ -352,11 +374,12 @@ fn run_gpu_ordered_handoff_put_gpu_and_section_5_3_hazard(_src: &mut Sources) {
     assert!(v_h2d == v_host);
 
     // Synchronize caller stream so dev_buf is ready as a put_gpu source.
-    let Tracked(k_h2d) = cuda::stream_synchronize(
+    engine.synchronize_caller_stream(
         &caller_stream,
+        caller_tl,
+        t_h2d,
         Tracked(_src.instance.borrow()),
     ).unwrap();
-    engine.core.mark_timeline_complete(caller_tl, t_h2d.seq(), Tracked(k_h2d));
 
     // 2. put_gpu into GPU VRAM -> verify not yet published before poll_progress/synchronize_cuda.
     let k_gpu = ObjectKey([104, 105, 106, 107]);
@@ -376,15 +399,15 @@ fn run_gpu_ordered_handoff_put_gpu_and_section_5_3_hazard(_src: &mut Sources) {
         Tracked(&mut dev_perm),
         Ghost(dev_cert),
     ).unwrap();
-    assert!(engine.core.lookup_tier(k_gpu, gpu_tier).is_none());
+    assert!(engine.core().lookup_tier(k_gpu, gpu_tier).is_none());
 
     let sync_rep = engine.synchronize_cuda(Tracked(_src.instance.borrow())).unwrap();
     assert!(sync_rep.writes_published == 1);
-    assert!(engine.core.lookup_tier(k_gpu, gpu_tier) == Some((gpu_f, v_gpu)));
+    assert!(engine.core().lookup_tier(k_gpu, gpu_tier) == Some((gpu_f, v_gpu)));
 
     // 3. Evict Host DRAM copy so get_into_host must execute 2-hop GPU -> Pinned DRAM -> Host!
     engine.evict_frame(dram_f).unwrap();
-    assert!(engine.reclaim_draining(engine.host_tier(), 4) == 1);
+    assert!(engine.reclaim_draining(engine.host_tier(), 4).unwrap() == 1);
 
     let mut host_out = vec![0u8; FRAME_SIZE];
     let got_2hop = engine.get_into_host(
@@ -415,7 +438,9 @@ fn run_gpu_ordered_handoff_put_gpu_and_section_5_3_hazard(_src: &mut Sources) {
     let src_gpu_slice = engine.gpu_frame_slice(gpu_lease.frame).unwrap();
     let tracked mut lease_perm = ReadPerm::Shared(gpu_lease.cap.get());
     let (_ev_d2d, receipt_d2d) = {
-        let tracked ledger_ref = engine.core.ledger.borrow_mut();
+        let tracked mut submitted = _src.instance.borrow().duplicate_submitted(
+            &engine.core().ledger().borrow().submitted,
+        );
         cuda::memcpy_async(
             &mut caller_stream,
             Tracked(_src.instance.borrow()),
@@ -423,12 +448,12 @@ fn run_gpu_ordered_handoff_put_gpu_and_section_5_3_hazard(_src: &mut Sources) {
             &src_gpu_slice,
             Tracked(&mut lease_perm),
             Tracked(&mut dst2_tok),
-            Tracked(&mut ledger_ref.submitted),
-            Tracked(&ledger_ref.knows),
-            Ghost(engine.core.citations()),
+            Tracked(&mut submitted),
+            Tracked(&engine.core().ledger().borrow().knows),
+            Ghost(engine.core().citations()),
         ).unwrap()
     };
-    let t_d2d = engine.core.issue_ticket(caller_tl, receipt_d2d).unwrap();
+    let t_d2d = engine.record_cuda_submission(&caller_stream, caller_tl, receipt_d2d).unwrap();
     let tracked cap_back = lease_perm.into_shared();
     engine.release_lease(
         Tracked(_src.instance.borrow()),
@@ -439,23 +464,25 @@ fn run_gpu_ordered_handoff_put_gpu_and_section_5_3_hazard(_src: &mut Sources) {
 
     // Evict GPU frame while t_d2d is unconfirmed: MUST stay Draining and NOT reclaim!
     engine.evict_frame(gpu_f).unwrap();
-    assert!(engine.core.frames.metas[gpu_f.0 as usize].state == STATE_DRAINING);
+    assert!(engine.core().frame_state(gpu_f).unwrap() == STATE_DRAINING);
     let rep_before = engine.poll_progress(Tracked(_src.instance.borrow())).unwrap();
     assert!(rep_before.reclaimed_frames == 0);
 
     // Confirm caller_stream; now poll_progress safely reclaims gpu_f!
-    let Tracked(k_d2d) = cuda::stream_synchronize(
+    engine.synchronize_caller_stream(
         &caller_stream,
+        caller_tl,
+        t_d2d,
         Tracked(_src.instance.borrow()),
     ).unwrap();
-    engine.core.mark_timeline_complete(caller_tl, t_d2d.seq(), Tracked(k_d2d));
     let rep_after = engine.poll_progress(Tracked(_src.instance.borrow())).unwrap();
     assert!(rep_after.reclaimed_frames == 1);
-    assert!(engine.core.frames.metas[gpu_f.0 as usize].state == STATE_EMPTY);
+    assert!(engine.core().frame_state(gpu_f).unwrap() == STATE_EMPTY);
 
     let _ = caller_stream.destroy();
 }
 
+#[cfg(all(feature = "cuda", feature = "nvme"))]
 fn run_gpu_dram_nvme_full_multitier_4slice_scatter_gather(_src: &mut Sources) {
     if !has_cuda_device() {
         if require_hw() {
@@ -465,7 +492,7 @@ fn run_gpu_dram_nvme_full_multitier_4slice_scatter_gather(_src: &mut Sources) {
     }
     let dev: DeviceId = 0;
     let mut core = CacheCore::new(0, FRAME_SIZE, Vec::new(), 4, Tracked(_src.instance.borrow()));
-    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked host_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let host = HostBackend::new(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -474,7 +501,7 @@ fn run_gpu_dram_nvme_full_multitier_4slice_scatter_gather(_src: &mut Sources) {
         2,
         4096,
     ).unwrap();
-    let tracked gpu_src = _src.events.borrow_mut().mint(EventSourceKind::CudaStream);
+    let tracked gpu_src = _src.events.borrow_mut().mint(EventSourceKind::cuda_stream());
     let mut cuda = CudaBackend::new(
         &mut core,
         Tracked(_src.instance.borrow()),
@@ -487,10 +514,10 @@ fn run_gpu_dram_nvme_full_multitier_4slice_scatter_gather(_src: &mut Sources) {
     ).unwrap();
     cuda.attach_pinned_host(&core, &host).unwrap();
 
-    let tracked ring_src = _src.events.borrow_mut().mint(EventSourceKind::IoUring);
+    let tracked ring_src = _src.events.borrow_mut().mint(EventSourceKind::io_uring());
     let nvme = match NvmeBackend::new(
         &mut core,
-        &host.ctx,
+        host.context(),
         Tracked(_src.instance.borrow()),
         Tracked(_src.allocations.borrow_mut()),
         Tracked(ring_src),
@@ -508,18 +535,20 @@ fn run_gpu_dram_nvme_full_multitier_4slice_scatter_gather(_src: &mut Sources) {
         Err(e) => panic!("unexpected NvmeBackend::new error: {e:?}"),
     };
 
-    let tracked caller_src = _src.events.borrow_mut().mint(EventSourceKind::CudaStream);
+    let tracked caller_src = _src.events.borrow_mut().mint(EventSourceKind::cuda_stream());
     let mut caller_stream = cuda::CudaStream::new(dev, Tracked(caller_src)).unwrap();
     let caller_tl = core.register_timeline(TimelineKind::CudaStream { device: dev }).unwrap();
 
-    let tracked eng_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked eng_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let eng_ctx = host::HostContext::new(Tracked(eng_src));
-    let mut engine = LocalEngine::new(core, &host, eng_ctx, Some(cuda), Some(nvme));
+    let mut engine = LocalEngine::new(core, &host, eng_ctx, Some(cuda), Some(nvme)).expect(
+        "assemble local engine",
+    );
 
     // Prepare 4 distinct 1024-byte slices (total 4096 == FRAME_SIZE) in pinned host memory,
     // then upload each into its own independent caller GPU buffer.
     let slice_len = FRAME_SIZE / 4;
-    let tracked prep_src = _src.events.borrow_mut().mint(EventSourceKind::Host);
+    let tracked prep_src = _src.events.borrow_mut().mint(EventSourceKind::host());
     let mut prep_ctx = host::HostContext::new(Tracked(prep_src));
 
     let mut expected = Vec::with_capacity(FRAME_SIZE);
@@ -545,19 +574,11 @@ fn run_gpu_dram_nvme_full_multitier_4slice_scatter_gather(_src: &mut Sources) {
             &h_slice,
             &chunk,
             Tracked(&mut h_tok),
-            Tracked(&engine.core.ledger.borrow().submitted),
-            Tracked(&engine.core.ledger.borrow().knows),
-            Ghost(engine.core.citations()),
+            Tracked(&engine.core().ledger().borrow().submitted),
+            Tracked(&engine.core().ledger().borrow().knows),
+            Ghost(engine.core().citations()),
         );
-        let t_w = engine.core.issue_ticket(
-            engine.host.timeline_id(),
-            Tracked(w_comp.submitted),
-        ).unwrap();
-        engine.core.mark_timeline_complete(
-            engine.host.timeline_id(),
-            t_w.seq(),
-            Tracked(w_comp.knows),
-        );
+        engine.record_host_completion(Tracked(w_comp));
 
         let (g_buf, Tracked(mut g_tok)) = cuda::alloc_device(
             Tracked(_src.allocations.borrow_mut()),
@@ -568,7 +589,9 @@ fn run_gpu_dram_nvme_full_multitier_4slice_scatter_gather(_src: &mut Sources) {
         let h_cuda = h_buf.as_cuda_slice();
         let tracked mut h_perm = ReadPerm::Owned(h_tok);
         let (_ev_g, receipt_g) = {
-            let tracked ledger_ref = engine.core.ledger.borrow_mut();
+            let tracked mut submitted = _src.instance.borrow().duplicate_submitted(
+                &engine.core().ledger().borrow().submitted,
+            );
             cuda::memcpy_async(
                 &mut caller_stream,
                 Tracked(_src.instance.borrow()),
@@ -576,12 +599,13 @@ fn run_gpu_dram_nvme_full_multitier_4slice_scatter_gather(_src: &mut Sources) {
                 &h_cuda,
                 Tracked(&mut h_perm),
                 Tracked(&mut g_tok),
-                Tracked(&mut ledger_ref.submitted),
-                Tracked(&ledger_ref.knows),
-                Ghost(engine.core.citations()),
+                Tracked(&mut submitted),
+                Tracked(&engine.core().ledger().borrow().knows),
+                Ghost(engine.core().citations()),
             ).unwrap()
         };
-        last_prep_ticket = engine.core.issue_ticket(caller_tl, receipt_g).unwrap();
+        last_prep_ticket =
+        engine.record_cuda_submission(&caller_stream, caller_tl, receipt_g).unwrap();
         let ghost cert_i = ValueCertificate {
             slot: g_slice.slot_ref(),
             writer: _ev_g@,
@@ -594,11 +618,12 @@ fn run_gpu_dram_nvme_full_multitier_4slice_scatter_gather(_src: &mut Sources) {
         }
         src_gpu_bufs.push(g_buf);
     }
-    let Tracked(k_prep) = cuda::stream_synchronize(
+    engine.synchronize_caller_stream(
         &caller_stream,
+        caller_tl,
+        last_prep_ticket,
         Tracked(_src.instance.borrow()),
     ).unwrap();
-    engine.core.mark_timeline_complete(caller_tl, last_prep_ticket.seq(), Tracked(k_prep));
 
     // 1. 4-slice GPU gather (`put_gpu_scatter`) into ONE GPU VRAM frame!
     let src_slices = [
@@ -620,11 +645,11 @@ fn run_gpu_dram_nvme_full_multitier_4slice_scatter_gather(_src: &mut Sources) {
         Ghost(expected@),
     ).unwrap();
     // Not visible in GPU tier before synchronize_cuda / poll_progress!
-    assert!(engine.core.lookup_tier(key, gpu_tier).is_none());
+    assert!(engine.core().lookup_tier(key, gpu_tier).is_none());
 
     let pub_rep = engine.synchronize_cuda(Tracked(_src.instance.borrow())).unwrap();
     assert!(pub_rep.writes_published == 1);
-    assert!(engine.core.lookup_tier(key, gpu_tier) == Some((gpu_f, ver)));
+    assert!(engine.core().lookup_tier(key, gpu_tier) == Some((gpu_f, ver)));
 
     // 2. 2-hop get_into_host (GPU VRAM -> Pinned Host DRAM -> caller slice) verifies exact bytes!
     let mut host_check = vec![0u8; FRAME_SIZE];
@@ -636,7 +661,7 @@ fn run_gpu_dram_nvme_full_multitier_4slice_scatter_gather(_src: &mut Sources) {
     ).unwrap();
     assert!(got_host == Some(ver));
     assert!(host_check == expected);
-    let (dram_f, _) = engine.core.lookup_tier(key, engine.host_tier()).unwrap();
+    let (dram_f, _) = engine.core().lookup_tier(key, engine.host_tier()).unwrap();
 
     // 3. Tier Host DRAM -> Local NVMe (`io_uring`), wait for completion.
     let (nvme_f, t_nvme) = engine.tier_dram_to_nvme(
@@ -646,15 +671,15 @@ fn run_gpu_dram_nvme_full_multitier_4slice_scatter_gather(_src: &mut Sources) {
     ).unwrap();
     let nvme_prog = engine.wait_nvme_ticket(Tracked(_src.instance.borrow()), t_nvme).unwrap();
     assert!(nvme_prog.completed == 1 && nvme_prog.failed == 0);
-    assert!(engine.core.lookup_tier(key, engine.nvme_tier().unwrap()) == Some((nvme_f, ver)));
+    assert!(engine.core().lookup_tier(key, engine.nvme_tier().unwrap()) == Some((nvme_f, ver)));
 
     // 4. Evict & reclaim BOTH GPU VRAM and Host DRAM replicas; only Local NVMe remains!
     engine.evict_frame(gpu_f).unwrap();
     engine.evict_frame(dram_f).unwrap();
     let clean_rep = engine.poll_progress(Tracked(_src.instance.borrow())).unwrap();
     assert!(clean_rep.reclaimed_frames == 2);
-    assert!(engine.core.lookup_tier(key, gpu_tier).is_none());
-    assert!(engine.core.lookup_tier(key, engine.host_tier()).is_none());
+    assert!(engine.core().lookup_tier(key, gpu_tier).is_none());
+    assert!(engine.core().lookup_tier(key, engine.host_tier()).is_none());
 
     // 5. 2-hop `get_into_gpu_scatter`: Local NVMe -> Pinned Host DRAM -> 4 caller GPU slices!
     let mut dst_gpu_bufs = Vec::new();
@@ -689,11 +714,12 @@ fn run_gpu_dram_nvme_full_multitier_4slice_scatter_gather(_src: &mut Sources) {
     assert!(v_out == ver);
 
     // Synchronize caller stream and read all 4 GPU destination slices back to host to check bytes!
-    let Tracked(k_out) = cuda::stream_synchronize(
+    engine.synchronize_caller_stream(
         &caller_stream,
+        caller_tl,
+        t_out,
         Tracked(_src.instance.borrow()),
     ).unwrap();
-    engine.core.mark_timeline_complete(caller_tl, t_out.seq(), Tracked(k_out));
 
     let mut reassembled = Vec::with_capacity(FRAME_SIZE);
     for i in 0..4usize {
@@ -705,7 +731,9 @@ fn run_gpu_dram_nvme_full_multitier_4slice_scatter_gather(_src: &mut Sources) {
         let tracked g_tok = dst_toks.tracked_remove(i as int);
         let tracked mut g_perm = ReadPerm::Owned(g_tok);
         let (_ev_rb, receipt_rb) = {
-            let tracked ledger_ref = engine.core.ledger.borrow_mut();
+            let tracked mut submitted = _src.instance.borrow().duplicate_submitted(
+                &engine.core().ledger().borrow().submitted,
+            );
             cuda::memcpy_async(
                 &mut caller_stream,
                 Tracked(_src.instance.borrow()),
@@ -713,17 +741,18 @@ fn run_gpu_dram_nvme_full_multitier_4slice_scatter_gather(_src: &mut Sources) {
                 &dst_slices[i],
                 Tracked(&mut g_perm),
                 Tracked(&mut rb_tok),
-                Tracked(&mut ledger_ref.submitted),
-                Tracked(&ledger_ref.knows),
-                Ghost(engine.core.citations()),
+                Tracked(&mut submitted),
+                Tracked(&engine.core().ledger().borrow().knows),
+                Ghost(engine.core().citations()),
             ).unwrap()
         };
-        let t_rb = engine.core.issue_ticket(caller_tl, receipt_rb).unwrap();
-        let Tracked(k_rb) = cuda::stream_synchronize(
+        let t_rb = engine.record_cuda_submission(&caller_stream, caller_tl, receipt_rb).unwrap();
+        engine.synchronize_caller_stream(
             &caller_stream,
+            caller_tl,
+            t_rb,
             Tracked(_src.instance.borrow()),
         ).unwrap();
-        engine.core.mark_timeline_complete(caller_tl, t_rb.seq(), Tracked(k_rb));
 
         let mut chunk_out = vec![0u8; slice_len];
         let rb_host = rb_buf.as_host_slice();
@@ -734,9 +763,9 @@ fn run_gpu_dram_nvme_full_multitier_4slice_scatter_gather(_src: &mut Sources) {
             &rb_host,
             &mut chunk_out,
             Tracked(&mut rb_perm),
-            Tracked(&engine.core.ledger.borrow().submitted),
-            Tracked(&engine.core.ledger.borrow().knows),
-            Ghost(engine.core.citations()),
+            Tracked(&engine.core().ledger().borrow().submitted),
+            Tracked(&engine.core().ledger().borrow().knows),
+            Ghost(engine.core().citations()),
         );
         reassembled.extend_from_slice(&chunk_out);
     }
@@ -758,18 +787,21 @@ fn version_range_exhaustion_returns_sequence_exhausted() {
 }
 
 #[test]
+#[cfg(feature = "nvme")]
 fn dram_nvme_two_hop_tier_and_reload() {
     let mut src = sources();
     run_dram_nvme_two_hop_tier_and_reload(&mut src);
 }
 
 #[test]
+#[cfg(feature = "cuda")]
 fn gpu_ordered_handoff_put_gpu_and_section_5_3_hazard() {
     let mut src = sources();
     run_gpu_ordered_handoff_put_gpu_and_section_5_3_hazard(&mut src);
 }
 
 #[test]
+#[cfg(all(feature = "cuda", feature = "nvme"))]
 fn gpu_dram_nvme_full_multitier_4slice_scatter_gather() {
     let mut src = sources();
     run_gpu_dram_nvme_full_multitier_4slice_scatter_gather(&mut src);

@@ -91,7 +91,9 @@ name = "vericache-core"
 version = "0.1.0"
 dependencies = [
  "vericache-foundation",
+ "vericache-kernel",
  "vericache-transfer",
+ "vericache-transfer-core",
  "vstd",
 ]
 
@@ -100,6 +102,15 @@ name = "vericache-foundation"
 version = "0.1.0"
 dependencies = [
  "verus_state_machines_macros",
+ "vstd",
+]
+
+[[package]]
+name = "vericache-kernel"
+version = "0.1.0"
+dependencies = [
+ "vericache-foundation",
+ "vericache-transfer-core",
  "vstd",
 ]
 
@@ -113,6 +124,15 @@ dependencies = [
 
 [[package]]
 name = "vericache-transfer"
+version = "0.1.0"
+dependencies = [
+ "vericache-foundation",
+ "vericache-transfer-core",
+ "vstd",
+]
+
+[[package]]
+name = "vericache-transfer-core"
 version = "0.1.0"
 dependencies = [
  "vericache-foundation",

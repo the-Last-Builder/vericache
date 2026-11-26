@@ -14,22 +14,23 @@ pub struct CudaHostBuffer {
 }
 
 pub struct CudaHostRegistration<'a> {
-    pub(super) buffer: &'a HostBuffer,
+    ptr: *mut u8,
+    #[cfg_attr(not(verus_only), allow(dead_code))]
+    len: usize,
+    num_slots: usize,
+    slot_len: usize,
+    #[cfg_attr(not(verus_only), allow(dead_code))]
+    node: Ghost<NodeId>,
+    #[cfg_attr(not(verus_only), allow(dead_code))]
+    space: Ghost<MemorySpace>,
+    instance: Ghost<InstanceId>,
+    borrow: PhantomData<&'a ()>,
     pub(super) guard: ffi::RawHostRegGuard,
 }
 
 impl CudaHostBuffer {
-    #[allow(dead_code)]
-    pub(crate) fn raw_parts(&self) -> (p: (*mut u8, usize))
-        requires
-            self.well_formed(),
-        ensures
-            p.1 == self.total_len(),
-            self.num_slots() >= 1,
-            p.1 == self.num_slots() * self.slot_len(),
-            p.0.addr() + p.1 <= usize::MAX,
-    {
-        (self.memory.ptr, self.memory.len)
+    pub closed spec fn address(&self) -> usize {
+        self.memory.allocation.address()
     }
 
     pub closed spec fn node(&self) -> NodeId {
@@ -67,7 +68,7 @@ impl CudaHostBuffer {
     }
 
     pub closed spec fn total_len(&self) -> usize {
-        self.memory.len
+        self.memory.allocation.total_len()
     }
 
     pub open spec fn slot_loc(&self, idx: nat) -> SlotLoc {
@@ -134,21 +135,99 @@ impl CudaHostBuffer {
             s.slot_ref() == self.slot_ref(idx as nat),
             s.instance_id() == self.instance_id(),
     {
-        assert!(idx < self.memory.num_slots);
-        let m = &self.memory;
-        proof {
-            lemma_mul_is_distributive_add_other_way(m.slot_len as int, idx as int, 1);
-            lemma_mul_inequality((idx + 1) as int, m.num_slots as int, m.slot_len as int);
-        }
-        let off = idx * m.slot_len;
-        let ptr = m.ptr.with_addr(m.ptr.addr() + off);
-        HostSlice::from_raw_parts(
-            self,
-            ptr,
-            m.slot_len,
-            Ghost(self.slot_ref(idx as nat)),
-            m.instance,
-        )
+        self.host_slice(idx)
+    }
+}
+
+impl HostDmaSlab for CudaHostBuffer {
+    open spec fn slab_node(&self) -> NodeId {
+        self.node()
+    }
+
+    open spec fn slab_space(&self) -> MemorySpace {
+        self.space()
+    }
+
+    open spec fn slab_num_slots(&self) -> usize {
+        self.num_slots()
+    }
+
+    open spec fn slab_slot_len(&self) -> usize {
+        self.slot_len()
+    }
+
+    open spec fn slab_total_len(&self) -> usize {
+        self.total_len()
+    }
+
+    open spec fn slab_instance_id(&self) -> InstanceId {
+        self.instance_id()
+    }
+
+    open spec fn slab_well_formed(&self) -> bool {
+        self.well_formed()
+    }
+
+    open spec fn slab_address(&self) -> usize {
+        self.address()
+    }
+
+    fn slab_allocation(&self) -> &DmaAllocation {
+        &self.memory.allocation
+    }
+
+    fn slab_num_slots_exec(&self) -> usize {
+        self.num_slots_val()
+    }
+
+    fn slab_slot_len_exec(&self) -> usize {
+        self.slot_len_val()
+    }
+}
+
+impl RdmaRegisterableSlab for CudaHostBuffer {
+    open spec fn reg_node(&self) -> NodeId {
+        self.node()
+    }
+
+    open spec fn reg_space(&self) -> MemorySpace {
+        self.space()
+    }
+
+    open spec fn reg_num_slots(&self) -> usize {
+        self.num_slots()
+    }
+
+    open spec fn reg_slot_len(&self) -> usize {
+        self.slot_len()
+    }
+
+    open spec fn reg_total_len(&self) -> usize {
+        self.total_len()
+    }
+
+    open spec fn reg_instance_id(&self) -> InstanceId {
+        self.instance_id()
+    }
+
+    open spec fn reg_well_formed(&self) -> bool {
+        self.well_formed()
+    }
+
+    open spec fn reg_gpu_device(&self) -> Option<DeviceId> {
+        None
+    }
+
+    fn reg_allocation(&self) -> &DmaAllocation {
+        &self.memory.allocation
+    }
+
+    fn reg_num_slots_exec(&self) -> usize {
+        self.num_slots_val()
+    }
+
+    fn reg_slot_len_exec(&self) -> usize {
+        self.slot_len_val()
     }
 }
 
@@ -164,24 +243,26 @@ pub fn alloc_host(Tracked(source): Tracked<&mut AllocSource>, len: usize) -> (r:
             Ok((buf, tok)) => {
                 &&& buf.well_formed() && buf.instance_id() == old(source).id()
                 &&& buf.num_slots() == 1 && buf.slot_len() == len
-                &&& buf.node() == old(source).node() && buf.space() == old(source).space(None)
-                &&& buf.slot_ref(0) == old(source).slot_ref(None, len as u64)
+                &&& buf.node() == old(source).node() && buf.space() == old(source).space_for(
+                    SPACE_HOST,
+                    0,
+                )
+                &&& buf.slot_ref(0) == old(source).slot_ref_for(SPACE_HOST, 0, len as u64)
                 &&& final(source).allocated_slot(*old(source), buf.slot_loc(0), tok@)
             },
         },
 {
-    let ptr = ffi::raw_alloc_host(len)?;
+    let allocation = ffi::raw_alloc_host(len)?;
     let ghost node = source.node();
-    let ghost space = source.space(None);
-    let tracked tok = source.allocate_slot(None);
+    let ghost space = MemorySpace::host(source.next_alloc_id());
+    let tracked tok = source.allocate_slot_in(space);
     Ok(
         (
             CudaHostBuffer {
                 memory: SlabMemory {
-                    ptr,
+                    allocation,
                     num_slots: 1,
                     slot_len: len,
-                    len,
                     kind: CudaPointerKind::PinnedHost,
                     node: Ghost(node),
                     space: Ghost(space),
@@ -208,7 +289,10 @@ pub fn alloc_host_slab(
             Ok((buf, tokens)) => {
                 &&& buf.well_formed() && buf.instance_id() == old(source).id()
                 &&& buf.num_slots() == num_slots && buf.slot_len() == slot_len
-                &&& buf.node() == old(source).node() && buf.space() == old(source).space(None)
+                &&& buf.node() == old(source).node() && buf.space() == old(source).space_for(
+                    SPACE_HOST,
+                    0,
+                )
                 &&& final(source).allocated_slab(*old(source), buf.space(), num_slots, tokens@)
             },
         },
@@ -219,18 +303,17 @@ pub fn alloc_host_slab(
     let Some(total) = num_slots.checked_mul(slot_len) else {
         return Err(CudaError::INVALID_VALUE);
     };
-    let ptr = ffi::raw_alloc_host(total)?;
+    let allocation = ffi::raw_alloc_host(total)?;
     let ghost node = source.node();
-    let ghost space = source.space(None);
-    let tracked tokens = source.allocate_slab_slots(None, num_slots);
+    let ghost space = MemorySpace::host(source.next_alloc_id());
+    let tracked tokens = source.allocate_slab_in(space, num_slots);
     Ok(
         (
             CudaHostBuffer {
                 memory: SlabMemory {
-                    ptr,
+                    allocation,
                     num_slots,
                     slot_len,
-                    len: total,
                     kind: CudaPointerKind::PinnedHost,
                     node: Ghost(node),
                     space: Ghost(space),
@@ -244,19 +327,19 @@ pub fn alloc_host_slab(
 
 impl<'a> CudaHostRegistration<'a> {
     pub closed spec fn node(&self) -> NodeId {
-        self.buffer.node()
+        self.node@
     }
 
     pub closed spec fn space(&self) -> MemorySpace {
-        self.buffer.space()
+        self.space@
     }
 
     pub closed spec fn num_slots(&self) -> usize {
-        self.buffer.num_slots()
+        self.num_slots
     }
 
     pub closed spec fn slot_len(&self) -> usize {
-        self.buffer.slot_len()
+        self.slot_len
     }
 
     pub open spec fn slot_loc(&self, idx: nat) -> SlotLoc {
@@ -268,11 +351,14 @@ impl<'a> CudaHostRegistration<'a> {
     }
 
     pub closed spec fn instance_id(&self) -> InstanceId {
-        self.buffer.instance_id()
+        self.instance@
     }
 
     pub closed spec fn well_formed(&self) -> bool {
-        self.buffer.well_formed()
+        &&& self.space@.is_host()
+        &&& self.num_slots >= 1
+        &&& self.len == self.num_slots * self.slot_len
+        &&& self.ptr.addr() + self.len <= usize::MAX
     }
 
     pub fn as_cuda_slice(&self) -> (s: CudaSlice<'_>)
@@ -298,36 +384,64 @@ impl<'a> CudaHostRegistration<'a> {
             s.instance_id() == self.instance_id(),
             s.kind() == CudaPointerKind::PinnedHost,
     {
-        assert!(idx < self.buffer.num_slots_val());
-        let h = self.buffer.slot_slice(idx);
-        let (ptr, len) = h.raw_parts();
+        assert!(idx < self.num_slots);
+        proof {
+            lemma_mul_is_distributive_add_other_way(self.slot_len as int, idx as int, 1);
+            lemma_mul_inequality((idx + 1) as int, self.num_slots as int, self.slot_len as int);
+        }
+        let offset = idx * self.slot_len;
+        let ptr = self.ptr.with_addr(self.ptr.addr() + offset);
         CudaSlice {
             memory: SliceMemory {
                 ptr,
-                len,
+                len: self.slot_len,
                 kind: CudaPointerKind::PinnedHost,
                 slot: Ghost(self.slot_ref(idx as nat)),
-                instance: Ghost(self.instance_id()),
+                instance: self.instance,
             },
             borrow: PhantomData,
         }
     }
 }
 
-pub fn host_register(buffer: &HostBuffer) -> (r: Result<CudaHostRegistration<'_>, CudaError>)
+pub fn host_register<'a, B: HostDmaSlab>(buffer: &'a B) -> (r: Result<
+    CudaHostRegistration<'a>,
+    CudaError,
+>)
     requires
-        buffer.well_formed(),
+        buffer.slab_well_formed(),
     ensures
-        r matches Ok(reg) ==> reg.well_formed() && reg.node() == buffer.node() && reg.space()
-            == buffer.space() && reg.num_slots() == buffer.num_slots() && reg.slot_len()
-            == buffer.slot_len() && reg.instance_id() == buffer.instance_id(),
+        r matches Ok(reg) ==> reg.well_formed() && reg.node() == buffer.slab_node() && reg.space()
+            == buffer.slab_space() && reg.num_slots() == buffer.slab_num_slots() && reg.slot_len()
+            == buffer.slab_slot_len() && reg.instance_id() == buffer.slab_instance_id(),
 {
-    let guard = ffi::raw_host_register(buffer)?;
-    Ok(CudaHostRegistration { buffer, guard })
+    let allocation = buffer.slab_allocation();
+    let (ptr, len) = allocation.raw_parts();
+    let num_slots = buffer.slab_num_slots_exec();
+    let slot_len = buffer.slab_slot_len_exec();
+    if allocation.device().is_some() || num_slots == 0 || num_slots.checked_mul(slot_len) != Some(
+        len,
+    ) {
+        return Err(CudaError::INVALID_VALUE);
+    }
+    let guard = ffi::raw_host_register(ptr, len)?;
+    Ok(
+        CudaHostRegistration {
+            ptr,
+            len,
+            num_slots,
+            slot_len,
+            node: Ghost(buffer.slab_node()),
+            space: Ghost(buffer.slab_space()),
+            instance: Ghost(buffer.slab_instance_id()),
+            borrow: PhantomData,
+            guard,
+        },
+    )
 }
 
 pub fn free_host(
-    _ctx: &mut HostContext,
+    _ctx: &mut SyncContext,
     Tracked(instance): Tracked<&TransferInstance>,
     buf: CudaHostBuffer,
     Tracked(tok): Tracked<SlotToken>,
@@ -340,7 +454,7 @@ pub fn free_host(
         buf.well_formed(),
         buf.num_slots() == 1,
         buf.instance_id() == instance.id(),
-        cpu_host::can_reclaim_slot(instance.id(), buf.slot_loc(0), tok, *infos, *knows, cited),
+        can_reclaim_slot(instance.id(), buf.slot_loc(0), tok, *infos, *knows, cited),
     ensures
         match r {
             Err((_, returned, ret_tok)) => returned == buf && ret_tok@ == tok && *final(_ctx)
@@ -366,9 +480,9 @@ pub fn free_host(
     };
     proof {
         assert(slab_locs(loc.node, loc.space, 1nat) =~= ISet::empty().insert(loc));
-        assert(completed.access == reclaim_access(loc));
+        assert(completed.access() == reclaim_access(loc));
     }
-    let tracked completion = cpu_host::finish_owned(
+    let tracked completion = finish_owned(
         _ctx.source.borrow_mut(),
         instance,
         completed,
@@ -381,7 +495,7 @@ pub fn free_host(
 }
 
 pub fn free_host_slab(
-    _ctx: &mut HostContext,
+    _ctx: &mut SyncContext,
     Tracked(instance): Tracked<&TransferInstance>,
     buf: CudaHostBuffer,
     Tracked(tokens): Tracked<Map<usize, SlotToken>>,
@@ -393,7 +507,7 @@ pub fn free_host_slab(
         old(_ctx).ready(instance.id(), buf.node()),
         buf.well_formed(),
         buf.instance_id() == instance.id(),
-        cpu_host::can_reclaim_slab(
+        can_reclaim_slab(
             instance.id(),
             buf.node(),
             buf.space(),
@@ -427,7 +541,7 @@ pub fn free_host_slab(
         Err(e) => return Err((e, buf, Tracked(tokens))),
         Ok(w) => w,
     };
-    let tracked (completion, _) = cpu_host::finish_slab_owned(
+    let tracked (completion, _) = finish_slab_owned(
         _ctx.source.borrow_mut(),
         instance,
         node,
@@ -443,7 +557,7 @@ pub fn free_host_slab(
 }
 
 pub fn host_unregister<'a>(
-    _ctx: &mut HostContext,
+    _ctx: &mut SyncContext,
     Tracked(instance): Tracked<&TransferInstance>,
     buf: CudaHostRegistration<'a>,
     Tracked(tok): Tracked<SlotToken>,
@@ -459,7 +573,7 @@ pub fn host_unregister<'a>(
         buf.well_formed(),
         buf.num_slots() == 1,
         buf.instance_id() == instance.id(),
-        cpu_host::can_reclaim_slot(instance.id(), buf.slot_loc(0), tok, *infos, *knows, cited),
+        can_reclaim_slot(instance.id(), buf.slot_loc(0), tok, *infos, *knows, cited),
     ensures
         match r {
             Err((_, returned, ret_tok)) => returned == buf && ret_tok@ == tok && *final(_ctx)
@@ -495,9 +609,9 @@ pub fn host_unregister<'a>(
     let _ = buf.guard.into_raw();
     proof {
         assert(slab_locs(loc.node, loc.space, 1nat) =~= ISet::empty().insert(loc));
-        assert(completed.access == dereg_access(loc));
+        assert(completed.access() == dereg_access(loc));
     }
-    let tracked completion = cpu_host::finish_owned(
+    let tracked completion = finish_owned(
         _ctx.source.borrow_mut(),
         instance,
         completed,
@@ -510,7 +624,7 @@ pub fn host_unregister<'a>(
 }
 
 pub fn host_unregister_slab<'a>(
-    _ctx: &mut HostContext,
+    _ctx: &mut SyncContext,
     Tracked(instance): Tracked<&TransferInstance>,
     buf: CudaHostRegistration<'a>,
     Tracked(tokens): Tracked<Map<usize, SlotToken>>,
@@ -525,7 +639,7 @@ pub fn host_unregister_slab<'a>(
         old(_ctx).ready(instance.id(), buf.node()),
         buf.well_formed(),
         buf.instance_id() == instance.id(),
-        cpu_host::can_reclaim_slab(
+        can_reclaim_slab(
             instance.id(),
             buf.node(),
             buf.space(),
@@ -575,7 +689,7 @@ pub fn host_unregister_slab<'a>(
         Ok(w) => w,
     };
     let _ = buf.guard.into_raw();
-    let tracked (completion, out_tokens) = cpu_host::finish_slab_owned(
+    let tracked (completion, out_tokens) = finish_slab_owned(
         _ctx.source.borrow_mut(),
         instance,
         node,

@@ -1,0 +1,797 @@
+use crate::provenance::KnowledgeLedger;
+use crate::spec::*;
+use transfer_core::context::{Knows, Submitted};
+use transfer_core::domain::*;
+use vstd::prelude::*;
+#[cfg(verus_only)]
+use vstd::tokens::InstanceId;
+#[cfg(verus_only)]
+use vstd::tokens::KeyValueToken;
+
+mod bitmap;
+pub use bitmap::*;
+
+verus! {
+
+broadcast use {
+    vstd::map::group_map_lemmas,
+    vstd::iset::group_iset_lemmas,
+    vstd::imap::group_imap_lemmas,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimelineKind {
+    Host,
+    CudaStream { device: DeviceId },
+    IoUring,
+    RdmaQueuePair { peer_node: NodeId },
+    Custom(u16),
+}
+
+pub struct TimelineTable {
+    pub(crate) confirmed_seq: Vec<u64>,
+    pub(crate) next_seq: Vec<u64>,
+    pub(crate) kinds: Vec<TimelineKind>,
+    pub(crate) count: usize,
+    pub(crate) events: Ghost<Map<(TimelineId, u64), TransferEvent>>,
+}
+
+impl TimelineTable {
+    pub open(crate) spec fn events_spec(&self) -> Ghost<Map<(TimelineId, u64), TransferEvent>> {
+        self.events
+    }
+
+    pub open(crate) spec fn kinds_spec(&self) -> Vec<TimelineKind> {
+        self.kinds
+    }
+
+    pub open(crate) spec fn count_spec(&self) -> usize {
+        self.count
+    }
+
+    pub open(crate) spec fn next_seq_spec(&self) -> Vec<u64> {
+        self.next_seq
+    }
+
+    pub open(crate) spec fn confirmed_seq_spec(&self) -> Vec<u64> {
+        self.confirmed_seq
+    }
+
+    pub open spec fn polled(&self, prior: &Self, timeline: TimelineId) -> bool {
+        &&& self.events_spec() == prior.events_spec() && self.next_seq_spec()
+            == prior.next_seq_spec()
+        &&& self.count_spec() == prior.count_spec() && self.kinds_spec() == prior.kinds_spec()
+        &&& forall|i: int|
+            0 <= i < self.count_spec() ==> (#[trigger] self.confirmed_seq_spec()[i])
+                >= prior.confirmed_seq_spec()[i] && (i != timeline ==> self.confirmed_seq_spec()[i]
+                == prior.confirmed_seq_spec()[i])
+    }
+
+    pub open spec fn only_watermarks(&self, before: &Self) -> bool {
+        *self == *before
+    }
+
+    pub open spec fn issued(&self, t: TimelineId, s: u64) -> bool {
+        t < self.count_spec() && 1 <= s < self.next_seq_spec()[t as int]
+    }
+
+    /// A FIFO tail protects each earlier sequence on the same timeline.
+    pub open spec fn ticket_covers(&self, k: Ticket, e: TransferEvent) -> bool {
+        k != Ticket::NONE && exists|s: u64|
+            1 <= s <= k.sequence() && #[trigger] self.events_spec()@[(k.timeline_id(), s)] == e
+    }
+
+    pub open spec fn valid_ticket(&self, ticket: Ticket) -> bool {
+        ticket == Ticket::NONE || self.issued(ticket.timeline_id(), ticket.sequence())
+    }
+
+    pub open spec fn retired(&self, ticket: Ticket) -> bool {
+        ticket == Ticket::NONE || ticket.sequence()
+            <= self.confirmed_seq_spec()[ticket.timeline_id() as int]
+    }
+
+    pub open spec fn observed(&self, t: TimelineId, s: u64, node: NodeId, k: Knows) -> bool {
+        k.set().contains((node, self.events_spec()@[(t, s)]))
+    }
+
+    pub open spec fn bounds(&self) -> bool {
+        &&& self.count_spec() <= MAX_TIMELINES
+        &&& self.confirmed_seq_spec().len() == self.count_spec()
+        &&& self.next_seq_spec().len() == self.count_spec()
+        &&& self.kinds_spec().len() == self.count_spec()
+        &&& forall|i: int|
+            0 <= i < self.count_spec() ==> 1 <= #[trigger] self.next_seq_spec()[i] <= MAX_TICKET_SEQ
+                + 1 && self.confirmed_seq_spec()[i] < self.next_seq_spec()[i]
+    }
+
+    pub open spec fn well_formed(
+        &self,
+        id: InstanceId,
+        node: NodeId,
+        ledger: &KnowledgeLedger,
+    ) -> bool {
+        &&& self.bounds() && ledger.valid(id, node)
+        &&& forall|t: TimelineId, s: u64|
+            self.issued(t, s) ==> #[trigger] self.events_spec()@.contains_key((t, s))
+                && ledger.submitted.dom().contains(self.events_spec()@[(t, s)])
+        &&& forall|t: TimelineId, s: u64|
+            t < self.count_spec() && 1 <= s <= self.confirmed_seq_spec()[t as int]
+                ==> #[trigger] self.observed(t, s, node, ledger.knows)
+    }
+
+    pub proof fn lemma_well_formed_ledger_growth(
+        &self,
+        id: InstanceId,
+        node: NodeId,
+        before: &KnowledgeLedger,
+        after: &KnowledgeLedger,
+    )
+        requires
+            self.well_formed(id, node, before),
+            after.valid(id, node),
+            before.submitted.map().submap_of(after.submitted.map()),
+            before.knows.set().subset_of(after.knows.set()),
+        ensures
+            self.well_formed(id, node, after),
+    {
+        assert forall|t: TimelineId, s: u64|
+            self.issued(t, s) implies #[trigger] self.events_spec()@.contains_key((t, s)) by {
+            assert(self.events_spec()@.contains_key((t, s)));
+        }
+        assert forall|t: TimelineId, s: u64|
+            self.issued(t, s) implies after.submitted.dom().contains(
+            #[trigger] self.events_spec()@[(t, s)],
+        ) by {
+            assert(self.events_spec()@.contains_key((t, s)));
+            let e = self.events_spec()@[(t, s)];
+            assert(before.submitted.dom().contains(e));
+            assert(after.submitted.dom().contains(e));
+        }
+        assert forall|t: TimelineId, s: u64|
+            t < self.count && 1 <= s
+                <= self.confirmed_seq[t as int] implies #[trigger] self.observed(
+            t,
+            s,
+            node,
+            after.knows,
+        ) by {
+            assert(self.observed(t, s, node, before.knows));
+        }
+        assert forall|t: TimelineId, s: u64|
+            t < self.count && 1 <= s
+                <= self.confirmed_seq[t as int] implies after.knows.set().contains(
+            (node, #[trigger] self.events_spec()@[(t, s)]),
+        ) by {
+            assert(self.observed(t, s, node, before.knows));
+        }
+    }
+
+    pub open spec fn prefix_in(
+        &self,
+        t: TimelineId,
+        through: u64,
+        events: ISet<TransferEvent>,
+    ) -> bool {
+        forall|s: u64| 1 <= s <= through ==> events.contains(#[trigger] self.events_spec()@[(t, s)])
+    }
+
+    pub open spec fn window_has_room(&self, t: TimelineId) -> bool {
+        self.next_seq_spec()[t as int] <= MAX_TICKET_SEQ && self.next_seq_spec()[t as int]
+            <= self.confirmed_seq_spec()[t as int] + BITMAP_CAPACITY
+    }
+
+    pub fn next_data_id(&self, timeline: TimelineId) -> (r: Result<u64, CoreError>)
+        requires
+            self.bounds(),
+            timeline < self.count_spec(),
+        ensures
+            r matches Ok(s) ==> s == self.next_seq_spec()[timeline as int] && s <= MAX_TICKET_SEQ
+                && s <= self.confirmed_seq_spec()[timeline as int] + BITMAP_CAPACITY,
+    {
+        let t = timeline as usize;
+        let next = self.next_seq[t];
+        if next > MAX_TICKET_SEQ {
+            return Err(CoreError::SequenceExhausted);
+        }
+        if next - self.confirmed_seq[t] > BITMAP_CAPACITY {
+            return Err(CoreError::CapacityExhausted);
+        }
+        Ok(next)
+    }
+
+    pub fn next_data_ids(&self, timeline: TimelineId, count: usize) -> (r: Result<u64, CoreError>)
+        requires
+            self.bounds(),
+            timeline < self.count_spec(),
+        ensures
+            r.is_ok() == (count > 0 && self.next_seq_spec()[timeline as int] + count - 1
+                <= MAX_TICKET_SEQ && self.next_seq_spec()[timeline as int] + count - 1
+                <= self.confirmed_seq_spec()[timeline as int] + BITMAP_CAPACITY),
+            r matches Ok(s) ==> s == self.next_seq_spec()[timeline as int] && count > 0 && s + count
+                - 1 <= MAX_TICKET_SEQ && s + count - 1 <= self.confirmed_seq_spec()[timeline as int]
+                + BITMAP_CAPACITY,
+    {
+        if count == 0 {
+            return Err(CoreError::InvalidArgument);
+        }
+        let t = timeline as usize;
+        let next = self.next_seq[t];
+        let count_u64 = count as u64;
+        if count_u64 > BITMAP_CAPACITY {
+            return Err(CoreError::CapacityExhausted);
+        }
+        if next > MAX_TICKET_SEQ || count_u64 - 1 > MAX_TICKET_SEQ - next {
+            return Err(CoreError::SequenceExhausted);
+        }
+        let last = next + (count_u64 - 1);
+        if last - self.confirmed_seq[t] > BITMAP_CAPACITY {
+            return Err(CoreError::CapacityExhausted);
+        }
+        Ok(next)
+    }
+
+    pub fn new() -> (r: Self)
+        ensures
+            r.count_spec() == 0,
+            r.events_spec()@ == Map::empty(),
+            r.bounds(),
+    {
+        Self {
+            confirmed_seq: Vec::new(),
+            next_seq: Vec::new(),
+            kinds: Vec::new(),
+            count: 0,
+            events: Ghost(Map::empty()),
+        }
+    }
+
+    /// Append a timeline with a fresh ID, preserving all previously registered IDs.
+    pub fn register_timeline(&mut self, kind: TimelineKind) -> (r: Result<TimelineId, CoreError>)
+        requires
+            old(self).bounds(),
+        ensures
+            match r {
+                Err(_) => *final(self) == *old(self) && old(self).count_spec() == MAX_TIMELINES,
+                Ok(t) => t == old(self).count_spec() && final(self).count_spec() == t + 1
+                    && final(self).kinds_spec()@ == old(self).kinds_spec()@.push(kind)
+                    && final(self).next_seq_spec()@ == old(self).next_seq_spec()@.push(1u64)
+                    && final(self).confirmed_seq_spec()@ == old(self).confirmed_seq_spec()@.push(
+                    0u64,
+                ) && final(self).events_spec() == old(self).events_spec() && final(self).bounds(),
+            },
+    {
+        let i = self.count;
+        if i == MAX_TIMELINES {
+            return Err(CoreError::CapacityExhausted);
+        }
+        self.kinds.push(kind);
+        self.confirmed_seq.push(0);
+        self.next_seq.push(1);
+        self.count += 1;
+        Ok(i as TimelineId)
+    }
+
+    pub fn issue_ticket(
+        &mut self,
+        t: TimelineId,
+        Ghost(event): Ghost<TransferEvent>,
+        Tracked(receipt): Tracked<Submitted>,
+        Tracked(ledger): Tracked<&mut KnowledgeLedger>,
+    ) -> (r: Result<Ticket, CoreError>)
+        requires
+            old(self).well_formed(receipt.instance_id(), event.observer, old(ledger)),
+            receipt.key() == event,
+        ensures
+            final(self).well_formed(receipt.instance_id(), event.observer, final(ledger)),
+            match r {
+                Err(_) => *final(self) == *old(self) && *final(ledger) == *old(ledger) && (t >= old(
+                    self,
+                ).count_spec() || old(self).next_seq_spec()[t as int] > MAX_TICKET_SEQ),
+                Ok(ticket) => {
+                    let s = old(self).next_seq_spec()[t as int];
+                    &&& t < old(self).count_spec() && ticket.timeline_id() == t && ticket.sequence()
+                        == s && ticket != Ticket::NONE
+                    &&& final(self).next_seq_spec()@ == old(self).next_seq_spec()@.update(
+                        t as int,
+                        (s + 1) as u64,
+                    )
+                    &&& final(self).events_spec()@ == old(self).events_spec()@.insert((t, s), event)
+                    &&& final(self).count_spec() == old(self).count_spec()
+                        && final(self).kinds_spec() == old(self).kinds_spec()
+                        && final(self).confirmed_seq_spec() == old(self).confirmed_seq_spec()
+                    &&& old(ledger).submitted.map().submap_of(final(ledger).submitted.map())
+                    &&& final(ledger).submitted.map() == old(ledger).submitted.map().insert(
+                        event,
+                        receipt.value(),
+                    ) && final(ledger).knows == old(ledger).knows && final(ledger).succeeded == old(
+                        ledger,
+                    ).succeeded && final(ledger).revoked == old(ledger).revoked
+                },
+            },
+    {
+        if t as usize >= self.count {
+            return Err(CoreError::InvalidArgument);
+        }
+        let s = self.next_seq[t as usize];
+        if s > MAX_TICKET_SEQ {
+            return Err(CoreError::SequenceExhausted);
+        }
+        proof {
+            ledger.record_submitted(receipt);
+            self.events = Ghost(self.events_spec()@.insert((t, s), event));
+        }
+        self.next_seq.set(t as usize, s + 1);
+        assert forall|u: TimelineId, q: u64|
+            self.issued(u, q) implies #[trigger] self.events_spec()@.contains_key((u, q))
+            && ledger.submitted.dom().contains(self.events_spec()@[(u, q)]) by {
+            if (u, q) != (t, s) {
+                assert(old(self).events_spec()@.contains_key((u, q)));
+            }
+        }
+        assert forall|u: TimelineId, q: u64|
+            u < self.count && 1 <= q
+                <= self.confirmed_seq[u as int] implies #[trigger] self.observed(
+            u,
+            q,
+            event.observer,
+            ledger.knows,
+        ) by {
+            assert(old(self).observed(u, q, event.observer, old(ledger).knows));
+        }
+        Ok(Ticket::pack(t, s))
+    }
+
+    pub fn advance_confirmed(
+        &mut self,
+        t: TimelineId,
+        new_confirmed: u64,
+        Tracked(knows): Tracked<Knows>,
+        Tracked(ledger): Tracked<&mut KnowledgeLedger>,
+        Ghost(node): Ghost<NodeId>,
+    )
+        requires
+            old(self).well_formed(knows.instance_id(), node, old(ledger)),
+            t < old(self).count_spec(),
+            old(self).confirmed_seq_spec()[t as int] <= new_confirmed < old(
+                self,
+            ).next_seq_spec()[t as int],
+            forall|s: u64|
+                old(self).confirmed_seq_spec()[t as int] < s <= new_confirmed ==> #[trigger] old(
+                    self,
+                ).observed(t, s, node, knows) || old(self).observed(t, s, node, old(ledger).knows),
+        ensures
+            final(self).well_formed(knows.instance_id(), node, final(ledger)),
+            final(self).confirmed_seq_spec()@ == old(self).confirmed_seq_spec()@.update(
+                t as int,
+                new_confirmed,
+            ),
+            final(self).next_seq_spec() == old(self).next_seq_spec(),
+            final(self).kinds_spec() == old(self).kinds_spec(),
+            final(self).count_spec() == old(self).count_spec(),
+            final(self).events_spec() == old(self).events_spec(),
+            final(ledger).knows.set() == old(ledger).knows.set().union(knows.set()),
+            final(ledger).submitted == old(ledger).submitted,
+            final(ledger).succeeded == old(ledger).succeeded,
+            final(ledger).revoked == old(ledger).revoked,
+    {
+        proof {
+            ledger.record_knows(knows);
+        }
+        self.confirmed_seq.set(t as usize, new_confirmed);
+        assert forall|u: TimelineId, s: u64|
+            u < self.count && 1 <= s
+                <= self.confirmed_seq[u as int] implies #[trigger] self.observed(
+            u,
+            s,
+            node,
+            ledger.knows,
+        ) by {
+            if s <= old(self).confirmed_seq[u as int] {
+                assert(old(self).observed(u, s, node, old(ledger).knows));
+            } else {
+                assert(old(self).observed(u, s, node, knows) || old(self).observed(
+                    u,
+                    s,
+                    node,
+                    old(ledger).knows,
+                ));
+            }
+        }
+    }
+
+    pub fn count(&self) -> (r: usize)
+        ensures
+            r == self.count_spec(),
+    {
+        self.count
+    }
+
+    pub fn kind(&self, timeline: TimelineId) -> Option<TimelineKind> {
+        let t = timeline as usize;
+        if t < self.kinds.len() {
+            Some(self.kinds[t])
+        } else {
+            None
+        }
+    }
+
+    pub fn confirmed_sequences(&self) -> (r: &[u64])
+        ensures
+            r@ == self.confirmed_seq_spec()@,
+    {
+        self.confirmed_seq.as_slice()
+    }
+
+    pub fn next_sequences(&self) -> (r: &[u64])
+        ensures
+            r@ == self.next_seq_spec()@,
+    {
+        self.next_seq.as_slice()
+    }
+
+    pub fn kinds(&self) -> (r: &[TimelineKind])
+        ensures
+            r@ == self.kinds_spec()@,
+    {
+        self.kinds.as_slice()
+    }
+
+    pub fn next_sequence(&self, timeline: TimelineId) -> (r: Option<u64>)
+        ensures
+            r matches Some(seq) ==> seq == self.next_seq_spec()[timeline as int],
+    {
+        let t = timeline as usize;
+        if t < self.next_seq.len() {
+            Some(self.next_seq[t])
+        } else {
+            None
+        }
+    }
+
+    pub fn confirmed_sequence(&self, timeline: TimelineId) -> Option<u64> {
+        let t = timeline as usize;
+        if t < self.confirmed_seq.len() {
+            Some(self.confirmed_seq[t])
+        } else {
+            None
+        }
+    }
+
+    pub fn contains_ticket(&self, ticket: Ticket) -> (valid: bool)
+        requires
+            self.bounds(),
+        ensures
+            valid == self.valid_ticket(ticket),
+    {
+        if ticket.is_none() {
+            return true;
+        }
+        let t = ticket.timeline() as usize;
+        let seq = ticket.seq();
+        t < self.count && seq != 0 && seq < self.next_seq[t]
+    }
+
+    pub fn is_retired(&self, ticket: Ticket) -> (r: bool)
+        requires
+            self.bounds(),
+        ensures
+            r == (self.valid_ticket(ticket) && self.retired(ticket)),
+    {
+        self.contains_ticket(ticket) && (ticket.is_none() || ticket.seq()
+            <= self.confirmed_seq[ticket.timeline() as usize])
+    }
+
+    pub proof fn lemma_retired_ticket_in_frontier(
+        &self,
+        id: InstanceId,
+        node: NodeId,
+        ledger: &KnowledgeLedger,
+        ticket: Ticket,
+    )
+        requires
+            self.well_formed(id, node, ledger),
+            self.valid_ticket(ticket),
+            self.retired(ticket),
+            ticket != Ticket::NONE,
+        ensures
+            self.observed(ticket.timeline_id(), ticket.sequence(), node, ledger.knows),
+    {
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataOperation {
+    Read,
+    Write,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingOperation {
+    pub frame: FrameId,
+    pub operation: DataOperation,
+    pub sequence: u64,
+}
+
+pub open spec fn remove_range(m: Map<u64, TransferEvent>, start: u64, count: int) -> Map<
+    u64,
+    TransferEvent,
+> {
+    Map::new(m.dom().filter(|s: u64| !(start <= s < start + count)), |s: u64| m[s])
+}
+
+pub open spec fn window_matches(
+    ops: [Option<PendingOperation>; BITMAP_SLOTS],
+    bitmap: SlidingBitmap,
+    table: &TimelineTable,
+    t: TimelineId,
+    pending: Map<u64, TransferEvent>,
+) -> bool {
+    let base = table.confirmed_seq_spec()[t as int];
+    &&& table.next_seq_spec()[t as int] <= base + BITMAP_CAPACITY + 1
+    &&& forall|s: u64| #[trigger]
+        pending.contains_key(s) ==> base < s < table.next_seq_spec()[t as int] && pending[s]
+            == table.events_spec()@[(t, s)] && (ops[(s % BITMAP_CAPACITY) as int] matches Some(op)
+            && op.sequence == s)
+    &&& forall|i: int|
+        0 <= i < BITMAP_CAPACITY ==> (#[trigger] ops[i] matches Some(op) ==> op.sequence
+            % BITMAP_CAPACITY == i && pending.contains_key(op.sequence))
+    &&& forall|s: u64|
+        base < s < table.next_seq_spec()[t as int] ==> #[trigger] pending.contains_key(s)
+            == !bitmap.bit_set(s - base - 1)
+}
+
+pub(crate) proof fn window_after_completion(
+    prior_ops: [Option<PendingOperation>; BITMAP_SLOTS],
+    ops: [Option<PendingOperation>; BITMAP_SLOTS],
+    prior_bitmap: SlidingBitmap,
+    bitmap: SlidingBitmap,
+    before: &TimelineTable,
+    table: &TimelineTable,
+    t: TimelineId,
+    s: u64,
+    pending: Map<u64, TransferEvent>,
+    advanced: u64,
+)
+    requires
+        window_matches(prior_ops, prior_bitmap, before, t, pending),
+        pending.contains_key(s),
+        table.next_seq == before.next_seq,
+        table.events == before.events,
+        ops@ == prior_ops@.update((s % BITMAP_CAPACITY) as int, None),
+        table.confirmed_seq[t as int] == before.confirmed_seq[t as int] + advanced,
+        forall|i: int|
+            0 <= i < advanced ==> #[trigger] prior_bitmap.bit_set(i)
+                || before.confirmed_seq[t as int] + 1 + i == s,
+        forall|i: int|
+            0 <= i ==> #[trigger] bitmap.bit_set(i) == (prior_bitmap.bit_set(i + advanced)
+                || table.confirmed_seq[t as int] + 1 + i == s),
+    ensures
+        window_matches(ops, bitmap, table, t, pending.remove(s)),
+{
+    assert forall|q: u64| #[trigger] pending.remove(s).contains_key(q) implies {
+        &&& table.confirmed_seq[t as int] < q < table.next_seq[t as int]
+        &&& pending.remove(s)[q] == table.events_spec()@[(t, q)]
+        &&& ops[(q % BITMAP_CAPACITY) as int] matches Some(p) && p.sequence == q
+    } by {
+        assert(pending.contains_key(q));
+        assert(!prior_bitmap.bit_set(q - before.confirmed_seq[t as int] - 1));
+        assert(q % BITMAP_CAPACITY != s % BITMAP_CAPACITY) by {
+            assert(prior_ops[(q % BITMAP_CAPACITY) as int]->Some_0.sequence == q);
+        }
+    }
+    let base = table.confirmed_seq[t as int];
+    let prior = before.confirmed_seq[t as int];
+    assert forall|q: u64| base < q < table.next_seq[t as int] implies #[trigger] pending.remove(
+        s,
+    ).contains_key(q) == !bitmap.bit_set(q - base - 1) by {
+        assert(bitmap.bit_set(q - base - 1) == (prior_bitmap.bit_set(q - prior - 1) || q == s));
+        assert(pending.contains_key(q) == !prior_bitmap.bit_set(q - prior - 1));
+    }
+    assert forall|i: int| 0 <= i < BITMAP_CAPACITY implies (#[trigger] ops[i] matches Some(p)
+        ==> p.sequence % BITMAP_CAPACITY == i && pending.remove(s).contains_key(p.sequence)) by {
+        if let Some(p) = ops[i] {
+            assert(prior_ops[i] == Some(p));
+            assert(p.sequence != s);
+        }
+    }
+}
+
+pub fn record_submission(
+    ops: &mut [Option<PendingOperation>; BITMAP_SLOTS],
+    Ghost(bitmap): Ghost<SlidingBitmap>,
+    table: &mut TimelineTable,
+    t: TimelineId,
+    frame: FrameId,
+    operation: DataOperation,
+    Ghost(pending): Ghost<Map<u64, TransferEvent>>,
+    Tracked(receipt): Tracked<Submitted>,
+    Tracked(ledger): Tracked<&mut KnowledgeLedger>,
+) -> (ticket: Ticket)
+    requires
+        old(table).well_formed(receipt.instance_id(), receipt.key().observer, old(ledger)),
+        t < old(table).count_spec(),
+        bitmap.well_formed(),
+        bitmap.observations(old(table), t, receipt.key().observer, old(ledger)),
+        ({
+            let s = old(table).next_seq_spec()[t as int];
+            &&& s <= MAX_TICKET_SEQ && s <= old(table).confirmed_seq_spec()[t as int]
+                + BITMAP_CAPACITY
+            &&& pending.contains_key(s) && pending[s] == receipt.key()
+            &&& window_matches(*old(ops), bitmap, old(table), t, pending.remove(s))
+        }),
+    ensures
+        final(table).well_formed(receipt.instance_id(), receipt.key().observer, final(ledger)),
+        bitmap.observations(final(table), t, receipt.key().observer, final(ledger)),
+        window_matches(*final(ops), bitmap, final(table), t, pending),
+        final(ledger).submitted.map() == old(ledger).submitted.map().insert(
+            receipt.key(),
+            receipt.value(),
+        ),
+        final(ledger).knows == old(ledger).knows,
+        final(ledger).succeeded == old(ledger).succeeded,
+        final(ledger).revoked == old(ledger).revoked,
+        old(ledger).submitted.map().submap_of(final(ledger).submitted.map()),
+        final(ops)@ == old(ops)@.update(
+            (ticket.sequence() % BITMAP_CAPACITY) as int,
+            Some(PendingOperation { sequence: ticket.sequence(), frame, operation }),
+        ),
+        ticket.sequence() == old(table).next_seq_spec()[t as int] && ticket.timeline_id() == t
+            && ticket != Ticket::NONE,
+        final(table).events_spec()@ == old(table).events_spec()@.insert(
+            (ticket.timeline_id(), ticket.sequence()),
+            receipt.key(),
+        ),
+        final(table).next_seq_spec()@ == old(table).next_seq_spec()@.update(
+            ticket.timeline_id() as int,
+            (ticket.sequence() + 1) as u64,
+        ),
+        final(table).kinds_spec() == old(table).kinds_spec(),
+        final(table).count_spec() == old(table).count_spec(),
+        final(table).confirmed_seq_spec() == old(table).confirmed_seq_spec(),
+{
+    let s = table.next_seq[t as usize];
+    let ticket = table.issue_ticket(
+        t,
+        Ghost(receipt.key()),
+        Tracked(receipt),
+        Tracked(ledger),
+    ).unwrap();
+    let idx = (s % BITMAP_CAPACITY) as usize;
+    ops[idx] = Some(PendingOperation { sequence: s, frame, operation });
+    let ghost base = table.confirmed_seq[t as int];
+    assert forall|q: u64| #[trigger] pending.contains_key(q) implies base < q
+        < table.next_seq[t as int] && pending[q] == table.events_spec()@[(t, q)] && (ops[(q
+        % BITMAP_CAPACITY) as int] matches Some(p) && p.sequence == q) by {
+        if q != s {
+            assert(pending.remove(s).contains_key(q));
+            assert(q % BITMAP_CAPACITY != s % BITMAP_CAPACITY) by {
+                assert(q == BITMAP_CAPACITY * (q / BITMAP_CAPACITY) + q % BITMAP_CAPACITY);
+                assert(s == BITMAP_CAPACITY * (s / BITMAP_CAPACITY) + s % BITMAP_CAPACITY);
+            }
+        }
+    }
+    assert forall|i: int| #[trigger] bitmap.bit_set(i) implies {
+        let q = (base + 1 + i) as u64;
+        table.issued(t, q) && table.observed(t, q, receipt.key().observer, ledger.knows)
+    } by {
+        assert(bitmap.bit_set(i));
+    }
+    assert(!bitmap.bit_set(s - base - 1)) by {
+        if bitmap.bit_set(s - base - 1) {
+            assert(old(table).issued(t, s));
+        }
+    }
+    assert forall|q: u64|
+        base < q < table.next_seq[t as int] implies #[trigger] pending.contains_key(q)
+        == !bitmap.bit_set(q - base - 1) by {
+        if q != s {
+            assert(pending.remove(s).contains_key(q) == !bitmap.bit_set(q - base - 1));
+        }
+    }
+    assert forall|i: int| 0 <= i < BITMAP_CAPACITY implies (#[trigger] ops[i] matches Some(p)
+        ==> p.sequence % BITMAP_CAPACITY == i && pending.contains_key(p.sequence)) by {
+        if i != idx {
+            if let Some(p) = ops[i] {
+                assert(old(ops)[i] == Some(p));
+                assert(pending.remove(s).contains_key(p.sequence));
+            }
+        }
+    }
+    ticket
+}
+
+/// Dispatch a reaped data completion and retain its success witness only on success.
+pub fn complete_data(
+    ops: &mut [Option<PendingOperation>; BITMAP_SLOTS],
+    bitmap: &mut SlidingBitmap,
+    table: &mut TimelineTable,
+    t: TimelineId,
+    s: u64,
+    Ghost(pending): Ghost<Map<u64, TransferEvent>>,
+    Ghost(node): Ghost<NodeId>,
+    Tracked(observation): Tracked<Knows>,
+    Tracked(success): Tracked<Option<transfer_core::context::Succeeded>>,
+    Tracked(ledger): Tracked<&mut KnowledgeLedger>,
+) -> (op: PendingOperation)
+    requires
+        old(table).well_formed(observation.instance_id(), node, old(ledger)),
+        t < old(table).count_spec(),
+        old(bitmap).well_formed(),
+        old(bitmap).observations(old(table), t, node, old(ledger)),
+        window_matches(*old(ops), *old(bitmap), old(table), t, pending),
+        pending.contains_key(s),
+        old(table).observed(t, s, node, observation),
+        success matches Some(w) ==> w.event() == pending[s] && w.instance_id()
+            == observation.instance_id(),
+    ensures
+        final(table).well_formed(observation.instance_id(), node, final(ledger)),
+        final(bitmap).well_formed(),
+        final(bitmap).observations(final(table), t, node, final(ledger)),
+        window_matches(*final(ops), *final(bitmap), final(table), t, pending.remove(s)),
+        Some(op) == old(ops)[(s % BITMAP_CAPACITY) as int],
+        final(ops)@ == old(ops)@.update((s % BITMAP_CAPACITY) as int, None),
+        op.sequence == s,
+        final(table).polled(old(table), t),
+        final(table).kinds_spec() == old(table).kinds_spec(),
+        final(table).count_spec() == old(table).count_spec(),
+        final(table).next_seq_spec() == old(table).next_seq_spec(),
+        final(table).events_spec() == old(table).events_spec(),
+        final(ledger).submitted == old(ledger).submitted,
+        final(ledger).revoked == old(ledger).revoked,
+        final(ledger).knows.set() == old(ledger).knows.set().union(observation.set()),
+        final(ledger).succeeded.witnesses == match success {
+            None => old(ledger).succeeded.witnesses,
+            Some(w) => old(ledger).succeeded.witnesses.insert(pending[s], w),
+        },
+{
+    let idx = (s % BITMAP_CAPACITY) as usize;
+    let op = ops[idx].take().unwrap();
+    let _advanced = apply_bitmap_completion(
+        bitmap,
+        table,
+        t,
+        s,
+        Tracked(observation),
+        Tracked(ledger),
+        Ghost(node),
+    );
+    let ghost after_bitmap = *ledger;
+    proof {
+        if let Some(w) = success {
+            assert(table.events_spec()@.contains_key((t, s)));
+            ledger.record_succeeded(w);
+        }
+        assert forall|u: TimelineId, q: u64|
+            u < table.count && 1 <= q
+                <= table.confirmed_seq[u as int] implies #[trigger] table.observed(
+            u,
+            q,
+            node,
+            ledger.knows,
+        ) by {
+            assert(table.observed(u, q, node, after_bitmap.knows));
+        }
+        assert forall|e| #[trigger]
+            ledger.succeeded.contains(e) implies ledger.submitted.dom().contains(e) by {
+            if e != pending[s] || success.is_none() {
+                assert(after_bitmap.succeeded.contains(e));
+            }
+        }
+        assert(ledger.valid(observation.instance_id(), node));
+        window_after_completion(
+            *old(ops),
+            *ops,
+            *old(bitmap),
+            *bitmap,
+            old(table),
+            table,
+            t,
+            s,
+            pending,
+            _advanced,
+        );
+    }
+    op
+}
+
+} // verus!

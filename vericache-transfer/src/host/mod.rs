@@ -4,28 +4,18 @@ mod proofs;
 
 use crate::context::*;
 use crate::domain::*;
-use core::marker::PhantomData;
-use foundation::space::{Access, Effect};
+use crate::memory::{DmaAllocation, HostDmaSlab, RdmaRegisterableSlab};
 #[cfg(verus_only)]
-use foundation::{
-    history::{self, Action},
-    space::restrict,
-    tracked::*,
-    value::*,
-};
-#[cfg(verus_only)]
-use vstd::arithmetic::mul::{lemma_mul_inequality, lemma_mul_is_distributive_add_other_way};
+use foundation::tracked::*;
+pub use transfer_core::memory::HostSlice;
 use vstd::prelude::*;
 use vstd::tokens::InstanceId;
 #[cfg(verus_only)]
 use vstd::tokens::KeyValueToken;
 
-pub(crate) use proofs::CompletedAccess;
-pub use proofs::Completion;
 #[cfg(verus_only)]
-pub use proofs::{can_reclaim_slab, can_reclaim_slot};
-#[cfg(verus_only)]
-pub(crate) use proofs::{finish_copy, finish_owned, finish_read, finish_slab_owned};
+pub use crate::context::{can_reclaim_slab, can_reclaim_slot};
+pub use crate::context::{Completion, HostContext, SyncContext};
 
 verus! {
 
@@ -35,62 +25,26 @@ broadcast use {
     vstd::map::group_map_lemmas,
 };
 
-pub struct HostContext {
-    pub source: Tracked<EventSourceToken>,
-}
-
-impl HostContext {
-    pub fn new(Tracked(source): Tracked<EventSourceToken>) -> (result: Self)
-        requires
-            source.well_formed(),
-            source.source() is Host,
-        ensures
-            result.source@ == source,
-    {
-        Self { source: Tracked(source) }
-    }
-
-    pub open spec fn ready(&self, instance: InstanceId, node: NodeId) -> bool {
-        self.source@.well_formed() && self.source@.node() == node && self.source@.source() is Host
-            && self.source@.id() == instance
-    }
-
-    pub open spec fn stepped(&self, previous: Self) -> bool {
-        &&& self.ready(previous.source@.id(), previous.source@.node())
-        &&& self.source@.source() == previous.source@.source()
-        &&& self.source@.next_seq() == previous.source@.next_seq() + 1
-    }
-}
-
 pub open spec fn is_power_of_two_usize(align: usize) -> bool {
     align > 0 && (align & ((align - 1) as usize)) == 0
 }
 
 pub struct HostBuffer {
     align: usize,
-    ptr: *mut u8,
+    allocation: DmaAllocation,
     num_slots: usize,
     slot_len: usize,
-    len: usize,
     #[cfg_attr(not(verus_only), allow(dead_code))]
     node: Ghost<NodeId>,
     #[cfg_attr(not(verus_only), allow(dead_code))]
     space: Ghost<MemorySpace>,
-    instance: Ghost<InstanceId>,
-}
-
-pub struct HostSlice<'a> {
-    ptr: *mut u8,
-    len: usize,
     #[cfg_attr(not(verus_only), allow(dead_code))]
-    slot: Ghost<SlotRef>,
     instance: Ghost<InstanceId>,
-    borrow: PhantomData<&'a HostBuffer>,
 }
 
 impl HostBuffer {
     pub closed spec fn address(&self) -> usize {
-        self.ptr.addr()
+        self.allocation.address()
     }
 
     pub closed spec fn align(&self) -> usize {
@@ -114,7 +68,7 @@ impl HostBuffer {
     }
 
     pub closed spec fn total_len(&self) -> usize {
-        self.len
+        self.allocation.total_len()
     }
 
     pub open spec fn slot_loc(&self, idx: nat) -> SlotLoc {
@@ -130,26 +84,14 @@ impl HostBuffer {
     }
 
     pub closed spec fn well_formed(&self) -> bool {
-        &&& self.space@ is HostAlloc
+        &&& self.allocation.well_formed()
+        &&& self.allocation.device_spec().is_none()
+        &&& self.space@.is_host()
         &&& self.num_slots >= 1
-        &&& self.len == self.num_slots * self.slot_len
+        &&& self.allocation.total_len() == self.num_slots * self.slot_len
         &&& is_power_of_two_usize(self.align)
-        &&& self.ptr.addr() % self.align == 0
-        &&& self.ptr.addr() + self.len <= usize::MAX
-    }
-
-    pub(crate) fn raw_parts(&self) -> (parts: (*mut u8, usize))
-        requires
-            self.well_formed(),
-        ensures
-            parts.0.addr() == self.address(),
-            parts.1 == self.total_len(),
-            self.num_slots() >= 1,
-            parts.1 == self.num_slots() * self.slot_len(),
-            parts.0.addr() + parts.1 <= usize::MAX,
-            self.space() is HostAlloc,
-    {
-        (self.ptr, self.len)
+        &&& self.allocation.address() % self.align == 0
+        &&& self.allocation.address() + self.allocation.total_len() <= usize::MAX
     }
 
     pub fn len(&self) -> (result: usize)
@@ -159,7 +101,14 @@ impl HostBuffer {
             result == self.total_len(),
             result == self.num_slots() * self.slot_len(),
     {
-        self.len
+        self.allocation.raw_parts().1
+    }
+
+    pub fn alignment(&self) -> (align: usize)
+        ensures
+            align == self.align(),
+    {
+        self.align
     }
 
     pub fn num_slots_val(&self) -> (result: usize)
@@ -203,109 +152,99 @@ impl HostBuffer {
             result.address() == self.address() + idx * self.slot_len(),
             result.instance_id() == self.instance_id(),
     {
-        assert!(idx < self.num_slots);
-        proof {
-            lemma_mul_is_distributive_add_other_way(self.slot_len as int, idx as int, 1);
-            lemma_mul_inequality((idx + 1) as int, self.num_slots as int, self.slot_len as int);
-        }
-        let off = idx * self.slot_len;
-        let ptr = self.ptr.with_addr(self.ptr.addr() + off);
-        HostSlice::from_raw_parts(
-            self,
-            ptr,
-            self.slot_len,
-            Ghost(self.slot_ref(idx as nat)),
-            self.instance,
-        )
+        self.host_slice(idx)
     }
 }
 
-impl<'a> HostSlice<'a> {
-    pub closed spec fn address(&self) -> usize {
-        self.ptr.addr()
+impl HostDmaSlab for HostBuffer {
+    open spec fn slab_node(&self) -> NodeId {
+        self.node()
     }
 
-    pub fn addr(&self) -> (r: usize)
-        ensures
-            r == self.address(),
-    {
-        self.ptr.addr()
+    open spec fn slab_space(&self) -> MemorySpace {
+        self.space()
     }
 
-    pub(crate) fn raw_parts(&self) -> (r: (*mut u8, usize))
-        requires
-            self.well_formed(),
-        ensures
-            r.0.addr() == self.address(),
-            r.1 == self.slot_ref().sub_len,
-            r.0.addr() + r.1 <= usize::MAX,
-            self.slot_ref().loc.space is HostAlloc,
-    {
-        (self.ptr, self.len)
+    open spec fn slab_num_slots(&self) -> usize {
+        self.num_slots()
     }
 
-    pub(crate) fn from_raw_parts<T>(
-        _owner: &'a T,
-        ptr: *mut u8,
-        len: usize,
-        slot: Ghost<SlotRef>,
-        instance: Ghost<InstanceId>,
-    ) -> (slice: Self)
-        requires
-            slot@.well_formed(),
-            slot@.loc.space is HostAlloc,
-            slot@.sub_len == len,
-            ptr.addr() + len <= usize::MAX,
-        ensures
-            slice.well_formed(),
-            slice.slot_ref() == slot@,
-            slice.address() == ptr.addr(),
-            slice.instance_id() == instance@,
-    {
-        Self { ptr, len, slot, instance, borrow: PhantomData }
+    open spec fn slab_slot_len(&self) -> usize {
+        self.slot_len()
     }
 
-    pub closed spec fn slot_ref(&self) -> SlotRef {
-        self.slot@
+    open spec fn slab_total_len(&self) -> usize {
+        self.total_len()
     }
 
-    pub closed spec fn instance_id(&self) -> InstanceId {
-        self.instance@
+    open spec fn slab_instance_id(&self) -> InstanceId {
+        self.instance_id()
     }
 
-    pub closed spec fn well_formed(&self) -> bool {
-        self.slot@.well_formed() && self.slot@.loc.space is HostAlloc && self.slot@.sub_len
-            == self.len && self.ptr.addr() + self.len <= usize::MAX
+    open spec fn slab_well_formed(&self) -> bool {
+        self.well_formed()
     }
 
-    pub fn len(&self) -> (result: usize)
-        requires
-            self.well_formed(),
-        ensures
-            result == self.slot_ref().sub_len,
-    {
-        self.len
+    open spec fn slab_address(&self) -> usize {
+        self.address()
     }
 
-    pub fn sub_slice(&self, offset: usize, len: usize) -> (result: HostSlice<'a>)
-        requires
-            self.well_formed(),
-            offset + len <= self.slot_ref().sub_len,
-        ensures
-            result.well_formed(),
-            result.instance_id() == self.instance_id(),
-            result.address() == self.address() + offset,
-            result.slot_ref() == self.slot_ref().sub_slice(offset as u64, len as u64),
-    {
-        assert!(offset <= self.len && len <= self.len - offset);
-        let ptr = self.ptr.with_addr(self.ptr.addr() + offset);
-        HostSlice {
-            ptr,
-            len,
-            slot: Ghost(self.slot@.sub_slice(offset as u64, len as u64)),
-            instance: self.instance,
-            borrow: PhantomData,
-        }
+    fn slab_allocation(&self) -> &DmaAllocation {
+        &self.allocation
+    }
+
+    fn slab_num_slots_exec(&self) -> usize {
+        self.num_slots_val()
+    }
+
+    fn slab_slot_len_exec(&self) -> usize {
+        self.slot_len_val()
+    }
+}
+
+impl RdmaRegisterableSlab for HostBuffer {
+    open spec fn reg_node(&self) -> NodeId {
+        self.node()
+    }
+
+    open spec fn reg_space(&self) -> MemorySpace {
+        self.space()
+    }
+
+    open spec fn reg_num_slots(&self) -> usize {
+        self.num_slots()
+    }
+
+    open spec fn reg_slot_len(&self) -> usize {
+        self.slot_len()
+    }
+
+    open spec fn reg_total_len(&self) -> usize {
+        self.total_len()
+    }
+
+    open spec fn reg_instance_id(&self) -> InstanceId {
+        self.instance_id()
+    }
+
+    open spec fn reg_well_formed(&self) -> bool {
+        self.well_formed()
+    }
+
+    open spec fn reg_gpu_device(&self) -> Option<DeviceId> {
+        None
+    }
+
+    fn reg_allocation(&self) -> &DmaAllocation {
+        &self.allocation
+    }
+
+    fn reg_num_slots_exec(&self) -> usize {
+        self.num_slots_val()
+    }
+
+    fn reg_slot_len_exec(&self) -> usize {
+        self.slot_len_val()
     }
 }
 
@@ -326,8 +265,11 @@ pub fn alloc(
             Some((buf, tok)) => {
                 &&& buf.well_formed() && buf.instance_id() == instance.id()
                 &&& buf.num_slots() == 1 && buf.slot_len() == len
-                &&& buf.node() == old(source).node() && buf.space() == old(source).space(None)
-                &&& buf.slot_ref(0) == old(source).slot_ref(None, len as u64)
+                &&& buf.node() == old(source).node() && buf.space() == old(source).space_for(
+                    SPACE_HOST,
+                    0,
+                )
+                &&& buf.slot_ref(0) == old(source).slot_ref_for(SPACE_HOST, 0, len as u64)
                 &&& final(source).allocated_slot(*old(source), buf.slot_loc(0), tok@)
             },
         },
@@ -355,8 +297,11 @@ pub fn alloc_aligned(
                 &&& buf.align() == align && buf.address() % align == 0
                 &&& buf.well_formed() && buf.instance_id() == instance.id()
                 &&& buf.num_slots() == 1 && buf.slot_len() == len
-                &&& buf.node() == old(source).node() && buf.space() == old(source).space(None)
-                &&& buf.slot_ref(0) == old(source).slot_ref(None, len as u64)
+                &&& buf.node() == old(source).node() && buf.space() == old(source).space_for(
+                    SPACE_HOST,
+                    0,
+                )
+                &&& buf.slot_ref(0) == old(source).slot_ref_for(SPACE_HOST, 0, len as u64)
                 &&& final(source).allocated_slot(*old(source), buf.slot_loc(0), tok@)
             },
         },
@@ -364,17 +309,16 @@ pub fn alloc_aligned(
     if align == 0 || (align & (align - 1)) != 0 {
         return None;
     }
-    let ptr = ffi::raw_alloc_aligned(len, align)?;
+    let allocation = ffi::raw_alloc_aligned(len, align)?;
     let ghost node = source.node();
-    let ghost space = source.space(None);
-    let tracked tok = source.allocate_slot(None);
+    let ghost space = MemorySpace::host(source.next_alloc_id());
+    let tracked tok = source.allocate_slot_in(space);
     Some(
         (
             HostBuffer {
-                ptr,
+                allocation,
                 num_slots: 1,
                 slot_len: len,
-                len,
                 align,
                 node: Ghost(node),
                 space: Ghost(space),
@@ -407,7 +351,10 @@ pub fn alloc_slab(
                 &&& buf.align() == align && buf.address() % align == 0
                 &&& buf.well_formed() && buf.instance_id() == instance.id()
                 &&& buf.num_slots() == num_slots && buf.slot_len() == slot_len
-                &&& buf.node() == old(source).node() && buf.space() == old(source).space(None)
+                &&& buf.node() == old(source).node() && buf.space() == old(source).space_for(
+                    SPACE_HOST,
+                    0,
+                )
                 &&& final(source).allocated_slab(*old(source), buf.space(), num_slots, tokens@)
             },
         },
@@ -418,17 +365,16 @@ pub fn alloc_slab(
     let Some(total) = num_slots.checked_mul(slot_len) else {
         return None;
     };
-    let ptr = ffi::raw_alloc_aligned(total, align)?;
+    let allocation = ffi::raw_alloc_aligned(total, align)?;
     let ghost node = source.node();
-    let ghost space = source.space(None);
-    let tracked tokens = source.allocate_slab_slots(None, num_slots);
+    let ghost space = MemorySpace::host(source.next_alloc_id());
+    let tracked tokens = source.allocate_slab_in(space, num_slots);
     Some(
         (
             HostBuffer {
-                ptr,
+                allocation,
                 num_slots,
                 slot_len,
-                len: total,
                 align,
                 node: Ghost(node),
                 space: Ghost(space),
@@ -477,7 +423,7 @@ pub fn write_slice(
             IMap::empty(),
         ),
 {
-    assert!(dst.len == data.len());
+    assert!(dst.len() == data.len());
     let Tracked(completed) = ffi::raw_write(dst, data);
     let tracked result = finish_owned(
         _ctx.source.borrow_mut(),
@@ -489,6 +435,59 @@ pub fn write_slice(
         cited,
     );
     Tracked(result)
+}
+
+/// Record a completed external write to an exclusively owned host slice.
+/// Finish and synchronize all external writes to `dst` before calling this.
+#[inline]
+pub fn record_external_write(
+    _ctx: &mut HostContext,
+    Tracked(instance): Tracked<&TransferInstance>,
+    dst: &HostSlice,
+    Tracked(dst_tok): Tracked<&mut SlotToken>,
+    Tracked(infos): Tracked<&SubmittedMap>,
+    Tracked(knows): Tracked<&Knows>,
+    Ghost(cited): Ghost<ISet<TransferEvent>>,
+) -> (result: (Tracked<Completion>, Ghost<Seq<u8>>))
+    requires
+        old(_ctx).ready(instance.id(), dst.slot_ref().loc.node),
+        dst.well_formed(),
+        dst.instance_id() == instance.id(),
+        slot_is_owned(*old(dst_tok), instance.id(), dst.slot_ref().loc),
+        infos.instance_id() == instance.id(),
+        knows.instance_id() == instance.id(),
+        cited.subset_of(infos.dom()),
+        knowledge_of(dst.slot_ref().loc.node, cited).subset_of(knows.set()),
+        write_admitted(slot_frontier(*old(dst_tok)), closure_from(infos.map(), cited)),
+    ensures
+        final(_ctx).stepped(*old(_ctx)),
+        slot_owned(
+            *final(dst_tok),
+            instance.id(),
+            dst.slot_ref().loc,
+            Frontier { last_writer: Some(old(_ctx).source@.next_event()), readers: ISet::empty() },
+        ),
+        result.1@.len() == dst.slot_ref().sub_len,
+        result.0@.records(
+            instance.id(),
+            old(_ctx).source@.next_event(),
+            write_access(dst.slot_ref()),
+            splice_bytes(dst.slot_ref(), result.1@),
+            closure_from(infos.map(), cited),
+            IMap::empty(),
+        ),
+{
+    let (Tracked(completed), bytes) = ffi::raw_observe_write(dst);
+    let tracked result = finish_owned(
+        _ctx.source.borrow_mut(),
+        instance,
+        completed,
+        dst_tok,
+        infos,
+        knows,
+        cited,
+    );
+    (Tracked(result), bytes)
 }
 
 pub fn read_slice(
@@ -506,7 +505,7 @@ pub fn read_slice(
         src.well_formed(),
         src.instance_id() == instance.id(),
         old(out)@.len() == src.slot_ref().sub_len,
-        old(src_perm).valid_local(instance.id(), src.slot_ref().loc),
+        old(src_perm).valid_cooperative(instance.id(), src.slot_ref().loc),
         infos.instance_id() == instance.id(),
         knows.instance_id() == instance.id(),
         cited.subset_of(infos.dom()),
@@ -525,7 +524,7 @@ pub fn read_slice(
             old(src_perm).read_guards(),
         ),
 {
-    assert!(src.len == out.len());
+    assert!(src.len() == out.len());
     let Tracked(completed) = ffi::raw_read(src, out);
     let tracked result = finish_read(
         _ctx.source.borrow_mut(),
@@ -559,7 +558,7 @@ pub fn copy(
         src.slot_ref().sub_len == dst.slot_ref().sub_len,
         src.slot_ref().loc.node == dst.slot_ref().loc.node,
         src.slot_ref().loc != dst.slot_ref().loc,
-        old(src_perm).valid_local(instance.id(), src.slot_ref().loc),
+        old(src_perm).valid_cooperative(instance.id(), src.slot_ref().loc),
         slot_is_owned(*old(dst_tok), instance.id(), dst.slot_ref().loc),
         infos.instance_id() == instance.id(),
         knows.instance_id() == instance.id(),
@@ -585,7 +584,7 @@ pub fn copy(
             old(src_perm).read_guards(),
         ),
 {
-    assert!(src.len == dst.len);
+    assert!(src.len() == dst.len());
     let Tracked(completed) = ffi::raw_copy(dst, src);
     let tracked result = finish_copy(
         _ctx.source.borrow_mut(),
@@ -631,7 +630,7 @@ pub fn free(
     let Tracked(completed) = ffi::raw_free(buf);
     proof {
         assert(slab_locs(loc.node, loc.space, 1nat) =~= ISet::empty().insert(loc));
-        assert(completed.access == reclaim_access(loc));
+        assert(completed.access() == reclaim_access(loc));
     }
     Tracked(
         finish_owned(_ctx.source.borrow_mut(), instance, completed, &mut tok, infos, knows, cited),

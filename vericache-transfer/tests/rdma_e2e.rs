@@ -4,6 +4,9 @@ use std::io;
 use transfer::context::*;
 #[cfg(verus_only)]
 use transfer::host::Completion;
+use transfer::integration_proofs::{
+    fenced_revocation_donor, fenced_revocation_initiator, read_lifecycle_initiator,
+};
 use transfer::rdma::*;
 use transfer::transport::*;
 use vstd::prelude::*;
@@ -199,7 +202,7 @@ fn donor(
     let empty = node.empty();
     let (writer, slot) = node.write(&buf, &initial, slot, empty);
     let flags = AccessFlags { local_write: true, mw_bind: true };
-    let mr = register_memory(pd, RegistrationBuffer::Host(&buf), flags).unwrap();
+    let mr = register_memory(pd, &buf, flags).unwrap();
     let mut mw = alloc_window(pd, node.name()).unwrap();
     if fenced {
         let replacement = pattern(109);
@@ -245,7 +248,7 @@ fn donor(
     proof {
         assert(mw.state() == WindowState::Unbound);
     }
-    let mr = register_memory(pd, RegistrationBuffer::Host(&buf), flags).unwrap();
+    let mr = register_memory(pd, &buf, flags).unwrap();
     let key = mw.next_rkey();
     post_bind_window(
         qp,
@@ -311,11 +314,7 @@ fn initiator(
     let expected = pattern(17);
     let n = expected.len();
     let (buf, slot) = node.buffer(n);
-    let mr = register_memory(
-        pd,
-        RegistrationBuffer::Host(&buf),
-        AccessFlags { local_write: true, mw_bind: false },
-    ).unwrap();
+    let mr = register_memory(pd, &buf, AccessFlags { local_write: true, mw_bind: false }).unwrap();
     let mut out = vec![0; n];
     if fenced {
         let sentinel = vec![0x5a; n];

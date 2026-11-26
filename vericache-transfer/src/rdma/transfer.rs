@@ -72,7 +72,7 @@ pub(super) tracked struct PostedTransfer {
 /// Submit a 2-slot RDMA transfer (1 source `ReadPerm` + 1 distinct destination `SlotToken`).
 #[inline(always)]
 #[cfg_attr(not(verus_only), allow(unused_variables))]
-fn submit_transfer_2(
+pub(super) fn submit_transfer_2(
     qp: &mut QueuePair,
     cq: &mut CompletionQueue,
     Tracked(instance): Tracked<&TransferInstance>,
@@ -112,6 +112,7 @@ fn submit_transfer_2(
             old(qp).transfer_ordered(fence, *old(infos), cited),
         ),
     ensures
+        !fence ==> *final(infos) == *old(infos),
         final(infos).map() == old(infos).map(),
         final(infos).instance_id() == instance.id(),
         final(src_perm).advanced_read(*old(src_perm), old(qp).source().next_event()),
@@ -272,8 +273,8 @@ pub(super) fn submit_transfer_multi(
                 &&& new_cap.instance_id() == old_cap.instance_id()
                 &&& new_cap.loc() == old_cap.loc()
                 &&& new_cap.share() == old_cap.share()
-                &&& new_cap.is_local() == old_cap.is_local()
-                &&& new_cap.is_rdma_bound() == old_cap.is_rdma_bound()
+                &&& new_cap.is_cooperative() == old_cap.is_cooperative()
+                &&& new_cap.is_fenced() == old_cap.is_fenced()
                 &&& new_cap.is_unbound() == old_cap.is_unbound()
                 &&& new_cap.frontier() == (Frontier {
                     last_writer: old_cap.frontier().last_writer,
@@ -440,7 +441,7 @@ pub fn post_rdma_read(
             )
         },
 {
-    if local.len != remote.len || local.len > MAX_RDMA_MSG_LEN {
+    if local.len != remote.wire_fields().1 || local.len > MAX_RDMA_MSG_LEN {
         return Err(RdmaError(22));
     }
     let Tracked(work) = ffi::transfer(qp, local, remote, wr_id, true, fence)?;
@@ -527,7 +528,7 @@ pub fn post_rdma_read_gdr(
             )
         },
 {
-    if local.len != remote.len || local.len > MAX_RDMA_MSG_LEN {
+    if local.len != remote.wire_fields().1 || local.len > MAX_RDMA_MSG_LEN {
         return Err((RdmaError(22), Tracked(local_tok)));
     }
     let Tracked(work) = match ffi::transfer(qp, local, remote, wr_id, true, fence) {
@@ -635,7 +636,7 @@ pub fn post_rdma_write_flush_read(
             )
         },
 {
-    if local.len != remote.len || local.len > MAX_RDMA_MSG_LEN {
+    if local.len != remote.wire_fields().1 || local.len > MAX_RDMA_MSG_LEN {
         return Err(RdmaError(22));
     }
     let Tracked(work) = ffi::transfer(qp, local, remote, wr_id, true, fence)?;
@@ -728,7 +729,7 @@ pub fn post_rdma_write(
             )
         },
 {
-    if local.len != remote.len || local.len > MAX_RDMA_MSG_LEN {
+    if local.len != remote.wire_fields().1 || local.len > MAX_RDMA_MSG_LEN {
         return Err((RdmaError(22), Tracked(remote_tok)));
     }
     let Tracked(work) = match ffi::transfer(qp, local, remote, wr_id, false, fence) {

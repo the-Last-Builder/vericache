@@ -8,9 +8,8 @@ mod stream;
 
 use crate::context::*;
 use crate::domain::*;
-#[cfg(verus_only)]
-use crate::host as cpu_host;
-use crate::host::{CompletedAccess, Completion, HostBuffer, HostContext, HostSlice};
+pub use crate::memory::GdrWritesOrdering;
+use crate::memory::{DmaAllocation, HostDmaSlab, HostSlice, RdmaRegisterableSlab};
 use core::marker::PhantomData;
 use foundation::space::{Access, Effect};
 #[cfg(verus_only)]
@@ -57,13 +56,6 @@ pub enum CudaPointerKind {
     PinnedHost,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GdrWritesOrdering {
-    None,
-    Owner,
-    AllDevices,
-}
-
 pub enum EventStatus {
     NotReady,
     Ready(Tracked<Knows>),
@@ -71,12 +63,10 @@ pub enum EventStatus {
 
 // Private slab backing metadata for `CudaBuffer` and `CudaHostBuffer`.
 pub(super) struct SlabMemory {
-    pub(super) ptr: *mut u8,
+    pub(super) allocation: DmaAllocation,
     #[cfg_attr(not(verus_only), allow(dead_code))]
     pub(super) num_slots: usize,
     pub(super) slot_len: usize,
-    #[cfg_attr(not(verus_only), allow(dead_code))]
-    pub(super) len: usize,
     pub(super) kind: CudaPointerKind,
     #[cfg_attr(not(verus_only), allow(dead_code))]
     pub(super) node: Ghost<NodeId>,
@@ -96,12 +86,13 @@ impl SlabMemory {
 
     pub(super) open spec fn well_formed(&self) -> bool {
         &&& self.num_slots >= 1
-        &&& self.len == self.num_slots * self.slot_len
-        &&& self.ptr.addr() + self.len <= usize::MAX
+        &&& self.allocation.total_len() == self.num_slots * self.slot_len
+        &&& self.allocation.well_formed()
         &&& match self.kind {
-            CudaPointerKind::PinnedHost => self.space@ is HostAlloc,
-            CudaPointerKind::Device(d) => self.space@ is GpuAlloc && self.space@->GpuAlloc_device
-                == d,
+            CudaPointerKind::PinnedHost => self.space@.is_host()
+                && self.allocation.device_spec().is_none(),
+            CudaPointerKind::Device(d) => self.space@.is_gpu() && self.space@.gpu_device() == d
+                && self.allocation.device_spec() == Some(d),
         }
     }
 
@@ -121,7 +112,8 @@ impl SlabMemory {
             lemma_mul_inequality((idx + 1) as int, self.num_slots as int, self.slot_len as int);
         }
         let off = idx * self.slot_len;
-        let ptr = self.ptr.with_addr(self.ptr.addr() + off);
+        let (base, _) = self.allocation.raw_parts();
+        let ptr = base.with_addr(base.addr() + off);
         CudaSlice {
             memory: SliceMemory {
                 ptr,
@@ -151,9 +143,9 @@ impl SliceMemory {
         &&& self.slot@.sub_len == self.len
         &&& self.ptr.addr() + self.len <= usize::MAX
         &&& match self.kind {
-            CudaPointerKind::PinnedHost => self.slot@.loc.space is HostAlloc,
-            CudaPointerKind::Device(d) => self.slot@.loc.space is GpuAlloc
-                && self.slot@.loc.space->GpuAlloc_device == d,
+            CudaPointerKind::PinnedHost => self.slot@.loc.space.is_host(),
+            CudaPointerKind::Device(d) => self.slot@.loc.space.is_gpu()
+                && self.slot@.loc.space.gpu_device() == d,
         }
     }
 }
@@ -229,19 +221,6 @@ impl<'a> CudaSlice<'a> {
 }
 
 impl CudaBuffer {
-    #[allow(dead_code)]
-    pub(crate) fn raw_parts(&self) -> (p: (*mut u8, usize))
-        requires
-            self.well_formed(),
-        ensures
-            p.1 == self.total_len(),
-            self.num_slots() >= 1,
-            p.1 == self.num_slots() * self.slot_len(),
-            p.0.addr() + p.1 <= usize::MAX,
-    {
-        (self.memory.ptr, self.memory.len)
-    }
-
     pub closed spec fn node(&self) -> NodeId {
         self.memory.node@
     }
@@ -277,7 +256,7 @@ impl CudaBuffer {
     }
 
     pub closed spec fn total_len(&self) -> usize {
-        self.memory.len
+        self.memory.allocation.total_len()
     }
 
     pub open spec fn slot_loc(&self, idx: nat) -> SlotLoc {
@@ -300,7 +279,7 @@ impl CudaBuffer {
         requires
             self.well_formed(),
         ensures
-            d == self.space()->GpuAlloc_device,
+            d == self.space().gpu_device(),
     {
         match self.memory.kind {
             CudaPointerKind::Device(d) => d,
@@ -316,7 +295,7 @@ impl CudaBuffer {
             s.well_formed(),
             s.slot_ref() == self.slot_ref(0),
             s.instance_id() == self.instance_id(),
-            s.kind() == CudaPointerKind::Device(self.space()->GpuAlloc_device),
+            s.kind() == CudaPointerKind::Device(self.space().gpu_device()),
     {
         self.memory.borrow_slot(0)
     }
@@ -329,10 +308,94 @@ impl CudaBuffer {
             s.well_formed(),
             s.slot_ref() == self.slot_ref(idx as nat),
             s.instance_id() == self.instance_id(),
-            s.kind() == CudaPointerKind::Device(self.space()->GpuAlloc_device),
+            s.kind() == CudaPointerKind::Device(self.space().gpu_device()),
     {
         assert!(idx < self.memory.num_slots);
         self.memory.borrow_slot(idx)
+    }
+}
+
+impl RdmaRegisterableSlab for CudaBuffer {
+    open spec fn reg_node(&self) -> NodeId {
+        self.node()
+    }
+
+    open spec fn reg_space(&self) -> MemorySpace {
+        self.space()
+    }
+
+    open spec fn reg_num_slots(&self) -> usize {
+        self.num_slots()
+    }
+
+    open spec fn reg_slot_len(&self) -> usize {
+        self.slot_len()
+    }
+
+    open spec fn reg_total_len(&self) -> usize {
+        self.total_len()
+    }
+
+    open spec fn reg_instance_id(&self) -> InstanceId {
+        self.instance_id()
+    }
+
+    open spec fn reg_well_formed(&self) -> bool {
+        self.well_formed()
+    }
+
+    open spec fn reg_gpu_device(&self) -> Option<DeviceId> {
+        Some(self.space().gpu_device())
+    }
+
+    fn reg_allocation(&self) -> &DmaAllocation {
+        &self.memory.allocation
+    }
+
+    fn reg_num_slots_exec(&self) -> usize {
+        self.num_slots_val()
+    }
+
+    fn reg_slot_len_exec(&self) -> usize {
+        self.slot_len_val()
+    }
+
+    fn prepare_rdma_registration(&self) -> Result<(), i32> {
+        match enable_sync_memops(self) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(e.0),
+        }
+    }
+
+    fn query_gdr_ordering(&self) -> Result<Option<GdrWritesOrdering>, i32> {
+        let device = gdr_device_index(self.device())?;
+        match gdr_writes_ordering(device) {
+            Ok(order) => Ok(Some(order)),
+            Err(e) => Err(e.0),
+        }
+    }
+
+    fn query_gdr_flush_supported(&self) -> Result<bool, i32> {
+        let device = gdr_device_index(self.device())?;
+        match gdr_flush_writes_supported(device) {
+            Ok(supported) => Ok(supported),
+            Err(e) => Err(e.0),
+        }
+    }
+
+    fn flush_gdr_writes(&self, device: i32) -> Result<(), i32> {
+        match flush_gdr_writes(device) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(e.0),
+        }
+    }
+}
+
+fn gdr_device_index(device: DeviceId) -> Result<i32, i32> {
+    if device > i32::MAX as u32 {
+        Err(22)
+    } else {
+        Ok(device as i32)
     }
 }
 
@@ -346,26 +409,26 @@ pub fn alloc_device(Tracked(source): Tracked<&mut AllocSource>, device: DeviceId
             Ok((buf, tok)) => {
                 &&& buf.well_formed() && buf.instance_id() == old(source).id()
                 &&& buf.num_slots() == 1 && buf.slot_len() == len
-                &&& buf.node() == old(source).node() && buf.space() == old(source).space(
-                    Some(device),
+                &&& buf.node() == old(source).node() && buf.space() == old(source).space_for(
+                    SPACE_GPU,
+                    device,
                 )
-                &&& buf.slot_ref(0) == old(source).slot_ref(Some(device), len as u64)
+                &&& buf.slot_ref(0) == old(source).slot_ref_for(SPACE_GPU, device, len as u64)
                 &&& final(source).allocated_slot(*old(source), buf.slot_loc(0), tok@)
             },
         },
 {
-    let ptr = ffi::raw_alloc_device(device, len)?;
+    let allocation = ffi::raw_alloc_device(device, len)?;
     let ghost node = source.node();
-    let ghost space = source.space(Some(device));
-    let tracked tok = source.allocate_slot(Some(device));
+    let ghost space = MemorySpace::gpu(device, source.next_alloc_id());
+    let tracked tok = source.allocate_slot_in(space);
     Ok(
         (
             CudaBuffer {
                 memory: SlabMemory {
-                    ptr,
+                    allocation,
                     num_slots: 1,
                     slot_len: len,
-                    len,
                     kind: CudaPointerKind::Device(device),
                     node: Ghost(node),
                     space: Ghost(space),
@@ -393,8 +456,9 @@ pub fn alloc_device_slab(
             Ok((buf, tokens)) => {
                 &&& buf.well_formed() && buf.instance_id() == old(source).id()
                 &&& buf.num_slots() == num_slots && buf.slot_len() == slot_len
-                &&& buf.node() == old(source).node() && buf.space() == old(source).space(
-                    Some(device),
+                &&& buf.node() == old(source).node() && buf.space() == old(source).space_for(
+                    SPACE_GPU,
+                    device,
                 )
                 &&& final(source).allocated_slab(*old(source), buf.space(), num_slots, tokens@)
             },
@@ -406,18 +470,17 @@ pub fn alloc_device_slab(
     let Some(total) = num_slots.checked_mul(slot_len) else {
         return Err(CudaError::INVALID_VALUE);
     };
-    let ptr = ffi::raw_alloc_device(device, total)?;
+    let allocation = ffi::raw_alloc_device(device, total)?;
     let ghost node = source.node();
-    let ghost space = source.space(Some(device));
-    let tracked tokens = source.allocate_slab_slots(Some(device), num_slots);
+    let ghost space = MemorySpace::gpu(device, source.next_alloc_id());
+    let tracked tokens = source.allocate_slab_in(space, num_slots);
     Ok(
         (
             CudaBuffer {
                 memory: SlabMemory {
-                    ptr,
+                    allocation,
                     num_slots,
                     slot_len,
-                    len: total,
                     kind: CudaPointerKind::Device(device),
                     node: Ghost(node),
                     space: Ghost(space),
@@ -429,8 +492,7 @@ pub fn alloc_device_slab(
     )
 }
 
-#[allow(dead_code)]
-pub(crate) fn enable_sync_memops(buf: &CudaBuffer) -> Result<(), CudaError>
+fn enable_sync_memops(buf: &CudaBuffer) -> Result<(), CudaError>
     requires
         buf.well_formed(),
 {
@@ -454,7 +516,7 @@ pub fn flush_gdr_writes(device: i32) -> Result<(), CudaError> {
 }
 
 pub fn free_device(
-    _ctx: &mut HostContext,
+    _ctx: &mut SyncContext,
     Tracked(instance): Tracked<&TransferInstance>,
     buf: CudaBuffer,
     Tracked(tok): Tracked<SlotToken>,
@@ -467,7 +529,7 @@ pub fn free_device(
         buf.well_formed(),
         buf.num_slots() == 1,
         buf.instance_id() == instance.id(),
-        cpu_host::can_reclaim_slot(instance.id(), buf.slot_loc(0), tok, *infos, *knows, cited),
+        can_reclaim_slot(instance.id(), buf.slot_loc(0), tok, *infos, *knows, cited),
     ensures
         match r {
             Err((_, returned, ret_tok)) => returned == buf && ret_tok@ == tok && *final(_ctx)
@@ -493,9 +555,9 @@ pub fn free_device(
     };
     proof {
         assert(slab_locs(loc.node, loc.space, 1nat) =~= ISet::empty().insert(loc));
-        assert(completed.access == reclaim_access(loc));
+        assert(completed.access() == reclaim_access(loc));
     }
-    let tracked completion = cpu_host::finish_owned(
+    let tracked completion = finish_owned(
         _ctx.source.borrow_mut(),
         instance,
         completed,
@@ -508,7 +570,7 @@ pub fn free_device(
 }
 
 pub fn free_device_slab(
-    _ctx: &mut HostContext,
+    _ctx: &mut SyncContext,
     Tracked(instance): Tracked<&TransferInstance>,
     buf: CudaBuffer,
     Tracked(tokens): Tracked<Map<usize, SlotToken>>,
@@ -520,7 +582,7 @@ pub fn free_device_slab(
         old(_ctx).ready(instance.id(), buf.node()),
         buf.well_formed(),
         buf.instance_id() == instance.id(),
-        cpu_host::can_reclaim_slab(
+        can_reclaim_slab(
             instance.id(),
             buf.node(),
             buf.space(),
@@ -554,7 +616,7 @@ pub fn free_device_slab(
         Err(e) => return Err((e, buf, Tracked(tokens))),
         Ok(w) => w,
     };
-    let tracked (completion, _) = cpu_host::finish_slab_owned(
+    let tracked (completion, _) = finish_slab_owned(
         _ctx.source.borrow_mut(),
         instance,
         node,

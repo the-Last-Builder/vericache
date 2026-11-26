@@ -5,9 +5,9 @@ verus! {
 impl<'a> RdmaBackend<'a> {
     /// Cooperatively release a `Bound` remote read lease: posts local MW
     /// invalidation first (atomic failure safety) and then calls
-    /// `core.unpin_remote_lease`, retaining the `ReturnedShare` until
+    /// `core.unpin_fenced_lease`, retaining the `ReturnedShare` until
     /// `finish_unbind_lease` observes `Completed::WindowInvalidated`.
-    pub fn unpin_and_unbind_lease(
+    pub(crate) fn unpin_and_unbind_lease(
         &mut self,
         core: &mut CacheCore,
         handle: RemoteLeaseHandle,
@@ -24,8 +24,8 @@ impl<'a> RdmaBackend<'a> {
             match old(self).lease_index_spec(handle) {
                 Some(idx) => old(self).active_leases@[idx].state == RemoteLeaseState::Bound ==> {
                     &&& returned_cap.share() == old(self).active_leases@[idx].share@
-                    &&& old(core).timelines.valid_ticket(read_ticket)
-                    &&& old(core).frames.returned_reads(
+                    &&& old(core).timelines_spec().valid_ticket(read_ticket)
+                    &&& old(core).frames_spec().returned_reads(
                         old(self).active_leases@[idx].frame,
                         returned_cap,
                         read_ticket,
@@ -37,12 +37,12 @@ impl<'a> RdmaBackend<'a> {
         ensures
             final(core).well_formed(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).spec == old(core).spec,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines == old(core).timelines,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec() == old(core).timelines_spec(),
             peer_core_step(old(core), final(core), old(self).timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -60,7 +60,7 @@ impl<'a> RdmaBackend<'a> {
             final(self).window_pool.pd() == old(self).window_pool.pd(),
             final(self).pending() == old(self).pending(),
             final(self).completed_pulls == old(self).completed_pulls,
-            r.is_ok() ==> final(core).frames.same_directory(&old(core).frames),
+            r.is_ok() ==> final(core).frames_spec().same_directory(&old(core).frames_spec()),
             match r {
                 Err((_, cap_back)) => cap_back@ == returned_cap && *final(core) == *old(core)
                     && final(self).window_pool.slots@ == old(self).window_pool.slots@
@@ -146,9 +146,9 @@ impl<'a> RdmaBackend<'a> {
             lemma_rdma_control_wr_id_fresh(
                 self.in_flight_ops,
                 self.bitmap,
-                &core.timelines,
+                &core.timelines_spec(),
                 self.timeline_id,
-                &core.ledger@,
+                &core.ledger_spec()@,
                 before_cq,
                 core.instance_id(),
                 wr_id,
@@ -185,10 +185,8 @@ impl<'a> RdmaBackend<'a> {
             return Err((e, Tracked(returned_cap)));
         }
         self.next_control_wr_id += 1;
-        let Tracked(returned_share) = match core.unpin_remote_lease(
+        let Tracked(returned_share) = match core.unpin_fenced_lease(
             frame,
-            mw_slot,
-            generation,
             Tracked(returned_cap),
             read_ticket,
             Tracked(instance),
@@ -209,9 +207,9 @@ impl<'a> RdmaBackend<'a> {
             lemma_rdma_window_after_control_post(
                 self.in_flight_ops,
                 self.bitmap,
-                &before_core.timelines,
+                &before_core.timelines_spec(),
                 self.timeline_id,
-                &before_core.ledger@,
+                &before_core.ledger_spec()@,
                 before_cq,
                 rdma::CqSnapshot::of(self.cq),
                 core.instance_id(),
@@ -221,22 +219,22 @@ impl<'a> RdmaBackend<'a> {
             lemma_rdma_window_after_watermarks(
                 self.in_flight_ops,
                 self.bitmap,
-                &before_core.timelines,
-                &core.timelines,
+                &before_core.timelines_spec(),
+                &core.timelines_spec(),
                 self.timeline_id,
-                &core.ledger@,
+                &core.ledger_spec()@,
                 rdma::CqSnapshot::of(self.cq),
                 core.instance_id(),
                 self.next_control_wr_id,
             );
             lemma_completed_pulls_after_step(
                 self.completed_pulls,
-                &before_core.timelines,
-                &core.timelines,
+                &before_core.timelines_spec(),
+                &core.timelines_spec(),
                 self.timeline_id,
                 self.cq.observer(),
-                &before_core.ledger@,
-                &core.ledger@,
+                &before_core.ledger_spec()@,
+                &core.ledger_spec()@,
             );
             lemma_rdma_all_slabs_same_directory(
                 &self.host_mr,
@@ -247,9 +245,10 @@ impl<'a> RdmaBackend<'a> {
                 core,
                 self.window_pool.pd(),
             );
-            assert(core.frames.metas.len() == before_core.frames.metas.len() && core.frames.frame(
+            assert(core.frames_spec().metas_spec().len()
+                == before_core.frames_spec().metas_spec().len() && core.frames_spec().frame(
                 frame,
-            ).slot == before_core.frames.frame(frame).slot) by {
+            ).slot == before_core.frames_spec().frame(frame).slot) by {
                 reveal(FrameTable::same_directory);
             }
             lemma_rdma_leases_update_in_place(
@@ -288,6 +287,7 @@ impl<'a> RdmaBackend<'a> {
             reveal(rdma_leases_valid);
             reveal(rdma_leases_disjoint);
             reveal(peer_core_step_except);
+            reveal(core_transition);
             reveal(FrameTable::same_directory);
             reveal(FrameTable::same_layout);
             reveal(FrameTable::preserves_initializing);
@@ -317,7 +317,7 @@ impl<'a> RdmaBackend<'a> {
 
     /// Complete a cooperative unbind after observing `Completed::WindowInvalidated`,
     /// returning the unbound MW slot to `self.window_pool`.
-    pub fn finish_unbind_lease(
+    pub(crate) fn finish_unbind_lease(
         &mut self,
         core: &CacheCore,
         handle: RemoteLeaseHandle,
@@ -396,10 +396,10 @@ impl<'a> RdmaBackend<'a> {
             Tracked(Some(returned)),
         );
         proof {
-            assert(core.frames.same_directory(&core.frames)) by {
+            assert(core.frames_spec().same_directory(&core.frames_spec())) by {
                 reveal(FrameTable::same_directory);
             }
-            assert(core.frames.same_other_pins(&core.frames, Some(lease.frame))) by {
+            assert(core.frames_spec().same_other_pins(&core.frames_spec(), Some(lease.frame))) by {
                 reveal(FrameTable::same_other_pins);
             }
             lemma_rdma_leases_swap_remove(
@@ -455,7 +455,7 @@ impl<'a> RdmaBackend<'a> {
     /// reset (`IBV_QPS_RESET`): deallocates the MW via `self.window_pool.dealloc_on_qp_reset`
     /// using the already-retained `lease.returned_share` without unpinning `core` a second time,
     /// leaving the slot `Vacant`.
-    pub fn recover_unbinding_on_qp_reset(
+    pub(crate) fn recover_unbinding_on_qp_reset(
         &mut self,
         core: &CacheCore,
         handle: RemoteLeaseHandle,
@@ -574,10 +574,10 @@ impl<'a> RdmaBackend<'a> {
         }
         let _removed = self.active_leases.swap_remove(lease_idx);
         proof {
-            assert(core.frames.same_directory(&core.frames)) by {
+            assert(core.frames_spec().same_directory(&core.frames_spec())) by {
                 reveal(FrameTable::same_directory);
             }
-            assert(core.frames.same_other_pins(&core.frames, Some(frame))) by {
+            assert(core.frames_spec().same_other_pins(&core.frames_spec(), Some(frame))) by {
                 reveal(FrameTable::same_other_pins);
             }
             lemma_rdma_leases_swap_remove(
@@ -658,8 +658,8 @@ impl<'a> RdmaBackend<'a> {
             after_pin_core.well_formed(),
             *old(core) == after_pin_core,
             instance.id() == old(core).instance_id(),
-            old(self).timeline_id < old(core).timelines.count,
-            old(core).timelines.kinds[old(self).timeline_id as int] == (
+            old(self).timeline_id < old(core).timelines_spec().count_spec(),
+            old(core).timelines_spec().kinds_spec()[old(self).timeline_id as int] == (
             TimelineKind::RdmaQueuePair { peer_node: old(self).peer_node }),
             old(self).qp.ready(),
             old(self).qp.state() is ReadyToSend,
@@ -712,19 +712,19 @@ impl<'a> RdmaBackend<'a> {
             rdma_window_wf(
                 old(self).in_flight_ops,
                 old(self).bitmap,
-                &old(core).timelines,
+                &old(core).timelines_spec(),
                 old(self).timeline_id,
-                &old(core).ledger@,
+                &old(core).ledger_spec()@,
                 rdma::CqSnapshot::of(old(self).cq),
                 old(core).instance_id(),
                 old(self).next_control_wr_id,
             ),
             completed_pulls_wf(
                 old(self).completed_pulls,
-                &old(core).timelines,
+                &old(core).timelines_spec(),
                 old(self).timeline_id,
                 old(self).cq.observer(),
-                &old(core).ledger@,
+                &old(core).ledger_spec()@,
             ),
             rdma_control_leases_match_cq(
                 before_leases,
@@ -733,35 +733,32 @@ impl<'a> RdmaBackend<'a> {
                 old(self).next_control_wr_id,
             ),
             rdma_pool_slots_owned_by_leases(before_leases, &before_pool),
-            old(core).node_id == before_core.node_id,
+            old(core).node_id_spec() == before_core.node_id_spec(),
             old(core).instance_id() == before_core.instance_id(),
-            old(core).tiers == before_core.tiers,
-            old(core).spec == before_core.spec,
-            old(core).version_registry == before_core.version_registry,
-            old(core).next_version_seq == before_core.next_version_seq,
-            old(core).version_seq_limit == before_core.version_seq_limit,
-            old(core).active_leases == before_core.active_leases,
-            old(core).timelines == before_core.timelines,
-            old(core).ledger == before_core.ledger,
-            old(core).frames.same_directory(&before_core.frames),
-            old(core).frames.preserves_initializing(&before_core.frames, None),
-            old(core).frames.same_other_pins(&before_core.frames, Some(frame)),
-            frame.0 < old(core).frames.metas.len(),
-            old(core).frames.meta(frame).state == STATE_PUBLISHED,
-            !before_core.frames.frame(frame).remote_shares.contains_key(share),
-            old(core).frames.frame(frame).remote_shares == before_core.frames.frame(
+            old(core).tiers_spec() == before_core.tiers_spec(),
+            old(core).spec_spec() == before_core.spec_spec(),
+            old(core).version_registry_spec() == before_core.version_registry_spec(),
+            old(core).next_version_seq_spec() == before_core.next_version_seq_spec(),
+            old(core).version_seq_limit_spec() == before_core.version_seq_limit_spec(),
+            old(core).active_leases_spec() == before_core.active_leases_spec(),
+            old(core).timelines_spec() == before_core.timelines_spec(),
+            old(core).ledger_spec() == before_core.ledger_spec(),
+            old(core).frames_spec().same_directory(&before_core.frames_spec()),
+            old(core).frames_spec().preserves_initializing(&before_core.frames_spec(), None),
+            old(core).frames_spec().same_other_pins(&before_core.frames_spec(), Some(frame)),
+            frame.0 < old(core).frames_spec().metas_spec().len(),
+            old(core).frames_spec().meta(frame).state == STATE_PUBLISHED,
+            !before_core.frames_spec().frame(frame).has_fenced_share(share),
+            old(core).frames_spec().frame(frame).fenced_shares == before_core.frames_spec().frame(
                 frame,
-            ).remote_shares.insert(
-                share,
-                crate::frame::RemoteShareEntry { mw_slot, mw_gen: generation },
-            ),
-            old(core).frames.frame(frame).matches_lease(share, mw_slot, generation),
+            ).fenced_shares.insert(share),
+            old(core).frames_spec().frame(frame).has_fenced_share(share),
             share == share_cap.share(),
-            share_cap.is_rdma_bound(),
+            share_cap.is_fenced(),
             share_cap.instance_id() == old(core).instance_id(),
-            share_cap.loc() == old(core).frames.frame(frame).slot.loc,
+            share_cap.loc() == old(core).frames_spec().frame(frame).slot.loc,
             share_cap.frontier().readers.is_empty(),
-            old(core).frames.returned_reads(
+            old(core).frames_spec().returned_reads(
                 frame,
                 share_cap,
                 Ticket::NONE,
@@ -769,31 +766,31 @@ impl<'a> RdmaBackend<'a> {
             ),
             returned_grant.access() == rdma::RemoteAccess::ReadOnly,
             returned_grant matches rdma::WindowBindGrant::ReadOnly(r) && r.share() == share
-                && r.instance_id() == old(core).instance_id() && r.loc() == old(core).frames.frame(
-                frame,
-            ).slot.loc,
+                && r.instance_id() == old(core).instance_id() && r.loc() == old(
+                core,
+            ).frames_spec().frame(frame).slot.loc,
         ensures
             final(core).well_formed(),
             final(self).well_formed(final(core)),
-            final(core).node_id == before_core.node_id,
+            final(core).node_id_spec() == before_core.node_id_spec(),
             final(core).instance_id() == before_core.instance_id(),
-            final(core).tiers == before_core.tiers,
-            final(core).spec == before_core.spec,
-            final(core).version_registry == before_core.version_registry,
-            final(core).next_version_seq == before_core.next_version_seq,
-            final(core).version_seq_limit == before_core.version_seq_limit,
-            final(core).active_leases == before_core.active_leases,
-            final(core).frames.same_directory(&before_core.frames),
-            final(core).frames.preserves_initializing(&before_core.frames, None),
-            final(core).frames.preserves_remote_leases(&before_core.frames),
+            final(core).tiers_spec() == before_core.tiers_spec(),
+            final(core).spec_spec() == before_core.spec_spec(),
+            final(core).version_registry_spec() == before_core.version_registry_spec(),
+            final(core).next_version_seq_spec() == before_core.next_version_seq_spec(),
+            final(core).version_seq_limit_spec() == before_core.version_seq_limit_spec(),
+            final(core).active_leases_spec() == before_core.active_leases_spec(),
+            final(core).frames_spec().same_directory(&before_core.frames_spec()),
+            final(core).frames_spec().preserves_initializing(&before_core.frames_spec(), None),
+            final(core).frames_spec().preserves_fenced_leases(&before_core.frames_spec()),
             peer_foreign_shares_preserved(
                 &before_core,
                 final(core),
                 before_leases,
                 final(self).active_leases@,
             ),
-            final(core).timelines.only_watermarks(&before_core.timelines),
-            final(core).ledger == before_core.ledger,
+            final(core).timelines_spec().only_watermarks(&before_core.timelines_spec()),
+            final(core).ledger_spec() == before_core.ledger_spec(),
             final(self).timeline_id == old(self).timeline_id,
             final(self).peer_node == old(self).peer_node,
             final(self).qp == old(self).qp,
@@ -806,6 +803,11 @@ impl<'a> RdmaBackend<'a> {
             final(self).shared_gpu_mr == old(self).shared_gpu_mr,
             final(self).window_pool.pd() == old(self).window_pool.pd(),
             final(self).pending() == old(self).pending(),
+            final(self).next_control_wr_id == old(self).next_control_wr_id,
+            final(self).window_pool.slots.len() == old(self).window_pool.slots.len(),
+            forall|j: int|
+                0 <= j < old(self).window_pool.slots.len() && j != mw_slot as int ==> (
+                #[trigger] final(self).window_pool.slots[j]) == old(self).window_pool.slots[j],
     {
         hide(CacheCore::well_formed);
         hide(replica_valid);
@@ -815,7 +817,7 @@ impl<'a> RdmaBackend<'a> {
         hide(FrameTable::same_other_pins);
         let tracked mut share_cap = share_cap;
         proof {
-            lemma_frame_remote_share_implies_nonzero(&after_pin_core, frame, share);
+            lemma_frame_fenced_share_implies_nonzero(&after_pin_core, frame, share);
             let tracked restored_right = match returned_grant {
                 rdma::WindowBindGrant::ReadOnly(r) => r,
                 rdma::WindowBindGrant::ReadWrite => {
@@ -823,17 +825,15 @@ impl<'a> RdmaBackend<'a> {
                     proof_from_false()
                 },
             };
-            share_cap.restore_window_bind_right(restored_right);
-            assert(core.frames.returned_reads(frame, share_cap, Ticket::NONE, core.kernel_view()));
+            share_cap.restore_fence_right(restored_right);
+            assert(core.frames_spec().returned_reads(
+                frame,
+                share_cap,
+                Ticket::NONE,
+                core.kernel_view(),
+            ));
         }
-        let _ = core.unpin_remote_lease(
-            frame,
-            mw_slot,
-            generation,
-            Tracked(share_cap),
-            Ticket::NONE,
-            Tracked(instance),
-        );
+        let _ = core.unpin_fenced_lease(frame, Tracked(share_cap), Ticket::NONE, Tracked(instance));
         let ret = self.window_pool.return_unbound(mw_slot, generation);
         proof {
             assert(ret.is_ok());
@@ -842,22 +842,22 @@ impl<'a> RdmaBackend<'a> {
             lemma_rdma_window_after_watermarks(
                 self.in_flight_ops,
                 self.bitmap,
-                &after_pin_core.timelines,
-                &core.timelines,
+                &after_pin_core.timelines_spec(),
+                &core.timelines_spec(),
                 self.timeline_id,
-                &core.ledger@,
+                &core.ledger_spec()@,
                 rdma::CqSnapshot::of(self.cq),
                 core.instance_id(),
                 self.next_control_wr_id,
             );
             lemma_completed_pulls_after_step(
                 self.completed_pulls,
-                &after_pin_core.timelines,
-                &core.timelines,
+                &after_pin_core.timelines_spec(),
+                &core.timelines_spec(),
                 self.timeline_id,
                 self.cq.observer(),
-                &after_pin_core.ledger@,
-                &core.ledger@,
+                &after_pin_core.ledger_spec()@,
+                &core.ledger_spec()@,
             );
             lemma_rdma_all_slabs_same_directory(
                 &self.host_mr,
@@ -916,120 +916,90 @@ impl<'a> RdmaBackend<'a> {
                         == before_pool.slots[before_leases[i].mw_slot as int]);
                 }
             }
+            reveal(rdma_leases_valid);
+            reveal(FrameTable::same_directory);
+            reveal(FrameTable::preserves_initializing);
+            reveal(FrameTable::same_other_pins);
+            broadcast use vstd::set::group_set_lemmas;
+
+            assert(core.frames_spec().frame(frame).fenced_shares
+                =~= before_core.frames_spec().frame(frame).fenced_shares);
+            assert forall|f: FrameId| f.0 < before_core.frames_spec().metas_spec().len() implies {
+                &&& (#[trigger] core.frames_spec().frame(f)).fenced_shares
+                    == before_core.frames_spec().frame(f).fenced_shares
+                &&& core.frames_spec().meta(f).active_fenced_leases
+                    == before_core.frames_spec().meta(f).active_fenced_leases
+            } by {
+                if f != frame {
+                    assert(after_pin_core.frames_spec().frame(f).fenced_shares
+                        == before_core.frames_spec().frame(f).fenced_shares);
+                    assert(after_pin_core.frames_spec().meta(f).active_fenced_leases
+                        == before_core.frames_spec().meta(f).active_fenced_leases);
+                } else {
+                    assert(before_core.frames_spec().valid_frame(frame, before_core.kernel_view()))
+                        by {
+                        reveal(CacheCore::well_formed);
+                    }
+                    assert(core.frames_spec().valid_frame(frame, core.kernel_view())) by {
+                        reveal(CacheCore::well_formed);
+                    }
+                    assert(before_core.frames_spec().frame(frame).authority(
+                        before_core.frames_spec().meta(frame),
+                        before_core.instance_id(),
+                    ));
+                    assert(core.frames_spec().frame(frame).authority(
+                        core.frames_spec().meta(frame),
+                        core.instance_id(),
+                    ));
+                }
+            }
             lemma_rdma_leases_after_bind_rollback(
                 before_leases,
                 &before_pool,
                 &self.window_pool,
                 &self.qp,
                 &before_core,
-                &after_pin_core,
                 core,
-                frame,
                 mw_slot,
-                share,
             );
-            reveal(rdma_leases_valid);
-            reveal(FrameTable::same_directory);
-            reveal(FrameTable::preserves_initializing);
-            reveal(FrameTable::same_other_pins);
-            broadcast use vstd::map::group_map_lemmas;
-
-            assert(core.frames.frame(frame).remote_shares =~= before_core.frames.frame(
-                frame,
-            ).remote_shares);
-            assert forall|f: FrameId| f.0 < before_core.frames.metas.len() implies {
-                &&& (#[trigger] core.frames.frame(f)).remote_shares == before_core.frames.frame(
-                    f,
-                ).remote_shares
-                &&& core.frames.meta(f).active_remote_leases == before_core.frames.meta(
-                    f,
-                ).active_remote_leases
-            } by {
-                if f != frame {
-                    assert(after_pin_core.frames.frame(f).remote_shares == before_core.frames.frame(
-                        f,
-                    ).remote_shares);
-                    assert(after_pin_core.frames.meta(f).active_remote_leases
-                        == before_core.frames.meta(f).active_remote_leases);
-                } else {
-                    assert(before_core.frames.valid_frame(frame, before_core.kernel_view())) by {
-                        reveal(CacheCore::well_formed);
-                    }
-                    assert(core.frames.valid_frame(frame, core.kernel_view())) by {
-                        reveal(CacheCore::well_formed);
-                    }
-                    assert(before_core.frames.frame(frame).authority(
-                        before_core.frames.meta(frame),
-                        before_core.instance_id(),
-                    ));
-                    assert(core.frames.frame(frame).authority(
-                        core.frames.meta(frame),
-                        core.instance_id(),
-                    ));
-                }
-            }
             lemma_foreign_shares_identical_pins(&before_core, core, before_leases);
             assert forall|f: FrameId|
-                f.0 < before_core.frames.metas.len() && (#[trigger] before_core.frames.meta(
-                    f,
-                )).state == STATE_INITIALIZING implies core.frames.meta(f)
-                == before_core.frames.meta(f) && core.frames.frame(f) == before_core.frames.frame(
-                f,
-            ) by {
-                assert(after_pin_core.frames.meta(f) == before_core.frames.meta(f));
-                assert(after_pin_core.frames.frame(f) == before_core.frames.frame(f));
+                f.0 < before_core.frames_spec().metas_spec().len() && (
+                #[trigger] before_core.frames_spec().meta(f)).state
+                    == STATE_INITIALIZING implies core.frames_spec().meta(f)
+                == before_core.frames_spec().meta(f) && core.frames_spec().frame(f)
+                == before_core.frames_spec().frame(f) by {
+                assert(after_pin_core.frames_spec().meta(f) == before_core.frames_spec().meta(f));
+                assert(after_pin_core.frames_spec().frame(f) == before_core.frames_spec().frame(f));
             }
         }
     }
 }
 
 /// Helper preserving `rdma_leases_valid` on rollback of `post_bind` failure
-/// (`pin_remote_lease` followed immediately by `unpin_remote_lease` of the same share).
+/// (`pin_fenced_lease` followed immediately by `unpin_fenced_lease` of the same share).
 proof fn lemma_rdma_leases_after_bind_rollback<'a>(
     leases: Seq<ActiveRemoteLease>,
     before_pool: &WindowPool<'a>,
     after_pool: &WindowPool<'a>,
     qp: &rdma::QueuePair<'a>,
     before_core: &CacheCore,
-    mid_core: &CacheCore,
     after_core: &CacheCore,
-    frame: FrameId,
     mw_slot: u32,
-    share: TransferShare,
 )
     requires
         rdma_leases_valid(leases, before_pool, qp, before_core),
-        before_core.well_formed(),
-        mid_core.well_formed(),
-        after_core.well_formed(),
-        mid_core.instance_id() == before_core.instance_id(),
         after_core.instance_id() == before_core.instance_id(),
         forall|i: int| 0 <= i < leases.len() ==> (#[trigger] leases[i]).mw_slot != mw_slot,
         after_pool.slots.len() == before_pool.slots.len(),
         forall|j: int|
             0 <= j < after_pool.slots.len() && j != mw_slot as int ==> (
             #[trigger] after_pool.slots[j]) == before_pool.slots[j],
-        mid_core.frames.same_directory(&before_core.frames),
-        after_core.frames.same_directory(&mid_core.frames),
-        mid_core.frames.same_other_pins(&before_core.frames, Some(frame)),
-        after_core.frames.same_other_pins(&mid_core.frames, Some(frame)),
-        !before_core.frames.frame(frame).remote_shares.contains_key(share),
-        mid_core.frames.frame(frame).remote_shares.contains_key(share),
-        forall|s: TransferShare|
-            s != share && before_core.frames.frame(frame).remote_shares.contains_key(s)
-                ==> #[trigger] mid_core.frames.frame(frame).remote_shares.contains_key(s)
-                && mid_core.frames.frame(frame).remote_shares[s] == before_core.frames.frame(
-                frame,
-            ).remote_shares[s],
-        after_core.frames.frame(frame).remote_shares == mid_core.frames.frame(
-            frame,
-        ).remote_shares.remove(share),
+        after_core.frames_spec().same_directory(&before_core.frames_spec()),
+        after_core.frames_spec().preserves_fenced_leases(&before_core.frames_spec()),
     ensures
         rdma_leases_valid(leases, after_pool, qp, after_core),
 {
-    hide(CacheCore::well_formed);
-    hide(replica_valid);
-    hide(complete_receipts);
     reveal(rdma_leases_valid);
     assert forall|i: int| 0 <= i < leases.len() implies (#[trigger] leases[i]).valid(
         after_pool,
@@ -1039,38 +1009,16 @@ proof fn lemma_rdma_leases_after_bind_rollback<'a>(
         assert(leases[i].valid(before_pool, qp, before_core));
         assert(after_pool.slots[leases[i].mw_slot as int]
             == before_pool.slots[leases[i].mw_slot as int]);
-        assert(after_core.frames.metas.len() == before_core.frames.metas.len());
-        assert(after_core.frames.frame(leases[i].frame).slot == before_core.frames.frame(
-            leases[i].frame,
-        ).slot);
+        assert(after_core.frames_spec().metas_spec().len()
+            == before_core.frames_spec().metas_spec().len());
+        assert(after_core.frames_spec().frame(leases[i].frame).slot
+            == before_core.frames_spec().frame(leases[i].frame).slot);
         if !leases[i].is_unpinned() {
-            if leases[i].frame == frame {
-                let s = leases[i].share@;
-                assert(s != share);
-                assert(mid_core.frames.frame(frame).remote_shares.contains_key(s));
-                assert(after_core.frames.frame(frame).remote_shares.contains_key(s)) by {
-                    broadcast use vstd::map::group_map_lemmas;
-
-                }
-                assert(after_core.frames.frame(frame).matches_lease(
-                    s,
-                    leases[i].mw_slot,
-                    leases[i].generation,
-                )) by {
-                    broadcast use vstd::map::group_map_lemmas;
-
-                }
-                lemma_frame_remote_share_implies_nonzero(after_core, frame, s);
-            } else {
-                assert(mid_core.frames.meta(leases[i].frame).active_remote_leases
-                    == before_core.frames.meta(leases[i].frame).active_remote_leases);
-                assert(after_core.frames.meta(leases[i].frame).active_remote_leases
-                    == mid_core.frames.meta(leases[i].frame).active_remote_leases);
-                assert(mid_core.frames.frame(leases[i].frame).remote_shares
-                    == before_core.frames.frame(leases[i].frame).remote_shares);
-                assert(after_core.frames.frame(leases[i].frame).remote_shares
-                    == mid_core.frames.frame(leases[i].frame).remote_shares);
-            }
+            let f = leases[i].frame;
+            assert(after_core.frames_spec().frame(f).fenced_shares
+                == before_core.frames_spec().frame(f).fenced_shares);
+            assert(after_core.frames_spec().meta(f).active_fenced_leases
+                == before_core.frames_spec().meta(f).active_fenced_leases);
         }
     }
 }

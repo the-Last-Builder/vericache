@@ -2,17 +2,12 @@
 mod ffi;
 
 use crate::context::*;
-use crate::cuda::{
-    gdr_flush_writes_supported, gdr_writes_ordering, CudaBuffer, CudaError, CudaHostBuffer,
-    GdrWritesOrdering,
-};
 use crate::domain::*;
-#[cfg(verus_only)]
-use crate::host;
-use crate::host::{CompletedAccess, Completion, HostBuffer, HostContext};
+use crate::memory::{GdrWritesOrdering, RdmaRegisterableSlab};
 #[cfg(verus_only)]
 use crate::transport::{covers, share_matches, slot_matches, Statement};
 use crate::transport::{ByteTransport, Channel};
+use core::marker::PhantomData;
 #[cfg(verus_only)]
 use foundation::history::no_access;
 #[cfg(verus_only)]
@@ -45,18 +40,17 @@ mod transfer;
 mod transfer_spec;
 mod window;
 
-pub use crate::cuda::{
-    flush_gdr_writes as gdr_flush_writes, gdr_flush_writes_supported as gdr_flush_supported,
-    gdr_writes_ordering as gdr_ordering, GdrWritesOrdering as RdmaGdrWritesOrdering,
-};
+pub use self::transfer::*;
 pub use batch::*;
+pub(crate) use lifecycle::wait_one;
 pub use lifecycle::*;
 pub use memory::*;
 pub use poll::*;
 #[cfg(verus_only)]
 pub use proofs::scatter_read_returns_last_write;
 pub use queue::*;
-pub use transfer::*;
+pub use transfer_core::memory::GdrWritesOrdering as RdmaGdrWritesOrdering;
+pub use transfer_core::transport::{QueuePairEndpoint, RemoteAccess, RemoteCapability};
 #[cfg(verus_only)]
 pub use transfer_spec::*;
 pub use window::*;
@@ -151,22 +145,26 @@ impl<'a> ProtectionDomain<'a> {
         requires
             name.well_formed(),
             name.node() == context.node(),
-            name.source() is RdmaQueuePair,
+            name.source().is_rdma_qp(),
         ensures
-            r matches Ok(pd) ==> pd.node() == context.node() && pd.id()
-                == name.source()->RdmaQueuePair_id,
+            r matches Ok(pd) ==> pd.node() == context.node() && pd.id() == name.source().id(),
     {
         Ok(
             Self {
                 raw: ffi::alloc_pd(context.raw.as_ptr())?,
                 context,
-                pd_id: Ghost(name.source()->RdmaQueuePair_id),
+                pd_id: Ghost(name.source().id()),
             },
         )
     }
 
     pub closed spec fn node(&self) -> NodeId {
         self.context.node()
+    }
+
+    /// Process-local identity, valid while the protection domain is alive.
+    pub fn runtime_id(&self) -> usize {
+        self.raw.as_ptr().addr()
     }
 
     pub fn destroy(self) -> Result<(), RdmaError> {
@@ -178,12 +176,6 @@ impl<'a> ProtectionDomain<'a> {
 pub struct AccessFlags {
     pub local_write: bool,
     pub mw_bind: bool,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum RemoteAccess {
-    ReadOnly,
-    ReadWrite,
 }
 
 } // verus!

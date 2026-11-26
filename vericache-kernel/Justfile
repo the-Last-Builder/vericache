@@ -1,0 +1,25 @@
+default:
+    @just --list
+
+verify:
+    cargo verus verify --fwd-verus-args-to roots -p vericache-kernel -- --no-cheating
+
+audit:
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-assume-admit-truncate.yml src
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-external-escape.yml src
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-external-body.yml src
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-unsafe.yml src
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-unverified-code.yml src
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-panicking-stubs.yml src
+    ast-grep scan --custom-languages allow -c ../sgconfig.yml -r ../rules/no-hardware-import-in-core.yml src
+
+fmt:
+    find src -name '*.rs' -exec verusfmt {} +
+
+fmt-check:
+    find src -name '*.rs' -exec verusfmt --check {} +
+
+check: verify audit fmt-check
+
+test:
+    cargo test -p vericache-kernel

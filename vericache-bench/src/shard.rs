@@ -83,19 +83,19 @@ impl ShardCapabilityBundle {
     }
 
     pub fn mint_host(&mut self) -> Tracked<EventSourceToken> {
-        Tracked(self.events.borrow_mut().mint(EventSourceKind::Host))
+        Tracked(self.events.borrow_mut().mint(EventSourceKind::host()))
     }
 
     pub fn mint_cuda(&mut self) -> Tracked<EventSourceToken> {
-        Tracked(self.events.borrow_mut().mint(EventSourceKind::CudaStream))
+        Tracked(self.events.borrow_mut().mint(EventSourceKind::cuda_stream()))
     }
 
     pub fn mint_nvme(&mut self) -> Tracked<EventSourceToken> {
-        Tracked(self.events.borrow_mut().mint(EventSourceKind::IoUring))
+        Tracked(self.events.borrow_mut().mint(EventSourceKind::io_uring()))
     }
 
     pub fn mint_rdma(&mut self) -> Tracked<EventSourceToken> {
-        Tracked(self.events.borrow_mut().mint(EventSourceKind::RdmaQueuePair))
+        Tracked(self.events.borrow_mut().mint(EventSourceKind::rdma_qp()))
     }
 
     /// Construct a shard-isolated `CacheCore` over `[version_start, version_limit)` for local engines.

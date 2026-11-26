@@ -1,14 +1,17 @@
-use super::super::host::HostBackend;
 use super::*;
 #[cfg(verus_only)]
+use crate::backends::traits::host_backend_layout;
+#[cfg(verus_only)]
 use transfer::nvme::DIRECT_IO_ALIGNMENT;
+#[cfg(verus_only)]
+use transfer_core::memory::HostDmaSlab;
 
 verus! {
 
 impl NvmeBackend {
-    pub(super) fn stage_ring_io(
+    pub(super) fn stage_ring_io<H: HostSlabBackend>(
         &mut self,
-        host_backend: &HostBackend,
+        host_backend: &H,
         core: &CacheCore,
         Tracked(instance): Tracked<&TransferInstance>,
         kind: NvmeOpKind,
@@ -23,7 +26,7 @@ impl NvmeBackend {
             old(self).file.instance_id() == core.instance_id(),
             old(self).file.node() == core.node(),
             old(self).file.num_slots() == old(self).num_frames as usize,
-            old(self).file.slot_len() == core.frames.tier_frame_size(old(self).tier) as u64,
+            old(self).file.slot_len() == core.frames_spec().tier_frame_size(old(self).tier) as u64,
             0 < old(self).file.slot_len() <= MAX_IO_LEN,
             old(self).file.slot_len() % DIRECT_IO_ALIGNMENT == 0,
             old(self).ring.well_formed(),
@@ -32,8 +35,8 @@ impl NvmeBackend {
             old(self).ring.staged_count() < old(self).ring.sq_capacity(),
             old(self).ring.pending_count() < old(self).ring.max_in_flight(),
             !old(self).ring.pending().contains_key(seq),
-            host_backend.well_formed(core),
-            host_backend.buffer.align() % (DIRECT_IO_ALIGNMENT as usize) == 0,
+            host_backend_layout(host_backend, core),
+            host_backend.host_alignment_spec() % (DIRECT_IO_ALIGNMENT as usize) == 0,
             instance.id() == core.instance_id(),
             slab_bound_to_core(
                 core,
@@ -43,20 +46,20 @@ impl NvmeBackend {
                 old(self).file.space(),
             ),
             match kind {
-                NvmeOpKind::DramToNvme => host_backend.owns(hop.src_frame) && old(self).owns(
+                NvmeOpKind::DramToNvme => host_backend.host_owns(hop.src_frame) && old(self).owns(
                     hop.dst_frame,
                 ),
-                NvmeOpKind::NvmeToDram => old(self).owns(hop.src_frame) && host_backend.owns(
+                NvmeOpKind::NvmeToDram => old(self).owns(hop.src_frame) && host_backend.host_owns(
                     hop.dst_frame,
                 ),
             },
-            hop.src_frame.0 < core.frames.metas.len(),
-            hop.dst_frame.0 < core.frames.metas.len(),
-            hop.src_slot@ == core.frames.frame(hop.src_frame).slot,
-            hop.dst_slot@ == core.frames.frame(hop.dst_frame).slot,
+            hop.src_frame.0 < core.frames_spec().metas_spec().len(),
+            hop.dst_frame.0 < core.frames_spec().metas_spec().len(),
+            hop.src_slot@ == core.frames_spec().frame(hop.src_frame).slot,
+            hop.dst_slot@ == core.frames_spec().frame(hop.dst_frame).slot,
             hop.src_slot@.slot_len == hop.dst_slot@.slot_len,
             hop.src_slot@.loc != hop.dst_slot@.loc,
-            old(src_perm).valid_local(core.instance_id(), hop.src_slot@.loc),
+            old(src_perm).valid_cooperative(core.instance_id(), hop.src_slot@.loc),
             slot_is_owned(*old(dst_tok), core.instance_id(), hop.dst_slot@.loc),
             read_admitted(old(src_perm).frontier(), core.citations()),
             write_admitted(slot_frontier(*old(dst_tok)), core.citations()),
@@ -78,7 +81,7 @@ impl NvmeBackend {
                 *final(src_perm),
                 *old(dst_tok),
                 *final(dst_tok),
-                core.ledger@.submitted,
+                core.ledger_spec()@.submitted,
                 core.citations(),
                 r,
             ),
@@ -93,10 +96,10 @@ impl NvmeBackend {
                 NvmeOpKind::DramToNvme => {
                     lemma_slab_frame_slot(
                         core,
-                        host_backend.tier,
-                        host_backend.first_frame,
-                        host_backend.num_frames,
-                        host_backend.buffer.space(),
+                        host_backend.host_tier_spec(),
+                        host_backend.host_first_frame_spec(),
+                        host_backend.host_num_frames_spec(),
+                        host_backend.host_buffer_spec().slab_space(),
                         hop.src_frame,
                     );
                     lemma_slab_frame_slot(
@@ -119,10 +122,10 @@ impl NvmeBackend {
                     );
                     lemma_slab_frame_slot(
                         core,
-                        host_backend.tier,
-                        host_backend.first_frame,
-                        host_backend.num_frames,
-                        host_backend.buffer.space(),
+                        host_backend.host_tier_spec(),
+                        host_backend.host_first_frame_spec(),
+                        host_backend.host_num_frames_spec(),
+                        host_backend.host_buffer_spec().slab_space(),
                         hop.dst_frame,
                     );
                 },
@@ -134,14 +137,15 @@ impl NvmeBackend {
         }
         match kind {
             NvmeOpKind::DramToNvme => {
-                let src_slice = host_backend.frame_slice(hop.src_frame);
+                let src_slice = host_backend.host_frame_slice(hop.src_frame);
                 proof {
-                    assert(host_backend.buffer.slot_len() as u64 == self.file.slot_len());
+                    assert(host_backend.host_buffer_spec().slab_slot_len() as u64
+                        == self.file.slot_len());
                     lemma_aligned_host_slot(
-                        host_backend.buffer.address(),
-                        host_backend.buffer.align(),
-                        (hop.src_frame.0 - host_backend.first_frame.0) as usize,
-                        host_backend.buffer.slot_len(),
+                        host_backend.host_buffer_spec().slab_address(),
+                        host_backend.host_alignment_spec(),
+                        (hop.src_frame.0 - host_backend.host_first_frame_spec().0) as usize,
+                        host_backend.host_buffer_spec().slab_slot_len(),
                     );
                 }
                 let dst_slice = self.file.slot_slice(
@@ -154,8 +158,8 @@ impl NvmeBackend {
                     seq,
                     Tracked(src_perm),
                     Tracked(dst_tok),
-                    Tracked(&core.ledger.borrow().submitted),
-                    Tracked(&core.ledger.borrow().knows),
+                    Tracked(&core.borrow_ledger().submitted),
+                    Tracked(&core.borrow_ledger().knows),
                     Ghost(core.citations()),
                 )
             },
@@ -163,14 +167,15 @@ impl NvmeBackend {
                 let src_slice = self.file.slot_slice(
                     (hop.src_frame.0 - self.first_frame.0) as usize,
                 );
-                let dst_slice = host_backend.frame_slice(hop.dst_frame);
+                let dst_slice = host_backend.host_frame_slice(hop.dst_frame);
                 proof {
-                    assert(host_backend.buffer.slot_len() as u64 == self.file.slot_len());
+                    assert(host_backend.host_buffer_spec().slab_slot_len() as u64
+                        == self.file.slot_len());
                     lemma_aligned_host_slot(
-                        host_backend.buffer.address(),
-                        host_backend.buffer.align(),
-                        (hop.dst_frame.0 - host_backend.first_frame.0) as usize,
-                        host_backend.buffer.slot_len(),
+                        host_backend.host_buffer_spec().slab_address(),
+                        host_backend.host_alignment_spec(),
+                        (hop.dst_frame.0 - host_backend.host_first_frame_spec().0) as usize,
+                        host_backend.host_buffer_spec().slab_slot_len(),
                     );
                 }
                 self.ring.stage_read(
@@ -180,8 +185,8 @@ impl NvmeBackend {
                     seq,
                     Tracked(src_perm),
                     Tracked(dst_tok),
-                    Tracked(&core.ledger.borrow().submitted),
-                    Tracked(&core.ledger.borrow().knows),
+                    Tracked(&core.borrow_ledger().submitted),
+                    Tracked(&core.borrow_ledger().knows),
                     Ghost(core.citations()),
                 )
             },
@@ -207,11 +212,13 @@ impl NvmeBackend {
             old(self).file.instance_id() == old(core).instance_id(),
             old(self).file.node() == old(core).node(),
             old(self).file.num_slots() == old(self).num_frames as usize,
-            old(self).file.slot_len() == old(core).frames.tier_frame_size(old(self).tier) as u64,
+            old(self).file.slot_len() == old(core).frames_spec().tier_frame_size(
+                old(self).tier,
+            ) as u64,
             0 < old(self).file.slot_len() <= MAX_IO_LEN,
             old(self).file.slot_len() % DIRECT_IO_ALIGNMENT == 0,
             before_ring.well_formed(),
-            before_ring.source().source() is IoUring,
+            before_ring.source().source().is_io_uring(),
             old(self).ring.well_formed(),
             old(self).ring.same_ring(before_ring),
             old(self).ring.instance_id() == old(core).instance_id(),
@@ -224,10 +231,11 @@ impl NvmeBackend {
                 old(self).ring.pending()[seq],
             ),
             old(self).ring.pending()[seq].event == before_ring.source().next_event(),
-            old(self).tier.valid(old(core).tiers.len()),
-            old(core).tiers[old(self).tier.index() as int].kind == TierKind::LocalNvme,
-            old(self).timeline < old(core).timelines.count <= MAX_TIMELINES,
-            old(core).timelines.kinds[old(self).timeline as int] == TimelineKind::IoUring,
+            old(self).tier.valid(old(core).tiers_spec().len()),
+            old(core).tiers_spec()[old(self).tier.index() as int].kind == TierKind::LocalNvme,
+            old(self).timeline < old(core).timelines_spec().count_spec() <= MAX_TIMELINES,
+            old(core).timelines_spec().kinds_spec()[old(self).timeline as int]
+                == TimelineKind::IoUring,
             slab_bound_to_core(
                 old(core),
                 old(self).tier,
@@ -250,54 +258,59 @@ impl NvmeBackend {
                 &before_hop_core,
                 old(self).timeline,
             ),
-            seq == old(core).timelines.next_seq[old(self).timeline as int],
+            seq == old(core).timelines_spec().next_seq_spec()[old(self).timeline as int],
             seq <= MAX_TICKET_SEQ,
-            seq <= old(core).timelines.confirmed_seq[old(self).timeline as int] + BITMAP_CAPACITY,
-            old(core).node_id == before_hop_core.node_id,
-            old(core).tiers == before_hop_core.tiers,
-            old(core).ledger == before_hop_core.ledger,
-            old(core).spec == before_hop_core.spec,
-            old(core).version_registry == before_hop_core.version_registry,
-            old(core).next_version_seq == before_hop_core.next_version_seq,
-            old(core).version_seq_limit == before_hop_core.version_seq_limit,
-            old(core).timelines.only_watermarks(&before_hop_core.timelines),
-            old(core).frames.same_directory(&before_hop_core.frames),
-            old(core).frames.preserves_initializing(&before_hop_core.frames, None),
-            old(core).frames.preserves_remote_leases(&before_hop_core.frames),
-            before_hop_core.frames.meta(hop.dst_frame).state != STATE_INITIALIZING,
-            (hop.src_lease.slot as usize) < before_hop_core.active_leases.len(),
-            before_hop_core.active_leases[hop.src_lease.slot as int].is_none(),
-            old(core).active_leases.len() == before_hop_core.active_leases.len(),
+            seq <= old(core).timelines_spec().confirmed_seq_spec()[old(self).timeline as int]
+                + BITMAP_CAPACITY,
+            old(core).node_id_spec() == before_hop_core.node_id_spec(),
+            old(core).tiers_spec() == before_hop_core.tiers_spec(),
+            old(core).ledger_spec() == before_hop_core.ledger_spec(),
+            old(core).spec_spec() == before_hop_core.spec_spec(),
+            old(core).version_registry_spec() == before_hop_core.version_registry_spec(),
+            old(core).next_version_seq_spec() == before_hop_core.next_version_seq_spec(),
+            old(core).version_seq_limit_spec() == before_hop_core.version_seq_limit_spec(),
+            old(core).timelines_spec().only_watermarks(&before_hop_core.timelines_spec()),
+            old(core).frames_spec().same_directory(&before_hop_core.frames_spec()),
+            old(core).frames_spec().preserves_initializing(&before_hop_core.frames_spec(), None),
+            old(core).frames_spec().preserves_fenced_leases(&before_hop_core.frames_spec()),
+            before_hop_core.frames_spec().meta(hop.dst_frame).state != STATE_INITIALIZING,
+            (hop.src_lease.slot_spec() as usize) < before_hop_core.active_leases_spec().len(),
+            before_hop_core.active_leases_spec()[hop.src_lease.slot_spec() as int].is_none(),
+            old(core).active_leases_spec().len() == before_hop_core.active_leases_spec().len(),
             forall|s: int|
-                0 <= s < before_hop_core.active_leases.len() && s != hop.src_lease.slot as int
-                    ==> #[trigger] old(core).active_leases[s] == before_hop_core.active_leases[s],
+                0 <= s < before_hop_core.active_leases_spec().len() && s
+                    != hop.src_lease.slot_spec() as int ==> #[trigger] old(
+                    core,
+                ).active_leases_spec()[s] == before_hop_core.active_leases_spec()[s],
             hop.src_frame != hop.dst_frame,
-            hop.src_frame.0 < old(core).frames.metas.len(),
-            hop.dst_frame.0 < old(core).frames.metas.len(),
-            hop.src_slot@ == old(core).frames.frame(hop.src_frame).slot,
-            hop.dst_slot@ == old(core).frames.frame(hop.dst_frame).slot,
+            hop.src_frame.0 < old(core).frames_spec().metas_spec().len(),
+            hop.dst_frame.0 < old(core).frames_spec().metas_spec().len(),
+            hop.src_slot@ == old(core).frames_spec().frame(hop.src_frame).slot,
+            hop.dst_slot@ == old(core).frames_spec().frame(hop.dst_frame).slot,
             hop.src_slot@.slot_len == hop.dst_slot@.slot_len,
             hop.src_slot@.loc != hop.dst_slot@.loc,
-            old(core).frames.meta(hop.src_frame).state == STATE_PUBLISHED,
-            old(core).frames.frame(hop.src_frame).cert == Some(hop.src_cert@),
-            replica_valid(old(core).ledger@, old(core).node(), hop.src_cert@),
+            old(core).frames_spec().meta(hop.src_frame).state == STATE_PUBLISHED,
+            old(core).frames_spec().frame(hop.src_frame).cert == Some(hop.src_cert@),
+            replica_valid(old(core).ledger_spec()@, old(core).node(), hop.src_cert@),
             old(core).citations().contains(hop.src_cert@.writer),
-            old(core).frames.versions@.contains_key(hop.version),
-            old(core).frames.versions@[hop.version] == hop.src_cert@.bytes,
-            hop.version.origin_node != old(core).node_id || hop.version.seq < old(
+            old(core).frames_spec().versions_spec()@.contains_key(hop.version),
+            old(core).frames_spec().versions_spec()@[hop.version] == hop.src_cert@.bytes,
+            hop.version.origin_node != old(core).node_id_spec() || hop.version.seq < old(
                 core,
-            ).next_version_seq || hop.version.seq >= old(core).version_seq_limit,
-            hop.src_lease.frame == hop.src_frame,
+            ).next_version_seq_spec() || hop.version.seq >= old(core).version_seq_limit_spec(),
+            hop.src_lease.frame_spec() == hop.src_frame,
             old(core).active_lease_matches(hop.src_lease),
-            old(core).active_leases[hop.src_lease.slot as int]->Some_0.internal,
-            src_cap.share() == old(core).active_leases[hop.src_lease.slot as int]->Some_0.share@,
-            old(core).frames.meta(hop.dst_frame).state == STATE_INITIALIZING,
-            !old(core).frames.meta(hop.dst_frame).queued(),
-            old(core).frames.frame(hop.dst_frame).tier == hop.dst_tier,
-            old(core).frames.frame(hop.dst_frame).bound_key == Some(hop.key),
-            old(core).frames.frame(hop.dst_frame).bound_version == Some(hop.version),
-            old(core).frames.frame(hop.dst_frame).token is None,
-            src_cap.is_local(),
+            old(core).active_leases_spec()[hop.src_lease.slot_spec() as int]->Some_0.internal,
+            src_cap.share() == old(
+                core,
+            ).active_leases_spec()[hop.src_lease.slot_spec() as int]->Some_0.share@,
+            old(core).frames_spec().meta(hop.dst_frame).state == STATE_INITIALIZING,
+            !old(core).frames_spec().meta(hop.dst_frame).queued(),
+            old(core).frames_spec().frame(hop.dst_frame).tier == hop.dst_tier,
+            old(core).frames_spec().frame(hop.dst_frame).bound_key == Some(hop.key),
+            old(core).frames_spec().frame(hop.dst_frame).bound_version == Some(hop.version),
+            old(core).frames_spec().frame(hop.dst_frame).token is None,
+            src_cap.is_cooperative(),
             src_cap.instance_id() == old(core).instance_id(),
             src_cap.loc() == hop.src_slot@.loc,
             src_cap.frontier().readers == ISet::empty().insert(before_ring.source().next_event()),
@@ -315,7 +328,7 @@ impl NvmeBackend {
             receipt.value().access == copy_access(hop.src_slot@, hop.dst_slot@),
             receipt.value().effect == copy_effect(hop.src_slot@, hop.dst_slot@),
             receipt.value().preds == foundation::tracked::closure_from(
-                old(core).ledger@.submitted.map(),
+                old(core).ledger_spec()@.submitted.map(),
                 old(core).citations(),
             ),
         ensures
@@ -325,22 +338,23 @@ impl NvmeBackend {
             final(self).timeline == old(self).timeline,
             final(self).first_frame == old(self).first_frame,
             final(self).num_frames == old(self).num_frames,
-            final(core).node_id == old(core).node_id,
-            final(core).tiers == old(core).tiers,
-            final(core).spec == old(core).spec,
-            final(core).version_registry == before_hop_core.version_registry,
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).version_registry_spec() == before_hop_core.version_registry_spec(),
             core_transition(
                 &before_hop_core,
                 final(core),
-                Some(old(self).timeline),
-                Some(before_ring.source().source()),
-                FrameTouchMode::PreserveAllInit,
+                CoreFootprint::preserve_all(
+                    Some(old(self).timeline),
+                    Some(before_ring.source().source()),
+                ),
             ),
             r.0 == hop.dst_frame,
             r.1 != Ticket::NONE,
             r.1.timeline_id() == old(self).timeline,
             r.1.sequence() == seq,
-            final(core).timelines.valid_ticket(r.1),
+            final(core).timelines_spec().valid_ticket(r.1),
     {
         hide(CacheCore::well_formed);
         hide(replica_valid);
@@ -372,16 +386,14 @@ impl NvmeBackend {
             lemma_nvme_ring_pending_insert(before_ring, self.ring, seq, writer);
             lemma_core_timelines_wf(core);
         }
-        let ticket = record_submission(
+        let ticket = core.record_submission(
             &mut self.in_flight_ops,
             Ghost(self.bitmap),
-            &mut core.timelines,
             self.timeline,
             dst_frame,
             data_op,
             Ghost(ring_event_map(self.ring)),
             Tracked(receipt),
-            Tracked(core.ledger.borrow_mut()),
         );
         let ghost copy;
         proof {
@@ -405,8 +417,8 @@ impl NvmeBackend {
             );
             copy =
             lemma_nvme_stage_copy_retained(
-                before_submit_core.ledger@,
-                core.ledger@,
+                before_submit_core.ledger_spec()@,
+                core.ledger_spec()@,
                 core.node(),
                 hop.src_cert@,
                 hop.src_slot@,
@@ -449,32 +461,31 @@ impl NvmeBackend {
                 sub_val,
             );
             lemma_core_frames_separated(&before_hop_core);
-            assert(core.frames.same_layout(&before_hop_core.frames)) by {
+            assert(core.frames_spec().same_layout(&before_hop_core.frames_spec())) by {
                 reveal(FrameTable::same_layout);
             }
-            assert(core.frames.preserves_initializing(&before_hop_core.frames, None)) by {
+            assert(core.frames_spec().preserves_initializing(&before_hop_core.frames_spec(), None))
+                by {
                 reveal(FrameTable::preserves_initializing);
             }
             assert forall|f: FrameId|
-                f.0 < before_hop_core.frames.metas.len() && (#[trigger] before_hop_core.frames.meta(
-                    f,
-                )).state == STATE_INITIALIZING implies hop.dst_slot@.loc
-                != before_hop_core.frames.frame(f).slot.loc by {
+                f.0 < before_hop_core.frames_spec().metas_spec().len() && (
+                #[trigger] before_hop_core.frames_spec().meta(f)).state
+                    == STATE_INITIALIZING implies hop.dst_slot@.loc
+                != before_hop_core.frames_spec().frame(f).slot.loc by {
                 assert(dst_frame != f);
                 if dst_frame.0 < f.0 {
-                    assert(before_hop_core.frames.ghosts@[dst_frame.0 as nat].slot.loc
-                        != before_hop_core.frames.ghosts@[f.0 as nat].slot.loc);
+                    assert(before_hop_core.frames_spec().ghosts_spec()@[dst_frame.0 as nat].slot.loc
+                        != before_hop_core.frames_spec().ghosts_spec()@[f.0 as nat].slot.loc);
                 } else {
-                    assert(before_hop_core.frames.ghosts@[f.0 as nat].slot.loc
-                        != before_hop_core.frames.ghosts@[dst_frame.0 as nat].slot.loc);
+                    assert(before_hop_core.frames_spec().ghosts_spec()@[f.0 as nat].slot.loc
+                        != before_hop_core.frames_spec().ghosts_spec()@[dst_frame.0 as nat].slot.loc);
                 }
             }
-            assert(core.ledger@.submitted.dom() =~= before_hop_core.ledger@.submitted.dom().insert(
-                writer,
-            ));
-            assert(core.ledger@.submitted.map()[writer].access.writes =~= ISet::empty().insert(
-                hop.dst_slot@.loc,
-            ));
+            assert(core.ledger_spec()@.submitted.dom()
+                =~= before_hop_core.ledger_spec()@.submitted.dom().insert(writer));
+            assert(core.ledger_spec()@.submitted.map()[writer].access.writes
+                =~= ISet::empty().insert(hop.dst_slot@.loc));
             lemma_core_transition_single_event(
                 &before_hop_core,
                 core,

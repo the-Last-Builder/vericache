@@ -48,6 +48,57 @@ pub tracked struct PendingGdrSlots {
 }
 
 impl PendingGdrSlots {
+    pub proof fn empty(instance: InstanceId) -> (tracked batch: Self)
+        ensures
+            batch.well_formed(),
+            batch.instance_id() == instance,
+            batch.dom().is_empty(),
+    {
+        Self { instance, writers: Map::empty(), tokens: Map::tracked_empty() }
+    }
+
+    pub proof fn insert(tracked &mut self, tracked slot: PendingGdrSlot)
+        requires
+            old(self).well_formed(),
+            slot.well_formed(),
+            slot.instance_id() == old(self).instance_id(),
+            !old(self).dom().contains(slot.loc()),
+        ensures
+            final(self).well_formed(),
+            final(self).instance_id() == old(self).instance_id(),
+            final(self).dom() == old(self).dom().insert(slot.loc()),
+            final(self).writers() == old(self).writers().insert(slot.loc(), slot.writer()),
+            final(self).frontiers() == old(self).frontiers().insert(slot.loc(), slot.frontier()),
+    {
+        let loc = slot.loc();
+        self.writers = self.writers.insert(loc, slot.writer());
+        self.tokens.tracked_insert(loc, slot.token);
+        assert(self.frontiers() =~= old(self).frontiers().insert(loc, slot.frontier()));
+    }
+
+    pub proof fn remove(tracked &mut self, loc: SlotLoc) -> (tracked slot: PendingGdrSlot)
+        requires
+            old(self).well_formed(),
+            old(self).dom().contains(loc),
+        ensures
+            final(self).well_formed(),
+            final(self).instance_id() == old(self).instance_id(),
+            final(self).dom() == old(self).dom().remove(loc),
+            final(self).writers() == old(self).writers().remove(loc),
+            final(self).frontiers() == old(self).frontiers().remove(loc),
+            slot.well_formed(),
+            slot.instance_id() == old(self).instance_id(),
+            slot.loc() == loc,
+            slot.writer() == old(self).writers()[loc],
+            slot.frontier() == old(self).frontiers()[loc],
+    {
+        let writer = self.writers[loc];
+        self.writers = self.writers.remove(loc);
+        let tracked token = self.tokens.tracked_remove(loc);
+        assert(self.frontiers() =~= old(self).frontiers().remove(loc));
+        PendingGdrSlot { writer, token }
+    }
+
     pub open(super) spec fn instance_id(self) -> InstanceId {
         self.instance
     }
@@ -69,82 +120,14 @@ impl PendingGdrSlots {
     }
 }
 
-pub enum RegistrationBuffer<'a> {
-    Host(&'a HostBuffer),
-    CudaHost(&'a CudaHostBuffer),
-    Cuda(&'a CudaBuffer),
+/// Erase the slab type for registrations that need a post-CQE flush.
+pub(super) trait GdrFlush {
+    fn flush(&self, device: i32) -> Result<(), i32>;
 }
 
-impl<'a> RegistrationBuffer<'a> {
-    pub open spec fn node(&self) -> NodeId {
-        match self {
-            Self::Host(b) => b.node(),
-            Self::CudaHost(b) => b.node(),
-            Self::Cuda(b) => b.node(),
-        }
-    }
-
-    pub open spec fn space(&self) -> MemorySpace {
-        match self {
-            Self::Host(b) => b.space(),
-            Self::CudaHost(b) => b.space(),
-            Self::Cuda(b) => b.space(),
-        }
-    }
-
-    pub open spec fn num_slots(&self) -> usize {
-        match self {
-            Self::Host(b) => b.num_slots(),
-            Self::CudaHost(b) => b.num_slots(),
-            Self::Cuda(b) => b.num_slots(),
-        }
-    }
-
-    pub open spec fn slot_len(&self) -> usize {
-        match self {
-            Self::Host(b) => b.slot_len(),
-            Self::CudaHost(b) => b.slot_len(),
-            Self::Cuda(b) => b.slot_len(),
-        }
-    }
-
-    pub open spec fn total_len(&self) -> usize {
-        match self {
-            Self::Host(b) => b.total_len(),
-            Self::CudaHost(b) => b.total_len(),
-            Self::Cuda(b) => b.total_len(),
-        }
-    }
-
-    pub open spec fn slot_loc(&self, idx: nat) -> SlotLoc {
-        SlotLoc { node: self.node(), space: self.space(), slot_index: idx }
-    }
-
-    pub open spec fn slot_ref(&self, idx: nat) -> SlotRef {
-        SlotRef::full(self.slot_loc(idx), self.slot_len() as u64)
-    }
-
-    pub open spec fn instance_id(&self) -> InstanceId {
-        match self {
-            Self::Host(b) => b.instance_id(),
-            Self::CudaHost(b) => b.instance_id(),
-            Self::Cuda(b) => b.instance_id(),
-        }
-    }
-
-    pub open spec fn well_formed(&self) -> bool {
-        match self {
-            Self::Host(b) => b.well_formed(),
-            Self::CudaHost(b) => b.well_formed(),
-            Self::Cuda(b) => b.well_formed(),
-        }
-    }
-
-    pub open spec fn gpu_device(&self) -> Option<DeviceId> {
-        match self {
-            Self::Cuda(b) => Some(b.space()->GpuAlloc_device),
-            _ => None,
-        }
+impl<B: RdmaRegisterableSlab> GdrFlush for B {
+    fn flush(&self, device: i32) -> Result<(), i32> {
+        self.flush_gdr_writes(device)
     }
 }
 
@@ -157,10 +140,18 @@ pub struct MemoryRegion<'a> {
     pub(super) slot_len: usize,
     pub(super) lkey: u32,
     #[cfg_attr(not(verus_only), allow(dead_code))]
-    pub(super) buffer: RegistrationBuffer<'a>,
+    pub(super) node: Ghost<NodeId>,
+    #[cfg_attr(not(verus_only), allow(dead_code))]
+    pub(super) space: Ghost<MemorySpace>,
+    #[cfg_attr(not(verus_only), allow(dead_code))]
+    pub(super) instance: Ghost<InstanceId>,
+    pub(super) gpu_device: Option<DeviceId>,
+    pub(super) borrow: PhantomData<&'a ()>,
     pub(super) pd: &'a ProtectionDomain<'a>,
     pub(super) flags: AccessFlags,
     pub(super) gdr_ordering: Option<GdrWritesOrdering>,
+    pub(super) gdr_flush_supported: bool,
+    pub(super) gdr_flush: Option<&'a dyn GdrFlush>,
 }
 
 pub struct MemoryRegionSlice<'a> {
@@ -173,6 +164,10 @@ pub struct MemoryRegionSlice<'a> {
 }
 
 impl<'a> MemoryRegion<'a> {
+    pub fn protection_domain(&self) -> &'a ProtectionDomain<'a> {
+        self.pd
+    }
+
     pub closed spec fn address(&self) -> u64 {
         self.addr
     }
@@ -182,11 +177,11 @@ impl<'a> MemoryRegion<'a> {
     }
 
     pub closed spec fn node(&self) -> NodeId {
-        self.buffer.node()
+        self.node@
     }
 
     pub closed spec fn space(&self) -> MemorySpace {
-        self.buffer.space()
+        self.space@
     }
 
     pub closed spec fn num_slots(&self) -> usize {
@@ -210,11 +205,18 @@ impl<'a> MemoryRegion<'a> {
     }
 
     pub closed spec fn instance_id(&self) -> InstanceId {
-        self.buffer.instance_id()
+        self.instance@
     }
 
     pub closed spec fn pd_id(&self) -> nat {
         self.pd.id()
+    }
+
+    pub fn access_flags(&self) -> (flags: AccessFlags)
+        ensures
+            flags == self.access(),
+    {
+        self.flags
     }
 
     pub closed spec fn access(&self) -> AccessFlags {
@@ -226,7 +228,7 @@ impl<'a> MemoryRegion<'a> {
     }
 
     pub closed spec fn gpu_device_spec(&self) -> Option<DeviceId> {
-        self.buffer.gpu_device()
+        self.gpu_device
     }
 
     pub open spec fn gdr_visible_to_device_spec(&self, consumer_device: DeviceId) -> bool {
@@ -261,10 +263,7 @@ impl<'a> MemoryRegion<'a> {
         ensures
             d == self.gpu_device_spec(),
     {
-        match self.buffer {
-            RegistrationBuffer::Cuda(b) => Some(b.device()),
-            _ => None,
-        }
+        self.gpu_device
     }
 
     /// True if GPUDirect RDMA writes into this region are natively visible to
@@ -305,21 +304,21 @@ impl<'a> MemoryRegion<'a> {
 
     /// Flush GPUDirect RDMA writes to the owning GPU derived from `self.gpu_device()`
     /// when `self.gdr_ordering()` is `Some(GdrWritesOrdering::None)`.
-    pub fn flush_gdr_writes(&self) -> (r: Result<(), CudaError>)
+    pub fn flush_gdr_writes(&self) -> (r: Result<(), RdmaError>)
         requires
             self.well_formed(),
         ensures
             self.gdr_ordering_spec() != Some(GdrWritesOrdering::None) ==> r is Ok,
     {
-        if let Some(GdrWritesOrdering::None) = self.gdr_ordering {
-            if let Some(dev_u32) = self.gpu_device() {
-                if dev_u32 > i32::MAX as u32 {
-                    return Err(CudaError(1));
-                }
-                gdr_flush_writes(dev_u32 as i32)?;
+        let Some(GdrWritesOrdering::None) = self.gdr_ordering else {
+            return Ok(());
+        };
+        if let (Some(device), Some(flush)) = (self.gpu_device, self.gdr_flush) {
+            if self.gdr_flush_supported && device <= i32::MAX as u32 {
+                return flush.flush(device as i32).map_err(|code| RdmaError(code));
             }
         }
-        Ok(())
+        Err(RdmaError(95))
     }
 
     /// Release a single GPU destination `SlotToken` after observing its RDMA READ
@@ -329,7 +328,7 @@ impl<'a> MemoryRegion<'a> {
         Tracked(instance): Tracked<&TransferInstance>,
         Tracked(pending): Tracked<PendingGdrSlot>,
         Tracked(knows): Tracked<&Knows>,
-    ) -> (r: Result<Tracked<SlotToken>, (CudaError, Tracked<PendingGdrSlot>)>)
+    ) -> (r: Result<Tracked<SlotToken>, (RdmaError, Tracked<PendingGdrSlot>)>)
         requires
             self.well_formed(),
             self.gpu_device_spec() is Some,
@@ -361,7 +360,7 @@ impl<'a> MemoryRegion<'a> {
         Tracked(instance): Tracked<&TransferInstance>,
         Tracked(pending): Tracked<PendingGdrSlots>,
         Tracked(knows): Tracked<&Knows>,
-    ) -> (r: Result<Tracked<Map<SlotLoc, SlotToken>>, (CudaError, Tracked<PendingGdrSlots>)>)
+    ) -> (r: Result<Tracked<Map<SlotLoc, SlotToken>>, (RdmaError, Tracked<PendingGdrSlots>)>)
         requires
             self.well_formed(),
             self.gpu_device_spec() is Some,
@@ -396,18 +395,21 @@ impl<'a> MemoryRegion<'a> {
         self.slot_len
     }
 
-    pub open(super) spec fn well_formed(&self) -> bool {
-        &&& self.buffer.well_formed()
-        &&& match self.buffer {
-            RegistrationBuffer::Cuda(_) => self.gdr_ordering is Some,
-            _ => self.gdr_ordering is None,
+    pub open spec fn well_formed(&self) -> bool {
+        &&& match self.gpu_device_spec() {
+            None => self.space().is_host() && self.gdr_ordering_spec().is_none(),
+            Some(d) => self.space().is_gpu() && self.space().gpu_device() == d && d <= i32::MAX
+                && self.gdr_ordering_spec().is_some(),
         }
-        &&& self.num_slots >= 1
-        &&& self.num_slots == self.buffer.num_slots()
-        &&& self.slot_len == self.buffer.slot_len()
-        &&& self.len == (self.num_slots * self.slot_len) as u64
-        &&& self.num_slots * self.slot_len <= usize::MAX
-        &&& self.addr + self.len <= u64::MAX
+        &&& (self.gdr_ordering_spec() == Some(GdrWritesOrdering::None) ==> self.has_flush_hook())
+        &&& self.num_slots() >= 1
+        &&& self.total_len() == (self.num_slots() * self.slot_len()) as u64
+        &&& self.num_slots() * self.slot_len() <= usize::MAX
+        &&& self.address() + self.total_len() <= u64::MAX
+    }
+
+    pub closed spec fn has_flush_hook(&self) -> bool {
+        self.gdr_flush_supported && self.gdr_flush.is_some()
     }
 
     pub fn as_slice(&'a self) -> (s: MemoryRegionSlice<'a>)
@@ -507,53 +509,44 @@ impl<'a> MemoryRegionSlice<'a> {
     }
 }
 
-pub fn register_memory<'a>(
+pub fn register_memory<'a, B: RdmaRegisterableSlab>(
     pd: &'a ProtectionDomain<'a>,
-    buffer: RegistrationBuffer<'a>,
+    buffer: &'a B,
     flags: AccessFlags,
 ) -> (r: Result<MemoryRegion<'a>, RdmaError>)
     requires
-        buffer.well_formed(),
-        buffer.node() == pd.node(),
+        buffer.reg_well_formed(),
+        buffer.reg_node() == pd.node(),
     ensures
-        r matches Ok(m) ==> m.well_formed() && m.node() == buffer.node() && m.space()
-            == buffer.space() && m.num_slots() == buffer.num_slots() && m.slot_len()
-            == buffer.slot_len() && m.total_len() == buffer.total_len() as u64 && m.instance_id()
-            == buffer.instance_id() && m.pd_id() == pd.id() && m.access() == flags
-            && m.gpu_device_spec() == buffer.gpu_device(),
+        r matches Ok(m) ==> m.well_formed() && m.node() == buffer.reg_node() && m.space()
+            == buffer.reg_space() && m.num_slots() == buffer.reg_num_slots() && m.slot_len()
+            == buffer.reg_slot_len() && m.total_len() == buffer.reg_total_len() as u64
+            && m.instance_id() == buffer.reg_instance_id() && m.pd_id() == pd.id() && m.access()
+            == flags && m.gpu_device_spec() == buffer.reg_gpu_device(),
 {
-    let (ptr, len, num_slots, slot_len, gdr_ordering) = match &buffer {
-        RegistrationBuffer::Host(b) => {
-            let (p, l) = b.raw_parts();
-            (p, l, b.num_slots_val(), b.slot_len_val(), None)
-        },
-        RegistrationBuffer::CudaHost(b) => {
-            let (p, l) = b.raw_parts();
-            (p, l, b.num_slots_val(), b.slot_len_val(), None)
-        },
-        RegistrationBuffer::Cuda(b) => {
-            if let Err(e) = crate::cuda::enable_sync_memops(b) {
-                return Err(RdmaError(e.0));
-            }
-            let dev_u32 = b.device();
-            if dev_u32 > i32::MAX as u32 {
-                return Err(RdmaError(22));
-            }
-            let dev = dev_u32 as i32;
-            let ord = match gdr_writes_ordering(dev) {
-                Ok(o) => o,
-                Err(e) => return Err(RdmaError(e.0)),
-            };
-            if let GdrWritesOrdering::None = ord {
-                match gdr_flush_writes_supported(dev) {
-                    Ok(true) => {},
-                    Ok(false) => return Err(RdmaError(95)),
-                    Err(e) => return Err(RdmaError(e.0)),
-                }
-            }
-            let (p, l) = b.raw_parts();
-            (p, l, b.num_slots_val(), b.slot_len_val(), Some(ord))
-        },
+    let allocation = buffer.reg_allocation();
+    let (ptr, len) = allocation.raw_parts();
+    let num_slots = buffer.reg_num_slots_exec();
+    let slot_len = buffer.reg_slot_len_exec();
+    let gpu_device = allocation.device();
+    if num_slots == 0 || num_slots.checked_mul(slot_len) != Some(len) {
+        return Err(RdmaError(22));
+    }
+    buffer.prepare_rdma_registration().map_err(|code| RdmaError(code))?;
+    if let Some(device) = gpu_device {
+        if device > i32::MAX as u32 {
+            return Err(RdmaError(22));
+        }
+    }
+    let gdr_ordering = buffer.query_gdr_ordering().map_err(|code| RdmaError(code))?;
+    let (gdr_flush_supported, gdr_flush) = if let Some(GdrWritesOrdering::None) = gdr_ordering {
+        let supported = buffer.query_gdr_flush_supported().map_err(|code| RdmaError(code))?;
+        if !supported {
+            return Err(RdmaError(95));
+        }
+        (true, Some(buffer as &dyn GdrFlush))
+    } else {
+        (false, None)
     };
     let (raw, lkey) = ffi::register(pd.raw.as_ptr(), ptr, len, flags)?;
     Ok(
@@ -564,16 +557,22 @@ pub fn register_memory<'a>(
             num_slots,
             slot_len,
             lkey,
-            buffer,
+            node: Ghost(buffer.reg_node()),
+            space: Ghost(buffer.reg_space()),
+            instance: Ghost(buffer.reg_instance_id()),
+            gpu_device,
+            borrow: PhantomData,
             pd,
             flags,
             gdr_ordering,
+            gdr_flush_supported,
+            gdr_flush,
         },
     )
 }
 
 pub fn deregister_memory<'a>(
-    _ctx: &mut HostContext,
+    _ctx: &mut SyncContext,
     Tracked(instance): Tracked<&TransferInstance>,
     buf: MemoryRegion<'a>,
     Tracked(tok): Tracked<SlotToken>,
@@ -589,7 +588,7 @@ pub fn deregister_memory<'a>(
         buf.well_formed(),
         buf.num_slots() == 1,
         buf.instance_id() == instance.id(),
-        host::can_reclaim_slot(instance.id(), buf.slot_loc(0), tok, *infos, *knows, cited),
+        can_reclaim_slot(instance.id(), buf.slot_loc(0), tok, *infos, *knows, cited),
     ensures
         match r {
             Err((_, returned, ret_tok)) => returned == buf && ret_tok@ == tok && *final(_ctx)
@@ -625,9 +624,9 @@ pub fn deregister_memory<'a>(
     let _ = buf.raw.into_raw();
     proof {
         assert(slab_locs(loc.node, loc.space, 1nat) =~= ISet::empty().insert(loc));
-        assert(completed.access == dereg_access(loc));
+        assert(completed.access() == dereg_access(loc));
     }
-    let tracked completion = host::finish_owned(
+    let tracked completion = finish_owned(
         _ctx.source.borrow_mut(),
         instance,
         completed,
@@ -640,7 +639,7 @@ pub fn deregister_memory<'a>(
 }
 
 pub fn deregister_memory_slab<'a>(
-    _ctx: &mut HostContext,
+    _ctx: &mut SyncContext,
     Tracked(instance): Tracked<&TransferInstance>,
     buf: MemoryRegion<'a>,
     Tracked(tokens): Tracked<Map<usize, SlotToken>>,
@@ -655,7 +654,7 @@ pub fn deregister_memory_slab<'a>(
         old(_ctx).ready(instance.id(), buf.node()),
         buf.well_formed(),
         buf.instance_id() == instance.id(),
-        host::can_reclaim_slab(
+        can_reclaim_slab(
             instance.id(),
             buf.node(),
             buf.space(),
@@ -705,7 +704,7 @@ pub fn deregister_memory_slab<'a>(
         Ok(w) => w,
     };
     let _ = buf.raw.into_raw();
-    let tracked (completion, out_tokens) = host::finish_slab_owned(
+    let tracked (completion, out_tokens) = finish_slab_owned(
         _ctx.source.borrow_mut(),
         instance,
         node,

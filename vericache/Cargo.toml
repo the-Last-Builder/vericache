@@ -12,8 +12,22 @@ verify = false
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)', 'cfg(verus_keep_ghost)', 'cfg(verus_keep_ghost_body)'] }
 
+[features]
+default = ["cuda", "nvme", "rdma"]
+cuda = ["transfer/cuda", "vericache-core/cuda"]
+nvme = ["transfer/nvme", "vericache-core/nvme"]
+rdma = ["transfer/rdma", "vericache-core/rdma"]
+
 [dependencies]
 foundation = { package = "vericache-foundation", path = "../vericache-foundation" }
-transfer = { package = "vericache-transfer", path = "../vericache-transfer" }
-vericache-core = { path = "../vericache-core" }
+transfer = { package = "vericache-transfer", path = "../vericache-transfer", default-features = false }
+vericache-core = { path = "../vericache-core", default-features = false }
 vstd = { path = "/opt/vericache/verus/source/vstd" }
+
+[[test]]
+name = "host_write_batch"
+required-features = ["cuda", "rdma"]
+
+[[test]]
+name = "location_transparent_e2e"
+required-features = ["cuda", "nvme", "rdma"]

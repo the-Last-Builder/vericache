@@ -1,0 +1,19 @@
+[package]
+name = "vericache-kernel"
+version.workspace = true
+edition.workspace = true
+description = "Verified hardware-independent cache state, transactions, and backend interface for VeriCache."
+
+[package.metadata.verus]
+verify = true
+
+[lib]
+name = "vericache_kernel"
+
+[dependencies]
+foundation.workspace = true
+transfer_core.workspace = true
+vstd.workspace = true
+
+[lints]
+workspace = true

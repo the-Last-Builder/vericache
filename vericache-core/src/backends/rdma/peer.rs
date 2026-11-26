@@ -3,6 +3,9 @@
 //! frames, driving Donor (`serve_fetch_request`, `handle_read_release`,
 //! `revoke_lease_unilateral`), Initiator (`send_fetch_request`,
 //! `fetch_remote_frame`), and QP recovery (`reset_and_reconnect`).
+#[cfg(verus_only)]
+use super::ops::bind_reservations_preserved;
+use super::ops::PreparedLeaseBind;
 use super::protocol::{
     decode_control_payload, decode_read_grant_meta, decode_read_release_meta,
     encode_control_payload, encode_read_grant_meta, encode_read_release_meta, ControlPayload,
@@ -10,23 +13,28 @@ use super::protocol::{
 };
 #[cfg(verus_only)]
 use super::protocol::{lemma_replica_valid_to_statement, lemma_statement_valid_in_receiver_ledger};
-use super::pull::{finish_pull_read, post_pull_read, InFlightRdmaPull, PullOutcome, PullTarget};
-use super::*;
+use super::pull::{
+    finish_pull_read, finish_pull_read_batch, post_pull_read, post_pull_read_batch,
+    InFlightRdmaPull, PreparedPull, PullBatchPost, PullOutcome, PullTarget,
+};
 #[cfg(verus_only)]
+use super::pull::{
+    lemma_observed_pull_batch_entry, lemma_posted_pull_batch_entry, observed_pull_batch_matches,
+};
+use super::*;
 use crate::frame::STATE_PUBLISHED;
 #[cfg(verus_only)]
 use crate::provenance::{
     complete_receipts, event_succeeded, replica_valid, revoked_submap, ValueCertificate,
 };
 #[cfg(verus_only)]
-use foundation::tracked::{closure_from, knowledge_of, ordered_or_absent};
+use foundation::tracked::{closure_from, knowledge_of, ordered_or_absent, Frontier};
 #[cfg(verus_only)]
 use transfer::context::cluster_version_instance_id;
 use transfer::context::{
-    EventSourceToken, RevokedMap, ShareCap, ShareSource, SubmittedMap, SucceededMap,
+    EventSourceToken, RevokedMap, ShareCap, ShareSource, SubmittedMap, SucceededMap, SyncContext,
     TransferInstance, VersionBinding,
 };
-use transfer::host::HostContext;
 use transfer::rdma;
 use transfer::transport::{
     ByteTransport, Channel, ChannelAttachment, ChannelError, EndpointOrFrame, GrantKind, GrantTag,
@@ -48,8 +56,8 @@ proof fn lemma_foreign_shares_identical_leases(
     leases: Seq<ActiveRemoteLease>,
 )
     requires
-        after.frames.metas.len() == before.frames.metas.len(),
-        after.frames.preserves_remote_leases(&before.frames),
+        after.frames_spec().metas_spec().len() == before.frames_spec().metas_spec().len(),
+        after.frames_spec().preserves_fenced_leases(&before.frames_spec()),
     ensures
         peer_foreign_shares_preserved(before, after, leases, leases),
 {
@@ -332,10 +340,10 @@ proof fn lemma_rdma_leases_after_begin_write<'a>(
 )
     requires
         rdma_leases_valid(leases, pool, qp, before_core),
-        after_core.node_id == before_core.node_id,
+        after_core.node_id_spec() == before_core.node_id_spec(),
         after_core.instance_id() == before_core.instance_id(),
-        after_core.frames.same_directory(&before_core.frames),
-        after_core.frames.same_other_pins(&before_core.frames, None),
+        after_core.frames_spec().same_directory(&before_core.frames_spec()),
+        after_core.frames_spec().same_other_pins(&before_core.frames_spec(), None),
     ensures
         rdma_leases_valid(leases, pool, qp, after_core),
 {
@@ -349,14 +357,13 @@ proof fn lemma_rdma_leases_after_begin_write<'a>(
     ) by {
         assert(leases[i].valid(pool, qp, before_core));
         let f = leases[i].frame;
-        assert(after_core.frames.frame(f).slot == before_core.frames.frame(f).slot);
-        assert(after_core.frames.published(f) == before_core.frames.published(f));
-        assert(after_core.frames.frame(f).remote_shares == before_core.frames.frame(
+        assert(after_core.frames_spec().frame(f).slot == before_core.frames_spec().frame(f).slot);
+        assert(after_core.frames_spec().published(f) == before_core.frames_spec().published(f));
+        assert(after_core.frames_spec().frame(f).fenced_shares == before_core.frames_spec().frame(
             f,
-        ).remote_shares);
-        assert(after_core.frames.meta(f).active_remote_leases == before_core.frames.meta(
-            f,
-        ).active_remote_leases);
+        ).fenced_shares);
+        assert(after_core.frames_spec().meta(f).active_fenced_leases
+            == before_core.frames_spec().meta(f).active_fenced_leases);
     }
 }
 
@@ -372,7 +379,7 @@ proof fn lemma_peer_grants_after_lease_update(
     after_core: &CacheCore,
 )
     requires
-        after_core.frames.same_directory(&before_core.frames),
+        after_core.frames_spec().same_directory(&before_core.frames_spec()),
         0 <= changed_idx < before_leases.len(),
         after_leases.len() == before_leases.len(),
         rdma_lease_index_spec(before_leases, changed_handle) == Some(changed_idx),
@@ -385,14 +392,14 @@ proof fn lemma_peer_grants_after_lease_update(
                 let g = #[trigger] grants[i];
                 &&& g.handle != changed_handle
                 &&& g.grant_tag < next_grant_tag
-                &&& g.frame.0 < before_core.frames.metas.len()
+                &&& g.frame.0 < before_core.frames_spec().metas_spec().len()
                 &&& rdma_lease_index_spec(before_leases, g.handle) matches Some(idx) && {
                     let lease = before_leases[idx];
                     &&& lease.frame == g.frame
                     &&& lease.state == RemoteLeaseState::Bound
                     &&& sent.contains_key(g.grant_tag)
                     &&& sent[g.grant_tag] == (GrantKind::ReadShare {
-                        slot: before_core.frames.frame(g.frame).slot,
+                        slot: before_core.frames_spec().frame(g.frame).slot,
                         share_id: lease.share@,
                     })
                 }
@@ -402,14 +409,14 @@ proof fn lemma_peer_grants_after_lease_update(
             0 <= i < grants.len() ==> {
                 let g = #[trigger] grants[i];
                 &&& g.grant_tag < next_grant_tag
-                &&& g.frame.0 < after_core.frames.metas.len()
+                &&& g.frame.0 < after_core.frames_spec().metas_spec().len()
                 &&& rdma_lease_index_spec(after_leases, g.handle) matches Some(idx) && {
                     let lease = after_leases[idx];
                     &&& lease.frame == g.frame
                     &&& lease.state == RemoteLeaseState::Bound
                     &&& sent.contains_key(g.grant_tag)
                     &&& sent[g.grant_tag] == (GrantKind::ReadShare {
-                        slot: after_core.frames.frame(g.frame).slot,
+                        slot: after_core.frames_spec().frame(g.frame).slot,
                         share_id: lease.share@,
                     })
                 }
@@ -419,14 +426,14 @@ proof fn lemma_peer_grants_after_lease_update(
     assert forall|i: int| 0 <= i < grants.len() implies {
         let g = #[trigger] grants[i];
         &&& g.grant_tag < next_grant_tag
-        &&& g.frame.0 < after_core.frames.metas.len()
+        &&& g.frame.0 < after_core.frames_spec().metas_spec().len()
         &&& rdma_lease_index_spec(after_leases, g.handle) matches Some(idx) && {
             let lease = after_leases[idx];
             &&& lease.frame == g.frame
             &&& lease.state == RemoteLeaseState::Bound
             &&& sent.contains_key(g.grant_tag)
             &&& sent[g.grant_tag] == (GrantKind::ReadShare {
-                slot: after_core.frames.frame(g.frame).slot,
+                slot: after_core.frames_spec().frame(g.frame).slot,
                 share_id: lease.share@,
             })
         }
@@ -455,7 +462,7 @@ proof fn lemma_peer_grants_after_lease_remove(
     after_core: &CacheCore,
 )
     requires
-        after_core.frames.same_directory(&before_core.frames),
+        after_core.frames_spec().same_directory(&before_core.frames_spec()),
         rdma_leases_disjoint(after_leases),
         rdma_leases_preserved_except(before_leases, after_leases, removed_handle),
         forall|i: int|
@@ -463,14 +470,14 @@ proof fn lemma_peer_grants_after_lease_remove(
                 let g = #[trigger] grants[i];
                 &&& g.handle != removed_handle
                 &&& g.grant_tag < next_grant_tag
-                &&& g.frame.0 < before_core.frames.metas.len()
+                &&& g.frame.0 < before_core.frames_spec().metas_spec().len()
                 &&& rdma_lease_index_spec(before_leases, g.handle) matches Some(idx) && {
                     let lease = before_leases[idx];
                     &&& lease.frame == g.frame
                     &&& lease.state == RemoteLeaseState::Bound
                     &&& sent.contains_key(g.grant_tag)
                     &&& sent[g.grant_tag] == (GrantKind::ReadShare {
-                        slot: before_core.frames.frame(g.frame).slot,
+                        slot: before_core.frames_spec().frame(g.frame).slot,
                         share_id: lease.share@,
                     })
                 }
@@ -480,14 +487,14 @@ proof fn lemma_peer_grants_after_lease_remove(
             0 <= i < grants.len() ==> {
                 let g = #[trigger] grants[i];
                 &&& g.grant_tag < next_grant_tag
-                &&& g.frame.0 < after_core.frames.metas.len()
+                &&& g.frame.0 < after_core.frames_spec().metas_spec().len()
                 &&& rdma_lease_index_spec(after_leases, g.handle) matches Some(idx) && {
                     let lease = after_leases[idx];
                     &&& lease.frame == g.frame
                     &&& lease.state == RemoteLeaseState::Bound
                     &&& sent.contains_key(g.grant_tag)
                     &&& sent[g.grant_tag] == (GrantKind::ReadShare {
-                        slot: after_core.frames.frame(g.frame).slot,
+                        slot: after_core.frames_spec().frame(g.frame).slot,
                         share_id: lease.share@,
                     })
                 }
@@ -497,14 +504,14 @@ proof fn lemma_peer_grants_after_lease_remove(
     assert forall|i: int| 0 <= i < grants.len() implies {
         let g = #[trigger] grants[i];
         &&& g.grant_tag < next_grant_tag
-        &&& g.frame.0 < after_core.frames.metas.len()
+        &&& g.frame.0 < after_core.frames_spec().metas_spec().len()
         &&& rdma_lease_index_spec(after_leases, g.handle) matches Some(idx) && {
             let lease = after_leases[idx];
             &&& lease.frame == g.frame
             &&& lease.state == RemoteLeaseState::Bound
             &&& sent.contains_key(g.grant_tag)
             &&& sent[g.grant_tag] == (GrantKind::ReadShare {
-                slot: after_core.frames.frame(g.frame).slot,
+                slot: after_core.frames_spec().frame(g.frame).slot,
                 share_id: lease.share@,
             })
         }
@@ -530,19 +537,19 @@ proof fn lemma_peer_grants_same_layout(
     after_core: &CacheCore,
 )
     requires
-        after_core.frames.same_layout(&before_core.frames),
+        after_core.frames_spec().same_layout(&before_core.frames_spec()),
         forall|i: int|
             0 <= i < grants.len() ==> {
                 let g = #[trigger] grants[i];
                 &&& g.grant_tag < next_grant_tag
-                &&& g.frame.0 < before_core.frames.metas.len()
+                &&& g.frame.0 < before_core.frames_spec().metas_spec().len()
                 &&& rdma_lease_index_spec(leases, g.handle) matches Some(idx) && {
                     let lease = leases[idx];
                     &&& lease.frame == g.frame
                     &&& lease.state == RemoteLeaseState::Bound
                     &&& sent.contains_key(g.grant_tag)
                     &&& sent[g.grant_tag] == (GrantKind::ReadShare {
-                        slot: before_core.frames.frame(g.frame).slot,
+                        slot: before_core.frames_spec().frame(g.frame).slot,
                         share_id: lease.share@,
                     })
                 }
@@ -552,14 +559,14 @@ proof fn lemma_peer_grants_same_layout(
             0 <= i < grants.len() ==> {
                 let g = #[trigger] grants[i];
                 &&& g.grant_tag < next_grant_tag
-                &&& g.frame.0 < after_core.frames.metas.len()
+                &&& g.frame.0 < after_core.frames_spec().metas_spec().len()
                 &&& rdma_lease_index_spec(leases, g.handle) matches Some(idx) && {
                     let lease = leases[idx];
                     &&& lease.frame == g.frame
                     &&& lease.state == RemoteLeaseState::Bound
                     &&& sent.contains_key(g.grant_tag)
                     &&& sent[g.grant_tag] == (GrantKind::ReadShare {
-                        slot: after_core.frames.frame(g.frame).slot,
+                        slot: after_core.frames_spec().frame(g.frame).slot,
                         share_id: lease.share@,
                     })
                 }
@@ -569,20 +576,22 @@ proof fn lemma_peer_grants_same_layout(
     assert forall|i: int| 0 <= i < grants.len() implies {
         let g = #[trigger] grants[i];
         &&& g.grant_tag < next_grant_tag
-        &&& g.frame.0 < after_core.frames.metas.len()
+        &&& g.frame.0 < after_core.frames_spec().metas_spec().len()
         &&& rdma_lease_index_spec(leases, g.handle) matches Some(idx) && {
             let lease = leases[idx];
             &&& lease.frame == g.frame
             &&& lease.state == RemoteLeaseState::Bound
             &&& sent.contains_key(g.grant_tag)
             &&& sent[g.grant_tag] == (GrantKind::ReadShare {
-                slot: after_core.frames.frame(g.frame).slot,
+                slot: after_core.frames_spec().frame(g.frame).slot,
                 share_id: lease.share@,
             })
         }
     } by {
         let g = grants[i];
-        assert(after_core.frames.frame(g.frame).slot == before_core.frames.frame(g.frame).slot);
+        assert(after_core.frames_spec().frame(g.frame).slot == before_core.frames_spec().frame(
+            g.frame,
+        ).slot);
     }
 }
 
@@ -668,30 +677,34 @@ proof fn lemma_outbound_grants_preserved(
 )
     requires
         rdma_leases_disjoint(after_leases),
-        after_core.node_id == before_core.node_id,
+        after_core.node_id_spec() == before_core.node_id_spec(),
         after_core.instance_id() == before_core.instance_id(),
-        after_core.frames.same_layout(&before_core.frames),
-        before_core.ledger@.submitted.map().submap_of(after_core.ledger@.submitted.map()),
-        before_core.ledger@.knows.set().subset_of(after_core.ledger@.knows.set()),
-        before_core.ledger@.succeeded.dom().subset_of(after_core.ledger@.succeeded.dom()),
+        after_core.frames_spec().same_layout(&before_core.frames_spec()),
+        before_core.ledger_spec()@.submitted.map().submap_of(
+            after_core.ledger_spec()@.submitted.map(),
+        ),
+        before_core.ledger_spec()@.knows.set().subset_of(after_core.ledger_spec()@.knows.set()),
+        before_core.ledger_spec()@.succeeded.dom().subset_of(
+            after_core.ledger_spec()@.succeeded.dom(),
+        ),
         forall|i: int|
             0 <= i < pending.len() ==> {
                 let p = #[trigger] pending[i];
-                &&& p.frame.0 < before_core.frames.metas.len()
-                &&& p.frame_size == before_core.frames.tier_frame_size(
-                    before_core.frames.frame(p.frame).tier,
+                &&& p.frame.0 < before_core.frames_spec().metas_spec().len()
+                &&& p.frame_size == before_core.frames_spec().tier_frame_size(
+                    before_core.frames_spec().frame(p.frame).tier,
                 ) as u64
-                &&& p.cert@.slot == before_core.frames.frame(p.frame).slot
+                &&& p.cert@.slot == before_core.frames_spec().frame(p.frame).slot
                 &&& p.cert@.slot.is_full()
                 &&& p.cert@.slot.well_formed()
                 &&& p.cert@.bytes.len() == p.frame_size
                 &&& p.bind_revoked@.instance_id() == before_core.instance_id()
-                &&& p.bind_sub@.map().submap_of(before_core.ledger@.submitted.map())
-                &&& p.bind_succ@.dom().subset_of(before_core.ledger@.succeeded.dom())
+                &&& p.bind_sub@.map().submap_of(before_core.ledger_spec()@.submitted.map())
+                &&& p.bind_succ@.dom().subset_of(before_core.ledger_spec()@.succeeded.dom())
                 &&& (forall|e: TransferEvent| #[trigger]
-                    p.bind_facts@.contains(e) ==> before_core.ledger@.submitted.map().contains_key(
-                        e,
-                    ) && before_core.ledger@.knows.set().contains((before_core.node(), e)))
+                    p.bind_facts@.contains(e)
+                        ==> before_core.ledger_spec()@.submitted.map().contains_key(e)
+                        && before_core.ledger_spec()@.knows.set().contains((before_core.node(), e)))
                 &&& p.bind_facts@.contains(p.cert@.writer)
                 &&& super::protocol::statement_replica_valid(
                     p.bind_sub@,
@@ -726,20 +739,21 @@ proof fn lemma_outbound_grants_preserved(
         forall|i: int|
             0 <= i < pending.len() ==> {
                 let p = #[trigger] pending[i];
-                &&& p.frame.0 < after_core.frames.metas.len()
-                &&& p.frame_size == after_core.frames.tier_frame_size(
-                    after_core.frames.frame(p.frame).tier,
+                &&& p.frame.0 < after_core.frames_spec().metas_spec().len()
+                &&& p.frame_size == after_core.frames_spec().tier_frame_size(
+                    after_core.frames_spec().frame(p.frame).tier,
                 ) as u64
-                &&& p.cert@.slot == after_core.frames.frame(p.frame).slot
+                &&& p.cert@.slot == after_core.frames_spec().frame(p.frame).slot
                 &&& p.cert@.slot.is_full()
                 &&& p.cert@.slot.well_formed()
                 &&& p.cert@.bytes.len() == p.frame_size
                 &&& p.bind_revoked@.instance_id() == after_core.instance_id()
-                &&& p.bind_sub@.map().submap_of(after_core.ledger@.submitted.map())
-                &&& p.bind_succ@.dom().subset_of(after_core.ledger@.succeeded.dom())
+                &&& p.bind_sub@.map().submap_of(after_core.ledger_spec()@.submitted.map())
+                &&& p.bind_succ@.dom().subset_of(after_core.ledger_spec()@.succeeded.dom())
                 &&& (forall|e: TransferEvent| #[trigger]
-                    p.bind_facts@.contains(e) ==> after_core.ledger@.submitted.map().contains_key(e)
-                        && after_core.ledger@.knows.set().contains((after_core.node(), e)))
+                    p.bind_facts@.contains(e)
+                        ==> after_core.ledger_spec()@.submitted.map().contains_key(e)
+                        && after_core.ledger_spec()@.knows.set().contains((after_core.node(), e)))
                 &&& p.bind_facts@.contains(p.cert@.writer)
                 &&& super::protocol::statement_replica_valid(
                     p.bind_sub@,
@@ -766,20 +780,20 @@ proof fn lemma_outbound_grants_preserved(
 {
     assert forall|i: int| 0 <= i < pending.len() implies {
         let p = #[trigger] pending[i];
-        &&& p.frame.0 < after_core.frames.metas.len()
-        &&& p.frame_size == after_core.frames.tier_frame_size(
-            after_core.frames.frame(p.frame).tier,
+        &&& p.frame.0 < after_core.frames_spec().metas_spec().len()
+        &&& p.frame_size == after_core.frames_spec().tier_frame_size(
+            after_core.frames_spec().frame(p.frame).tier,
         ) as u64
-        &&& p.cert@.slot == after_core.frames.frame(p.frame).slot
+        &&& p.cert@.slot == after_core.frames_spec().frame(p.frame).slot
         &&& p.cert@.slot.is_full()
         &&& p.cert@.slot.well_formed()
         &&& p.cert@.bytes.len() == p.frame_size
         &&& p.bind_revoked@.instance_id() == after_core.instance_id()
-        &&& p.bind_sub@.map().submap_of(after_core.ledger@.submitted.map())
-        &&& p.bind_succ@.dom().subset_of(after_core.ledger@.succeeded.dom())
+        &&& p.bind_sub@.map().submap_of(after_core.ledger_spec()@.submitted.map())
+        &&& p.bind_succ@.dom().subset_of(after_core.ledger_spec()@.succeeded.dom())
         &&& (forall|e: TransferEvent| #[trigger]
-            p.bind_facts@.contains(e) ==> after_core.ledger@.submitted.map().contains_key(e)
-                && after_core.ledger@.knows.set().contains((after_core.node(), e)))
+            p.bind_facts@.contains(e) ==> after_core.ledger_spec()@.submitted.map().contains_key(e)
+                && after_core.ledger_spec()@.knows.set().contains((after_core.node(), e)))
         &&& p.bind_facts@.contains(p.cert@.writer)
         &&& super::protocol::statement_replica_valid(
             p.bind_sub@,
@@ -812,24 +826,26 @@ proof fn lemma_outbound_grants_preserved(
         assert(after_leases[aidx].share_cap == before_leases[bidx].share_cap);
         vstd::imap_lib::lemma_submap_of_trans(
             p.bind_sub@.map(),
-            before_core.ledger@.submitted.map(),
-            after_core.ledger@.submitted.map(),
+            before_core.ledger_spec()@.submitted.map(),
+            after_core.ledger_spec()@.submitted.map(),
         );
-        assert(p.bind_succ@.dom().subset_of(after_core.ledger@.succeeded.dom())) by {
+        assert(p.bind_succ@.dom().subset_of(after_core.ledger_spec()@.succeeded.dom())) by {
             assert forall|k: TransferEvent| #[trigger]
-                p.bind_succ@.dom().contains(k) implies after_core.ledger@.succeeded.dom().contains(
-                k,
-            ) by {
-                assert(before_core.ledger@.succeeded.dom().contains(k));
+                p.bind_succ@.dom().contains(
+                    k,
+                ) implies after_core.ledger_spec()@.succeeded.dom().contains(k) by {
+                assert(before_core.ledger_spec()@.succeeded.dom().contains(k));
             };
         };
         assert forall|e: TransferEvent| #[trigger]
-            p.bind_facts@.contains(e) implies after_core.ledger@.submitted.map().contains_key(e)
-            && after_core.ledger@.knows.set().contains((after_core.node(), e)) by {
-            assert(before_core.ledger@.submitted.map().dom().contains(e));
-            assert(before_core.ledger@.submitted.map().contains_key(e));
-            assert(after_core.ledger@.submitted.map().dom().contains(e));
-            assert(before_core.ledger@.knows.set().contains((before_core.node(), e)));
+            p.bind_facts@.contains(
+                e,
+            ) implies after_core.ledger_spec()@.submitted.map().contains_key(e)
+            && after_core.ledger_spec()@.knows.set().contains((after_core.node(), e)) by {
+            assert(before_core.ledger_spec()@.submitted.map().dom().contains(e));
+            assert(before_core.ledger_spec()@.submitted.map().contains_key(e));
+            assert(after_core.ledger_spec()@.submitted.map().dom().contains(e));
+            assert(before_core.ledger_spec()@.knows.set().contains((before_core.node(), e)));
         };
         assert(p.version_binding@@ matches Some(vb) && vb.instance_id()
             == cluster_version_instance_id() && vb.key() == (
@@ -875,6 +891,17 @@ impl PeerProgress {
             windows_replenished: 0,
         }
     }
+
+    /// Combine counters from multiple peers or pump passes.
+    pub fn accumulate(&mut self, other: Self) {
+        self.cq_processed = self.cq_processed.saturating_add(other.cq_processed);
+        self.frames_received = self.frames_received.saturating_add(other.frames_received);
+        self.releases_processed = self.releases_processed.saturating_add(other.releases_processed);
+        self.grants_completed = self.grants_completed.saturating_add(other.grants_completed);
+        self.windows_replenished = self.windows_replenished.saturating_add(
+            other.windows_replenished,
+        );
+    }
 }
 
 /// Outbound MW-bind response queued on `PeerSession` awaiting CQ completion.
@@ -896,21 +923,21 @@ pub struct PendingOutboundGrant {
 }
 
 impl PendingOutboundGrant {
-    pub open spec fn valid(&self, rdma: &RdmaBackend, core: &CacheCore) -> bool {
-        &&& self.frame.0 < core.frames.metas.len()
-        &&& self.frame_size == core.frames.tier_frame_size(
-            core.frames.frame(self.frame).tier,
+    pub open(crate) spec fn valid(&self, rdma: &RdmaBackend, core: &CacheCore) -> bool {
+        &&& self.frame.0 < core.frames_spec().metas_spec().len()
+        &&& self.frame_size == core.frames_spec().tier_frame_size(
+            core.frames_spec().frame(self.frame).tier,
         ) as u64
-        &&& self.cert@.slot == core.frames.frame(self.frame).slot
+        &&& self.cert@.slot == core.frames_spec().frame(self.frame).slot
         &&& self.cert@.slot.is_full()
         &&& self.cert@.slot.well_formed()
         &&& self.cert@.bytes.len() == self.frame_size
         &&& self.bind_revoked@.instance_id() == core.instance_id()
-        &&& self.bind_sub@.map().submap_of(core.ledger@.submitted.map())
-        &&& self.bind_succ@.dom().subset_of(core.ledger@.succeeded.dom())
+        &&& self.bind_sub@.map().submap_of(core.ledger_spec()@.submitted.map())
+        &&& self.bind_succ@.dom().subset_of(core.ledger_spec()@.succeeded.dom())
         &&& forall|e: TransferEvent| #[trigger]
-            self.bind_facts@.contains(e) ==> core.ledger@.submitted.map().contains_key(e)
-                && core.ledger@.knows.set().contains((core.node(), e))
+            self.bind_facts@.contains(e) ==> core.ledger_spec()@.submitted.map().contains_key(e)
+                && core.ledger_spec()@.knows.set().contains((core.node(), e))
         &&& self.bind_facts@.contains(self.cert@.writer)
         &&& super::protocol::statement_replica_valid(
             self.bind_sub@,
@@ -969,7 +996,7 @@ impl PendingInboundGrant {
         &&& self.cap.slot_ref() == self.cert@.slot
         &&& self.cert@.slot.is_full()
         &&& self.cert@.bytes.len() == self.meta.frame_size
-        &&& self.share@.is_rdma_bound()
+        &&& self.share@.is_fenced()
         &&& self.share@.instance_id() == core.instance_id()
         &&& self.share@.loc() == self.cap.slot_ref().loc
         &&& self.share@.frontier().last_writer == Some(self.cert@.writer)
@@ -1028,24 +1055,306 @@ pub enum FetchOutcome {
     Miss,
 }
 
+pub struct PullGrantReturn {
+    pub tag: GrantTag,
+    pub request_id: u64,
+    pub binding: Tracked<VersionBinding>,
+    pub frontier: Ghost<foundation::tracked::Frontier<TransferDomain>>,
+}
+
+impl PullGrantReturn {
+    pub open spec fn owns_grant(
+        &self,
+        received: Map<GrantTag, GrantKind>,
+        share: ShareCap,
+    ) -> bool {
+        &&& received.contains_key(self.tag)
+        &&& received[self.tag] is ReadShare
+        &&& received[self.tag]->ReadShare_slot.loc == share.loc()
+        &&& received[self.tag]->ReadShare_share_id == share.share()
+    }
+
+    pub open spec fn matches_version(&self, version: VersionId, bytes: Seq<u8>) -> bool {
+        &&& self.binding@.instance_id() == cluster_version_instance_id()
+        &&& self.binding@.key() == (version.origin_node as NodeId, version.seq)
+        &&& self.binding@.value() == bytes
+    }
+
+    pub open spec fn matches_posted(
+        &self,
+        pull: &InFlightRdmaPull,
+        received: Map<GrantTag, GrantKind>,
+        core: &CacheCore,
+    ) -> bool {
+        &&& self.owns_grant(received, pull.share_cap@)
+        &&& self.matches_version(pull.handle.version, pull.copy@.source.bytes)
+        &&& transfer::transport::covers(self.frontier@, core.citations())
+        &&& pull.share_cap@.frontier() == (foundation::tracked::Frontier {
+            last_writer: self.frontier@.last_writer,
+            readers: self.frontier@.readers.insert(pull.writer@),
+        })
+    }
+
+    pub open spec fn matches_prepared(
+        &self,
+        plan: &PreparedPull,
+        received: Map<GrantTag, GrantKind>,
+        core: &CacheCore,
+    ) -> bool {
+        &&& self.owns_grant(received, plan.share@)
+        &&& self.matches_version(plan.handle.version, plan.source@.bytes)
+        &&& transfer::transport::covers(self.frontier@, core.citations())
+        &&& plan.share@.frontier() == self.frontier@
+    }
+}
+
+#[verifier::opaque]
+pub(crate) open spec fn pull_batch_targets_distinct(
+    pulls: Seq<InFlightRdmaPull>,
+    routes: Seq<PullGrantReturn>,
+) -> bool {
+    forall|a: int, b: int|
+        0 <= a < b < pulls.len() ==> {
+            &&& (#[trigger] pulls[a]).handle.frame != (#[trigger] pulls[b]).handle.frame
+            &&& routes[a].tag != routes[b].tag
+        }
+}
+
+proof fn lemma_pull_batch_targets_distinct(
+    pulls: Seq<InFlightRdmaPull>,
+    routes: Seq<PullGrantReturn>,
+    a: int,
+    b: int,
+)
+    requires
+        pull_batch_targets_distinct(pulls, routes),
+        0 <= a < b < pulls.len(),
+    ensures
+        pulls[a].handle.frame != pulls[b].handle.frame,
+        routes[a].tag != routes[b].tag,
+{
+    reveal(pull_batch_targets_distinct);
+}
+
+pub(crate) ghost struct PullBatchView {
+    pub pulls: Seq<InFlightRdmaPull>,
+    pub routes: Seq<PullGrantReturn>,
+    pub statuses: Seq<Result<(), i32>>,
+    pub plans: Seq<PreparedPull>,
+    pub before: CacheCore,
+    pub visible: bool,
+}
+
+impl PullBatchView {
+    pub(crate) open spec fn valid_entry<'a, T: ByteTransport>(
+        self,
+        i: int,
+        session: &PeerSession<'a, T>,
+        core: &CacheCore,
+    ) -> bool {
+        let p = self.pulls[i];
+        &&& p.valid(&session.rdma, core)
+        &&& p.handle.frame == self.plans[i].handle.frame
+        &&& p.handle.frame.0 < self.before.frames_spec().metas_spec().len()
+        &&& self.before.frames_spec().meta(p.handle.frame).state != STATE_INITIALIZING
+        &&& self.routes[i].matches_posted(&p, session.channel.received(), core)
+        &&& (i < self.statuses.len() ==> observed_batch_status(&p, core, self.statuses[i]))
+        &&& (self.visible ==> p.batch_visible())
+    }
+
+    #[verifier::opaque]
+    pub(crate) open spec fn valid_suffix<'a, T: ByteTransport>(
+        self,
+        start: int,
+        session: &PeerSession<'a, T>,
+        core: &CacheCore,
+    ) -> bool {
+        forall|i: int|
+            start <= i < self.pulls.len() ==> #[trigger] self.valid_entry(i, session, core)
+    }
+
+    proof fn lemma_entry<'a, T: ByteTransport>(
+        self,
+        start: int,
+        i: int,
+        session: &PeerSession<'a, T>,
+        core: &CacheCore,
+    )
+        requires
+            start <= i < self.pulls.len(),
+            self.valid_suffix(start, session, core),
+        ensures
+            self.valid_entry(i, session, core),
+    {
+        reveal(PullBatchView::valid_suffix);
+    }
+}
+
+pub struct PendingBatchPull {
+    pub pull: InFlightRdmaPull,
+    pub route: PullGrantReturn,
+    pub status: Option<Result<(), i32>>,
+}
+
+/// Results carry request IDs since misses and rejected reservations can resolve
+/// before a posted read. On CQ or GPU visibility errors, pending pulls stay owned.
+pub struct FetchBatchPulls {
+    pub results: Vec<(u64, Result<FetchOutcome, CoreError>)>,
+    pub pending: Vec<PendingBatchPull>,
+    pub wait_error: Option<CoreError>,
+}
+
+pub open(crate) spec fn observed_batch_status(
+    p: &InFlightRdmaPull,
+    core: &CacheCore,
+    status: Result<(), i32>,
+) -> bool {
+    &&& p.completion_observed(core)
+    &&& core.citations().contains(p.writer@)
+    &&& status.is_ok() ==> event_succeeded(core.ledger_spec()@, core.node(), p.writer@)
+}
+
+proof fn lemma_batch_status_growth(
+    before: &CacheCore,
+    after: &CacheCore,
+    t: TimelineId,
+    retired: Option<FrameId>,
+)
+    requires
+        before.well_formed(),
+        after.well_formed(),
+        peer_core_step_except(before, after, t, retired),
+    ensures
+        before.citations().subset_of(after.citations()),
+        forall|p: InFlightRdmaPull, status: Result<(), i32>| #[trigger]
+            observed_batch_status(&p, before, status) ==> observed_batch_status(&p, after, status),
+{
+    hide(CacheCore::well_formed);
+    reveal(peer_core_step_except);
+    reveal(core_transition);
+    broadcast use {vstd::imap::group_imap_lemmas, vstd::iset::group_iset_lemmas};
+
+    assert forall|e: TransferEvent| #[trigger]
+        before.citations().contains(e) implies after.citations().contains(e) by {
+        assert(before.ledger_spec()@.submitted.dom().contains(e));
+        assert(before.ledger_spec()@.knows.set().contains((before.node(), e)));
+    }
+    assert(before.citations().subset_of(after.citations()));
+    assert forall|p: InFlightRdmaPull, status: Result<(), i32>| #[trigger]
+        observed_batch_status(&p, before, status) implies observed_batch_status(
+        &p,
+        after,
+        status,
+    ) by {
+        let writer = p.writer@;
+        assert(before.citations().contains(writer));
+        assert(after.citations().contains(writer));
+        assert(p.completion_observed(after));
+        if status.is_ok() && !writer.source.succeeds_on_observe() {
+            assert(before.ledger_spec()@.succeeded.dom().contains(writer));
+            assert(after.ledger_spec()@.succeeded.dom().contains(writer));
+        }
+    }
+}
+
 /// Combined RDMA backend + authenticated `Channel<T, VeriCacheAttachment>` session
 /// with one remote peer node.
+fn append_fetch_entries(queue: &mut Vec<(u64, ObjectKey)>, entries: &[(u64, ObjectKey)])
+    ensures
+        final(queue)@ == old(queue)@ + entries@,
+{
+    let mut i = 0;
+    while i < entries.len()
+        invariant
+            i <= entries.len(),
+            queue@ == old(queue)@ + entries@.take(i as int),
+        decreases entries.len() - i,
+    {
+        queue.push(entries[i]);
+        assert(queue@ =~= old(queue)@ + entries@.take(i + 1));
+        i += 1;
+    }
+    assert(entries@.take(i as int) =~= entries@);
+}
+
 pub struct PeerSession<'a, T: ByteTransport> {
-    pub rdma: RdmaBackend<'a>,
-    pub channel: Channel<T, VeriCacheAttachment>,
-    pub next_grant_tag: u64,
-    pub next_request_id: u64,
-    pub active_grants: Vec<ActiveGrant>,
-    pub pending_outbound_grants: Vec<PendingOutboundGrant>,
-    pub pending_inbound_fetches: Vec<(u64, ObjectKey)>,
-    pub pending_inbound_grants: Vec<PendingInboundGrant>,
-    pub pending_inbound_misses: Vec<u64>,
-    pub pending_revoke_notices: Vec<GrantTag>,
-    pub pending_revoke_acks: Vec<GrantTag>,
-    pub pending_reconnect_barriers: Vec<u64>,
-    pub quarantined_grants: Vec<(GrantTag, u32)>,
-    pub reconnect_epoch: u64,
-    pub peer_reconnect_epoch: u64,
+    pub(crate) rdma: RdmaBackend<'a>,
+    pub(crate) channel: Channel<T, VeriCacheAttachment>,
+    pub(crate) next_grant_tag: u64,
+    pub(crate) next_request_id: u64,
+    pub(crate) active_grants: Vec<ActiveGrant>,
+    pub(crate) pending_outbound_grants: Vec<PendingOutboundGrant>,
+    pub(crate) pending_inbound_fetches: Vec<(u64, ObjectKey)>,
+    pub(crate) pending_inbound_grants: Vec<PendingInboundGrant>,
+    pub(crate) pending_inbound_misses: Vec<u64>,
+    pub(crate) pending_revoke_notices: Vec<GrantTag>,
+    pub(crate) pending_revoke_acks: Vec<GrantTag>,
+    pub(crate) pending_reconnect_barriers: Vec<u64>,
+    pub(crate) quarantined_grants: Vec<(GrantTag, u32)>,
+    pub(crate) reconnect_epoch: u64,
+    pub(crate) peer_reconnect_epoch: u64,
+}
+
+impl<'a, T: ByteTransport> PeerSession<'a, T> {
+    pub open(crate) spec fn peer_reconnect_epoch_spec(&self) -> u64 {
+        self.peer_reconnect_epoch
+    }
+
+    pub open(crate) spec fn quarantined_grants_spec(&self) -> Vec<(GrantTag, u32)> {
+        self.quarantined_grants
+    }
+
+    pub open(crate) spec fn pending_reconnect_barriers_spec(&self) -> Vec<u64> {
+        self.pending_reconnect_barriers
+    }
+
+    pub open(crate) spec fn pending_revoke_acks_spec(&self) -> Vec<GrantTag> {
+        self.pending_revoke_acks
+    }
+
+    pub open(crate) spec fn pending_revoke_notices_spec(&self) -> Vec<GrantTag> {
+        self.pending_revoke_notices
+    }
+
+    pub open(crate) spec fn pending_inbound_misses_spec(&self) -> Vec<u64> {
+        self.pending_inbound_misses
+    }
+
+    pub open(crate) spec fn reconnect_epoch_spec(&self) -> u64 {
+        self.reconnect_epoch
+    }
+
+    pub open(crate) spec fn pending_inbound_grants_spec(&self) -> Vec<PendingInboundGrant> {
+        self.pending_inbound_grants
+    }
+
+    pub open(crate) spec fn pending_outbound_grants_spec(&self) -> Vec<PendingOutboundGrant> {
+        self.pending_outbound_grants
+    }
+
+    pub open(crate) spec fn active_grants_spec(&self) -> Vec<ActiveGrant> {
+        self.active_grants
+    }
+
+    pub open(crate) spec fn pending_inbound_fetches_spec(&self) -> Vec<(u64, ObjectKey)> {
+        self.pending_inbound_fetches
+    }
+
+    pub open(crate) spec fn channel_spec(&self) -> Channel<T, VeriCacheAttachment> {
+        self.channel
+    }
+
+    pub open(crate) spec fn next_grant_tag_spec(&self) -> u64 {
+        self.next_grant_tag
+    }
+
+    pub open(crate) spec fn rdma_spec(&self) -> RdmaBackend<'a> {
+        self.rdma
+    }
+
+    pub open(crate) spec fn next_request_id_spec(&self) -> u64 {
+        self.next_request_id
+    }
 }
 
 #[verifier::opaque]
@@ -1066,7 +1375,7 @@ pub open spec fn pull_tracked_or_done_state(
     })
 }
 
-pub open spec fn pull_tracked_or_done<'a>(
+pub open(crate) spec fn pull_tracked_or_done<'a>(
     rdma: &RdmaBackend<'a>,
     seq: u64,
     writer: TransferEvent,
@@ -1140,21 +1449,23 @@ proof fn lemma_pump_cq_all_preserves_pull_tracked<'a>(
 proof fn lemma_pull_retained_after_peer_step(
     prev: &CacheCore,
     next: &CacheCore,
-    rdma_tl: u8,
+    rdma_tl: TimelineId,
     copy: &crate::provenance::GuardedReplicaCopy,
+    retired: Option<FrameId>,
 )
     requires
         prev.well_formed(),
         next.well_formed(),
-        peer_core_step(prev, next, rdma_tl),
-        copy.retained(prev.ledger@, prev.node()),
+        peer_core_step_except(prev, next, rdma_tl, retired),
+        copy.retained(prev.ledger_spec()@, prev.node()),
     ensures
         prev.citations().subset_of(next.citations()),
         copy.before.citations(next.node()).subset_of(next.citations()),
-        copy.retained(next.ledger@, next.node()),
+        copy.retained(next.ledger_spec()@, next.node()),
 {
     hide(CacheCore::well_formed);
     reveal(peer_core_step_except);
+    reveal(core_transition);
     lemma_core_wf_facts(prev);
     lemma_core_wf_facts(next);
     broadcast use {
@@ -1166,27 +1477,28 @@ proof fn lemma_pull_retained_after_peer_step(
     assert(prev.citations().subset_of(next.citations())) by {
         assert forall|e: TransferEvent| #[trigger]
             prev.citations().contains(e) implies next.citations().contains(e) by {
-            assert(prev.ledger@.knows.set().contains((prev.node(), e)));
+            assert(prev.ledger_spec()@.knows.set().contains((prev.node(), e)));
         }
     }
     vstd::imap_lib::lemma_submap_of_trans(
         copy.before.submitted.map(),
-        prev.ledger@.submitted.map(),
-        next.ledger@.submitted.map(),
+        prev.ledger_spec()@.submitted.map(),
+        next.ledger_spec()@.submitted.map(),
     );
-    assert(revoked_submap(copy.before.revoked, next.ledger@.revoked)) by {
+    assert(revoked_submap(copy.before.revoked, next.ledger_spec()@.revoked)) by {
         assert forall|k: (SlotLoc, TransferShare)| #[trigger]
-            copy.before.revoked.dom().contains(k) implies (next.ledger@.revoked.dom().contains(k)
-            && next.ledger@.revoked.map()[k] == copy.before.revoked.map()[k]) by {
-            assert(prev.ledger@.revoked.dom().contains(k));
+            copy.before.revoked.dom().contains(k) implies (
+        next.ledger_spec()@.revoked.dom().contains(k) && next.ledger_spec()@.revoked.map()[k]
+            == copy.before.revoked.map()[k]) by {
+            assert(prev.ledger_spec()@.revoked.dom().contains(k));
         }
     }
-    assert(copy.before.succeeded.dom().subset_of(next.ledger@.succeeded.dom())) by {
+    assert(copy.before.succeeded.dom().subset_of(next.ledger_spec()@.succeeded.dom())) by {
         assert forall|e: TransferEvent| #[trigger]
-            copy.before.succeeded.dom().contains(e) implies next.ledger@.succeeded.dom().contains(
-            e,
-        ) by {
-            assert(prev.ledger@.succeeded.dom().contains(e));
+            copy.before.succeeded.dom().contains(
+                e,
+            ) implies next.ledger_spec()@.succeeded.dom().contains(e) by {
+            assert(prev.ledger_spec()@.succeeded.dom().contains(e));
         }
     }
     assert(copy.before.citations(next.node()).subset_of(next.citations())) by {
@@ -1195,16 +1507,18 @@ proof fn lemma_pull_retained_after_peer_step(
             assert(prev.citations().contains(e));
         }
     }
-    assert(next.ledger@.submitted.dom().contains(copy.writer));
-    assert(next.ledger@.submitted.dom().contains(copy.source.writer));
-    assert(next.ledger@.submitted.map()[copy.writer] == prev.ledger@.submitted.map()[copy.writer]);
-    assert(next.ledger@.submitted.map()[copy.writer].preds.subset_of(next.ledger@.submitted.dom()))
-        by {
+    assert(next.ledger_spec()@.submitted.dom().contains(copy.writer));
+    assert(next.ledger_spec()@.submitted.dom().contains(copy.source.writer));
+    assert(next.ledger_spec()@.submitted.map()[copy.writer]
+        == prev.ledger_spec()@.submitted.map()[copy.writer]);
+    assert(next.ledger_spec()@.submitted.map()[copy.writer].preds.subset_of(
+        next.ledger_spec()@.submitted.dom(),
+    )) by {
         assert forall|e: TransferEvent| #[trigger]
-            next.ledger@.submitted.map()[copy.writer].preds.contains(
+            next.ledger_spec()@.submitted.map()[copy.writer].preds.contains(
                 e,
-            ) implies next.ledger@.submitted.dom().contains(e) by {
-            assert(prev.ledger@.submitted.dom().contains(e));
+            ) implies next.ledger_spec()@.submitted.dom().contains(e) by {
+            assert(prev.ledger_spec()@.submitted.dom().contains(e));
         }
     }
 }
@@ -1215,14 +1529,16 @@ proof fn lemma_pull_valid_after_peer_step<'a>(
     prev_core: &CacheCore,
     next_core: &CacheCore,
     pull: &InFlightRdmaPull,
+    retired: Option<FrameId>,
 )
     requires
         prev_core.well_formed(),
         next_core.well_formed(),
-        peer_core_step(prev_core, next_core, prev_rdma.timeline_id),
-        next_core.timelines.count == prev_core.timelines.count,
-        next_core.timelines.events == prev_core.timelines.events,
-        next_core.timelines.next_seq == prev_core.timelines.next_seq,
+        peer_core_step_except(prev_core, next_core, prev_rdma.timeline_id, retired),
+        retired != Some(pull.handle.frame),
+        next_core.timelines_spec().count_spec() == prev_core.timelines_spec().count_spec(),
+        next_core.timelines_spec().events_spec() == prev_core.timelines_spec().events_spec(),
+        next_core.timelines_spec().next_seq_spec() == prev_core.timelines_spec().next_seq_spec(),
         next_rdma.timeline_id == prev_rdma.timeline_id,
         next_rdma.host_mr == prev_rdma.host_mr,
         next_rdma.gpu_mr == prev_rdma.gpu_mr,
@@ -1235,12 +1551,23 @@ proof fn lemma_pull_valid_after_peer_step<'a>(
 {
     hide(CacheCore::well_formed);
     reveal(peer_core_step_except);
+    reveal(core_transition);
     reveal(FrameTable::same_layout);
     reveal(FrameTable::preserves_initializing);
-    lemma_pull_retained_after_peer_step(prev_core, next_core, prev_rdma.timeline_id, &pull.copy@);
-    assert(next_core.timelines.issued(next_rdma.timeline_id, pull.wr_id));
-    assert(next_core.frames.meta(pull.handle.frame) == prev_core.frames.meta(pull.handle.frame));
-    assert(next_core.frames.frame(pull.handle.frame) == prev_core.frames.frame(pull.handle.frame));
+    lemma_pull_retained_after_peer_step(
+        prev_core,
+        next_core,
+        prev_rdma.timeline_id,
+        &pull.copy@,
+        retired,
+    );
+    assert(next_core.timelines_spec().issued(next_rdma.timeline_id, pull.wr_id));
+    assert(next_core.frames_spec().meta(pull.handle.frame) == prev_core.frames_spec().meta(
+        pull.handle.frame,
+    ));
+    assert(next_core.frames_spec().frame(pull.handle.frame) == prev_core.frames_spec().frame(
+        pull.handle.frame,
+    ));
     assert(next_rdma.effective_gpu_mr_spec() == prev_rdma.effective_gpu_mr_spec());
 }
 
@@ -1325,7 +1652,7 @@ enum BindAwaitStatus {
 }
 
 impl<'a, T: ByteTransport> PeerSession<'a, T> {
-    pub open spec fn session_queues_valid(&self, core: &CacheCore) -> bool {
+    pub open(crate) spec fn session_queues_valid(&self, core: &CacheCore) -> bool {
         &&& forall|i: int, j: int|
             0 <= i < j < self.pending_outbound_grants@.len() ==> (
             #[trigger] self.pending_outbound_grants@[i]).handle != (
@@ -1342,7 +1669,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             )
     }
 
-    pub open spec fn well_formed(&self, core: &CacheCore) -> bool {
+    pub open(crate) spec fn well_formed(&self, core: &CacheCore) -> bool {
         &&& self.rdma.well_formed(core)
         &&& self.channel.local() == core.node()
         &&& self.channel.peer() == self.rdma.peer_node
@@ -1357,19 +1684,34 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             0 <= i < self.active_grants@.len() ==> {
                 let g = #[trigger] self.active_grants@[i];
                 &&& g.grant_tag < self.next_grant_tag
-                &&& g.frame.0 < core.frames.metas.len()
+                &&& g.frame.0 < core.frames_spec().metas_spec().len()
                 &&& self.rdma.lease_index_spec(g.handle) matches Some(idx) && {
                     let lease = self.rdma.active_leases@[idx];
                     &&& lease.frame == g.frame
                     &&& lease.state == RemoteLeaseState::Bound
                     &&& self.channel.sent().contains_key(g.grant_tag)
                     &&& self.channel.sent()[g.grant_tag] == (GrantKind::ReadShare {
-                        slot: core.frames.frame(g.frame).slot,
+                        slot: core.frames_spec().frame(g.frame).slot,
                         share_id: lease.share@,
                     })
                 }
             }
         &&& self.session_queues_valid(core)
+    }
+
+    /// Take ownership of the RDMA backend after detaching this session.
+    pub fn into_rdma(self) -> (r: RdmaBackend<'a>)
+        ensures
+            r == self.rdma_spec(),
+    {
+        self.rdma
+    }
+
+    pub fn rdma(&self) -> (backend: &RdmaBackend<'a>)
+        ensures
+            *backend == self.rdma_spec(),
+    {
+        &self.rdma
     }
 
     pub fn new(
@@ -1381,19 +1723,19 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             core.well_formed(),
             rdma.well_formed(core),
             channel.local() == core.node(),
-            channel.peer() == rdma.peer_node,
+            channel.peer() == rdma.peer_node_spec(),
             channel.id() == core.instance_id(),
             channel.sent() == Map::<GrantTag, GrantKind>::empty(),
         ensures
             s.well_formed(core),
-            s.rdma == rdma,
-            s.channel == channel,
-            s.next_grant_tag == 1,
-            s.next_request_id == 1,
-            s.active_grants@.len() == 0,
-            s.pending_outbound_grants@.len() == 0,
-            s.pending_inbound_grants@.len() == 0,
-            s.reconnect_epoch == 0,
+            s.rdma_spec() == rdma,
+            s.channel_spec() == channel,
+            s.next_grant_tag_spec() == 1,
+            s.next_request_id_spec() == 1,
+            s.active_grants_spec()@.len() == 0,
+            s.pending_outbound_grants_spec()@.len() == 0,
+            s.pending_inbound_grants_spec()@.len() == 0,
+            s.reconnect_epoch_spec() == 0,
     {
         let _ = core;
         Self {
@@ -1416,7 +1758,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     }
 
     /// Receive and decode the next peer message using `Channel::recv_any` exclusively.
-    pub fn recv_message(
+    pub(crate) fn recv_message(
         &mut self,
         core: &CacheCore,
         Tracked(instance): Tracked<&TransferInstance>,
@@ -1471,7 +1813,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 &&& cap.slot_ref() == cert@.slot
                 &&& cert@.slot.is_full()
                 &&& cert@.bytes.len() == meta.frame_size
-                &&& share@.is_rdma_bound()
+                &&& share@.is_fenced()
                 &&& share@.instance_id() == core.instance_id()
                 &&& share@.loc() == cap.slot_ref().loc
                 &&& share@.frontier().last_writer == Some(cert@.writer)
@@ -1498,7 +1840,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 &&& final(self).channel.sent() == old(self).channel.sent().remove(tag)
                 &&& final(self).channel.received() == old(self).channel.received()
                 &&& old(self).channel.sent()[tag] matches GrantKind::ReadShare { slot, share_id }
-                    && share@.is_rdma_bound() && share@.instance_id() == core.instance_id()
+                    && share@.is_fenced() && share@.instance_id() == core.instance_id()
                     && share@.loc() == slot.loc && share@.share() == share_id
                     && transfer::transport::covers(share@.frontier(), statement@.closure())
                 &&& crate::provenance::complete_receipts_map(statement@.submitted)
@@ -1577,7 +1919,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     }
 
     /// Send a `ControlPayload` notice on `self.channel`.
-    pub fn send_control(
+    pub(crate) fn send_control(
         &mut self,
         core: &CacheCore,
         payload: ControlPayload,
@@ -1609,6 +1951,11 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(self).channel.sent() == old(self).channel.sent(),
             final(self).channel.received() == old(self).channel.received(),
     {
+        if let ControlPayload::FetchBatch { ref entries } = payload {
+            if entries.is_empty() || entries.len() > super::protocol::MAX_FETCH_BATCH {
+                return Err(ChannelError::InvalidFrame);
+            }
+        }
         let bytes = encode_control_payload(payload);
         let ghost cited = core.citations();
         let tracked att = VeriCacheAttachment::Control { payload };
@@ -1618,9 +1965,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         match self.channel.send_notice_with(
             &bytes,
             Tracked(instance),
-            Tracked(&core.ledger.borrow().submitted),
-            Tracked(&core.ledger.borrow().knows),
-            Tracked(&core.ledger.borrow().succeeded),
+            Tracked(&core.borrow_ledger().submitted),
+            Tracked(&core.borrow_ledger().knows),
+            Tracked(&core.borrow_ledger().succeeded),
             Ghost(cited),
             Tracked(att),
         ) {
@@ -1641,27 +1988,29 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             core.well_formed(),
             old(self).well_formed(core),
             instance.id() == core.instance_id(),
-            old(self).next_request_id < u64::MAX,
+            old(self).next_request_id_spec() < u64::MAX,
         ensures
             final(self).well_formed(core),
-            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
-            final(self).rdma.qp == old(self).rdma.qp,
-            final(self).rdma == old(self).rdma,
-            final(self).next_grant_tag == old(self).next_grant_tag,
-            final(self).active_grants == old(self).active_grants,
-            final(self).pending_outbound_grants == old(self).pending_outbound_grants,
-            final(self).pending_inbound_fetches == old(self).pending_inbound_fetches,
-            final(self).pending_inbound_grants == old(self).pending_inbound_grants,
-            final(self).pending_inbound_misses == old(self).pending_inbound_misses,
-            final(self).pending_revoke_notices == old(self).pending_revoke_notices,
-            final(self).pending_revoke_acks == old(self).pending_revoke_acks,
-            final(self).pending_reconnect_barriers == old(self).pending_reconnect_barriers,
-            final(self).quarantined_grants == old(self).quarantined_grants,
-            final(self).reconnect_epoch == old(self).reconnect_epoch,
-            final(self).peer_reconnect_epoch == old(self).peer_reconnect_epoch,
-            final(self).channel.same_session(old(self).channel),
-            final(self).channel.sent() == old(self).channel.sent(),
-            final(self).channel.received() == old(self).channel.received(),
+            final(self).rdma_spec().timeline_id_spec() == old(self).rdma_spec().timeline_id_spec(),
+            final(self).rdma_spec().qp_spec() == old(self).rdma_spec().qp_spec(),
+            final(self).rdma_spec() == old(self).rdma_spec(),
+            final(self).next_grant_tag_spec() == old(self).next_grant_tag_spec(),
+            final(self).active_grants_spec() == old(self).active_grants_spec(),
+            final(self).pending_outbound_grants_spec() == old(self).pending_outbound_grants_spec(),
+            final(self).pending_inbound_fetches_spec() == old(self).pending_inbound_fetches_spec(),
+            final(self).pending_inbound_grants_spec() == old(self).pending_inbound_grants_spec(),
+            final(self).pending_inbound_misses_spec() == old(self).pending_inbound_misses_spec(),
+            final(self).pending_revoke_notices_spec() == old(self).pending_revoke_notices_spec(),
+            final(self).pending_revoke_acks_spec() == old(self).pending_revoke_acks_spec(),
+            final(self).pending_reconnect_barriers_spec() == old(
+                self,
+            ).pending_reconnect_barriers_spec(),
+            final(self).quarantined_grants_spec() == old(self).quarantined_grants_spec(),
+            final(self).reconnect_epoch_spec() == old(self).reconnect_epoch_spec(),
+            final(self).peer_reconnect_epoch_spec() == old(self).peer_reconnect_epoch_spec(),
+            final(self).channel_spec().same_session(old(self).channel_spec()),
+            final(self).channel_spec().sent() == old(self).channel_spec().sent(),
+            final(self).channel_spec().received() == old(self).channel_spec().received(),
     {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
@@ -1671,6 +2020,55 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             Tracked(instance),
         )?;
         Ok(request_id)
+    }
+
+    /// Allocate consecutive request IDs and emit a single fetch notice.
+    pub(crate) fn send_fetch_batch(
+        &mut self,
+        core: &CacheCore,
+        keys: &[ObjectKey],
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<u64, ChannelError<T::Error>>)
+        requires
+            core.well_formed(),
+            old(self).well_formed(core),
+            instance.id() == core.instance_id(),
+        ensures
+            final(self).well_formed(core),
+            final(self).rdma == old(self).rdma,
+            final(self).channel.same_session(old(self).channel),
+            final(self).channel.sent() == old(self).channel.sent(),
+            final(self).channel.received() == old(self).channel.received(),
+            final(self).active_grants == old(self).active_grants,
+            final(self).pending_outbound_grants == old(self).pending_outbound_grants,
+            final(self).pending_inbound_grants == old(self).pending_inbound_grants,
+            final(self).pending_inbound_fetches == old(self).pending_inbound_fetches,
+            r matches Ok(base) ==> base == old(self).next_request_id && final(self).next_request_id
+                == base + keys.len(),
+    {
+        if keys.is_empty() || keys.len() > super::protocol::MAX_FETCH_BATCH {
+            return Err(ChannelError::InvalidFrame);
+        }
+        let base = self.next_request_id;
+        if keys.len() as u64 > u64::MAX - base {
+            return Err(ChannelError::InvalidFrame);
+        }
+        let mut entries = Vec::with_capacity(keys.len());
+        let mut i = 0;
+        while i < keys.len()
+            invariant
+                i == entries.len() <= keys.len(),
+                base + keys.len() <= u64::MAX,
+                forall|j: int|
+                    0 <= j < i ==> #[trigger] entries@[j] == ((base + j) as u64, keys@[j]),
+            decreases keys.len() - i,
+        {
+            entries.push((base + i as u64, keys[i]));
+            i += 1;
+        }
+        self.next_request_id = base + keys.len() as u64;
+        self.send_control(core, ControlPayload::FetchBatch { entries }, Tracked(instance))?;
+        Ok(base)
     }
 
     fn find_grant_index(&self, grant_tag: GrantTag) -> (r: Option<usize>)
@@ -1699,7 +2097,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
 
     /// Lease `handle` is in `RemoteLeaseState::Binding` for `frame` with retained
     /// `ShareCap` last writer `writer` (whether or not the bind CQE has been reaped).
-    pub open spec fn lease_is_binding(
+    pub open(crate) spec fn lease_is_binding(
         &self,
         handle: RemoteLeaseHandle,
         frame: FrameId,
@@ -1716,7 +2114,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     }
 
     /// Lease `handle` is a pending MW bind of `frame` whose bind WR is still in flight.
-    pub open spec fn binding_lease(
+    pub open(crate) spec fn binding_lease(
         &self,
         handle: RemoteLeaseHandle,
         frame: FrameId,
@@ -1738,7 +2136,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         frame: FrameId,
         Tracked(shares): Tracked<&mut ShareSource>,
         Tracked(instance): Tracked<&TransferInstance>,
-    ) -> (r: Option<(RemoteLeaseHandle, u64)>)
+    ) -> (r: Result<(RemoteLeaseHandle, u64), CoreError>)
         requires
             old(core).well_formed(),
             old(self).well_formed(old(core)),
@@ -1754,13 +2152,13 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).spec == old(core).spec,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines == old(core).timelines,
-            final(core).frames.same_directory(&old(core).frames),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec() == old(core).timelines_spec(),
+            final(core).frames_spec().same_directory(&old(core).frames_spec()),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -1791,9 +2189,93 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(self).quarantined_grants == old(self).quarantined_grants,
             final(self).reconnect_epoch == old(self).reconnect_epoch,
             final(self).peer_reconnect_epoch == old(self).peer_reconnect_epoch,
-            r matches Some((handle, wr_id)) ==> {
+            r matches Ok((handle, wr_id)) ==> {
                 &&& old(self).rdma.lease_index_spec(handle) is None
-                &&& final(core).frames.published(frame) matches Some((_, _, c, _))
+                &&& final(core).frames_spec().published(frame) matches Some((_, _, c, _))
+                    && final(self).binding_lease(handle, frame, wr_id, c.writer)
+            },
+    {
+        let mut reserved = None;
+        self.serve_bind_with(core, frame, Tracked(shares), Tracked(instance), false, &mut reserved)
+    }
+
+    #[verifier::rlimit(250)]
+    fn serve_bind_with(
+        &mut self,
+        core: &mut CacheCore,
+        frame: FrameId,
+        Tracked(shares): Tracked<&mut ShareSource>,
+        Tracked(instance): Tracked<&TransferInstance>,
+        prepare: bool,
+        reserved: &mut Option<PreparedLeaseBind>,
+    ) -> (r: Result<(RemoteLeaseHandle, u64), CoreError>)
+        requires
+            old(core).well_formed(),
+            old(reserved).is_none(),
+            old(self).well_formed(old(core)),
+            old(self).rdma.qp.ready(),
+            old(self).rdma.qp.state() is ReadyToSend,
+            instance.id() == old(core).instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(core).instance_id(),
+            old(shares).node() == old(core).node(),
+        ensures
+            final(core).well_formed(),
+            final(self).well_formed(final(core)),
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).instance_id() == old(core).instance_id(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec() == old(core).timelines_spec(),
+            final(core).frames_spec().same_directory(&old(core).frames_spec()),
+            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
+            final(self).rdma.qp == old(self).rdma.qp,
+            final(core).frames_spec().same_directory(&old(core).frames_spec()),
+            bind_reservations_preserved(&old(self).rdma, &final(self).rdma),
+            r.is_err() ==> final(reserved).is_none(),
+            r.is_ok() ==> {
+                &&& final(reserved).is_some() == prepare
+                &&& (*final(reserved) matches Some(p) ==> p.frame == frame && p.valid(
+                    &final(self).rdma,
+                    final(core),
+                ) && old(self).rdma.next_control_wr_id <= p.bind.id() && p.bind.id()
+                    < final(self).rdma.next_control_wr_id)
+            },
+            final(self).rdma.peer_node == old(self).rdma.peer_node,
+            final(self).rdma.host_mr == old(self).rdma.host_mr,
+            final(self).rdma.gpu_mr == old(self).rdma.gpu_mr,
+            final(self).rdma.shared_host_mr == old(self).rdma.shared_host_mr,
+            final(self).rdma.shared_gpu_mr == old(self).rdma.shared_gpu_mr,
+            final(self).rdma.pending() == old(self).rdma.pending(),
+            final(self).rdma.completed_pulls == old(self).rdma.completed_pulls,
+            final(self).channel == old(self).channel,
+            final(self).next_grant_tag == old(self).next_grant_tag,
+            final(self).next_request_id == old(self).next_request_id,
+            final(self).active_grants == old(self).active_grants,
+            final(self).pending_outbound_grants == old(self).pending_outbound_grants,
+            final(self).pending_inbound_fetches == old(self).pending_inbound_fetches,
+            final(self).pending_inbound_grants == old(self).pending_inbound_grants,
+            final(self).pending_inbound_misses == old(self).pending_inbound_misses,
+            final(self).pending_revoke_notices == old(self).pending_revoke_notices,
+            final(self).pending_revoke_acks == old(self).pending_revoke_acks,
+            final(self).pending_reconnect_barriers == old(self).pending_reconnect_barriers,
+            final(self).quarantined_grants == old(self).quarantined_grants,
+            final(self).reconnect_epoch == old(self).reconnect_epoch,
+            final(self).peer_reconnect_epoch == old(self).peer_reconnect_epoch,
+            r matches Ok((handle, wr_id)) ==> {
+                &&& old(self).rdma.lease_index_spec(handle) is None
+                &&& final(core).frames_spec().published(frame) matches Some((_, _, c, _))
                     && final(self).binding_lease(handle, frame, wr_id, c.writer)
             },
     {
@@ -1802,20 +2284,27 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         hide(complete_receipts);
         let ghost before_leases = self.rdma.active_leases@;
         let ghost before_core = *core;
-        match self.rdma.bind_remote_read_lease(core, frame, Tracked(shares), Tracked(instance)) {
+        match self.rdma.bind_remote_read_lease_with(
+            core,
+            frame,
+            Tracked(shares),
+            Tracked(instance),
+            prepare,
+            reserved,
+        ) {
             Ok((handle, _mw_slot, _gen, bind_wr_id)) => {
                 proof {
                     assert forall|i: int| 0 <= i < self.active_grants@.len() implies {
                         let g = #[trigger] self.active_grants@[i];
                         &&& g.grant_tag < self.next_grant_tag
-                        &&& g.frame.0 < core.frames.metas.len()
+                        &&& g.frame.0 < core.frames_spec().metas_spec().len()
                         &&& self.rdma.lease_index_spec(g.handle) matches Some(idx) && {
                             let lease = self.rdma.active_leases@[idx];
                             &&& lease.frame == g.frame
                             &&& lease.state == RemoteLeaseState::Bound
                             &&& self.channel.sent().contains_key(g.grant_tag)
                             &&& self.channel.sent()[g.grant_tag] == (GrantKind::ReadShare {
-                                slot: core.frames.frame(g.frame).slot,
+                                slot: core.frames_spec().frame(g.frame).slot,
                                 share_id: lease.share@,
                             })
                         }
@@ -1864,7 +2353,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                             bidx,
                         );
                     }
-                    assert(core.frames.same_layout(&before_core.frames)) by {
+                    assert(core.frames_spec().same_layout(&before_core.frames_spec())) by {
                         reveal(FrameTable::same_directory);
                         reveal(FrameTable::same_layout);
                     }
@@ -1877,21 +2366,23 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                     );
                     reveal(rdma_leases_valid);
                     reveal(peer_core_step_except);
+                    reveal(core_transition);
                     reveal(FrameTable::same_directory);
                     reveal(FrameTable::same_layout);
                     reveal(FrameTable::preserves_initializing);
                 }
-                Some((handle, bind_wr_id))
+                Ok((handle, bind_wr_id))
             },
-            Err(_) => {
+            Err(e) => {
                 proof {
                     reveal(rdma_leases_valid);
                     reveal(peer_core_step_except);
+                    reveal(core_transition);
                     reveal(FrameTable::same_directory);
                     reveal(FrameTable::same_layout);
                     reveal(FrameTable::preserves_initializing);
                 }
-                None
+                Err(e)
             },
         }
     }
@@ -1915,23 +2406,27 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         ensures
             final(core).well_formed(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames == old(core).frames,
-            final(core).catalog == old(core).catalog,
-            final(core).spec == old(core).spec,
-            final(core).next_version_seq == old(core).next_version_seq,
-            final(core).version_seq_limit == old(core).version_seq_limit,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines.count == old(core).timelines.count,
-            final(core).timelines.kinds == old(core).timelines.kinds,
-            final(core).timelines.events == old(core).timelines.events,
-            final(core).timelines.next_seq == old(core).timelines.next_seq,
-            final(core).ledger@.submitted == old(core).ledger@.submitted,
-            final(core).ledger@.revoked == old(core).ledger@.revoked,
-            old(core).ledger@.knows.set().subset_of(final(core).ledger@.knows.set()),
-            old(core).ledger@.succeeded.dom().subset_of(final(core).ledger@.succeeded.dom()),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec() == old(core).frames_spec(),
+            final(core).catalog_spec() == old(core).catalog_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            final(core).version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
+            final(core).ledger_spec()@.submitted == old(core).ledger_spec()@.submitted,
+            final(core).ledger_spec()@.revoked == old(core).ledger_spec()@.revoked,
+            old(core).ledger_spec()@.knows.set().subset_of(final(core).ledger_spec()@.knows.set()),
+            old(core).ledger_spec()@.succeeded.dom().subset_of(
+                final(core).ledger_spec()@.succeeded.dom(),
+            ),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -1994,23 +2489,25 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 core.well_formed(),
                 self.well_formed(core),
                 instance.id() == core.instance_id(),
-                core.node_id == old(core).node_id,
+                core.node_id_spec() == old(core).node_id_spec(),
                 core.instance_id() == old(core).instance_id(),
-                core.tiers == old(core).tiers,
-                core.frames == old(core).frames,
-                core.catalog == old(core).catalog,
-                core.spec == old(core).spec,
-                core.next_version_seq == old(core).next_version_seq,
-                core.version_seq_limit == old(core).version_seq_limit,
-                core.version_registry == old(core).version_registry,
-                core.timelines.count == old(core).timelines.count,
-                core.timelines.kinds == old(core).timelines.kinds,
-                core.timelines.events == old(core).timelines.events,
-                core.timelines.next_seq == old(core).timelines.next_seq,
-                core.ledger@.submitted == old(core).ledger@.submitted,
-                core.ledger@.revoked == old(core).ledger@.revoked,
-                old(core).ledger@.knows.set().subset_of(core.ledger@.knows.set()),
-                old(core).ledger@.succeeded.dom().subset_of(core.ledger@.succeeded.dom()),
+                core.tiers_spec() == old(core).tiers_spec(),
+                core.frames_spec() == old(core).frames_spec(),
+                core.catalog_spec() == old(core).catalog_spec(),
+                core.spec_spec() == old(core).spec_spec(),
+                core.next_version_seq_spec() == old(core).next_version_seq_spec(),
+                core.version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+                core.version_registry_spec() == old(core).version_registry_spec(),
+                core.timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+                core.timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+                core.timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+                core.timelines_spec().next_seq_spec() == old(core).timelines_spec().next_seq_spec(),
+                core.ledger_spec()@.submitted == old(core).ledger_spec()@.submitted,
+                core.ledger_spec()@.revoked == old(core).ledger_spec()@.revoked,
+                old(core).ledger_spec()@.knows.set().subset_of(core.ledger_spec()@.knows.set()),
+                old(core).ledger_spec()@.succeeded.dom().subset_of(
+                    core.ledger_spec()@.succeeded.dom(),
+                ),
                 peer_core_step(old(core), core, old(self).rdma.timeline_id),
                 peer_foreign_shares_preserved(
                     old(core),
@@ -2085,14 +2582,14 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                         assert forall|i: int| 0 <= i < self.active_grants@.len() implies {
                             let g = #[trigger] self.active_grants@[i];
                             &&& g.grant_tag < self.next_grant_tag
-                            &&& g.frame.0 < core.frames.metas.len()
+                            &&& g.frame.0 < core.frames_spec().metas_spec().len()
                             &&& self.rdma.lease_index_spec(g.handle) matches Some(idx) && {
                                 let lease = self.rdma.active_leases@[idx];
                                 &&& lease.frame == g.frame
                                 &&& lease.state == RemoteLeaseState::Bound
                                 &&& self.channel.sent().contains_key(g.grant_tag)
                                 &&& self.channel.sent()[g.grant_tag] == (GrantKind::ReadShare {
-                                    slot: core.frames.frame(g.frame).slot,
+                                    slot: core.frames_spec().frame(g.frame).slot,
                                     share_id: lease.share@,
                                 })
                             }
@@ -2104,7 +2601,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                             assert(step_leases[oidx].state == RemoteLeaseState::Bound);
                             assert(!step_leases[oidx].has_active_wr());
                         }
-                        assert(core.frames.same_layout(&step_core.frames)) by {
+                        assert(core.frames_spec().same_layout(&step_core.frames_spec())) by {
                             reveal(FrameTable::same_layout);
                         }
                         assert forall|i: int| 0 <= i < self.pending_outbound_grants@.len() implies {
@@ -2179,7 +2676,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             old(self).rdma.qp.state() is ReadyToSend,
             instance.id() == core.instance_id(),
             old(self).next_grant_tag < u64::MAX,
-            frame.0 < core.frames.metas.len(),
+            frame.0 < core.frames_spec().metas_spec().len(),
             old(self).rdma.lease_index_spec(handle) matches Some(idx) && {
                 let lease = old(self).rdma.active_leases@[idx];
                 &&& lease.frame == frame
@@ -2193,16 +2690,18 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                     self,
                 ).pending_outbound_grants@[i]).handle != handle,
             revoked.instance_id() == core.instance_id(),
-            bind_sub.map().submap_of(core.ledger@.submitted.map()),
-            bind_succ.dom().subset_of(core.ledger@.succeeded.dom()),
+            bind_sub.map().submap_of(core.ledger_spec()@.submitted.map()),
+            bind_succ.dom().subset_of(core.ledger_spec()@.succeeded.dom()),
             forall|e: TransferEvent| #[trigger]
-                bind_facts.contains(e) ==> core.ledger@.submitted.map().contains_key(e)
-                    && core.ledger@.knows.set().contains((core.node(), e)),
+                bind_facts.contains(e) ==> core.ledger_spec()@.submitted.map().contains_key(e)
+                    && core.ledger_spec()@.knows.set().contains((core.node(), e)),
             bind_facts.contains(cert.writer),
-            cert.slot == core.frames.frame(frame).slot,
+            cert.slot == core.frames_spec().frame(frame).slot,
             cert.slot.is_full(),
             cert.slot.well_formed(),
-            cert.bytes.len() == core.frames.tier_frame_size(core.frames.frame(frame).tier) as u64,
+            cert.bytes.len() == core.frames_spec().tier_frame_size(
+                core.frames_spec().frame(frame).tier,
+            ) as u64,
             super::protocol::statement_replica_valid(
                 bind_sub,
                 bind_succ,
@@ -2216,15 +2715,17 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         ensures
             final(core).well_formed(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames.versions@ == old(core).frames.versions@,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines.count == old(core).timelines.count,
-            final(core).timelines.kinds == old(core).timelines.kinds,
-            final(core).timelines.events == old(core).timelines.events,
-            final(core).timelines.next_seq == old(core).timelines.next_seq,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -2269,7 +2770,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         }
         let (cap, Tracked(share_cap)) = self.rdma.complete_ready_bind(core, handle)?;
         proof {
-            assert(core.frames.same_directory(&core.frames)) by {
+            assert(core.frames_spec().same_directory(&core.frames_spec())) by {
                 reveal(FrameTable::same_directory);
             };
             Self::lemma_session_wf_after_outbound_lease_update(
@@ -2287,12 +2788,12 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             lemma_core_wf_facts(core);
             lemma_initializing_frame_slot_valid(core, frame);
         }
-        let (_, frame_tier) = core.frames.bindings[frame.0 as usize];
+        let (_, frame_tier) = core.frame_binding(frame).unwrap();
         let meta = ReadGrantMeta {
             request_id,
             key,
             version,
-            frame_size: core.tier_frame_size(frame_tier) as u64,
+            frame_size: core.registered_tier_frame_size(frame_tier) as u64,
         };
         let meta_bytes = encode_read_grant_meta(meta);
         let ghost cited = core.citations();
@@ -2322,9 +2823,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             &cap,
             &meta_bytes,
             Tracked(instance),
-            Tracked(&core.ledger.borrow().submitted),
-            Tracked(&core.ledger.borrow().knows),
-            Tracked(&core.ledger.borrow().succeeded),
+            Tracked(&core.borrow_ledger().submitted),
+            Tracked(&core.borrow_ledger().knows),
+            Tracked(&core.borrow_ledger().succeeded),
             Ghost(cited),
             Tracked(share_cap),
             Tracked(att),
@@ -2444,10 +2945,10 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             core.well_formed(),
         ensures
             r matches Some((f, version)) ==> {
-                &&& f.0 < core.frames.metas.len()
-                &&& core.frames.meta(f).state == STATE_PUBLISHED
-                &&& core.frames.frame(f).bound_key == Some(key)
-                &&& core.frames.frame(f).bound_version == Some(version)
+                &&& f.0 < core.frames_spec().metas_spec().len()
+                &&& core.frames_spec().meta(f).state == STATE_PUBLISHED
+                &&& core.frames_spec().frame(f).bound_key == Some(key)
+                &&& core.frames_spec().frame(f).bound_version == Some(version)
             },
     {
         match core.lookup_tier(key, primary_tier) {
@@ -2462,7 +2963,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     /// Donor-side handler for `FetchRequest { request_id, key }` checking `primary_tier`
     /// first and optionally falling back to `fallback_tier` (e.g., GPU HBM -> Host DRAM).
     #[verifier::rlimit(250)]
-    pub fn serve_fetch_request_multi(
+    pub(crate) fn serve_fetch_request_multi(
         &mut self,
         core: &mut CacheCore,
         primary_tier: TierId,
@@ -2490,10 +2991,10 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).version_registry == old(core).version_registry,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -2533,7 +3034,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         };
         let ghost before_bind_core = *core;
         let ghost before_bind_self = *self;
-        let Some((handle, bind_wr_id)) = self.serve_bind(
+        let Ok((handle, bind_wr_id)) = self.serve_bind(
             core,
             frame,
             Tracked(shares),
@@ -2556,22 +3057,24 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             lemma_published_frame_slot_valid(core, frame);
             lemma_initializing_frame_slot_valid(core, frame);
             lemma_citations_closure(core);
-            assert(core.frames.published(frame) == before_bind_core.frames.published(frame));
+            assert(core.frames_spec().published(frame) == before_bind_core.frames_spec().published(
+                frame,
+            ));
         }
-        let (_, frame_tier) = core.frames.bindings[frame.0 as usize];
-        let frame_size = core.tier_frame_size(frame_tier) as u64;
-        let ghost cert = core.frames.published(frame).unwrap().2;
-        let ghost bind_sub = core.ledger@.submitted;
-        let ghost bind_succ = core.ledger@.succeeded;
-        let tracked bind_revoked = instance.duplicate_revoked(&core.ledger.borrow().revoked);
+        let (_, frame_tier) = core.frame_binding(frame).unwrap();
+        let frame_size = core.registered_tier_frame_size(frame_tier) as u64;
+        let ghost cert = core.frames_spec().published(frame).unwrap().2;
+        let ghost bind_sub = core.ledger_spec()@.submitted;
+        let ghost bind_succ = core.ledger_spec()@.succeeded;
+        let tracked bind_revoked = instance.duplicate_revoked(&core.borrow_ledger().revoked);
         let ghost bind_facts = core.citations();
         let Tracked(version_binding) = core.version_binding_for(version);
         proof {
-            lemma_replica_valid_to_statement(core.ledger@, core.node(), cert);
+            lemma_replica_valid_to_statement(core.ledger_spec()@, core.node(), cert);
             super::protocol::lemma_statement_replica_valid_revoked_ext(
-                core.ledger@.submitted,
-                core.ledger@.succeeded,
-                core.ledger@.revoked,
+                core.ledger_spec()@.submitted,
+                core.ledger_spec()@.succeeded,
+                core.ledger_spec()@.revoked,
                 bind_revoked,
                 core.citations(),
                 cert,
@@ -2666,6 +3169,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                         );
                         assert(peer_core_step(&pre_fail_core, core, self.rdma.timeline_id)) by {
                             reveal(peer_core_step_except);
+                            reveal(core_transition);
                             reveal(FrameTable::same_directory);
                             reveal(FrameTable::same_layout);
                         };
@@ -2756,7 +3260,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     /// invalidating the bound MW (pumping CQ for `WindowInvalidated` without
     /// dropping any unrelated completions).
     #[verifier::rlimit(250)]
-    pub fn handle_read_release(
+    pub(crate) fn handle_read_release(
         &mut self,
         core: &mut CacheCore,
         grant_tag: GrantTag,
@@ -2789,7 +3293,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 0 <= i < old(self).active_grants@.len() ==> {
                     let g = #[trigger] old(self).active_grants@[i];
                     &&& g.grant_tag < old(self).next_grant_tag
-                    &&& g.frame.0 < old(core).frames.metas.len()
+                    &&& g.frame.0 < old(core).frames_spec().metas_spec().len()
                     &&& old(self).rdma.lease_index_spec(g.handle) matches Some(idx) && {
                         let lease = old(self).rdma.active_leases@[idx];
                         &&& lease.frame == g.frame
@@ -2797,12 +3301,12 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                         &&& (g.grant_tag != grant_tag ==> old(self).channel.sent().contains_key(
                             g.grant_tag,
                         ) && old(self).channel.sent()[g.grant_tag] == (GrantKind::ReadShare {
-                            slot: old(core).frames.frame(g.frame).slot,
+                            slot: old(core).frames_spec().frame(g.frame).slot,
                             share_id: lease.share@,
                         }))
-                        &&& (g.grant_tag == grant_tag ==> share_cap.is_rdma_bound()
+                        &&& (g.grant_tag == grant_tag ==> share_cap.is_fenced()
                             && share_cap.instance_id() == old(core).instance_id() && share_cap.loc()
-                            == old(core).frames.frame(g.frame).slot.loc && share_cap.share()
+                            == old(core).frames_spec().frame(g.frame).slot.loc && share_cap.share()
                             == lease.share@ && transfer::transport::covers(
                             share_cap.frontier(),
                             statement.closure(),
@@ -2812,15 +3316,17 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         ensures
             final(core).well_formed(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames.versions@ == old(core).frames.versions@,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines.count == old(core).timelines.count,
-            final(core).timelines.kinds == old(core).timelines.kinds,
-            final(core).timelines.events == old(core).timelines.events,
-            final(core).timelines.next_seq == old(core).timelines.next_seq,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -3000,15 +3506,17 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         ensures
             final(core).well_formed(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames.versions@ == old(core).frames.versions@,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines.count == old(core).timelines.count,
-            final(core).timelines.kinds == old(core).timelines.kinds,
-            final(core).timelines.events == old(core).timelines.events,
-            final(core).timelines.next_seq == old(core).timelines.next_seq,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -3051,23 +3559,25 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 core.well_formed(),
                 self.well_formed(core),
                 instance.id() == core.instance_id(),
-                core.node_id == old(core).node_id,
+                core.node_id_spec() == old(core).node_id_spec(),
                 core.instance_id() == old(core).instance_id(),
-                core.tiers == old(core).tiers,
-                core.frames == old(core).frames,
-                core.catalog == old(core).catalog,
-                core.spec == old(core).spec,
-                core.next_version_seq == old(core).next_version_seq,
-                core.version_seq_limit == old(core).version_seq_limit,
-                core.version_registry == old(core).version_registry,
-                core.timelines.count == old(core).timelines.count,
-                core.timelines.kinds == old(core).timelines.kinds,
-                core.timelines.events == old(core).timelines.events,
-                core.timelines.next_seq == old(core).timelines.next_seq,
-                core.ledger@.submitted == old(core).ledger@.submitted,
-                core.ledger@.revoked == old(core).ledger@.revoked,
-                old(core).ledger@.knows.set().subset_of(core.ledger@.knows.set()),
-                old(core).ledger@.succeeded.dom().subset_of(core.ledger@.succeeded.dom()),
+                core.tiers_spec() == old(core).tiers_spec(),
+                core.frames_spec() == old(core).frames_spec(),
+                core.catalog_spec() == old(core).catalog_spec(),
+                core.spec_spec() == old(core).spec_spec(),
+                core.next_version_seq_spec() == old(core).next_version_seq_spec(),
+                core.version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+                core.version_registry_spec() == old(core).version_registry_spec(),
+                core.timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+                core.timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+                core.timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+                core.timelines_spec().next_seq_spec() == old(core).timelines_spec().next_seq_spec(),
+                core.ledger_spec()@.submitted == old(core).ledger_spec()@.submitted,
+                core.ledger_spec()@.revoked == old(core).ledger_spec()@.revoked,
+                old(core).ledger_spec()@.knows.set().subset_of(core.ledger_spec()@.knows.set()),
+                old(core).ledger_spec()@.succeeded.dom().subset_of(
+                    core.ledger_spec()@.succeeded.dom(),
+                ),
                 peer_core_step(old(core), core, old(self).rdma.timeline_id),
                 peer_foreign_shares_preserved(
                     old(core),
@@ -3135,13 +3645,14 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                             core,
                             self.rdma.timeline_id,
                         );
-                        assert(old(core).ledger@.knows.set().subset_of(core.ledger@.knows.set()))
-                            by {
+                        assert(old(core).ledger_spec()@.knows.set().subset_of(
+                            core.ledger_spec()@.knows.set(),
+                        )) by {
                             broadcast use vstd::iset::group_iset_lemmas;
 
                         };
-                        assert(old(core).ledger@.succeeded.dom().subset_of(
-                            core.ledger@.succeeded.dom(),
+                        assert(old(core).ledger_spec()@.succeeded.dom().subset_of(
+                            core.ledger_spec()@.succeeded.dom(),
                         )) by {
                             broadcast use vstd::iset::group_iset_lemmas;
 
@@ -3163,14 +3674,14 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                         assert forall|i: int| 0 <= i < self.active_grants@.len() implies {
                             let g = #[trigger] self.active_grants@[i];
                             &&& g.grant_tag < self.next_grant_tag
-                            &&& g.frame.0 < core.frames.metas.len()
+                            &&& g.frame.0 < core.frames_spec().metas_spec().len()
                             &&& self.rdma.lease_index_spec(g.handle) matches Some(idx) && {
                                 let lease = self.rdma.active_leases@[idx];
                                 &&& lease.frame == g.frame
                                 &&& lease.state == RemoteLeaseState::Bound
                                 &&& self.channel.sent().contains_key(g.grant_tag)
                                 &&& self.channel.sent()[g.grant_tag] == (GrantKind::ReadShare {
-                                    slot: core.frames.frame(g.frame).slot,
+                                    slot: core.frames_spec().frame(g.frame).slot,
                                     share_id: lease.share@,
                                 })
                             }
@@ -3181,7 +3692,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                             assert(step_leases[oidx].state == RemoteLeaseState::Bound);
                             assert(!step_leases[oidx].has_active_wr());
                         }
-                        assert(core.frames.same_layout(&step_core.frames)) by {
+                        assert(core.frames_spec().same_layout(&step_core.frames_spec())) by {
                             reveal(FrameTable::same_layout);
                         }
                         lemma_outbound_grants_preserved(
@@ -3213,15 +3724,15 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     pub fn revoke_lease_unilateral(
         &mut self,
         core: &mut CacheCore,
-        host: &mut HostContext,
+        host: &mut SyncContext,
         grant_tag: GrantTag,
         Tracked(instance): Tracked<&TransferInstance>,
     ) -> (r: Result<u32, CoreError>)
         requires
             old(core).well_formed(),
             old(self).well_formed(old(core)),
-            old(self).rdma.qp.ready(),
-            old(self).rdma.qp.state() is ReadyToSend,
+            old(self).rdma_spec().qp_spec().ready(),
+            old(self).rdma_spec().qp_spec().state() is ReadyToSend,
             old(host).ready(old(core).instance_id(), old(core).node()),
             instance.id() == old(core).instance_id(),
         ensures
@@ -3229,21 +3740,23 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(self).well_formed(final(core)),
             final(host).ready(final(core).instance_id(), final(core).node()),
             final(host).source@.source() == old(host).source@.source(),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames.versions@ == old(core).frames.versions@,
-            final(core).version_registry == old(core).version_registry,
-            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            peer_core_step(old(core), final(core), old(self).rdma_spec().timeline_id_spec()),
             peer_foreign_shares_preserved(
                 old(core),
                 final(core),
-                old(self).rdma.active_leases@,
-                final(self).rdma.active_leases@,
+                old(self).rdma_spec().active_leases_spec()@,
+                final(self).rdma_spec().active_leases_spec()@,
             ),
-            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
-            final(self).rdma.qp == old(self).rdma.qp,
-            r.is_ok() ==> final(self).active_grants@.len() + 1 == old(self).active_grants@.len(),
+            final(self).rdma_spec().timeline_id_spec() == old(self).rdma_spec().timeline_id_spec(),
+            final(self).rdma_spec().qp_spec() == old(self).rdma_spec().qp_spec(),
+            r.is_ok() ==> final(self).active_grants_spec()@.len() + 1 == old(
+                self,
+            ).active_grants_spec()@.len(),
     {
         hide(CacheCore::well_formed);
         hide(PeerSession::well_formed);
@@ -3286,7 +3799,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             },
         };
         proof {
-            assert(core.frames.same_directory(&core.frames)) by {
+            assert(core.frames_spec().same_directory(&core.frames_spec())) by {
                 reveal(FrameTable::same_directory);
             };
             Self::lemma_session_wf_after_outbound_lease_update(
@@ -3311,23 +3824,25 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 host.ready(core.instance_id(), core.node()),
                 host.source@.source() == old(host).source@.source(),
                 instance.id() == core.instance_id(),
-                core.node_id == old(core).node_id,
+                core.node_id_spec() == old(core).node_id_spec(),
                 core.instance_id() == old(core).instance_id(),
-                core.tiers == old(core).tiers,
-                core.frames == old(core).frames,
-                core.catalog == old(core).catalog,
-                core.spec == old(core).spec,
-                core.next_version_seq == old(core).next_version_seq,
-                core.version_seq_limit == old(core).version_seq_limit,
-                core.version_registry == old(core).version_registry,
-                core.timelines.count == old(core).timelines.count,
-                core.timelines.kinds == old(core).timelines.kinds,
-                core.timelines.events == old(core).timelines.events,
-                core.timelines.next_seq == old(core).timelines.next_seq,
-                core.ledger@.submitted == old(core).ledger@.submitted,
-                core.ledger@.revoked == old(core).ledger@.revoked,
-                old(core).ledger@.knows.set().subset_of(core.ledger@.knows.set()),
-                old(core).ledger@.succeeded.dom().subset_of(core.ledger@.succeeded.dom()),
+                core.tiers_spec() == old(core).tiers_spec(),
+                core.frames_spec() == old(core).frames_spec(),
+                core.catalog_spec() == old(core).catalog_spec(),
+                core.spec_spec() == old(core).spec_spec(),
+                core.next_version_seq_spec() == old(core).next_version_seq_spec(),
+                core.version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+                core.version_registry_spec() == old(core).version_registry_spec(),
+                core.timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+                core.timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+                core.timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+                core.timelines_spec().next_seq_spec() == old(core).timelines_spec().next_seq_spec(),
+                core.ledger_spec()@.submitted == old(core).ledger_spec()@.submitted,
+                core.ledger_spec()@.revoked == old(core).ledger_spec()@.revoked,
+                old(core).ledger_spec()@.knows.set().subset_of(core.ledger_spec()@.knows.set()),
+                old(core).ledger_spec()@.succeeded.dom().subset_of(
+                    core.ledger_spec()@.succeeded.dom(),
+                ),
                 peer_core_step(old(core), core, old(self).rdma.timeline_id),
                 peer_foreign_shares_preserved(
                     old(core),
@@ -3507,15 +4022,15 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         ensures
             final(core).well_formed(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames == old(core).frames,
-            final(core).catalog == old(core).catalog,
-            final(core).spec == old(core).spec,
-            final(core).next_version_seq == old(core).next_version_seq,
-            final(core).version_seq_limit == old(core).version_seq_limit,
-            final(core).version_registry == old(core).version_registry,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec() == old(core).frames_spec(),
+            final(core).catalog_spec() == old(core).catalog_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            final(core).version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -3545,14 +4060,16 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(self).reconnect_epoch == old(self).reconnect_epoch,
             final(self).peer_reconnect_epoch == old(self).peer_reconnect_epoch,
             pull.valid(&final(self).rdma, final(core)),
-            old(core).ledger@.submitted == final(core).ledger@.submitted,
-            old(core).ledger@.revoked == final(core).ledger@.revoked,
+            old(core).ledger_spec()@.submitted == final(core).ledger_spec()@.submitted,
+            old(core).ledger_spec()@.revoked == final(core).ledger_spec()@.revoked,
             old(core).citations().subset_of(final(core).citations()),
             r matches Ok(st) ==> {
-                &&& final(core).ledger@.knows.set().contains((final(core).node(), pull.writer@))
+                &&& final(core).ledger_spec()@.knows.set().contains(
+                    (final(core).node(), pull.writer@),
+                )
                 &&& final(core).citations().contains(pull.writer@)
                 &&& (st.is_ok() ==> event_succeeded(
-                    final(core).ledger@,
+                    final(core).ledger_spec()@,
                     final(core).node(),
                     pull.writer@,
                 ))
@@ -3572,19 +4089,19 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 core.well_formed(),
                 self.well_formed(core),
                 instance.id() == core.instance_id(),
-                core.node_id == old(core).node_id,
+                core.node_id_spec() == old(core).node_id_spec(),
                 core.instance_id() == old(core).instance_id(),
-                core.tiers == old(core).tiers,
-                core.frames == old(core).frames,
-                core.catalog == old(core).catalog,
-                core.spec == old(core).spec,
-                core.next_version_seq == old(core).next_version_seq,
-                core.version_seq_limit == old(core).version_seq_limit,
-                core.version_registry == old(core).version_registry,
-                core.timelines.count == old(core).timelines.count,
-                core.timelines.kinds == old(core).timelines.kinds,
-                core.timelines.events == old(core).timelines.events,
-                core.timelines.next_seq == old(core).timelines.next_seq,
+                core.tiers_spec() == old(core).tiers_spec(),
+                core.frames_spec() == old(core).frames_spec(),
+                core.catalog_spec() == old(core).catalog_spec(),
+                core.spec_spec() == old(core).spec_spec(),
+                core.next_version_seq_spec() == old(core).next_version_seq_spec(),
+                core.version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+                core.version_registry_spec() == old(core).version_registry_spec(),
+                core.timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+                core.timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+                core.timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+                core.timelines_spec().next_seq_spec() == old(core).timelines_spec().next_seq_spec(),
                 peer_core_step(old(core), core, old(self).rdma.timeline_id),
                 peer_foreign_shares_preserved(
                     old(core),
@@ -3614,8 +4131,8 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 self.reconnect_epoch == old(self).reconnect_epoch,
                 self.peer_reconnect_epoch == old(self).peer_reconnect_epoch,
                 pull.valid(&self.rdma, core),
-                old(core).ledger@.submitted == core.ledger@.submitted,
-                old(core).ledger@.revoked == core.ledger@.revoked,
+                old(core).ledger_spec()@.submitted == core.ledger_spec()@.submitted,
+                old(core).ledger_spec()@.revoked == core.ledger_spec()@.revoked,
                 old(core).citations().subset_of(core.citations()),
                 self.rdma.pending().contains_key(pull.wr_id) || self.rdma.completed_pull_spec(
                     pull.wr_id,
@@ -3632,12 +4149,12 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 proof {
                     lemma_core_wf_facts(core);
                     lemma_core_timelines_wf(core);
-                    assert(core.ledger@.knows.set().contains((core.node(), pull.writer@)));
-                    assert(core.ledger@.submitted.dom().contains(pull.writer@));
+                    assert(core.ledger_spec()@.knows.set().contains((core.node(), pull.writer@)));
+                    assert(core.ledger_spec()@.submitted.dom().contains(pull.writer@));
                     assert(core.citations().contains(pull.writer@));
                     if st.is_ok() {
-                        assert(core.ledger@.succeeded.dom().contains(pull.writer@));
-                        assert(event_succeeded(core.ledger@, core.node(), pull.writer@));
+                        assert(core.ledger_spec()@.succeeded.dom().contains(pull.writer@));
+                        assert(event_succeeded(core.ledger_spec()@, core.node(), pull.writer@));
                     }
                     lemma_outbound_grants_preserved(
                         self.pending_outbound_grants@,
@@ -3679,7 +4196,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                         );
                         broadcast use {vstd::iset::group_iset_lemmas, vstd::map::group_map_lemmas};
 
-                        assert(core.frames.same_layout(&step_core.frames));
+                        assert(core.frames_spec().same_layout(&step_core.frames_spec()));
                         assert(step_core.citations().subset_of(core.citations()));
                         assert(pull.copy@.before.citations(core.node()).subset_of(
                             core.citations(),
@@ -3690,18 +4207,19 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                             &step_core,
                             core,
                             pull,
+                            None,
                         );
                         assert forall|i: int| 0 <= i < self.active_grants@.len() implies {
                             let g = #[trigger] self.active_grants@[i];
                             &&& g.grant_tag < self.next_grant_tag
-                            &&& g.frame.0 < core.frames.metas.len()
+                            &&& g.frame.0 < core.frames_spec().metas_spec().len()
                             &&& self.rdma.lease_index_spec(g.handle) matches Some(idx) && {
                                 let lease = self.rdma.active_leases@[idx];
                                 &&& lease.frame == g.frame
                                 &&& lease.state == RemoteLeaseState::Bound
                                 &&& self.channel.sent().contains_key(g.grant_tag)
                                 &&& self.channel.sent()[g.grant_tag] == (GrantKind::ReadShare {
-                                    slot: core.frames.frame(g.frame).slot,
+                                    slot: core.frames_spec().frame(g.frame).slot,
                                     share_id: lease.share@,
                                 })
                             }
@@ -3758,7 +4276,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                                 assert(core.citations().contains(pull.writer@));
                                 if st.is_ok() {
                                     assert(event_succeeded(
-                                        core.ledger@,
+                                        core.ledger_spec()@,
                                         core.node(),
                                         pull.writer@,
                                     ));
@@ -3886,7 +4404,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         }
     }
 
-    fn take_inbound_grant(&mut self, core: &CacheCore, request_id: u64) -> (r: Option<
+    pub(crate) fn take_inbound_grant(&mut self, core: &CacheCore, request_id: u64) -> (r: Option<
         PendingInboundGrant,
     >)
         requires
@@ -3955,7 +4473,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         None
     }
 
-    fn take_inbound_miss(&mut self, request_id: u64) -> (r: bool)
+    pub(crate) fn take_inbound_miss(&mut self, request_id: u64) -> (r: bool)
         ensures
             final(self).rdma == old(self).rdma,
             final(self).channel == old(self).channel,
@@ -4017,7 +4535,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             instance.id() == core.instance_id(),
             old(self).channel.received().contains_key(tag),
             old(self).channel.received()[tag] is ReadShare,
-            share_cap.is_rdma_bound(),
+            share_cap.is_fenced(),
             share_cap.instance_id() == core.instance_id(),
             share_cap.loc() == old(self).channel.received()[tag]->ReadShare_slot.loc,
             share_cap.share() == old(self).channel.received()[tag]->ReadShare_share_id,
@@ -4068,16 +4586,16 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             reveal(complete_receipts);
             assert(transfer::transport::covers(
                 share_cap.frontier(),
-                closure_from(core.ledger@.submitted.map(), cited),
+                closure_from(core.ledger_spec()@.submitted.map(), cited),
             ));
         }
         let _ = self.channel.send_remote_read_release_with(
             tag,
             &rel_bytes,
             Tracked(instance),
-            Tracked(&core.ledger.borrow().submitted),
-            Tracked(&core.ledger.borrow().knows),
-            Tracked(&core.ledger.borrow().succeeded),
+            Tracked(&core.borrow_ledger().submitted),
+            Tracked(&core.borrow_ledger().knows),
+            Tracked(&core.borrow_ledger().succeeded),
             Ghost(cited),
             Tracked(share_cap),
             Tracked(att),
@@ -4111,6 +4629,57 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         }
     }
 
+    pub(crate) fn discard_read_grant(
+        &mut self,
+        core: &mut CacheCore,
+        g: PendingInboundGrant,
+        Tracked(instance): Tracked<&TransferInstance>,
+    )
+        requires
+            old(self).well_formed(old(core)),
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            g.valid(old(core), &old(self).channel, old(self).rdma.peer_node),
+            instance.id() == old(core).instance_id(),
+        ensures
+            final(self).well_formed(final(core)),
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(self).rdma == old(self).rdma,
+            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+    {
+        hide(CacheCore::well_formed);
+        let ghost before = *core;
+        let tracked stmt = g.statement.get();
+        let ghost stmt_sub = stmt.submitted;
+        let ghost stmt_facts = stmt.facts;
+        let ghost stmt_closure = stmt.closure();
+        core.merge_peer_statement(
+            Tracked(stmt.submitted),
+            Tracked(stmt.knows),
+            Tracked(stmt.succeeded),
+            Tracked(instance),
+        );
+        proof {
+            self.lemma_session_wf_after_merge_statement(
+                &before,
+                core,
+                stmt_sub,
+                stmt_facts,
+                stmt_closure,
+            );
+            lemma_foreign_shares_identical_leases(&before, core, self.rdma.active_leases@);
+            assert(transfer::transport::covers(g.share@.frontier(), core.citations()));
+        }
+        self.fetch_release_grant(core, g.tag, g.meta.request_id, g.share, Tracked(instance));
+    }
+
     /// Drain all stale buffered `pending_inbound_grants`, merging statements and
     /// releasing every `ShareCap` over `self.channel`.
     #[verifier::rlimit(200)]
@@ -4126,15 +4695,15 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         ensures
             final(core).well_formed(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames == old(core).frames,
-            final(core).catalog == old(core).catalog,
-            final(core).spec == old(core).spec,
-            final(core).next_version_seq == old(core).next_version_seq,
-            final(core).version_seq_limit == old(core).version_seq_limit,
-            final(core).version_registry == old(core).version_registry,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec() == old(core).frames_spec(),
+            final(core).catalog_spec() == old(core).catalog_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            final(core).version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -4169,15 +4738,15 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 core.well_formed(),
                 self.well_formed(core),
                 instance.id() == core.instance_id(),
-                core.node_id == old(core).node_id,
+                core.node_id_spec() == old(core).node_id_spec(),
                 core.instance_id() == old(core).instance_id(),
-                core.tiers == old(core).tiers,
-                core.frames == old(core).frames,
-                core.catalog == old(core).catalog,
-                core.spec == old(core).spec,
-                core.next_version_seq == old(core).next_version_seq,
-                core.version_seq_limit == old(core).version_seq_limit,
-                core.version_registry == old(core).version_registry,
+                core.tiers_spec() == old(core).tiers_spec(),
+                core.frames_spec() == old(core).frames_spec(),
+                core.catalog_spec() == old(core).catalog_spec(),
+                core.spec_spec() == old(core).spec_spec(),
+                core.next_version_seq_spec() == old(core).next_version_seq_spec(),
+                core.version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+                core.version_registry_spec() == old(core).version_registry_spec(),
                 peer_core_step(old(core), core, old(self).rdma.timeline_id),
                 self.rdma == old(self).rdma,
                 self.channel.same_session(old(self).channel),
@@ -4211,27 +4780,27 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 lemma_rdma_window_after_fence_ledger(
                     self.rdma.in_flight_ops,
                     self.rdma.bitmap,
-                    &core.timelines,
+                    &core.timelines_spec(),
                     self.rdma.timeline_id,
-                    &step_core.ledger@,
-                    &core.ledger@,
+                    &step_core.ledger_spec()@,
+                    &core.ledger_spec()@,
                     rdma::CqSnapshot::of(self.rdma.cq),
                     core.instance_id(),
                     self.rdma.next_control_wr_id,
                 );
                 lemma_completed_pulls_after_step(
                     self.rdma.completed_pulls,
-                    &step_core.timelines,
-                    &core.timelines,
+                    &step_core.timelines_spec(),
+                    &core.timelines_spec(),
                     self.rdma.timeline_id,
                     self.rdma.cq.observer(),
-                    &step_core.ledger@,
-                    &core.ledger@,
+                    &step_core.ledger_spec()@,
+                    &core.ledger_spec()@,
                 );
-                assert(core.frames.same_directory(&step_core.frames)) by {
+                assert(core.frames_spec().same_directory(&step_core.frames_spec())) by {
                     reveal(FrameTable::same_directory);
                 }
-                assert(core.frames.same_layout(&step_core.frames)) by {
+                assert(core.frames_spec().same_layout(&step_core.frames_spec())) by {
                     reveal(FrameTable::same_layout);
                 }
                 lemma_rdma_all_slabs_same_directory(
@@ -4259,6 +4828,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 );
                 assert(peer_core_step(&step_core, core, self.rdma.timeline_id)) by {
                     reveal(peer_core_step_except);
+                    reveal(core_transition);
                     reveal(FrameTable::preserves_initializing);
                 }
                 lemma_peer_core_step_trans(old(core), &step_core, core, self.rdma.timeline_id);
@@ -4274,8 +4844,8 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                                 assert(stmt_sub.map()[m].preds.subset_of(stmt_sub.dom()));
                             }
                         }
-                        assert(core.ledger@.submitted.dom().contains(e));
-                        assert(core.ledger@.knows.set().contains((core.node(), e)));
+                        assert(core.ledger_spec()@.submitted.dom().contains(e));
+                        assert(core.ledger_spec()@.knows.set().contains((core.node(), e)));
                     }
                 }
                 assert(transfer::transport::covers(g.share@.frontier(), core.citations()));
@@ -4287,24 +4857,21 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         }
     }
 
-    /// Initiator helper: merge peer statement + revocations, reserve a destination
-    /// frame in `dst_tier`, and post the RDMA READ pull (supporting both owned
-    /// and shared host/GPU RDMA slabs).
-    #[verifier::rlimit(250)]
-    pub fn fetch_post_pull(
+    #[verifier::rlimit(120)]
+    fn fetch_prepare_pull(
         &mut self,
         core: &mut CacheCore,
         key: ObjectKey,
         dst_tier: TierId,
         target: PullTarget,
         meta: ReadGrantMeta,
-        cap: &rdma::RemoteCapability,
+        cap: rdma::RemoteCapability,
         Tracked(share): Tracked<ShareCap>,
         Tracked(statement): Tracked<Statement>,
         Ghost(cert): Ghost<ValueCertificate>,
         Tracked(revoked): Tracked<RevokedMap>,
         Tracked(instance): Tracked<&TransferInstance>,
-    ) -> (r: Result<InFlightRdmaPull, CoreError>)
+    ) -> (r: Result<PreparedPull, (CoreError, Tracked<ShareCap>)>)
         requires
             old(core).well_formed(),
             old(core).all_versions_bound(),
@@ -4314,8 +4881,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             old(self).rdma.qp.source().well_formed(),
             old(self).rdma.qp.effective_max_rd_atomic() > 0,
             old(self).rdma.peer_node != old(core).node(),
-            old(core).frames.tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
-            meta.frame_size == old(core).frames.tier_frame_size(dst_tier) as u64,
+            old(core).frames_spec().tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
             instance.id() == old(core).instance_id(),
             statement.valid(old(core).instance_id(), old(core).node()),
             statement.knows.set() == knowledge_of(old(core).node(), statement.closure()),
@@ -4327,7 +4893,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             cap.slot_ref() == cert.slot,
             cert.slot.is_full(),
             cert.bytes.len() == meta.frame_size,
-            share.is_rdma_bound(),
+            share.is_fenced(),
             share.instance_id() == old(core).instance_id(),
             share.loc() == cap.slot_ref().loc,
             share.frontier().last_writer == Some(cert.writer),
@@ -4352,9 +4918,369 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(core).well_formed(),
             final(core).all_versions_bound(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
+            final(self).rdma.peer_node == old(self).rdma.peer_node,
+            final(self).rdma.host_mr == old(self).rdma.host_mr,
+            final(self).rdma.gpu_mr == old(self).rdma.gpu_mr,
+            final(self).rdma.shared_host_mr == old(self).rdma.shared_host_mr,
+            final(self).rdma.shared_gpu_mr == old(self).rdma.shared_gpu_mr,
+            final(self).rdma.qp.ready(),
+            final(self).rdma.qp.state() is ReadyToSend,
+            final(self).rdma.qp.source().well_formed(),
+            final(self).rdma.qp.source().source() == old(self).rdma.qp.source().source(),
+            final(self).channel == old(self).channel,
+            final(self).next_grant_tag == old(self).next_grant_tag,
+            final(self).next_request_id == old(self).next_request_id,
+            final(self).active_grants == old(self).active_grants,
+            final(self).pending_outbound_grants == old(self).pending_outbound_grants,
+            final(self).pending_inbound_fetches == old(self).pending_inbound_fetches,
+            final(self).pending_inbound_grants == old(self).pending_inbound_grants,
+            final(self).pending_inbound_misses == old(self).pending_inbound_misses,
+            final(self).pending_revoke_notices == old(self).pending_revoke_notices,
+            final(self).pending_revoke_acks == old(self).pending_revoke_acks,
+            final(self).pending_reconnect_barriers == old(self).pending_reconnect_barriers,
+            final(self).quarantined_grants == old(self).quarantined_grants,
+            final(self).reconnect_epoch == old(self).reconnect_epoch,
+            final(self).peer_reconnect_epoch == old(self).peer_reconnect_epoch,
+            final(self).rdma == old(self).rdma,
+            final(core).frames_spec().same_directory(&old(core).frames_spec()),
+            final(core).frames_spec().preserves_fenced_leases(&old(core).frames_spec()),
+            final(core).timelines_spec() == old(core).timelines_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            old(core).citations().subset_of(final(core).citations()),
+            transfer::transport::covers(share.frontier(), final(core).citations()),
+            r matches Ok(p) ==> {
+                &&& p.valid(&final(self).rdma, final(core), target)
+                &&& p.handle.frame.0 < old(core).frames_spec().metas_spec().len()
+                &&& old(core).frames_spec().meta(p.handle.frame).state != STATE_INITIALIZING
+                &&& p.handle.version == meta.version
+                &&& p.source@ == cert
+                &&& p.share@ == share
+                &&& p.remote == cap
+            },
+            r matches Err((_, sh)) ==> sh@ == share,
+    {
+        hide(CacheCore::well_formed);
+        hide(replica_valid);
+        hide(complete_receipts);
+        let ghost stmt_sub = statement.submitted;
+        let ghost stmt_succ = statement.succeeded;
+        let ghost stmt_facts = statement.facts;
+        let ghost stmt_closure = statement.closure();
+        let ghost orig_share_frontier = share.frontier();
+        let ghost rev_ghost = revoked;
+        let ghost before_merge = *core;
+        core.merge_peer_statement(
+            Tracked(statement.submitted),
+            Tracked(statement.knows),
+            Tracked(statement.succeeded),
+            Tracked(instance),
+        );
+        core.record_revoked_map(Tracked(revoked));
+        proof {
+            lemma_rdma_window_after_fence_ledger(
+                self.rdma.in_flight_ops,
+                self.rdma.bitmap,
+                &core.timelines_spec(),
+                self.rdma.timeline_id,
+                &before_merge.ledger_spec()@,
+                &core.ledger_spec()@,
+                rdma::CqSnapshot::of(self.rdma.cq),
+                core.instance_id(),
+                self.rdma.next_control_wr_id,
+            );
+            lemma_completed_pulls_after_step(
+                self.rdma.completed_pulls,
+                &before_merge.timelines_spec(),
+                &core.timelines_spec(),
+                self.rdma.timeline_id,
+                self.rdma.cq.observer(),
+                &before_merge.ledger_spec()@,
+                &core.ledger_spec()@,
+            );
+            assert(core.frames_spec().same_directory(&before_merge.frames_spec())) by {
+                reveal(FrameTable::same_directory);
+            }
+            assert(core.frames_spec().same_layout(&before_merge.frames_spec())) by {
+                reveal(FrameTable::same_layout);
+            }
+            lemma_rdma_all_slabs_same_directory(
+                &self.rdma.host_mr,
+                &self.rdma.gpu_mr,
+                self.rdma.shared_host_mr,
+                self.rdma.shared_gpu_mr,
+                &before_merge,
+                core,
+                self.rdma.window_pool.pd(),
+            );
+            lemma_rdma_leases_same_frames(
+                self.rdma.active_leases@,
+                &self.rdma.window_pool,
+                &self.rdma.qp,
+                &before_merge,
+                core,
+            );
+            lemma_outbound_grants_preserved(
+                self.pending_outbound_grants@,
+                self.rdma.active_leases@,
+                self.rdma.active_leases@,
+                &before_merge,
+                core,
+            );
+            lemma_statement_valid_in_receiver_ledger(
+                core.ledger_spec()@,
+                core.node(),
+                stmt_sub,
+                stmt_succ,
+                rev_ghost,
+                stmt_facts,
+                cert,
+            );
+            assert(stmt_closure.subset_of(core.citations())) by {
+                assert forall|e: TransferEvent| #[trigger]
+                    stmt_closure.contains(e) implies core.citations().contains(e) by {
+                    assert(stmt_sub.dom().contains(e)) by {
+                        if !stmt_facts.contains(e) {
+                            let m = choose|m: TransferEvent|
+                                stmt_facts.contains(m) && (
+                                #[trigger] stmt_sub.map()[m]).preds.contains(e);
+                            assert(stmt_sub.dom().contains(m));
+                            assert(stmt_sub.map()[m].preds.subset_of(stmt_sub.dom()));
+                        }
+                    }
+                    assert(core.ledger_spec()@.submitted.dom().contains(e));
+                    assert(core.ledger_spec()@.knows.set().contains((core.node(), e)));
+                }
+            }
+            assert(transfer::transport::covers(orig_share_frontier, core.citations()));
+        }
+        if meta.frame_size != core.registered_tier_frame_size(dst_tier) as u64 {
+            proof {
+                reveal(peer_core_step_except);
+                reveal(core_transition);
+                reveal(FrameTable::same_layout);
+                reveal(FrameTable::preserves_initializing);
+                lemma_foreign_shares_identical_leases(old(core), core, self.rdma.active_leases@);
+            }
+            return Err((CoreError::InvalidArgument, Tracked(share)));
+        }
+        let ghost before_bw = *core;
+        let (handle, dst_tok) = match core.begin_write_version(dst_tier, key, meta.version) {
+            Ok(v) => v,
+            Err(e) => {
+                proof {
+                    reveal(peer_core_step_except);
+                    reveal(core_transition);
+                    reveal(FrameTable::same_layout);
+                    reveal(FrameTable::preserves_initializing);
+                    lemma_foreign_shares_identical_leases(
+                        old(core),
+                        core,
+                        self.rdma.active_leases@,
+                    );
+                }
+                return Err((e, Tracked(share)));
+            },
+        };
+        proof {
+            reveal(FrameTable::same_directory);
+            reveal(FrameTable::same_layout);
+            lemma_completed_pulls_after_step(
+                self.rdma.completed_pulls,
+                &before_bw.timelines_spec(),
+                &core.timelines_spec(),
+                self.rdma.timeline_id,
+                self.rdma.cq.observer(),
+                &before_bw.ledger_spec()@,
+                &core.ledger_spec()@,
+            );
+            lemma_rdma_all_slabs_same_directory(
+                &self.rdma.host_mr,
+                &self.rdma.gpu_mr,
+                self.rdma.shared_host_mr,
+                self.rdma.shared_gpu_mr,
+                &before_bw,
+                core,
+                self.rdma.window_pool.pd(),
+            );
+            lemma_rdma_leases_after_begin_write(
+                self.rdma.active_leases@,
+                &self.rdma.window_pool,
+                &self.rdma.qp,
+                &before_bw,
+                core,
+            );
+            lemma_outbound_grants_preserved(
+                self.pending_outbound_grants@,
+                self.rdma.active_leases@,
+                self.rdma.active_leases@,
+                &before_bw,
+                core,
+            );
+            assert(peer_core_step(&before_merge, core, self.rdma.timeline_id)) by {
+                reveal(peer_core_step_except);
+                reveal(core_transition);
+                reveal(FrameTable::preserves_initializing);
+            }
+        }
+        let owns = match target {
+            PullTarget::Host => self.rdma.effective_host_mr().unwrap().owns_frame(handle.frame),
+            PullTarget::GpuGdr => self.rdma.effective_gpu_mr().unwrap().owns_frame(handle.frame),
+        };
+        if !owns {
+            let ghost before_ab = *core;
+            let ghost ab_frame = handle.frame;
+            core.abort_write(handle, dst_tok);
+            proof {
+                reveal(FrameTable::same_directory);
+                reveal(FrameTable::same_layout);
+                lemma_completed_pulls_after_step(
+                    self.rdma.completed_pulls,
+                    &before_ab.timelines_spec(),
+                    &core.timelines_spec(),
+                    self.rdma.timeline_id,
+                    self.rdma.cq.observer(),
+                    &before_ab.ledger_spec()@,
+                    &core.ledger_spec()@,
+                );
+                lemma_rdma_all_slabs_same_directory(
+                    &self.rdma.host_mr,
+                    &self.rdma.gpu_mr,
+                    self.rdma.shared_host_mr,
+                    self.rdma.shared_gpu_mr,
+                    &before_ab,
+                    core,
+                    self.rdma.window_pool.pd(),
+                );
+                lemma_rdma_leases_after_begin_write(
+                    self.rdma.active_leases@,
+                    &self.rdma.window_pool,
+                    &self.rdma.qp,
+                    &before_ab,
+                    core,
+                );
+                lemma_outbound_grants_preserved(
+                    self.pending_outbound_grants@,
+                    self.rdma.active_leases@,
+                    self.rdma.active_leases@,
+                    &before_ab,
+                    core,
+                );
+                assert(peer_core_step_except(
+                    &before_ab,
+                    core,
+                    self.rdma.timeline_id,
+                    Some(ab_frame),
+                )) by {
+                    reveal(peer_core_step_except);
+                    reveal(core_transition);
+                    reveal(FrameTable::preserves_initializing);
+                }
+                lemma_peer_core_step_trans_retire_new_init(
+                    &before_merge,
+                    &before_ab,
+                    core,
+                    self.rdma.timeline_id,
+                    ab_frame,
+                );
+                lemma_foreign_shares_identical_leases(old(core), core, self.rdma.active_leases@);
+            }
+            return Err((CoreError::UnsupportedTier, Tracked(share)));
+        }
+        proof {
+            reveal(FrameTable::same_layout);
+            reveal(FrameTable::same_directory);
+            lemma_foreign_shares_identical_leases(old(core), core, self.rdma.active_leases@);
+        }
+        Ok(
+            PreparedPull {
+                handle,
+                dst: dst_tok,
+                share: Tracked(share),
+                remote: cap,
+                source: Ghost(cert),
+            },
+        )
+    }
+
+    /// Initiator helper: merge peer statement + revocations, reserve a destination
+    /// frame in `dst_tier`, and post the RDMA READ pull (supporting both owned
+    /// and shared host/GPU RDMA slabs).
+    #[verifier::rlimit(250)]
+    pub(crate) fn fetch_post_pull(
+        &mut self,
+        core: &mut CacheCore,
+        key: ObjectKey,
+        dst_tier: TierId,
+        target: PullTarget,
+        meta: ReadGrantMeta,
+        cap: &rdma::RemoteCapability,
+        Tracked(share): Tracked<ShareCap>,
+        Tracked(statement): Tracked<Statement>,
+        Ghost(cert): Ghost<ValueCertificate>,
+        Tracked(revoked): Tracked<RevokedMap>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<InFlightRdmaPull, CoreError>)
+        requires
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            old(self).rdma.qp.ready(),
+            old(self).rdma.qp.state() is ReadyToSend,
+            old(self).rdma.qp.source().well_formed(),
+            old(self).rdma.qp.effective_max_rd_atomic() > 0,
+            old(self).rdma.peer_node != old(core).node(),
+            old(core).frames_spec().tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
+            meta.frame_size == old(core).frames_spec().tier_frame_size(dst_tier) as u64,
+            instance.id() == old(core).instance_id(),
+            statement.valid(old(core).instance_id(), old(core).node()),
+            statement.knows.set() == knowledge_of(old(core).node(), statement.closure()),
+            crate::provenance::complete_receipts_map(statement.submitted),
+            cap.well_formed(),
+            cap.slot_ref().loc.node == old(self).rdma.peer_node,
+            cap.access() == rdma::RemoteAccess::ReadOnly,
+            cap.share() == Some(share.share()),
+            cap.slot_ref() == cert.slot,
+            cert.slot.is_full(),
+            cert.bytes.len() == meta.frame_size,
+            share.is_fenced(),
+            share.instance_id() == old(core).instance_id(),
+            share.loc() == cap.slot_ref().loc,
+            share.frontier().last_writer == Some(cert.writer),
+            transfer::transport::covers(share.frontier(), statement.closure()),
+            revoked.instance_id() == old(core).instance_id(),
+            super::protocol::statement_replica_valid(
+                statement.submitted,
+                statement.succeeded,
+                revoked,
+                statement.facts,
+                cert,
+            ),
+            match target {
+                PullTarget::Host => old(self).rdma.effective_host_mr_spec() matches Some(s)
+                    && s.tier == dst_tier && s.mr.access().local_write
+                    && s.mr.gpu_device_spec().is_none(),
+                PullTarget::GpuGdr => old(self).rdma.effective_gpu_mr_spec() matches Some(s)
+                    && s.tier == dst_tier && s.mr.access().local_write
+                    && s.mr.gpu_device_spec() is Some,
+            },
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(self).well_formed(final(core)),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).instance_id() == old(core).instance_id(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -4388,8 +5314,8 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(self).peer_reconnect_epoch == old(self).peer_reconnect_epoch,
             r matches Ok(pull) ==> {
                 &&& pull.valid(&final(self).rdma, final(core))
-                &&& pull.handle.frame.0 < old(core).frames.metas.len()
-                &&& old(core).frames.meta(pull.handle.frame).state != STATE_INITIALIZING
+                &&& pull.handle.frame.0 < old(core).frames_spec().metas_spec().len()
+                &&& old(core).frames_spec().meta(pull.handle.frame).state != STATE_INITIALIZING
                 &&& pull.handle.version == meta.version
                 &&& pull.copy@.source == cert
                 &&& pull.share_cap@.loc() == cap.slot_ref().loc
@@ -4408,217 +5334,24 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         hide(CacheCore::well_formed);
         hide(replica_valid);
         hide(complete_receipts);
-        let ghost stmt_sub = statement.submitted;
-        let ghost stmt_succ = statement.succeeded;
-        let ghost stmt_facts = statement.facts;
-        let ghost stmt_closure = statement.closure();
-        let ghost orig_share_frontier = share.frontier();
-        let ghost rev_ghost = revoked;
         let ghost before_merge = *core;
-        core.merge_peer_statement(
-            Tracked(statement.submitted),
-            Tracked(statement.knows),
-            Tracked(statement.succeeded),
+        let PreparedPull { handle, dst: dst_tok, share, remote, source } =
+            match self.fetch_prepare_pull(
+            core,
+            key,
+            dst_tier,
+            target,
+            meta,
+            cap.descriptor_copy(),
+            Tracked(share),
+            Tracked(statement),
+            Ghost(cert),
+            Tracked(revoked),
             Tracked(instance),
-        );
-        core.record_revoked_map(Tracked(revoked));
-        proof {
-            lemma_rdma_window_after_fence_ledger(
-                self.rdma.in_flight_ops,
-                self.rdma.bitmap,
-                &core.timelines,
-                self.rdma.timeline_id,
-                &before_merge.ledger@,
-                &core.ledger@,
-                rdma::CqSnapshot::of(self.rdma.cq),
-                core.instance_id(),
-                self.rdma.next_control_wr_id,
-            );
-            lemma_completed_pulls_after_step(
-                self.rdma.completed_pulls,
-                &before_merge.timelines,
-                &core.timelines,
-                self.rdma.timeline_id,
-                self.rdma.cq.observer(),
-                &before_merge.ledger@,
-                &core.ledger@,
-            );
-            assert(core.frames.same_directory(&before_merge.frames)) by {
-                reveal(FrameTable::same_directory);
-            }
-            assert(core.frames.same_layout(&before_merge.frames)) by {
-                reveal(FrameTable::same_layout);
-            }
-            lemma_rdma_all_slabs_same_directory(
-                &self.rdma.host_mr,
-                &self.rdma.gpu_mr,
-                self.rdma.shared_host_mr,
-                self.rdma.shared_gpu_mr,
-                &before_merge,
-                core,
-                self.rdma.window_pool.pd(),
-            );
-            lemma_rdma_leases_same_frames(
-                self.rdma.active_leases@,
-                &self.rdma.window_pool,
-                &self.rdma.qp,
-                &before_merge,
-                core,
-            );
-            lemma_outbound_grants_preserved(
-                self.pending_outbound_grants@,
-                self.rdma.active_leases@,
-                self.rdma.active_leases@,
-                &before_merge,
-                core,
-            );
-            lemma_statement_valid_in_receiver_ledger(
-                core.ledger@,
-                core.node(),
-                stmt_sub,
-                stmt_succ,
-                rev_ghost,
-                stmt_facts,
-                cert,
-            );
-            assert(stmt_closure.subset_of(core.citations())) by {
-                assert forall|e: TransferEvent| #[trigger]
-                    stmt_closure.contains(e) implies core.citations().contains(e) by {
-                    assert(stmt_sub.dom().contains(e)) by {
-                        if !stmt_facts.contains(e) {
-                            let m = choose|m: TransferEvent|
-                                stmt_facts.contains(m) && (
-                                #[trigger] stmt_sub.map()[m]).preds.contains(e);
-                            assert(stmt_sub.dom().contains(m));
-                            assert(stmt_sub.map()[m].preds.subset_of(stmt_sub.dom()));
-                        }
-                    }
-                    assert(core.ledger@.submitted.dom().contains(e));
-                    assert(core.ledger@.knows.set().contains((core.node(), e)));
-                }
-            }
-            assert(transfer::transport::covers(orig_share_frontier, core.citations()));
-        }
-        let ghost before_bw = *core;
-        let (handle, dst_tok) = match core.begin_write_version(dst_tier, key, meta.version) {
-            Ok(v) => v,
-            Err(e) => {
-                proof {
-                    reveal(peer_core_step_except);
-                    reveal(FrameTable::same_layout);
-                    reveal(FrameTable::preserves_initializing);
-                    lemma_foreign_shares_identical_leases(
-                        old(core),
-                        core,
-                        self.rdma.active_leases@,
-                    );
-                }
-                return Err(e);
-            },
+        ) {
+            Ok(p) => p,
+            Err((e, _)) => return Err(e),
         };
-        proof {
-            reveal(FrameTable::same_directory);
-            reveal(FrameTable::same_layout);
-            lemma_completed_pulls_after_step(
-                self.rdma.completed_pulls,
-                &before_bw.timelines,
-                &core.timelines,
-                self.rdma.timeline_id,
-                self.rdma.cq.observer(),
-                &before_bw.ledger@,
-                &core.ledger@,
-            );
-            lemma_rdma_all_slabs_same_directory(
-                &self.rdma.host_mr,
-                &self.rdma.gpu_mr,
-                self.rdma.shared_host_mr,
-                self.rdma.shared_gpu_mr,
-                &before_bw,
-                core,
-                self.rdma.window_pool.pd(),
-            );
-            lemma_rdma_leases_after_begin_write(
-                self.rdma.active_leases@,
-                &self.rdma.window_pool,
-                &self.rdma.qp,
-                &before_bw,
-                core,
-            );
-            lemma_outbound_grants_preserved(
-                self.pending_outbound_grants@,
-                self.rdma.active_leases@,
-                self.rdma.active_leases@,
-                &before_bw,
-                core,
-            );
-            assert(peer_core_step(&before_merge, core, self.rdma.timeline_id)) by {
-                reveal(peer_core_step_except);
-                reveal(FrameTable::preserves_initializing);
-            }
-        }
-        let owns = match target {
-            PullTarget::Host => self.rdma.effective_host_mr().unwrap().owns_frame(handle.frame),
-            PullTarget::GpuGdr => self.rdma.effective_gpu_mr().unwrap().owns_frame(handle.frame),
-        };
-        if !owns {
-            let ghost before_ab = *core;
-            let ghost ab_frame = handle.frame;
-            core.abort_write(handle, dst_tok);
-            proof {
-                reveal(FrameTable::same_directory);
-                reveal(FrameTable::same_layout);
-                lemma_completed_pulls_after_step(
-                    self.rdma.completed_pulls,
-                    &before_ab.timelines,
-                    &core.timelines,
-                    self.rdma.timeline_id,
-                    self.rdma.cq.observer(),
-                    &before_ab.ledger@,
-                    &core.ledger@,
-                );
-                lemma_rdma_all_slabs_same_directory(
-                    &self.rdma.host_mr,
-                    &self.rdma.gpu_mr,
-                    self.rdma.shared_host_mr,
-                    self.rdma.shared_gpu_mr,
-                    &before_ab,
-                    core,
-                    self.rdma.window_pool.pd(),
-                );
-                lemma_rdma_leases_after_begin_write(
-                    self.rdma.active_leases@,
-                    &self.rdma.window_pool,
-                    &self.rdma.qp,
-                    &before_ab,
-                    core,
-                );
-                lemma_outbound_grants_preserved(
-                    self.pending_outbound_grants@,
-                    self.rdma.active_leases@,
-                    self.rdma.active_leases@,
-                    &before_ab,
-                    core,
-                );
-                assert(peer_core_step_except(
-                    &before_ab,
-                    core,
-                    self.rdma.timeline_id,
-                    Some(ab_frame),
-                )) by {
-                    reveal(peer_core_step_except);
-                    reveal(FrameTable::preserves_initializing);
-                }
-                lemma_peer_core_step_trans_retire_new_init(
-                    &before_merge,
-                    &before_ab,
-                    core,
-                    self.rdma.timeline_id,
-                    ab_frame,
-                );
-                lemma_foreign_shares_identical_leases(old(core), core, self.rdma.active_leases@);
-            }
-            return Err(CoreError::UnsupportedTier);
-        }
         let ghost before_post = *core;
         match post_pull_read(
             &mut self.rdma,
@@ -4627,9 +5360,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             target,
             handle,
             dst_tok,
-            cap,
-            Tracked(share),
-            Ghost(cert),
+            &remote,
+            share,
+            source,
         ) {
             Ok(p) => {
                 proof {
@@ -4648,8 +5381,16 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                         core,
                     );
                     lemma_foreign_shares_identical_leases(
-                        old(core),
+                        &before_post,
                         core,
+                        self.rdma.active_leases@,
+                    );
+                    lemma_foreign_shares_trans(
+                        old(core),
+                        &before_post,
+                        core,
+                        old(self).rdma.active_leases@,
+                        self.rdma.active_leases@,
                         self.rdma.active_leases@,
                     );
                 }
@@ -4664,12 +5405,12 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                     reveal(FrameTable::same_layout);
                     lemma_completed_pulls_after_step(
                         self.rdma.completed_pulls,
-                        &before_ab.timelines,
-                        &core.timelines,
+                        &before_ab.timelines_spec(),
+                        &core.timelines_spec(),
                         self.rdma.timeline_id,
                         self.rdma.cq.observer(),
-                        &before_ab.ledger@,
-                        &core.ledger@,
+                        &before_ab.ledger_spec()@,
+                        &core.ledger_spec()@,
                     );
                     lemma_rdma_all_slabs_same_directory(
                         &self.rdma.host_mr,
@@ -4701,6 +5442,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                         Some(ab_frame),
                     )) by {
                         reveal(peer_core_step_except);
+                        reveal(core_transition);
                         reveal(FrameTable::preserves_initializing);
                     }
                     lemma_peer_core_step_trans_retire_new_init(
@@ -4711,8 +5453,16 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                         ab_frame,
                     );
                     lemma_foreign_shares_identical_leases(
-                        old(core),
+                        &before_post,
                         core,
+                        self.rdma.active_leases@,
+                    );
+                    lemma_foreign_shares_trans(
+                        old(core),
+                        &before_post,
+                        core,
+                        old(self).rdma.active_leases@,
+                        self.rdma.active_leases@,
                         self.rdma.active_leases@,
                     );
                 }
@@ -4721,11 +5471,1439 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         }
     }
 
+    fn cancel_batch_pull(
+        &mut self,
+        core: &mut CacheCore,
+        target: PullTarget,
+        plan: PreparedPull,
+        route: PullGrantReturn,
+        Tracked(instance): Tracked<&TransferInstance>,
+    )
+        requires
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            instance.id() == old(core).instance_id(),
+            plan.valid(&old(self).rdma, old(core), target),
+            route.owns_grant(old(self).channel.received(), plan.share@),
+            transfer::transport::covers(plan.share@.frontier(), old(core).citations()),
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(self).well_formed(final(core)),
+            final(self).rdma == old(self).rdma,
+            final(core).ledger_spec() == old(core).ledger_spec(),
+            final(core).timelines_spec() == old(core).timelines_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            peer_core_step_except(
+                old(core),
+                final(core),
+                old(self).rdma.timeline_id,
+                Some(plan.handle.frame),
+            ),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            forall|k: GrantTag|
+                k != route.tag && #[trigger] old(self).channel.received().contains_key(k)
+                    ==> final(self).channel.received().contains_key(k)
+                    && final(self).channel.received()[k] == old(self).channel.received()[k],
+    {
+        hide(CacheCore::well_formed);
+        hide(replica_valid);
+        hide(complete_receipts);
+        let ghost before = *core;
+        let ghost rdma = self.rdma;
+        core.abort_write(plan.handle, plan.dst);
+        proof {
+            reveal(FrameTable::same_directory);
+            reveal(FrameTable::same_layout);
+            reveal(FrameTable::preserves_initializing);
+            reveal(peer_core_step_except);
+            reveal(core_transition);
+            lemma_core_wf_facts(core);
+            lemma_rdma_all_slabs_same_directory(
+                &self.rdma.host_mr,
+                &self.rdma.gpu_mr,
+                self.rdma.shared_host_mr,
+                self.rdma.shared_gpu_mr,
+                &before,
+                core,
+                self.rdma.window_pool.pd(),
+            );
+            lemma_rdma_leases_after_begin_write(
+                self.rdma.active_leases@,
+                &self.rdma.window_pool,
+                &self.rdma.qp,
+                &before,
+                core,
+            );
+            lemma_completed_pulls_after_step(
+                self.rdma.completed_pulls,
+                &before.timelines_spec(),
+                &core.timelines_spec(),
+                self.rdma.timeline_id,
+                self.rdma.cq.observer(),
+                &before.ledger_spec()@,
+                &core.ledger_spec()@,
+            );
+            lemma_outbound_grants_preserved(
+                self.pending_outbound_grants@,
+                rdma.active_leases@,
+                self.rdma.active_leases@,
+                &before,
+                core,
+            );
+            lemma_foreign_shares_identical_leases(&before, core, self.rdma.active_leases@);
+        }
+        self.fetch_release_grant(core, route.tag, route.request_id, plan.share, Tracked(instance));
+    }
+
+    /// Reap the batch's data statuses while leaving its destination tokens sealed.
+    fn await_batch_completions(
+        &mut self,
+        core: &mut CacheCore,
+        pulls: &[InFlightRdmaPull],
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: (Vec<Result<(), i32>>, Option<CoreError>))
+        requires
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            instance.id() == old(core).instance_id(),
+            forall|i: int|
+                0 <= i < pulls.len() ==> {
+                    let p = #[trigger] pulls@[i];
+                    &&& p.valid(&old(self).rdma, old(core))
+                    &&& pull_tracked_or_done(&old(self).rdma, p.wr_id, p.writer@)
+                },
+            forall|a: int, b: int|
+                0 <= a < b < pulls.len() ==> (#[trigger] pulls@[a]).wr_id != (
+                #[trigger] pulls@[b]).wr_id,
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(self).well_formed(final(core)),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).instance_id() == old(core).instance_id(),
+            final(self).rdma.qp == old(self).rdma.qp,
+            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
+            final(self).rdma.peer_node == old(self).rdma.peer_node,
+            final(self).channel == old(self).channel,
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
+            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            old(core).citations().subset_of(final(core).citations()),
+            r.0.len() <= pulls.len(),
+            r.1.is_none() ==> r.0.len() == pulls.len(),
+            forall|i: int|
+                0 <= i < pulls.len() ==> {
+                    let p = #[trigger] pulls@[i];
+                    &&& p.valid(&final(self).rdma, final(core))
+                    &&& i < r.0.len() ==> observed_batch_status(&p, final(core), r.0[i])
+                    &&& i >= r.0.len() ==> pull_tracked_or_done(
+                        &final(self).rdma,
+                        p.wr_id,
+                        p.writer@,
+                    )
+                },
+    {
+        hide(CacheCore::well_formed);
+        hide(replica_valid);
+        hide(complete_receipts);
+        let mut statuses: Vec<Result<(), i32>> = Vec::with_capacity(pulls.len());
+        let mut spins = 0u32;
+        proof {
+            lemma_peer_core_step_refl(core, self.rdma.timeline_id);
+            lemma_foreign_shares_refl(core, self.rdma.active_leases@);
+        }
+        while statuses.len() < pulls.len() && spins < 1_000_000
+            invariant
+                statuses.len() <= pulls.len(),
+                spins <= 1_000_000,
+                self.well_formed(core),
+                core.well_formed(),
+                core.all_versions_bound(),
+                self.rdma.qp == old(self).rdma.qp,
+                self.rdma.timeline_id == old(self).rdma.timeline_id,
+                self.rdma.peer_node == old(self).rdma.peer_node,
+                self.channel == old(self).channel,
+                core.timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+                core.timelines_spec().next_seq_spec() == old(core).timelines_spec().next_seq_spec(),
+                instance.id() == core.instance_id(),
+                core.instance_id() == old(core).instance_id(),
+                core.node_id_spec() == old(core).node_id_spec(),
+                peer_core_step(old(core), core, self.rdma.timeline_id),
+                peer_foreign_shares_preserved(
+                    old(core),
+                    core,
+                    old(self).rdma.active_leases@,
+                    self.rdma.active_leases@,
+                ),
+                old(core).citations().subset_of(core.citations()),
+                forall|j: int|
+                    0 <= j < pulls.len() ==> {
+                        let p = #[trigger] pulls@[j];
+                        &&& p.valid(&self.rdma, core)
+                        &&& j >= statuses.len() ==> pull_tracked_or_done(
+                            &self.rdma,
+                            p.wr_id,
+                            p.writer@,
+                        )
+                        &&& j < statuses.len() ==> observed_batch_status(&p, core, statuses[j])
+                    },
+                forall|a: int, b: int|
+                    0 <= a < b < pulls.len() ==> (#[trigger] pulls@[a]).wr_id != (
+                    #[trigger] pulls@[b]).wr_id,
+            decreases 1_000_000 - spins, pulls.len() - statuses.len(),
+        {
+            let i = statuses.len();
+            let p = &pulls[i];
+            let ghost pre = *self;
+            if let Some(status) = self.rdma.take_completed_pull(core, p.wr_id) {
+                proof {
+                    Self::lemma_session_wf_same_leases(&pre, self, core);
+                    lemma_core_wf_facts(core);
+                    lemma_core_timelines_wf(core);
+                    assert(observed_batch_status(p, core, status));
+                    assert forall|j: int| i < j < pulls.len() implies pull_tracked_or_done(
+                        &self.rdma,
+                        (#[trigger] pulls@[j]).wr_id,
+                        pulls@[j].writer@,
+                    ) by {
+                        let other = pulls@[j];
+                        let seq = other.wr_id;
+                        assert(pull_tracked_or_done(&pre.rdma, seq, other.writer@));
+                        assert(seq != p.wr_id);
+                        assert(self.rdma.pending() == pre.rdma.pending());
+                        assert(self.rdma.completed_pull_spec(seq) == pre.rdma.completed_pull_spec(
+                            seq,
+                        ));
+                        reveal(pull_tracked_or_done_state);
+                        if !pre.rdma.pending().contains_key(seq) {
+                            assert(pre.rdma.completed_pull_spec(seq).is_some());
+                            assert(self.rdma.completed_pull_spec(seq).is_some());
+                        }
+                    }
+                }
+                statuses.push(status);
+            } else {
+                let ghost before = *core;
+                let ghost rdma = self.rdma;
+                proof {
+                    Self::lemma_session_wf_same_leases(&pre, self, core);
+                    assert forall|j: int| i <= j < pulls.len() implies pull_tracked_or_done(
+                        &self.rdma,
+                        (#[trigger] pulls@[j]).wr_id,
+                        pulls@[j].writer@,
+                    ) by {
+                        let other = pulls@[j];
+                        let seq = other.wr_id;
+                        assert(pull_tracked_or_done(&pre.rdma, seq, other.writer@));
+                        assert(self.rdma.pending() == pre.rdma.pending());
+                        reveal(pull_tracked_or_done_state);
+                        if j == i {
+                            assert(pre.rdma.completed_pull_spec(p.wr_id).is_none());
+                            assert(pre.rdma.pending().contains_key(seq));
+                        } else if !pre.rdma.pending().contains_key(seq) {
+                            assert(seq != p.wr_id);
+                            assert(pre.rdma.completed_pull_spec(seq).is_some());
+                            assert(self.rdma.completed_pull_spec(seq)
+                                == pre.rdma.completed_pull_spec(seq));
+                        }
+                    }
+                }
+                let progress = self.pump_session_cq(core, Tracked(instance));
+                proof {
+                    lemma_peer_core_step_trans(old(core), &before, core, self.rdma.timeline_id);
+                    lemma_foreign_shares_trans(
+                        old(core),
+                        &before,
+                        core,
+                        old(self).rdma.active_leases@,
+                        rdma.active_leases@,
+                        self.rdma.active_leases@,
+                    );
+                    lemma_batch_status_growth(&before, core, self.rdma.timeline_id, None);
+                    assert forall|j: int| 0 <= j < pulls.len() implies {
+                        let p = #[trigger] pulls@[j];
+                        &&& p.valid(&self.rdma, core)
+                        &&& j >= i ==> pull_tracked_or_done(&self.rdma, p.wr_id, p.writer@)
+                        &&& j < i ==> observed_batch_status(&p, core, statuses[j])
+                    } by {
+                        lemma_pull_valid_after_peer_step(
+                            &rdma,
+                            &self.rdma,
+                            &before,
+                            core,
+                            &pulls@[j],
+                            None,
+                        );
+                    }
+                }
+                if let Err(e) = progress {
+                    return (statuses, Some(e));
+                }
+                spins += 1;
+            }
+        }
+        if statuses.len() == pulls.len() {
+            (statuses, None)
+        } else {
+            (statuses, Some(rdma_error(rdma::RdmaError(11))))
+        }
+    }
+
+    /// Reserve destinations for received grants and collect errors for failed reservations.
+    fn prepare_batch_pulls(
+        &mut self,
+        core: &mut CacheCore,
+        dst_tier: TierId,
+        target: PullTarget,
+        grants: Vec<PendingInboundGrant>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (out: (
+        Vec<PreparedPull>,
+        Vec<PullGrantReturn>,
+        Vec<(u64, Result<FetchOutcome, CoreError>)>,
+    ))
+        requires
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            instance.id() == old(core).instance_id(),
+            old(self).rdma.qp.ready(),
+            old(self).rdma.qp.state() is ReadyToSend,
+            old(self).rdma.qp.source().well_formed(),
+            old(self).rdma.qp.effective_max_rd_atomic() > 0,
+            old(self).rdma.peer_node != old(core).node(),
+            old(core).frames_spec().tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
+            old(self).pull_tier_valid(dst_tier, target),
+            forall|i: int|
+                0 <= i < grants.len() ==> (#[trigger] grants[i]).valid(
+                    old(core),
+                    &old(self).channel,
+                    old(self).rdma.peer_node,
+                ),
+            forall|i: int, j: int|
+                0 <= i < j < grants.len() ==> (#[trigger] grants[i]).tag != (
+                #[trigger] grants[j]).tag,
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(self).well_formed(final(core)),
+            final(self).rdma == old(self).rdma,
+            final(core).instance_id() == old(core).instance_id(),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            out.0.len() == out.1.len(),
+            out.0.len() + out.2.len() == grants.len(),
+            forall|j: int|
+                0 <= j < out.0.len() ==> {
+                    let p = #[trigger] out.0[j];
+                    &&& p.valid(&final(self).rdma, final(core), target)
+                    &&& out.1[j].matches_prepared(&p, final(self).channel.received(), final(core))
+                    &&& p.handle.frame.0 < old(core).frames_spec().metas_spec().len()
+                    &&& old(core).frames_spec().meta(p.handle.frame).state != STATE_INITIALIZING
+                },
+            forall|a: int, b: int|
+                0 <= a < b < out.0.len() ==> {
+                    &&& (#[trigger] out.0[a]).handle.frame != (#[trigger] out.0[b]).handle.frame
+                    &&& out.1[a].tag != out.1[b].tag
+                },
+    {
+        hide(CacheCore::well_formed);
+        hide(CacheCore::all_versions_bound);
+        hide(PeerSession::well_formed);
+        hide(RdmaBackend::well_formed);
+        hide(rdma_lease_index_spec);
+        hide(replica_valid);
+        hide(complete_receipts);
+        hide(super::protocol::statement_replica_valid);
+        let count = grants.len();
+        let ghost received = grants@;
+        let mut incoming = grants.into_iter();
+        let mut plans: Vec<PreparedPull> = Vec::with_capacity(count);
+        let mut routes: Vec<PullGrantReturn> = Vec::with_capacity(count);
+        let mut results = Vec::with_capacity(count);
+        let mut i = 0;
+        proof {
+            lemma_peer_core_step_refl(core, self.rdma.timeline_id);
+            lemma_foreign_shares_refl(core, self.rdma.active_leases@);
+        }
+        while i < count
+            invariant
+                i <= count == received.len(),
+                plans.len() == routes.len(),
+                plans.len() + results.len() == i,
+                vstd::std_specs::iter::IteratorSpec::remaining(&incoming) == received.skip(
+                    i as int,
+                ),
+                core.well_formed(),
+                core.all_versions_bound(),
+                self.well_formed(core),
+                self.rdma == old(self).rdma,
+                instance.id() == core.instance_id(),
+                self.rdma.qp.ready(),
+                self.rdma.qp.state() is ReadyToSend,
+                self.rdma.qp.source().well_formed(),
+                self.rdma.qp.effective_max_rd_atomic() > 0,
+                core.node() == old(core).node(),
+                core.frames_spec().metas_spec().len() == old(core).frames_spec().metas_spec().len(),
+                self.pull_tier_valid(dst_tier, target),
+                core.frames_spec().tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
+                self.rdma.peer_node != core.node(),
+                core.frames_spec().tier_frame_size(dst_tier) == old(
+                    core,
+                ).frames_spec().tier_frame_size(dst_tier),
+                peer_core_step(old(core), core, self.rdma.timeline_id),
+                peer_foreign_shares_preserved(
+                    old(core),
+                    core,
+                    old(self).rdma.active_leases@,
+                    self.rdma.active_leases@,
+                ),
+                forall|j: int|
+                    i <= j < count ==> (#[trigger] received[j]).valid(
+                        core,
+                        &self.channel,
+                        self.rdma.peer_node,
+                    ),
+                forall|j: int|
+                    0 <= j < plans.len() ==> {
+                        let p = #[trigger] plans[j];
+                        let route = routes[j];
+                        &&& p.valid(&self.rdma, core, target)
+                        &&& route.matches_prepared(&p, self.channel.received(), core)
+                        &&& p.handle.frame.0 < old(core).frames_spec().metas_spec().len()
+                        &&& old(core).frames_spec().meta(p.handle.frame).state != STATE_INITIALIZING
+                        &&& exists|k: int| 0 <= k < i && (#[trigger] received[k]).tag == route.tag
+                    },
+                forall|a: int, b: int|
+                    0 <= a < b < plans.len() ==> {
+                        &&& (#[trigger] plans[a]).handle.frame != (#[trigger] plans[b]).handle.frame
+                        &&& routes[a].tag != routes[b].tag
+                    },
+                forall|a: int, b: int|
+                    0 <= a < b < count ==> (#[trigger] received[a]).tag != (
+                    #[trigger] received[b]).tag,
+            decreases count - i,
+        {
+            let g = incoming.next().unwrap();
+            let ghost before = *core;
+            let ghost pre = *self;
+            let ghost frontier = g.share@.frontier();
+            let result = self.fetch_prepare_pull(
+                core,
+                g.meta.key,
+                dst_tier,
+                target,
+                g.meta,
+                g.cap,
+                g.share,
+                g.statement,
+                g.cert,
+                g.revoked,
+                Tracked(instance),
+            );
+            proof {
+                reveal(FrameTable::same_layout);
+                reveal(FrameTable::preserves_initializing);
+                reveal(peer_core_step_except);
+                reveal(core_transition);
+                lemma_peer_core_step_trans(old(core), &before, core, self.rdma.timeline_id);
+                assert forall|j: int| 0 <= j < plans.len() implies {
+                    let p = #[trigger] plans[j];
+                    &&& p.valid(&self.rdma, core, target)
+                    &&& routes[j].matches_prepared(&p, self.channel.received(), core)
+                    &&& (result matches Ok(new) ==> new.handle.frame != p.handle.frame)
+                    &&& g.tag != routes[j].tag
+                } by {
+                    let p = plans[j];
+                    p.lemma_after_step(&before, core, &pre.rdma, &self.rdma, target, None);
+                    let k = choose|k: int|
+                        0 <= k < i && (#[trigger] received[k]).tag == routes[j].tag;
+                    assert(g == received[i as int]);
+                }
+            }
+            match result {
+                Ok(plan) => {
+                    let tracked binding = g.version_binding.get().tracked_unwrap();
+                    let route = PullGrantReturn {
+                        tag: g.tag,
+                        request_id: g.meta.request_id,
+                        binding: Tracked(binding),
+                        frontier: Ghost(frontier),
+                    };
+                    proof {
+                        if old(core).frames_spec().meta(plan.handle.frame).state
+                            == STATE_INITIALIZING {
+                            assert(before.frames_spec().meta(plan.handle.frame) == old(
+                                core,
+                            ).frames_spec().meta(plan.handle.frame));
+                            assert(false);
+                        }
+                    }
+                    plans.push(plan);
+                    routes.push(route);
+                },
+                Err((err, share)) => {
+                    self.fetch_release_grant(
+                        core,
+                        g.tag,
+                        g.meta.request_id,
+                        share,
+                        Tracked(instance),
+                    );
+                    results.push((g.meta.request_id, Err(err)));
+                },
+            }
+            proof {
+                lemma_foreign_shares_trans(
+                    old(core),
+                    &before,
+                    core,
+                    old(self).rdma.active_leases@,
+                    pre.rdma.active_leases@,
+                    self.rdma.active_leases@,
+                );
+                assert forall|j: int| i < j < count implies (#[trigger] received[j]).valid(
+                    core,
+                    &self.channel,
+                    self.rdma.peer_node,
+                ) by {
+                    assert(received[j].tag != g.tag);
+                }
+            }
+            i += 1;
+        }
+        proof {
+            assert(core.node_id_spec() == old(core).node_id_spec()) by {
+                reveal(peer_core_step_except);
+                reveal(core_transition);
+            }
+        }
+        (plans, routes, results)
+    }
+
+    /// Submit the prepared reads and preserve the channel's buffered grants.
+    #[verifier::rlimit(30)]
+    fn post_batch_pulls(
+        &mut self,
+        core: &mut CacheCore,
+        target: PullTarget,
+        plans: Vec<PreparedPull>,
+        routes: &[PullGrantReturn],
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (out: PullBatchPost)
+        requires
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            instance.id() == old(core).instance_id(),
+            old(self).rdma.qp.ready(),
+            old(self).rdma.qp.state() is ReadyToSend,
+            old(self).rdma.qp.source().well_formed(),
+            old(self).rdma.qp.effective_max_rd_atomic() > 0,
+            plans.len() == routes.len(),
+            forall|j: int|
+                0 <= j < plans.len() ==> {
+                    let p = #[trigger] plans[j];
+                    &&& p.valid(&old(self).rdma, old(core), target)
+                    &&& routes@[j].matches_prepared(&p, old(self).channel.received(), old(core))
+                },
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(self).well_formed(final(core)),
+            final(core).instance_id() == old(core).instance_id(),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(self).channel == old(self).channel,
+            final(self).rdma.active_leases == old(self).rdma.active_leases,
+            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
+            final(self).rdma.peer_node == old(self).rdma.peer_node,
+            rdma::read_batch_qp_frame(&final(self).rdma.qp, &old(self).rdma.qp),
+            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            out.posted.len() + out.unposted.len() == plans.len(),
+            out.unposted@ == plans@.skip(out.posted.len() as int),
+            forall|j: int|
+                0 <= j < out.posted.len() ==> {
+                    let p = #[trigger] out.posted[j];
+                    &&& p.valid(&final(self).rdma, final(core)) && p.target == target
+                    &&& !p.visibility_flushed && p.handle == plans[j].handle
+                    &&& p.wr_id == old(core).timelines_spec().next_seq_spec()[old(
+                        self,
+                    ).rdma.timeline_id as int] + j
+                    &&& routes@[j].matches_posted(&p, final(self).channel.received(), final(core))
+                    &&& pull_tracked_or_done(&final(self).rdma, p.wr_id, p.writer@)
+                },
+            forall|j: int|
+                0 <= j < out.unposted.len() ==> {
+                    let p = #[trigger] out.unposted[j];
+                    &&& p.valid(&final(self).rdma, final(core), target)
+                    &&& routes@[out.posted.len() + j].matches_prepared(
+                        &p,
+                        final(self).channel.received(),
+                        final(core),
+                    )
+                },
+    {
+        hide(CacheCore::well_formed);
+        hide(CacheCore::all_versions_bound);
+        hide(PeerSession::well_formed);
+        hide(RdmaBackend::well_formed);
+        hide(InFlightRdmaPull::valid);
+        hide(PreparedPull::valid);
+        hide(PullGrantReturn::matches_posted);
+        hide(PullGrantReturn::matches_prepared);
+        hide(rdma_lease_index_spec);
+        hide(replica_valid);
+        hide(complete_receipts);
+        hide(super::protocol::statement_replica_valid);
+        let ghost plan_view = plans@;
+        let ghost before = *core;
+        let ghost prior = *self;
+        proof {
+            assert(self.rdma.well_formed(core)) by {
+                reveal(PeerSession::well_formed);
+            }
+        }
+        let post = post_pull_read_batch(&mut self.rdma, core, Tracked(instance), target, plans);
+        let n = post.posted.len();
+        proof {
+            assert(self.well_formed(core)) by {
+                reveal(PeerSession::well_formed);
+                reveal(FrameTable::same_layout);
+                assert(rdma_leases_disjoint(self.rdma.active_leases@)) by {
+                    reveal(RdmaBackend::well_formed);
+                }
+                lemma_outbound_grants_preserved(
+                    self.pending_outbound_grants@,
+                    prior.rdma.active_leases@,
+                    self.rdma.active_leases@,
+                    &before,
+                    core,
+                );
+            }
+            lemma_foreign_shares_identical_leases(&before, core, self.rdma.active_leases@);
+            assert forall|j: int| 0 <= j < n implies {
+                let p = #[trigger] post.posted[j];
+                &&& p.valid(&self.rdma, core) && p.target == target && !p.visibility_flushed
+                &&& p.handle == plan_view[j].handle
+                &&& p.wr_id
+                    == before.timelines_spec().next_seq_spec()[prior.rdma.timeline_id as int] + j
+                &&& routes@[j].matches_posted(&p, self.channel.received(), core)
+                &&& pull_tracked_or_done(&self.rdma, p.wr_id, p.writer@)
+            } by {
+                lemma_posted_pull_batch_entry(
+                    post.posted@,
+                    plan_view,
+                    &self.rdma,
+                    core,
+                    target,
+                    before.timelines_spec().next_seq_spec()[prior.rdma.timeline_id as int],
+                    j,
+                );
+                assert(routes@[j].matches_posted(&post.posted[j], self.channel.received(), core))
+                    by {
+                    reveal(PullGrantReturn::matches_posted);
+                    reveal(PullGrantReturn::matches_prepared);
+                    assert(routes@[j].matches_prepared(
+                        &plan_view[j],
+                        prior.channel.received(),
+                        &before,
+                    ));
+                    assert(post.posted[j].copy@.source == plan_view[j].source@);
+                }
+                lemma_rdma_wf_implies_pull_tracked(
+                    &self.rdma,
+                    core,
+                    post.posted[j].wr_id,
+                    post.posted[j].writer@,
+                );
+            }
+            assert forall|j: int| 0 <= j < post.unposted.len() implies {
+                let p = #[trigger] post.unposted[j];
+                &&& p.valid(&self.rdma, core, target)
+                &&& routes@[n + j].matches_prepared(&p, self.channel.received(), core)
+            } by {
+                assert(post.unposted[j] == plan_view[(n + j) as int]);
+                assert(routes@[n + j].matches_prepared(
+                    &post.unposted[j],
+                    self.channel.received(),
+                    core,
+                )) by {
+                    reveal(PullGrantReturn::matches_prepared);
+                    assert(routes@[n + j].matches_prepared(
+                        &plan_view[(n + j) as int],
+                        prior.channel.received(),
+                        &before,
+                    ));
+                }
+                post.unposted[j].lemma_after_step(
+                    &before,
+                    core,
+                    &prior.rdma,
+                    &self.rdma,
+                    target,
+                    None,
+                );
+            }
+        }
+        post
+    }
+
+    /// Return grants for unposted reads and append their posting errors.
+    fn cancel_unposted_pulls(
+        &mut self,
+        core: &mut CacheCore,
+        target: PullTarget,
+        mut unposted: Vec<PreparedPull>,
+        mut routes: Vec<PullGrantReturn>,
+        mut results: Vec<(u64, Result<FetchOutcome, CoreError>)>,
+        post_error: CoreError,
+        Tracked(instance): Tracked<&TransferInstance>,
+        Ghost(batch_core): Ghost<CacheCore>,
+        Ghost(batch_rdma): Ghost<RdmaBackend<'a>>,
+        Ghost(plan_view): Ghost<Seq<PreparedPull>>,
+        Ghost(posted): Ghost<Seq<InFlightRdmaPull>>,
+    ) -> (out: (Vec<PullGrantReturn>, Vec<(u64, Result<FetchOutcome, CoreError>)>))
+        requires
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            instance.id() == old(core).instance_id(),
+            old(self).rdma.timeline_id == batch_rdma.timeline_id,
+            peer_core_step(&batch_core, old(core), batch_rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                &batch_core,
+                old(core),
+                batch_rdma.active_leases@,
+                old(self).rdma.active_leases@,
+            ),
+            posted.len() + unposted.len() == routes.len() == plan_view.len(),
+            unposted@ == plan_view.skip(posted.len() as int),
+            forall|j: int|
+                0 <= j < routes.len() ==> {
+                    let frame = (#[trigger] plan_view[j]).handle.frame;
+                    &&& frame.0 < batch_core.frames_spec().metas_spec().len()
+                    &&& batch_core.frames_spec().meta(frame).state != STATE_INITIALIZING
+                },
+            forall|a: int, b: int|
+                0 <= a < b < routes.len() ==> (#[trigger] routes[a]).tag != (
+                #[trigger] routes[b]).tag && (#[trigger] plan_view[a]).handle.frame != (
+                #[trigger] plan_view[b]).handle.frame,
+            forall|j: int|
+                0 <= j < posted.len() ==> {
+                    let p = #[trigger] posted[j];
+                    &&& p.valid(&old(self).rdma, old(core)) && p.target == target
+                    &&& !p.visibility_flushed && p.handle == plan_view[j].handle
+                    &&& routes[j].matches_posted(&p, old(self).channel.received(), old(core))
+                    &&& pull_tracked_or_done(&old(self).rdma, p.wr_id, p.writer@)
+                },
+            forall|j: int|
+                0 <= j < unposted.len() ==> {
+                    let p = #[trigger] unposted[j];
+                    &&& p.valid(&old(self).rdma, old(core), target)
+                    &&& routes[posted.len() + j].matches_prepared(
+                        &p,
+                        old(self).channel.received(),
+                        old(core),
+                    )
+                },
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(self).well_formed(final(core)),
+            final(self).rdma == old(self).rdma,
+            final(core).node_id_spec() == batch_core.node_id_spec(),
+            final(core).instance_id() == batch_core.instance_id(),
+            peer_core_step(&batch_core, final(core), batch_rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                &batch_core,
+                final(core),
+                batch_rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            out.0.len() == posted.len(),
+            out.0@ == routes@.take(posted.len() as int),
+            out.1.len() + posted.len() == results.len() + routes.len(),
+            forall|j: int|
+                0 <= j < posted.len() ==> {
+                    let p = #[trigger] posted[j];
+                    &&& p.valid(&final(self).rdma, final(core)) && p.target == target
+                    &&& !p.visibility_flushed && p.handle == plan_view[j].handle
+                    &&& out.0[j].matches_posted(&p, final(self).channel.received(), final(core))
+                    &&& pull_tracked_or_done(&final(self).rdma, p.wr_id, p.writer@)
+                },
+    {
+        hide(CacheCore::well_formed);
+        hide(CacheCore::all_versions_bound);
+        hide(PeerSession::well_formed);
+        hide(RdmaBackend::well_formed);
+        hide(InFlightRdmaPull::valid);
+        hide(rdma_lease_index_spec);
+        hide(replica_valid);
+        hide(complete_receipts);
+        hide(super::protocol::statement_replica_valid);
+        let ghost n = posted.len();
+        let ghost route_view = routes@;
+        let ghost count = results@.len() + routes@.len();
+        assert(unposted@ =~= plan_view.subrange(n as int, routes.len() as int));
+        let ghost after_post_rdma = self.rdma;
+        while !unposted.is_empty()
+            invariant
+                n + unposted.len() == routes.len() <= route_view.len() == plan_view.len(),
+                n == posted.len(),
+                results.len() + routes.len() == count,
+                routes@ == route_view.take(routes.len() as int),
+                unposted@ == plan_view.subrange(n as int, routes.len() as int),
+                self.rdma == after_post_rdma,
+                core.well_formed(),
+                core.all_versions_bound(),
+                self.well_formed(core),
+                instance.id() == core.instance_id(),
+                peer_core_step(&batch_core, core, self.rdma.timeline_id),
+                peer_foreign_shares_preserved(
+                    &batch_core,
+                    core,
+                    batch_rdma.active_leases@,
+                    self.rdma.active_leases@,
+                ),
+                forall|j: int|
+                    0 <= j < routes.len() ==> {
+                        &&& batch_core.frames_spec().meta(
+                            (#[trigger] plan_view[j]).handle.frame,
+                        ).state != STATE_INITIALIZING
+                        &&& plan_view[j].handle.frame.0
+                            < batch_core.frames_spec().metas_spec().len()
+                    },
+                forall|a: int, b: int|
+                    0 <= a < b < route_view.len() ==> (#[trigger] route_view[a]).tag != (
+                    #[trigger] route_view[b]).tag && (#[trigger] plan_view[a]).handle.frame != (
+                    #[trigger] plan_view[b]).handle.frame,
+                forall|j: int|
+                    0 <= j < n ==> {
+                        let p = #[trigger] posted[j];
+                        &&& p.valid(&self.rdma, core) && p.target == target && !p.visibility_flushed
+                        &&& p.handle == plan_view[j].handle
+                        &&& routes[j].matches_posted(&p, self.channel.received(), core)
+                        &&& pull_tracked_or_done(&self.rdma, p.wr_id, p.writer@)
+                    },
+                forall|j: int|
+                    0 <= j < unposted.len() ==> {
+                        let p = #[trigger] unposted[j];
+                        &&& p.valid(&self.rdma, core, target)
+                        &&& routes[n + j].matches_prepared(&p, self.channel.received(), core)
+                    },
+            decreases unposted.len(),
+        {
+            let ghost cut = routes.len() - 1;
+            let plan = unposted.pop().unwrap();
+            let route = routes.pop().unwrap();
+            proof {
+                assert(plan == plan_view[cut]);
+                assert(route == route_view[cut]);
+                assert(routes@ =~= route_view.take(cut));
+                assert(unposted@ =~= plan_view.subrange(n as int, cut));
+            }
+            let request_id = route.request_id;
+            let ghost frame = plan.handle.frame;
+            let ghost tag = route.tag;
+            let ghost before_cancel = *core;
+            self.cancel_batch_pull(core, target, plan, route, Tracked(instance));
+            proof {
+                lemma_peer_core_step_trans_retire_new_init(
+                    &batch_core,
+                    &before_cancel,
+                    core,
+                    self.rdma.timeline_id,
+                    frame,
+                );
+                lemma_foreign_shares_trans(
+                    &batch_core,
+                    &before_cancel,
+                    core,
+                    batch_rdma.active_leases@,
+                    self.rdma.active_leases@,
+                    self.rdma.active_leases@,
+                );
+                assert forall|j: int| 0 <= j < n implies {
+                    let p = #[trigger] posted[j];
+                    &&& p.valid(&self.rdma, core)
+                    &&& routes[j].matches_posted(&p, self.channel.received(), core)
+                } by {
+                    assert(routes[j] == route_view[j]);
+                    assert(routes[j].tag != tag);
+                    lemma_pull_valid_after_peer_step(
+                        &self.rdma,
+                        &self.rdma,
+                        &before_cancel,
+                        core,
+                        &posted[j],
+                        Some(frame),
+                    );
+                }
+                assert forall|j: int| 0 <= j < unposted.len() implies {
+                    let p = #[trigger] unposted[j];
+                    &&& p.valid(&self.rdma, core, target)
+                    &&& routes[n + j].matches_prepared(&p, self.channel.received(), core)
+                } by {
+                    assert(routes[n + j] == route_view[n + j]);
+                    assert(routes[n + j].tag != tag);
+                    unposted[j].lemma_after_step(
+                        &before_cancel,
+                        core,
+                        &self.rdma,
+                        &self.rdma,
+                        target,
+                        Some(frame),
+                    );
+                }
+            }
+            results.push((request_id, Err(post_error)));
+        }
+        proof {
+            assert(core.node_id_spec() == batch_core.node_id_spec() && core.instance_id()
+                == batch_core.instance_id()) by {
+                reveal(peer_core_step_except);
+                reveal(core_transition);
+            }
+        }
+        (routes, results)
+    }
+
+    /// Pull a batch of received grants. Entries can arrive in any order.
+    #[verifier::rlimit(160)]
+    pub(crate) fn fetch_batch_from_grants(
+        &mut self,
+        core: &mut CacheCore,
+        dst_tier: TierId,
+        target: PullTarget,
+        grants: Vec<PendingInboundGrant>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: FetchBatchPulls)
+        requires
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            instance.id() == old(core).instance_id(),
+            old(self).rdma.qp.ready(),
+            old(self).rdma.qp.state() is ReadyToSend,
+            old(self).rdma.qp.source().well_formed(),
+            old(self).rdma.qp.effective_max_rd_atomic() > 0,
+            old(self).rdma.peer_node != old(core).node(),
+            old(core).frames_spec().tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
+            old(self).pull_tier_valid(dst_tier, target),
+            forall|i: int|
+                0 <= i < grants.len() ==> (#[trigger] grants[i]).valid(
+                    old(core),
+                    &old(self).channel,
+                    old(self).rdma.peer_node,
+                ),
+            forall|i: int, j: int|
+                0 <= i < j < grants.len() ==> (#[trigger] grants[i]).tag != (
+                #[trigger] grants[j]).tag,
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(core).instance_id() == old(core).instance_id(),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(self).well_formed(final(core)),
+            final(self).rdma.qp.ready(),
+            final(self).rdma.qp.state() is ReadyToSend,
+            final(self).rdma.qp.source().well_formed(),
+            final(self).rdma.qp.source().source() == old(self).rdma.qp.source().source(),
+            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
+            final(self).rdma.peer_node == old(self).rdma.peer_node,
+            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            r.pending.len() == 0 || r.wait_error.is_some(),
+            r.results.len() + r.pending.len() == grants.len(),
+    {
+        hide(CacheCore::well_formed);
+        hide(CacheCore::all_versions_bound);
+        hide(PeerSession::well_formed);
+        hide(RdmaBackend::well_formed);
+        hide(InFlightRdmaPull::valid);
+        hide(rdma_lease_index_spec);
+        hide(replica_valid);
+        hide(complete_receipts);
+        hide(super::protocol::statement_replica_valid);
+        let (plans, routes, results) = self.prepare_batch_pulls(
+            core,
+            dst_tier,
+            target,
+            grants,
+            Tracked(instance),
+        );
+        let ghost plan_view = plans@;
+        let ghost route_view = routes@;
+        let ghost before_post = *core;
+        let ghost before_leases = self.rdma.active_leases@;
+        let post = self.post_batch_pulls(core, target, plans, routes.as_slice(), Tracked(instance));
+        proof {
+            lemma_peer_core_step_trans(old(core), &before_post, core, self.rdma.timeline_id);
+            lemma_foreign_shares_trans(
+                old(core),
+                &before_post,
+                core,
+                old(self).rdma.active_leases@,
+                before_leases,
+                self.rdma.active_leases@,
+            );
+        }
+        let posted = post.posted;
+        let (routes, results) = self.cancel_unposted_pulls(
+            core,
+            target,
+            post.unposted,
+            routes,
+            results,
+            post.error.unwrap_or(CoreError::CapacityExhausted),
+            Tracked(instance),
+            Ghost(*old(core)),
+            Ghost(old(self).rdma),
+            Ghost(plan_view),
+            Ghost(posted@),
+        );
+        proof {
+            assert forall|a: int, b: int| 0 <= a < b < posted.len() implies {
+                &&& (#[trigger] posted[a]).wr_id != (#[trigger] posted[b]).wr_id
+                &&& posted[a].handle.frame != posted[b].handle.frame
+                &&& routes[a].tag != routes[b].tag
+            } by {
+                assert(posted[a].wr_id == before_post.timelines_spec().next_seq_spec()[old(
+                    self,
+                ).rdma.timeline_id as int] + a);
+                assert(posted[b].wr_id == before_post.timelines_spec().next_seq_spec()[old(
+                    self,
+                ).rdma.timeline_id as int] + b);
+                assert(routes[a] == route_view[a]);
+                assert(routes[b] == route_view[b]);
+            }
+        }
+        self.finish_posted_pulls(
+            core,
+            target,
+            posted,
+            routes,
+            results,
+            Tracked(instance),
+            Ghost(*old(core)),
+            Ghost(old(self).rdma),
+            Ghost(plan_view),
+        )
+    }
+
+    /// Await the posted reads, then publish completed destinations or return sealed pulls.
+    #[verifier::rlimit(30)]
+    fn finish_posted_pulls(
+        &mut self,
+        core: &mut CacheCore,
+        target: PullTarget,
+        posted: Vec<InFlightRdmaPull>,
+        routes: Vec<PullGrantReturn>,
+        mut results: Vec<(u64, Result<FetchOutcome, CoreError>)>,
+        Tracked(instance): Tracked<&TransferInstance>,
+        Ghost(batch_core): Ghost<CacheCore>,
+        Ghost(batch_rdma): Ghost<RdmaBackend<'a>>,
+        Ghost(plan_view): Ghost<Seq<PreparedPull>>,
+    ) -> (r: FetchBatchPulls)
+        requires
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            instance.id() == old(core).instance_id(),
+            old(core).instance_id() == batch_core.instance_id(),
+            old(core).node_id_spec() == batch_core.node_id_spec(),
+            old(self).rdma.qp.ready(),
+            old(self).rdma.qp.state() is ReadyToSend,
+            rdma::read_batch_qp_frame(&old(self).rdma.qp, &batch_rdma.qp),
+            old(self).rdma.timeline_id == batch_rdma.timeline_id,
+            old(self).rdma.peer_node == batch_rdma.peer_node,
+            peer_core_step(&batch_core, old(core), batch_rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                &batch_core,
+                old(core),
+                batch_rdma.active_leases@,
+                old(self).rdma.active_leases@,
+            ),
+            posted.len() == routes.len() <= plan_view.len(),
+            forall|j: int|
+                0 <= j < posted.len() ==> {
+                    let p = #[trigger] posted[j];
+                    &&& p.valid(&old(self).rdma, old(core))
+                    &&& p.target == target && !p.visibility_flushed
+                    &&& p.handle == plan_view[j].handle
+                    &&& p.handle.frame.0 < batch_core.frames_spec().metas_spec().len()
+                    &&& batch_core.frames_spec().meta(p.handle.frame).state != STATE_INITIALIZING
+                    &&& routes[j].matches_posted(&p, old(self).channel.received(), old(core))
+                    &&& pull_tracked_or_done(&old(self).rdma, p.wr_id, p.writer@)
+                },
+            forall|a: int, b: int|
+                0 <= a < b < posted.len() ==> {
+                    &&& (#[trigger] posted[a]).wr_id != (#[trigger] posted[b]).wr_id
+                    &&& posted[a].handle.frame != posted[b].handle.frame
+                    &&& routes[a].tag != routes[b].tag
+                },
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(core).instance_id() == batch_core.instance_id(),
+            final(core).node_id_spec() == batch_core.node_id_spec(),
+            final(self).well_formed(final(core)),
+            final(self).rdma.qp.ready(),
+            final(self).rdma.qp.state() is ReadyToSend,
+            rdma::read_batch_qp_frame(&final(self).rdma.qp, &batch_rdma.qp),
+            final(self).rdma.timeline_id == batch_rdma.timeline_id,
+            final(self).rdma.peer_node == batch_rdma.peer_node,
+            peer_core_step(&batch_core, final(core), batch_rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                &batch_core,
+                final(core),
+                batch_rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            r.pending.len() == 0 || r.wait_error.is_some(),
+            r.results.len() + r.pending.len() == results.len() + posted.len(),
+    {
+        hide(CacheCore::well_formed);
+        hide(CacheCore::all_versions_bound);
+        hide(PeerSession::well_formed);
+        hide(RdmaBackend::well_formed);
+        hide(InFlightRdmaPull::valid);
+        hide(PullGrantReturn::matches_posted);
+        hide(rdma_lease_index_spec);
+        hide(replica_valid);
+        hide(complete_receipts);
+        hide(super::protocol::statement_replica_valid);
+        let n = posted.len();
+        let ghost count = results@.len() + posted@.len();
+        let ghost before_wait = *core;
+        let ghost before_wait_rdma = self.rdma;
+        let ghost before_wait_channel = self.channel;
+        let (statuses, wait_error) = self.await_batch_completions(
+            core,
+            posted.as_slice(),
+            Tracked(instance),
+        );
+        proof {
+            lemma_peer_core_step_trans(&batch_core, &before_wait, core, self.rdma.timeline_id);
+            lemma_foreign_shares_trans(
+                &batch_core,
+                &before_wait,
+                core,
+                batch_rdma.active_leases@,
+                before_wait_rdma.active_leases@,
+                self.rdma.active_leases@,
+            );
+        }
+        let ghost pre_flush = posted@;
+        let (posted, wait_error) = if wait_error.is_none() {
+            proof {
+                assert(self.rdma.well_formed(core)) by {
+                    reveal(PeerSession::well_formed);
+                }
+                assert forall|j: int| 0 <= j < n implies {
+                    let p = #[trigger] pre_flush[j];
+                    &&& p.valid(&self.rdma, core) && p.target == target
+                    &&& p.completion_observed(core)
+                    &&& target is GpuGdr ==> !p.batch_visible()
+                } by {
+                    assert(observed_batch_status(&pre_flush[j], core, statuses[j]));
+                }
+                lemma_core_frames_separated(core);
+                assert forall|a: int, b: int| 0 <= a < b < n implies (
+                #[trigger] pre_flush[a]).handle.slot@.loc != (
+                #[trigger] pre_flush[b]).handle.slot@.loc by {
+                    reveal(InFlightRdmaPull::valid);
+                    let left = pre_flush[a];
+                    let right = pre_flush[b];
+                    assert(left.handle == plan_view[a].handle);
+                    assert(right.handle == plan_view[b].handle);
+                    assert(left.handle.frame != right.handle.frame);
+                    assert(left.handle.slot@ == core.frames_spec().frame(left.handle.frame).slot);
+                    assert(right.handle.slot@ == core.frames_spec().frame(right.handle.frame).slot);
+                }
+            }
+            finish_pull_read_batch(&self.rdma, core, Tracked(instance), target, posted)
+        } else {
+            proof {
+                assert(observed_pull_batch_matches(posted@, pre_flush, &self.rdma, core, false))
+                    by {
+                    reveal(observed_pull_batch_matches);
+                }
+            }
+            (posted, wait_error)
+        };
+        let ghost all_pulls = posted@;
+        let ghost all_routes = routes@;
+        let ghost batch = PullBatchView {
+            pulls: all_pulls,
+            routes: all_routes,
+            statuses: statuses@,
+            plans: plan_view,
+            before: batch_core,
+            visible: wait_error.is_none(),
+        };
+        assert(n == all_pulls.len() == all_routes.len() <= plan_view.len());
+        proof {
+            assert(pull_batch_targets_distinct(all_pulls, all_routes)) by {
+                reveal(pull_batch_targets_distinct);
+                assert forall|a: int, b: int| 0 <= a < b < n implies {
+                    &&& (#[trigger] all_pulls[a]).handle.frame != (
+                    #[trigger] all_pulls[b]).handle.frame
+                    &&& all_routes[a].tag != all_routes[b].tag
+                } by {
+                    lemma_observed_pull_batch_entry(
+                        all_pulls,
+                        pre_flush,
+                        &self.rdma,
+                        core,
+                        wait_error.is_none(),
+                        a,
+                    );
+                    lemma_observed_pull_batch_entry(
+                        all_pulls,
+                        pre_flush,
+                        &self.rdma,
+                        core,
+                        wait_error.is_none(),
+                        b,
+                    );
+                }
+            }
+            assert(batch.valid_suffix(0, self, core)) by {
+                reveal(PullBatchView::valid_suffix);
+                assert forall|j: int| 0 <= j < n implies #[trigger] batch.valid_entry(
+                    j,
+                    self,
+                    core,
+                ) by {
+                    let p = all_pulls[j];
+                    let previous = pre_flush[j];
+                    lemma_observed_pull_batch_entry(
+                        all_pulls,
+                        pre_flush,
+                        &self.rdma,
+                        core,
+                        wait_error.is_none(),
+                        j,
+                    );
+                    assert(all_routes[j].matches_posted(&p, self.channel.received(), core)) by {
+                        reveal(PullGrantReturn::matches_posted);
+                        assert(all_routes[j].matches_posted(
+                            &previous,
+                            before_wait_channel.received(),
+                            &before_wait,
+                        ));
+                    }
+                    if j < statuses.len() {
+                        assert(observed_batch_status(&previous, core, statuses[j]));
+                    }
+                }
+            }
+        }
+        let mut pulls = posted.into_iter();
+        let mut routes = routes.into_iter();
+        let mut pending = Vec::new();
+        let mut k = 0;
+        proof {
+            assert(core.node_id_spec() == batch_core.node_id_spec()) by {
+                reveal(peer_core_step_except);
+                reveal(core_transition);
+            }
+        }
+        while k < n
+            invariant
+                k <= n == all_pulls.len() == all_routes.len(),
+                n <= plan_view.len(),
+                results.len() + pending.len() + n - k == count,
+                vstd::std_specs::iter::IteratorSpec::remaining(&pulls) == all_pulls.skip(k as int),
+                vstd::std_specs::iter::IteratorSpec::remaining(&routes) == all_routes.skip(
+                    k as int,
+                ),
+                core.well_formed(),
+                core.all_versions_bound(),
+                self.well_formed(core),
+                instance.id() == core.instance_id(),
+                core.instance_id() == batch_core.instance_id(),
+                core.node_id_spec() == batch_core.node_id_spec(),
+                self.rdma.qp.ready(),
+                self.rdma.qp.state() is ReadyToSend,
+                rdma::read_batch_qp_frame(&self.rdma.qp, &batch_rdma.qp),
+                self.rdma.timeline_id == batch_rdma.timeline_id,
+                self.rdma.peer_node == batch_rdma.peer_node,
+                peer_core_step(&batch_core, core, self.rdma.timeline_id),
+                peer_foreign_shares_preserved(
+                    &batch_core,
+                    core,
+                    batch_rdma.active_leases@,
+                    self.rdma.active_leases@,
+                ),
+                pending.len() == 0 || wait_error.is_some(),
+                statuses.len() <= n,
+                wait_error.is_none() ==> statuses.len() == n,
+                batch == (PullBatchView {
+                    pulls: all_pulls,
+                    routes: all_routes,
+                    statuses: statuses@,
+                    plans: plan_view,
+                    before: batch_core,
+                    visible: wait_error.is_none(),
+                }),
+                pull_batch_targets_distinct(all_pulls, all_routes),
+                batch.valid_suffix(k as int, self, core),
+            decreases n - k,
+        {
+            let pull = pulls.next().unwrap();
+            let route = routes.next().unwrap();
+            if wait_error.is_some() {
+                let status = if k < statuses.len() {
+                    Some(statuses[k])
+                } else {
+                    None
+                };
+                pending.push(PendingBatchPull { pull, route, status });
+                assert(batch.valid_suffix(k as int + 1, self, core)) by {
+                    reveal(PullBatchView::valid_suffix);
+                }
+            } else {
+                let status = statuses[k];
+                let ghost before_finish = *core;
+                let ghost prior_rdma = self.rdma;
+                let ghost prior_session = *self;
+                let ghost frame = pull.handle.frame;
+                let ghost tag = route.tag;
+                proof {
+                    assert(pull == all_pulls[k as int]);
+                    assert(route == all_routes[k as int]);
+                    batch.lemma_entry(k as int, k as int, self, core);
+                    assert(pull.valid(&self.rdma, core));
+                    assert(route.matches_posted(&pull, self.channel.received(), core));
+                    assert(route.owns_grant(self.channel.received(), pull.share_cap@)
+                        && route.matches_version(pull.handle.version, pull.copy@.source.bytes)
+                        && transfer::transport::covers(route.frontier@, core.citations())
+                        && pull.share_cap@.frontier() == (Frontier {
+                        last_writer: route.frontier@.last_writer,
+                        readers: route.frontier@.readers.insert(pull.writer@),
+                    })) by {
+                        reveal(PullGrantReturn::matches_posted);
+                    }
+                    assert(observed_batch_status(&pull, core, status));
+                    assert(core.citations().contains(pull.writer@));
+                }
+                let outcome = self.finish_observed_pull(
+                    core,
+                    route.tag,
+                    route.request_id,
+                    pull,
+                    status,
+                    route.binding,
+                    route.frontier,
+                    Tracked(instance),
+                );
+                proof {
+                    lemma_peer_core_step_trans_retire_new_init(
+                        &batch_core,
+                        &before_finish,
+                        core,
+                        self.rdma.timeline_id,
+                        frame,
+                    );
+                    lemma_foreign_shares_trans(
+                        &batch_core,
+                        &before_finish,
+                        core,
+                        batch_rdma.active_leases@,
+                        prior_rdma.active_leases@,
+                        self.rdma.active_leases@,
+                    );
+                    lemma_batch_status_growth(
+                        &before_finish,
+                        core,
+                        self.rdma.timeline_id,
+                        Some(frame),
+                    );
+                    assert(batch.valid_suffix(k as int + 1, self, core)) by {
+                        reveal(PullBatchView::valid_suffix);
+                        assert forall|j: int| k < j < n implies #[trigger] batch.valid_entry(
+                            j,
+                            self,
+                            core,
+                        ) by {
+                            lemma_pull_batch_targets_distinct(all_pulls, all_routes, k as int, j);
+                            batch.lemma_entry(k as int, j, &prior_session, &before_finish);
+                            assert(all_pulls[j].handle.frame != frame);
+                            assert(all_routes[j].tag != tag);
+                            lemma_pull_valid_after_peer_step(
+                                &prior_rdma,
+                                &self.rdma,
+                                &before_finish,
+                                core,
+                                &all_pulls[j],
+                                Some(frame),
+                            );
+                            assert(all_routes[j].matches_posted(
+                                &all_pulls[j],
+                                self.channel.received(),
+                                core,
+                            )) by {
+                                reveal(PullGrantReturn::matches_posted);
+                            }
+                        }
+                    }
+                }
+                results.push((route.request_id, outcome));
+            }
+            k += 1;
+        }
+        FetchBatchPulls { results, pending, wait_error }
+    }
+
+    pub open(crate) spec fn pull_tier_valid(&self, tier: TierId, target: PullTarget) -> bool {
+        match target {
+            PullTarget::Host => self.rdma.effective_host_mr_spec() matches Some(s) && s.tier == tier
+                && s.mr.access().local_write && s.mr.gpu_device_spec().is_none(),
+            PullTarget::GpuGdr => self.rdma.effective_gpu_mr_spec() matches Some(s) && s.tier
+                == tier && s.mr.access().local_write && s.mr.gpu_device_spec() is Some,
+        }
+    }
+
     /// Initiator helper: await CQ completion (via `pump_cq` / `completed_pulls`),
     /// verify version binding, finish/abort the pull, register the version binding
     /// on hit, and send `READ_RELEASE`.
     #[verifier::rlimit(250)]
-    pub fn fetch_complete_pull(
+    pub(crate) fn fetch_complete_pull(
         &mut self,
         core: &mut CacheCore,
         tag: GrantTag,
@@ -4763,9 +6941,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(core).well_formed(),
             final(core).all_versions_bound(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
+            final(core).tiers_spec() == old(core).tiers_spec(),
             peer_core_step_except(
                 old(core),
                 final(core),
@@ -4807,11 +6985,135 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             Err(e) => {
                 proof {
                     reveal(peer_core_step_except);
+                    reveal(core_transition);
                     reveal(FrameTable::preserves_initializing);
                 }
                 return Err(e);
             },
         };
+        let ghost before_finish = *core;
+        let ghost before_finish_leases = self.rdma.active_leases@;
+        let res = self.finish_observed_pull(
+            core,
+            tag,
+            req_id,
+            pull,
+            status,
+            Tracked(vb),
+            Ghost(orig_share_frontier),
+            Tracked(instance),
+        );
+        proof {
+            lemma_peer_core_step_then_except(
+                old(core),
+                &before_finish,
+                core,
+                self.rdma.timeline_id,
+                Some(pull_frame),
+            );
+            lemma_foreign_shares_trans(
+                old(core),
+                &before_finish,
+                core,
+                old(self).rdma.active_leases@,
+                before_finish_leases,
+                self.rdma.active_leases@,
+            );
+        }
+        res
+    }
+
+    /// Finish a pull whose CQ status has already been reaped.
+    #[verifier::rlimit(150)]
+    pub(crate) fn finish_observed_pull(
+        &mut self,
+        core: &mut CacheCore,
+        tag: GrantTag,
+        req_id: u64,
+        pull: InFlightRdmaPull,
+        status: Result<(), i32>,
+        Tracked(vb): Tracked<VersionBinding>,
+        Ghost(orig_share_frontier): Ghost<foundation::tracked::Frontier<TransferDomain>>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<FetchOutcome, CoreError>)
+        requires
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            instance.id() == old(core).instance_id(),
+            pull.valid(&old(self).rdma, old(core)),
+            pull.completion_observed(old(core)),
+            old(core).citations().contains(pull.writer@),
+            status.is_ok() ==> event_succeeded(
+                old(core).ledger_spec()@,
+                old(core).node(),
+                pull.writer@,
+            ),
+            old(self).channel.received().contains_key(tag),
+            old(self).channel.received()[tag] is ReadShare,
+            pull.share_cap@.loc() == old(self).channel.received()[tag]->ReadShare_slot.loc,
+            pull.share_cap@.share() == old(self).channel.received()[tag]->ReadShare_share_id,
+            pull.share_cap@.frontier() == (foundation::tracked::Frontier {
+                last_writer: orig_share_frontier.last_writer,
+                readers: orig_share_frontier.readers.insert(pull.writer@),
+            }),
+            transfer::transport::covers(orig_share_frontier, old(core).citations()),
+            vb.instance_id() == cluster_version_instance_id(),
+            vb.key() == (pull.handle.version.origin_node as NodeId, pull.handle.version.seq),
+            vb.value() == pull.copy@.source.bytes,
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(self).well_formed(final(core)),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).instance_id() == old(core).instance_id(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            peer_core_step_except(
+                old(core),
+                final(core),
+                old(self).rdma.timeline_id,
+                Some(pull.handle.frame),
+            ),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
+            final(self).rdma.peer_node == old(self).rdma.peer_node,
+            final(self).rdma.qp == old(self).rdma.qp,
+            final(self).rdma.host_mr == old(self).rdma.host_mr,
+            final(self).rdma.gpu_mr == old(self).rdma.gpu_mr,
+            final(self).rdma.shared_host_mr == old(self).rdma.shared_host_mr,
+            final(self).rdma.shared_gpu_mr == old(self).rdma.shared_gpu_mr,
+            final(self).next_grant_tag == old(self).next_grant_tag,
+            final(self).next_request_id == old(self).next_request_id,
+            final(self).active_grants == old(self).active_grants,
+            final(self).pending_outbound_grants == old(self).pending_outbound_grants,
+            final(self).pending_inbound_fetches == old(self).pending_inbound_fetches,
+            final(self).pending_inbound_misses == old(self).pending_inbound_misses,
+            final(self).pending_revoke_notices == old(self).pending_revoke_notices,
+            final(self).pending_revoke_acks == old(self).pending_revoke_acks,
+            final(self).pending_reconnect_barriers == old(self).pending_reconnect_barriers,
+            final(self).quarantined_grants == old(self).quarantined_grants,
+            final(self).reconnect_epoch == old(self).reconnect_epoch,
+            final(self).peer_reconnect_epoch == old(self).peer_reconnect_epoch,
+            final(core).timelines_spec() == old(core).timelines_spec(),
+            final(self).rdma == old(self).rdma,
+            forall|k: GrantTag|
+                k != tag && #[trigger] old(self).channel.received().contains_key(k)
+                    ==> final(self).channel.received().contains_key(k)
+                    && final(self).channel.received()[k] == old(self).channel.received()[k],
+    {
+        hide(CacheCore::well_formed);
+        hide(replica_valid);
+        hide(complete_receipts);
+        let ghost pull_frame = pull.handle.frame;
+        proof {
+            lemma_peer_core_step_refl(core, self.rdma.timeline_id);
+            lemma_foreign_shares_refl(core, self.rdma.active_leases@);
+        }
         core.verify_version_binding(pull.handle.version, Tracked(&vb));
         let ghost before_fin_core = *core;
         let ghost pull_writer = pull.writer@;
@@ -4846,10 +7148,11 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 &before_fin_core,
                 core,
             );
-            assert(core.frames.same_layout(&before_fin_core.frames)) by {
+            assert(core.frames_spec().same_layout(&before_fin_core.frames_spec())) by {
                 reveal(FrameTable::same_layout);
             }
             reveal(peer_core_step_except);
+            reveal(core_transition);
             broadcast use {vstd::imap::group_imap_lemmas, vstd::iset::group_iset_lemmas};
 
             lemma_outbound_grants_preserved(
@@ -4874,10 +7177,10 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 let ghost before_reg = *core;
                 core.try_register_version_binding(version, Tracked(Some(vb)));
                 proof {
-                    assert(core.frames.same_directory(&before_reg.frames)) by {
+                    assert(core.frames_spec().same_directory(&before_reg.frames_spec())) by {
                         reveal(FrameTable::same_directory);
                     }
-                    assert(core.frames.same_layout(&before_reg.frames)) by {
+                    assert(core.frames_spec().same_layout(&before_reg.frames_spec())) by {
                         reveal(FrameTable::same_layout);
                     }
                     lemma_foreign_shares_identical_leases(
@@ -4895,12 +7198,12 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                     );
                     lemma_completed_pulls_after_step(
                         self.rdma.completed_pulls,
-                        &before_reg.timelines,
-                        &core.timelines,
+                        &before_reg.timelines_spec(),
+                        &core.timelines_spec(),
                         self.rdma.timeline_id,
                         self.rdma.cq.observer(),
-                        &before_reg.ledger@,
-                        &core.ledger@,
+                        &before_reg.ledger_spec()@,
+                        &core.ledger_spec()@,
                     );
                     lemma_rdma_all_slabs_same_directory(
                         &self.rdma.host_mr,
@@ -4927,6 +7230,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                     );
                     assert(peer_core_step(&before_reg, core, self.rdma.timeline_id)) by {
                         reveal(peer_core_step_except);
+                        reveal(core_transition);
                         reveal(FrameTable::same_layout);
                         reveal(FrameTable::preserves_initializing);
                     }
@@ -4939,11 +7243,13 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                     );
                     assert(core.all_versions_bound()) by {
                         assert forall|v: VersionId| #[trigger]
-                            core.frames.versions@.contains_key(v) implies core.has_version_binding(
-                            v,
-                        ) by {
+                            core.frames_spec().versions_spec()@.contains_key(
+                                v,
+                            ) implies core.has_version_binding(v) by {
                             if v != version {
-                                assert(before_fin_core.frames.versions@.contains_key(v));
+                                assert(before_fin_core.frames_spec().versions_spec()@.contains_key(
+                                    v,
+                                ));
                                 assert(before_fin_core.has_version_binding(v));
                                 assert(before_reg.has_version_binding(v));
                             }
@@ -5004,14 +7310,14 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 0 <= i < old(self).active_grants@.len() ==> {
                     let g = #[trigger] old(self).active_grants@[i];
                     &&& g.grant_tag < old(self).next_grant_tag
-                    &&& g.frame.0 < old(core).frames.metas.len()
+                    &&& g.frame.0 < old(core).frames_spec().metas_spec().len()
                     &&& old(self).rdma.lease_index_spec(g.handle) matches Some(idx) && {
                         let lease = old(self).rdma.active_leases@[idx];
                         &&& lease.frame == g.frame
                         &&& lease.state == RemoteLeaseState::Bound
                         &&& pre_chan.sent().contains_key(g.grant_tag)
                         &&& pre_chan.sent()[g.grant_tag] == (GrantKind::ReadShare {
-                            slot: old(core).frames.frame(g.frame).slot,
+                            slot: old(core).frames_spec().frame(g.frame).slot,
                             share_id: lease.share@,
                         })
                     }
@@ -5033,15 +7339,17 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         ensures
             final(core).well_formed(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames.versions@ == old(core).frames.versions@,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines.count == old(core).timelines.count,
-            final(core).timelines.kinds == old(core).timelines.kinds,
-            final(core).timelines.events == old(core).timelines.events,
-            final(core).timelines.next_seq == old(core).timelines.next_seq,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -5088,6 +7396,10 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 match decode_control_payload(&user_bytes) {
                     Some(ControlPayload::FetchRequest { request_id, key }) => {
                         self.pending_inbound_fetches.push((request_id, key));
+                        Ok((true, false))
+                    },
+                    Some(ControlPayload::FetchBatch { entries }) => {
+                        append_fetch_entries(&mut self.pending_inbound_fetches, entries.as_slice());
                         Ok((true, false))
                     },
                     Some(ControlPayload::FetchMiss { request_id }) => {
@@ -5205,27 +7517,27 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                         lemma_rdma_window_after_fence_ledger(
                             self.rdma.in_flight_ops,
                             self.rdma.bitmap,
-                            &core.timelines,
+                            &core.timelines_spec(),
                             self.rdma.timeline_id,
-                            &before_merge.ledger@,
-                            &core.ledger@,
+                            &before_merge.ledger_spec()@,
+                            &core.ledger_spec()@,
                             rdma::CqSnapshot::of(self.rdma.cq),
                             core.instance_id(),
                             self.rdma.next_control_wr_id,
                         );
                         lemma_completed_pulls_after_step(
                             self.rdma.completed_pulls,
-                            &before_merge.timelines,
-                            &core.timelines,
+                            &before_merge.timelines_spec(),
+                            &core.timelines_spec(),
                             self.rdma.timeline_id,
                             self.rdma.cq.observer(),
-                            &before_merge.ledger@,
-                            &core.ledger@,
+                            &before_merge.ledger_spec()@,
+                            &core.ledger_spec()@,
                         );
-                        assert(core.frames.same_directory(&before_merge.frames)) by {
+                        assert(core.frames_spec().same_directory(&before_merge.frames_spec())) by {
                             reveal(FrameTable::same_directory);
                         }
-                        assert(core.frames.same_layout(&before_merge.frames)) by {
+                        assert(core.frames_spec().same_layout(&before_merge.frames_spec())) by {
                             reveal(FrameTable::same_layout);
                         }
                         lemma_rdma_all_slabs_same_directory(
@@ -5253,6 +7565,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                         );
                         assert(peer_core_step(&before_merge, core, self.rdma.timeline_id)) by {
                             reveal(peer_core_step_except);
+                            reveal(core_transition);
                             reveal(FrameTable::preserves_initializing);
                         }
                         lemma_foreign_shares_identical_leases(
@@ -5270,7 +7583,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
 
     /// Blocking-transport-safe single step: drain all currently posted CQEs
     /// (`pump_cq_all`) and process at most ONE frame via `Channel::try_recv_any`.
-    pub fn pump_cq_and_channel_step(
+    pub(crate) fn pump_cq_and_channel_step(
         &mut self,
         core: &mut CacheCore,
         Tracked(instance): Tracked<&TransferInstance>,
@@ -5284,15 +7597,17 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         ensures
             final(core).well_formed(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames.versions@ == old(core).frames.versions@,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines.count == old(core).timelines.count,
-            final(core).timelines.kinds == old(core).timelines.kinds,
-            final(core).timelines.events == old(core).timelines.events,
-            final(core).timelines.next_seq == old(core).timelines.next_seq,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -5345,14 +7660,14 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             assert forall|i: int| 0 <= i < self.active_grants@.len() implies {
                 let g = #[trigger] self.active_grants@[i];
                 &&& g.grant_tag < self.next_grant_tag
-                &&& g.frame.0 < core.frames.metas.len()
+                &&& g.frame.0 < core.frames_spec().metas_spec().len()
                 &&& self.rdma.lease_index_spec(g.handle) matches Some(idx) && {
                     let lease = self.rdma.active_leases@[idx];
                     &&& lease.frame == g.frame
                     &&& lease.state == RemoteLeaseState::Bound
                     &&& self.channel.sent().contains_key(g.grant_tag)
                     &&& self.channel.sent()[g.grant_tag] == (GrantKind::ReadShare {
-                        slot: core.frames.frame(g.frame).slot,
+                        slot: core.frames_spec().frame(g.frame).slot,
                         share_id: lease.share@,
                     })
                 }
@@ -5362,7 +7677,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 assert(step_leases[oidx].state == RemoteLeaseState::Bound);
                 assert(!step_leases[oidx].has_active_wr());
             }
-            assert(core.frames.same_layout(&step_core.frames)) by {
+            assert(core.frames_spec().same_layout(&step_core.frames_spec())) by {
                 reveal(FrameTable::same_layout);
             }
             lemma_outbound_grants_preserved(
@@ -5428,9 +7743,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     }
 
     /// Bounded non-blocking drain of CQEs + inbound channel frames (does NOT
-    /// require `HostContext` or `ShareSource`). Use `pump_cq_and_channel_step`
+    /// require `SyncContext` or `ShareSource`). Use `pump_cq_and_channel_step`
     /// when interleaving single frames over blocking `TcpTransport`.
-    pub fn pump_cq_and_channel_basic(
+    pub(crate) fn pump_cq_and_channel_basic(
         &mut self,
         core: &mut CacheCore,
         Tracked(instance): Tracked<&TransferInstance>,
@@ -5444,15 +7759,17 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         ensures
             final(core).well_formed(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames.versions@ == old(core).frames.versions@,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines.count == old(core).timelines.count,
-            final(core).timelines.kinds == old(core).timelines.kinds,
-            final(core).timelines.events == old(core).timelines.events,
-            final(core).timelines.next_seq == old(core).timelines.next_seq,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -5463,6 +7780,185 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(self).rdma.timeline_id == old(self).rdma.timeline_id,
             final(self).rdma.peer_node == old(self).rdma.peer_node,
             final(self).rdma.qp == old(self).rdma.qp,
+            final(self).rdma.window_pool.pd() == old(self).rdma.window_pool.pd(),
+            final(self).rdma.host_mr == old(self).rdma.host_mr,
+            final(self).rdma.gpu_mr == old(self).rdma.gpu_mr,
+            final(self).rdma.shared_host_mr == old(self).rdma.shared_host_mr,
+            final(self).rdma.shared_gpu_mr == old(self).rdma.shared_gpu_mr,
+            final(self).channel.same_session(old(self).channel),
+            final(self).next_grant_tag == old(self).next_grant_tag,
+            final(self).next_request_id == old(self).next_request_id,
+            final(self).active_grants@.len() < old(self).active_grants@.len()
+                || final(self).active_grants == old(self).active_grants,
+            forall|seq: u64, writer: TransferEvent| #[trigger]
+                pull_tracked_or_done(&old(self).rdma, seq, writer) ==> pull_tracked_or_done(
+                    &final(self).rdma,
+                    seq,
+                    writer,
+                ),
+    {
+        let progress = self.drain_inbound_frames(core, Tracked(instance))?;
+        Ok(
+            progress.cq_processed > 0 || progress.frames_received > 0 || progress.releases_processed
+                > 0,
+        )
+    }
+
+    /// Poll CQEs while preserving the session's buffered grants and pulls.
+    fn pump_session_cq(
+        &mut self,
+        core: &mut CacheCore,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<usize, CoreError>)
+        requires
+            old(core).well_formed(),
+            old(self).well_formed(old(core)),
+            instance.id() == old(core).instance_id(),
+        ensures
+            final(core).well_formed(),
+            final(self).well_formed(final(core)),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).instance_id() == old(core).instance_id(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
+            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
+            final(self).rdma.peer_node == old(self).rdma.peer_node,
+            final(self).rdma.qp == old(self).rdma.qp,
+            final(self).rdma.host_mr == old(self).rdma.host_mr,
+            final(self).rdma.gpu_mr == old(self).rdma.gpu_mr,
+            final(self).rdma.shared_host_mr == old(self).rdma.shared_host_mr,
+            final(self).rdma.shared_gpu_mr == old(self).rdma.shared_gpu_mr,
+            final(self).channel.same_session(old(self).channel),
+            final(self).next_grant_tag == old(self).next_grant_tag,
+            final(self).next_request_id == old(self).next_request_id,
+            final(self).active_grants == old(self).active_grants,
+            final(self).pending_outbound_grants == old(self).pending_outbound_grants,
+            final(self).pending_inbound_grants == old(self).pending_inbound_grants,
+            final(self).channel == old(self).channel,
+            final(self).rdma.window_pool.pd() == old(self).rdma.window_pool.pd(),
+            final(self).pending_inbound_fetches == old(self).pending_inbound_fetches,
+            forall|seq: u64, writer: TransferEvent| #[trigger]
+                pull_tracked_or_done(&old(self).rdma, seq, writer) ==> pull_tracked_or_done(
+                    &final(self).rdma,
+                    seq,
+                    writer,
+                ),
+            final(self).rdma.pending().dom().subset_of(old(self).rdma.pending().dom()),
+    {
+        hide(CacheCore::well_formed);
+        hide(PeerSession::well_formed);
+        hide(RdmaBackend::well_formed);
+        hide(RdmaBackend::pending);
+        hide(RdmaBackend::completed_pull_spec);
+        hide(rdma_lease_index_spec);
+        hide(replica_valid);
+        hide(complete_receipts);
+        hide(super::protocol::statement_replica_valid);
+        let ghost step_core = *core;
+        let ghost step_leases = self.rdma.active_leases@;
+        let ghost step_rdma = self.rdma;
+        proof {
+            assert(self.rdma.well_formed(core)) by {
+                reveal(PeerSession::well_formed);
+            }
+        }
+        let result = self.rdma.pump_cq_all(core, Tracked(instance));
+        proof {
+            assert(self.well_formed(core)) by {
+                reveal(PeerSession::well_formed);
+                assert forall|i: int| 0 <= i < self.active_grants@.len() implies {
+                    let g = #[trigger] self.active_grants@[i];
+                    &&& g.grant_tag < self.next_grant_tag
+                    &&& g.frame.0 < core.frames_spec().metas_spec().len()
+                    &&& self.rdma.lease_index_spec(g.handle) matches Some(idx) && {
+                        let lease = self.rdma.active_leases@[idx];
+                        &&& lease.frame == g.frame
+                        &&& lease.state == RemoteLeaseState::Bound
+                        &&& self.channel.sent().contains_key(g.grant_tag)
+                        &&& self.channel.sent()[g.grant_tag] == (GrantKind::ReadShare {
+                            slot: core.frames_spec().frame(g.frame).slot,
+                            share_id: lease.share@,
+                        })
+                    }
+                } by {
+                    let g = self.active_grants@[i];
+                    let before_idx = step_rdma.lease_index_spec(g.handle).unwrap();
+                    let before_lease = step_leases[before_idx];
+                    assert(before_lease.state == RemoteLeaseState::Bound);
+                    assert(!before_lease.has_active_wr());
+                    assert(self.rdma.lease_index_spec(g.handle) matches Some(idx)
+                        && self.rdma.active_leases@[idx] == before_lease);
+                }
+                assert(core.frames_spec().same_layout(&step_core.frames_spec())) by {
+                    reveal(FrameTable::same_layout);
+                }
+                assert(rdma_leases_disjoint(self.rdma.active_leases@)) by {
+                    reveal(RdmaBackend::well_formed);
+                }
+                lemma_outbound_grants_preserved(
+                    self.pending_outbound_grants@,
+                    step_leases,
+                    self.rdma.active_leases@,
+                    &step_core,
+                    core,
+                );
+            }
+            lemma_pump_cq_all_preserves_pull_tracked(&step_rdma, &self.rdma);
+        }
+        result
+    }
+
+    /// Drain a bounded burst of frames after polling currently available CQEs.
+    fn drain_inbound_frames(
+        &mut self,
+        core: &mut CacheCore,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<PeerProgress, CoreError>)
+        requires
+            old(core).well_formed(),
+            old(self).well_formed(old(core)),
+            old(self).rdma.qp.ready(),
+            old(self).rdma.qp.state() is ReadyToSend,
+            instance.id() == old(core).instance_id(),
+        ensures
+            final(core).well_formed(),
+            final(self).well_formed(final(core)),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).instance_id() == old(core).instance_id(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
+            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
+            final(self).rdma.peer_node == old(self).rdma.peer_node,
+            final(self).rdma.qp == old(self).rdma.qp,
+            final(self).rdma.window_pool.pd() == old(self).rdma.window_pool.pd(),
             final(self).rdma.host_mr == old(self).rdma.host_mr,
             final(self).rdma.gpu_mr == old(self).rdma.gpu_mr,
             final(self).rdma.shared_host_mr == old(self).rdma.shared_host_mr,
@@ -5482,53 +7978,8 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         hide(CacheCore::well_formed);
         hide(replica_valid);
         hide(complete_receipts);
-        let ghost step_core = *core;
-        let ghost step_leases = self.rdma.active_leases@;
-        let ghost step_rdma = self.rdma;
-        let cq_n = match self.rdma.pump_cq_all(core, Tracked(instance)) {
-            Ok(n) => n,
-            Err(e) => {
-                proof {
-                    lemma_pump_cq_all_preserves_pull_tracked(&step_rdma, &self.rdma);
-                }
-                return Err(e);
-            },
-        };
-        let mut did_work: bool = cq_n > 0;
-        proof {
-            reveal(rdma_leases_valid);
-            assert forall|i: int| 0 <= i < self.active_grants@.len() implies {
-                let g = #[trigger] self.active_grants@[i];
-                &&& g.grant_tag < self.next_grant_tag
-                &&& g.frame.0 < core.frames.metas.len()
-                &&& self.rdma.lease_index_spec(g.handle) matches Some(idx) && {
-                    let lease = self.rdma.active_leases@[idx];
-                    &&& lease.frame == g.frame
-                    &&& lease.state == RemoteLeaseState::Bound
-                    &&& self.channel.sent().contains_key(g.grant_tag)
-                    &&& self.channel.sent()[g.grant_tag] == (GrantKind::ReadShare {
-                        slot: core.frames.frame(g.frame).slot,
-                        share_id: lease.share@,
-                    })
-                }
-            } by {
-                let g = self.active_grants@[i];
-                let oidx = rdma_lease_index_spec(step_leases, g.handle).unwrap();
-                assert(step_leases[oidx].state == RemoteLeaseState::Bound);
-                assert(!step_leases[oidx].has_active_wr());
-            }
-            assert(core.frames.same_layout(&step_core.frames)) by {
-                reveal(FrameTable::same_layout);
-            }
-            lemma_outbound_grants_preserved(
-                self.pending_outbound_grants@,
-                step_leases,
-                self.rdma.active_leases@,
-                &step_core,
-                core,
-            );
-            lemma_pump_cq_all_preserves_pull_tracked(&step_rdma, &self.rdma);
-        }
+        let mut progress = PeerProgress::empty();
+        progress.cq_processed = self.pump_session_cq(core, Tracked(instance))?;
         let mut budget: usize = 64;
         while budget > 0
             invariant
@@ -5538,15 +7989,15 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 self.rdma.qp.ready(),
                 self.rdma.qp.state() is ReadyToSend,
                 instance.id() == core.instance_id(),
-                core.node_id == old(core).node_id,
+                core.node_id_spec() == old(core).node_id_spec(),
                 core.instance_id() == old(core).instance_id(),
-                core.tiers == old(core).tiers,
-                core.frames.versions@ == old(core).frames.versions@,
-                core.version_registry == old(core).version_registry,
-                core.timelines.count == old(core).timelines.count,
-                core.timelines.kinds == old(core).timelines.kinds,
-                core.timelines.events == old(core).timelines.events,
-                core.timelines.next_seq == old(core).timelines.next_seq,
+                core.tiers_spec() == old(core).tiers_spec(),
+                core.frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+                core.version_registry_spec() == old(core).version_registry_spec(),
+                core.timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+                core.timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+                core.timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+                core.timelines_spec().next_seq_spec() == old(core).timelines_spec().next_seq_spec(),
                 peer_core_step(old(core), core, old(self).rdma.timeline_id),
                 peer_foreign_shares_preserved(
                     old(core),
@@ -5557,6 +8008,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 self.rdma.timeline_id == old(self).rdma.timeline_id,
                 self.rdma.peer_node == old(self).rdma.peer_node,
                 self.rdma.qp == old(self).rdma.qp,
+                self.rdma.window_pool.pd() == old(self).rdma.window_pool.pd(),
                 self.rdma.host_mr == old(self).rdma.host_mr,
                 self.rdma.gpu_mr == old(self).rdma.gpu_mr,
                 self.rdma.shared_host_mr == old(self).rdma.shared_host_mr,
@@ -5609,9 +8061,21 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                     }
                     match route_res {
                         Ok((was_f, was_r)) => {
-                            if was_f || was_r {
-                                did_work = true;
-                            }
+                            progress.frames_received = progress.frames_received.saturating_add(
+                                if was_f {
+                                    1
+                                } else {
+                                    0
+                                },
+                            );
+                            progress.releases_processed
+                                = progress.releases_processed.saturating_add(
+                                if was_r {
+                                    1
+                                } else {
+                                    0
+                                },
+                            );
                             budget -= 1;
                         },
                         Err(e) => return Err(e),
@@ -5619,14 +8083,14 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 },
             }
         }
-        Ok(did_work)
+        Ok(progress)
     }
 
     /// Donor: apply all received `RevokeAck { grant_tag }` notifications against
     /// `self.quarantined_grants`, transitioning their MW pool slots from
     /// `Quarantined` to `Vacant`.
     #[verifier::rlimit(50)]
-    pub fn acknowledge_pending_revoke_acks(&mut self, core: &CacheCore) -> (n: usize)
+    pub(crate) fn acknowledge_pending_revoke_acks(&mut self, core: &CacheCore) -> (n: usize)
         requires
             core.well_formed(),
             old(self).well_formed(core),
@@ -5761,7 +8225,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     /// Acknowledge pending `RevokeAck`s and replenish any resulting `Vacant`
     /// `window_pool` slots using caller-supplied `EventSourceToken`s for `pd`.
     #[verifier::rlimit(200)]
-    pub fn replenish_acknowledged_windows(
+    pub(crate) fn replenish_acknowledged_windows(
         &mut self,
         core: &CacheCore,
         pd: &'a rdma::ProtectionDomain<'a>,
@@ -5775,7 +8239,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             forall|k: int|
                 0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
                     tokens,
-                )@[k]@.source() is RdmaQueuePair && old(tokens)@[k]@.node() == pd.node(),
+                )@[k]@.source().is_rdma_qp() && old(tokens)@[k]@.node() == pd.node(),
         ensures
             final(self).well_formed(core),
             final(self).rdma.timeline_id == old(self).rdma.timeline_id,
@@ -5805,7 +8269,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(self).peer_reconnect_epoch == old(self).peer_reconnect_epoch,
             forall|k: int|
                 0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
-                    && final(tokens)@[k]@.source() is RdmaQueuePair && final(tokens)@[k]@.node()
+                    && final(tokens)@[k]@.source().is_rdma_qp() && final(tokens)@[k]@.node()
                     == pd.node(),
             forall|seq: u64, writer: TransferEvent| #[trigger]
                 pull_tracked_or_done(&old(self).rdma, seq, writer) ==> pull_tracked_or_done(
@@ -5856,7 +8320,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 self.peer_reconnect_epoch == old(self).peer_reconnect_epoch,
                 forall|k: int|
                     0 <= k < tokens@.len() ==> (#[trigger] tokens@[k])@.well_formed()
-                        && tokens@[k]@.source() is RdmaQueuePair && tokens@[k]@.node() == pd.node(),
+                        && tokens@[k]@.source().is_rdma_qp() && tokens@[k]@.node() == pd.node(),
             decreases len - idx,
         {
             if matches!(self.rdma.window_pool.slots[idx].state, MwSlotState::Vacant) {
@@ -5923,16 +8387,16 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         ensures
             final(core).well_formed(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames == old(core).frames,
-            final(core).catalog == old(core).catalog,
-            final(core).spec == old(core).spec,
-            final(core).next_version_seq == old(core).next_version_seq,
-            final(core).version_seq_limit == old(core).version_seq_limit,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines == old(core).timelines,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec() == old(core).frames_spec(),
+            final(core).catalog_spec() == old(core).catalog_spec(),
+            final(core).spec_spec() == old(core).spec_spec(),
+            final(core).next_version_seq_spec() == old(core).next_version_seq_spec(),
+            final(core).version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec() == old(core).timelines_spec(),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -5970,16 +8434,16 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 core.well_formed(),
                 self.well_formed(core),
                 instance.id() == core.instance_id(),
-                core.node_id == old(core).node_id,
+                core.node_id_spec() == old(core).node_id_spec(),
                 core.instance_id() == old(core).instance_id(),
-                core.tiers == old(core).tiers,
-                core.frames == old(core).frames,
-                core.catalog == old(core).catalog,
-                core.spec == old(core).spec,
-                core.next_version_seq == old(core).next_version_seq,
-                core.version_seq_limit == old(core).version_seq_limit,
-                core.version_registry == old(core).version_registry,
-                core.timelines == old(core).timelines,
+                core.tiers_spec() == old(core).tiers_spec(),
+                core.frames_spec() == old(core).frames_spec(),
+                core.catalog_spec() == old(core).catalog_spec(),
+                core.spec_spec() == old(core).spec_spec(),
+                core.next_version_seq_spec() == old(core).next_version_seq_spec(),
+                core.version_seq_limit_spec() == old(core).version_seq_limit_spec(),
+                core.version_registry_spec() == old(core).version_registry_spec(),
+                core.timelines_spec() == old(core).timelines_spec(),
                 peer_core_step(old(core), core, old(self).rdma.timeline_id),
                 self.rdma == old(self).rdma,
                 self.channel.same_session(old(self).channel),
@@ -6036,27 +8500,27 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                     lemma_rdma_window_after_fence_ledger(
                         self.rdma.in_flight_ops,
                         self.rdma.bitmap,
-                        &core.timelines,
+                        &core.timelines_spec(),
                         self.rdma.timeline_id,
-                        &step_core.ledger@,
-                        &core.ledger@,
+                        &step_core.ledger_spec()@,
+                        &core.ledger_spec()@,
                         rdma::CqSnapshot::of(self.rdma.cq),
                         core.instance_id(),
                         self.rdma.next_control_wr_id,
                     );
                     lemma_completed_pulls_after_step(
                         self.rdma.completed_pulls,
-                        &step_core.timelines,
-                        &core.timelines,
+                        &step_core.timelines_spec(),
+                        &core.timelines_spec(),
                         self.rdma.timeline_id,
                         self.rdma.cq.observer(),
-                        &step_core.ledger@,
-                        &core.ledger@,
+                        &step_core.ledger_spec()@,
+                        &core.ledger_spec()@,
                     );
-                    assert(core.frames.same_directory(&step_core.frames)) by {
+                    assert(core.frames_spec().same_directory(&step_core.frames_spec())) by {
                         reveal(FrameTable::same_directory);
                     }
-                    assert(core.frames.same_layout(&step_core.frames)) by {
+                    assert(core.frames_spec().same_layout(&step_core.frames_spec())) by {
                         reveal(FrameTable::same_layout);
                     }
                     lemma_rdma_all_slabs_same_directory(
@@ -6084,6 +8548,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                     );
                     assert(peer_core_step(&step_core, core, self.rdma.timeline_id)) by {
                         reveal(peer_core_step_except);
+                        reveal(core_transition);
                         reveal(FrameTable::preserves_initializing);
                     }
                     lemma_peer_core_step_trans(old(core), &step_core, core, self.rdma.timeline_id);
@@ -6099,8 +8564,8 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                                     assert(stmt_sub.map()[m].preds.subset_of(stmt_sub.dom()));
                                 }
                             }
-                            assert(core.ledger@.submitted.dom().contains(e));
-                            assert(core.ledger@.knows.set().contains((core.node(), e)));
+                            assert(core.ledger_spec()@.submitted.dom().contains(e));
+                            assert(core.ledger_spec()@.knows.set().contains((core.node(), e)));
                         }
                     }
                     assert(transfer::transport::covers(g.share@.frontier(), core.citations()));
@@ -6159,8 +8624,481 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         Ok(sent_acks)
     }
 
-    /// Donor helper: non-blockingly initiate MW binds for queued `pending_inbound_fetches`
-    /// (sending `FetchMiss` immediately if key is absent or bind fails to post).
+    pub closed spec fn inbound_fetches(&self) -> Seq<(u64, ObjectKey)> {
+        self.pending_inbound_fetches@
+    }
+
+    /// Drain received fetch requests so the caller can decide when to serve them.
+    pub fn take_inbound_fetches(&mut self, core: &CacheCore) -> (r: Vec<(u64, ObjectKey)>)
+        requires
+            old(self).well_formed(core),
+        ensures
+            final(self).well_formed(core),
+            final(self).rdma_spec() == old(self).rdma_spec(),
+            r@ == old(self).inbound_fetches(),
+            final(self).inbound_fetches().len() == 0,
+    {
+        let mut requests = Vec::new();
+        core::mem::swap(&mut self.pending_inbound_fetches, &mut requests);
+        requests
+    }
+
+    /// Number of window binds that fit in the free MW slots and CQ entries.
+    pub fn bind_budget(&self, core: &CacheCore) -> (r: usize)
+        requires
+            self.well_formed(core),
+        ensures
+            r <= self.rdma_spec().window_pool_spec().free_spec()@.len(),
+    {
+        let free = self.rdma.window_pool.free.len();
+        let cq_avail = self.rdma.cq.capacity_exec().saturating_sub(self.rdma.cq.in_flight_count());
+        free.min(cq_avail)
+    }
+
+    /// Reply to a fetch with an explicit miss.
+    pub fn reject_fetch_request(
+        &mut self,
+        core: &CacheCore,
+        request_id: u64,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<(), CoreError>)
+        requires
+            core.well_formed(),
+            old(self).well_formed(core),
+            instance.id() == core.instance_id(),
+        ensures
+            final(self).well_formed(core),
+            final(self).rdma_spec() == old(self).rdma_spec(),
+            final(self).channel_spec().same_session(old(self).channel_spec()),
+            final(self).pending_inbound_fetches_spec() == old(self).pending_inbound_fetches_spec(),
+            final(self).channel_spec().sent() == old(self).channel_spec().sent(),
+            final(self).channel_spec().received() == old(self).channel_spec().received(),
+            final(self).next_grant_tag_spec() == old(self).next_grant_tag_spec(),
+            final(self).next_request_id_spec() == old(self).next_request_id_spec(),
+            final(self).active_grants_spec() == old(self).active_grants_spec(),
+            final(self).pending_outbound_grants_spec() == old(self).pending_outbound_grants_spec(),
+            final(self).pending_inbound_grants_spec() == old(self).pending_inbound_grants_spec(),
+    {
+        match self.send_control(core, ControlPayload::FetchMiss { request_id }, Tracked(instance)) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(rdma_error(rdma::RdmaError(-1))),
+        }
+    }
+
+    /// Pin the caller-selected published replica and post its Type-2 MW bind.
+    /// Success queues a grant to transmit when the bind completes. An error
+    /// leaves the admission decision with the caller.
+    #[verifier::rlimit(250)]
+    pub fn grant_fetch_from_frame(
+        &mut self,
+        core: &mut CacheCore,
+        request_id: u64,
+        key: ObjectKey,
+        frame: FrameId,
+        Tracked(shares): Tracked<&mut ShareSource>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<(), CoreError>)
+        requires
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            old(self).rdma_spec().qp_spec().ready(),
+            old(self).rdma_spec().qp_spec().state() is ReadyToSend,
+            instance.id() == old(core).instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(core).instance_id(),
+            old(shares).node() == old(core).node(),
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(self).well_formed(final(core)),
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).instance_id() == old(core).instance_id(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
+            peer_core_step(old(core), final(core), old(self).rdma_spec().timeline_id_spec()),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma_spec().active_leases_spec()@,
+                final(self).rdma_spec().active_leases_spec()@,
+            ),
+            final(self).rdma_spec().timeline_id_spec() == old(self).rdma_spec().timeline_id_spec(),
+            final(self).rdma_spec().peer_node_spec() == old(self).rdma_spec().peer_node_spec(),
+            final(self).rdma_spec().qp_spec() == old(self).rdma_spec().qp_spec(),
+            final(self).rdma_spec().window_pool_spec().pd() == old(
+                self,
+            ).rdma_spec().window_pool_spec().pd(),
+            final(self).rdma_spec().host_mr_spec() == old(self).rdma_spec().host_mr_spec(),
+            final(self).rdma_spec().gpu_mr_spec() == old(self).rdma_spec().gpu_mr_spec(),
+            final(self).rdma_spec().shared_host_mr_spec() == old(
+                self,
+            ).rdma_spec().shared_host_mr_spec(),
+            final(self).rdma_spec().shared_gpu_mr_spec() == old(
+                self,
+            ).rdma_spec().shared_gpu_mr_spec(),
+            final(self).rdma_spec().pending() == old(self).rdma_spec().pending(),
+            final(self).rdma_spec().completed_pulls_spec() == old(
+                self,
+            ).rdma_spec().completed_pulls_spec(),
+            final(self).channel_spec() == old(self).channel_spec(),
+            final(self).next_grant_tag_spec() == old(self).next_grant_tag_spec(),
+            final(self).next_request_id_spec() == old(self).next_request_id_spec(),
+            final(self).active_grants_spec() == old(self).active_grants_spec(),
+            final(self).pending_inbound_grants_spec() == old(self).pending_inbound_grants_spec(),
+            final(self).pending_inbound_fetches_spec() == old(self).pending_inbound_fetches_spec(),
+            match r {
+                Err(_) => final(self).pending_outbound_grants_spec() == old(
+                    self,
+                ).pending_outbound_grants_spec(),
+                Ok(()) => {
+                    let grants = final(self).pending_outbound_grants_spec()@;
+                    &&& grants.len() == old(self).pending_outbound_grants_spec()@.len() + 1
+                    &&& grants.last().request_id == request_id
+                    &&& grants.last().key == key
+                    &&& grants.last().frame == frame
+                    &&& grants.last().send_on_ready
+                },
+            },
+    {
+        let mut reserved = None;
+        self.grant_fetch_from_frame_with(
+            core,
+            request_id,
+            key,
+            frame,
+            Tracked(shares),
+            Tracked(instance),
+            false,
+            &mut reserved,
+        )
+    }
+
+    #[verifier::rlimit(250)]
+    fn grant_fetch_from_frame_with(
+        &mut self,
+        core: &mut CacheCore,
+        request_id: u64,
+        key: ObjectKey,
+        frame: FrameId,
+        Tracked(shares): Tracked<&mut ShareSource>,
+        Tracked(instance): Tracked<&TransferInstance>,
+        prepare: bool,
+        reserved: &mut Option<PreparedLeaseBind>,
+    ) -> (r: Result<(), CoreError>)
+        requires
+            old(core).well_formed(),
+            old(reserved).is_none(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            old(self).rdma.qp.ready(),
+            old(self).rdma.qp.state() is ReadyToSend,
+            instance.id() == old(core).instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(core).instance_id(),
+            old(shares).node() == old(core).node(),
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(self).well_formed(final(core)),
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).instance_id() == old(core).instance_id(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
+            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
+            final(self).rdma.peer_node == old(self).rdma.peer_node,
+            final(self).rdma.qp == old(self).rdma.qp,
+            final(core).frames_spec().same_directory(&old(core).frames_spec()),
+            bind_reservations_preserved(&old(self).rdma, &final(self).rdma),
+            r.is_err() ==> final(reserved).is_none(),
+            r.is_ok() ==> {
+                &&& final(reserved).is_some() == prepare
+                &&& (*final(reserved) matches Some(p) ==> p.frame == frame && p.valid(
+                    &final(self).rdma,
+                    final(core),
+                ) && old(self).rdma.next_control_wr_id <= p.bind.id() && p.bind.id()
+                    < final(self).rdma.next_control_wr_id)
+            },
+            final(self).rdma.window_pool.pd() == old(self).rdma.window_pool.pd(),
+            final(self).rdma.host_mr == old(self).rdma.host_mr,
+            final(self).rdma.gpu_mr == old(self).rdma.gpu_mr,
+            final(self).rdma.shared_host_mr == old(self).rdma.shared_host_mr,
+            final(self).rdma.shared_gpu_mr == old(self).rdma.shared_gpu_mr,
+            final(self).rdma.pending() == old(self).rdma.pending(),
+            final(self).rdma.completed_pulls == old(self).rdma.completed_pulls,
+            final(self).channel == old(self).channel,
+            final(self).next_grant_tag == old(self).next_grant_tag,
+            final(self).next_request_id == old(self).next_request_id,
+            final(self).active_grants == old(self).active_grants,
+            final(self).pending_inbound_grants == old(self).pending_inbound_grants,
+            final(self).pending_inbound_fetches == old(self).pending_inbound_fetches,
+            match r {
+                Err(_) => final(self).pending_outbound_grants == old(self).pending_outbound_grants,
+                Ok(()) => {
+                    let grants = final(self).pending_outbound_grants@;
+                    &&& grants.len() == old(self).pending_outbound_grants@.len() + 1
+                    &&& grants.last().request_id == request_id
+                    &&& grants.last().key == key
+                    &&& grants.last().frame == frame
+                    &&& grants.last().send_on_ready
+                },
+            },
+    {
+        hide(CacheCore::well_formed);
+        hide(replica_valid);
+        hide(complete_receipts);
+        proof {
+            lemma_core_wf_facts(core);
+            lemma_peer_core_step_refl(core, self.rdma.timeline_id);
+            lemma_foreign_shares_refl(core, self.rdma.active_leases@);
+        }
+        let idx = frame.0 as usize;
+        if idx >= core.frame_count() {
+            return Err(CoreError::InvalidArgument);
+        }
+        let (frame_key, _) = core.frame_binding(frame).unwrap();
+        if core.frame_meta(frame).unwrap().state != STATE_PUBLISHED || frame_key != key {
+            return Err(CoreError::StaleReplica);
+        }
+        if self.next_grant_tag == u64::MAX {
+            return Err(CoreError::SequenceExhausted);
+        }
+        let version = VersionId::unpack(core.frame_meta(frame).unwrap().version_packed);
+        proof {
+            assert(core.frames_spec().valid_frame(frame, core.kernel_view())) by {
+                reveal(CacheCore::well_formed);
+            }
+            lemma_version_pack_unpack(
+                core.frames_spec().frame(frame).bound_version.unwrap(),
+                core.frames_spec().meta(frame).version_packed,
+            );
+        }
+        let bind = self.serve_bind_with(
+            core,
+            frame,
+            Tracked(shares),
+            Tracked(instance),
+            prepare,
+            reserved,
+        );
+        proof {
+            reveal(FrameTable::same_directory);
+        }
+        let (handle, bind_wr_id) = bind?;
+        proof {
+            old(self).lemma_fresh_handle_excluded_from_session(old(core), handle);
+            lemma_core_wf_facts(core);
+            lemma_published_frame_replica_valid(core, frame);
+            lemma_published_frame_slot_valid(core, frame);
+            lemma_initializing_frame_slot_valid(core, frame);
+            lemma_citations_closure(core);
+        }
+        let (_, frame_tier) = core.frame_binding(frame).unwrap();
+        let frame_size = core.registered_tier_frame_size(frame_tier) as u64;
+        let ghost cert = core.frames_spec().published(frame).unwrap().2;
+        let ghost bind_sub = core.ledger_spec()@.submitted;
+        let ghost bind_succ = core.ledger_spec()@.succeeded;
+        let tracked bind_revoked = instance.duplicate_revoked(&core.borrow_ledger().revoked);
+        let ghost bind_facts = core.citations();
+        let Tracked(version_binding) = core.version_binding_for(version);
+        proof {
+            lemma_replica_valid_to_statement(core.ledger_spec()@, core.node(), cert);
+        }
+        let grant = PendingOutboundGrant {
+            request_id,
+            key,
+            frame,
+            version,
+            frame_size,
+            handle,
+            bind_wr_id,
+            send_on_ready: true,
+            cert: Ghost(cert),
+            bind_sub: Ghost(bind_sub),
+            bind_succ: Ghost(bind_succ),
+            bind_revoked: Tracked(bind_revoked),
+            bind_facts: Ghost(bind_facts),
+            version_binding: Tracked(version_binding),
+        };
+        let ghost before = *self;
+        let ghost item = grant;
+        self.pending_outbound_grants.push(grant);
+        proof {
+            Self::lemma_session_wf_after_push_outbound_grant(&before, self, core, &item);
+        }
+        Ok(())
+    }
+
+    /// Admit the batch on this peer's PD and ring one doorbell for its binds.
+    /// Rejected entries get a miss. CQ processing sends grants and cleans up
+    /// failed binds using the usual lease state machine.
+    #[verifier::rlimit(80)]
+    pub fn grant_fetch_batch(
+        &mut self,
+        core: &mut CacheCore,
+        serve_tier: TierId,
+        entries: &[(u64, ObjectKey)],
+        Tracked(shares): Tracked<&mut ShareSource>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<usize, CoreError>)
+        requires
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            old(self).rdma_spec().qp_spec().ready(),
+            old(self).rdma_spec().qp_spec().state() is ReadyToSend,
+            instance.id() == old(core).instance_id(),
+            old(shares).well_formed(),
+            old(shares).id() == old(core).instance_id(),
+            old(shares).node() == old(core).node(),
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(self).well_formed(final(core)),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).instance_id() == old(core).instance_id(),
+            final(self).rdma_spec().qp_spec() == old(self).rdma_spec().qp_spec(),
+            final(self).rdma_spec().timeline_id_spec() == old(self).rdma_spec().timeline_id_spec(),
+            final(self).rdma_spec().peer_node_spec() == old(self).rdma_spec().peer_node_spec(),
+            peer_core_step(old(core), final(core), old(self).rdma_spec().timeline_id_spec()),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma_spec().active_leases_spec()@,
+                final(self).rdma_spec().active_leases_spec()@,
+            ),
+            final(shares).well_formed(),
+            final(shares).id() == old(shares).id(),
+            final(shares).node() == old(shares).node(),
+            r matches Ok(n) ==> n <= entries.len(),
+    {
+        hide(CacheCore::well_formed);
+        hide(replica_valid);
+        hide(complete_receipts);
+        let mut binds: Vec<PreparedLeaseBind> = Vec::new();
+        let mut i = 0;
+        let mut reply_error = None;
+        proof {
+            lemma_peer_core_step_refl(core, self.rdma.timeline_id);
+            lemma_foreign_shares_refl(core, self.rdma.active_leases@);
+        }
+        if entries.is_empty() || entries.len() > super::protocol::MAX_FETCH_BATCH {
+            return Err(CoreError::InvalidArgument);
+        }
+        while i < entries.len()
+            invariant
+                binds.len() <= i <= entries.len(),
+                self.well_formed(core),
+                core.well_formed(),
+                core.all_versions_bound(),
+                self.rdma.qp == old(self).rdma.qp,
+                self.rdma.qp.ready(),
+                self.rdma.qp.state() is ReadyToSend,
+                self.rdma.timeline_id == old(self).rdma.timeline_id,
+                self.rdma.peer_node == old(self).rdma.peer_node,
+                core.node_id_spec() == old(core).node_id_spec(),
+                core.instance_id() == old(core).instance_id(),
+                instance.id() == core.instance_id(),
+                shares.well_formed(),
+                shares.id() == old(shares).id(),
+                shares.id() == core.instance_id(),
+                shares.node() == old(shares).node() == core.node(),
+                peer_core_step(old(core), core, self.rdma.timeline_id),
+                peer_foreign_shares_preserved(
+                    old(core),
+                    core,
+                    old(self).rdma.active_leases@,
+                    self.rdma.active_leases@,
+                ),
+                forall|j: int|
+                    0 <= j < binds.len() ==> {
+                        let b = #[trigger] binds[j];
+                        b.valid(&self.rdma, core) && b.bind.id() < self.rdma.next_control_wr_id
+                    },
+                forall|j: int, k: int|
+                    0 <= j < k < binds.len() ==> (#[trigger] binds[j]).bind.id() < (
+                    #[trigger] binds[k]).bind.id(),
+            decreases entries.len() - i,
+        {
+            let (request_id, key) = entries[i];
+            let chosen = Self::lookup_serve_frame(core, key, serve_tier, None);
+            let mut staged = None;
+            if let Some((frame, _)) = chosen {
+                let ghost before = *core;
+                let ghost before_rdma = self.rdma;
+                let _ = self.grant_fetch_from_frame_with(
+                    core,
+                    request_id,
+                    key,
+                    frame,
+                    Tracked(shares),
+                    Tracked(instance),
+                    true,
+                    &mut staged,
+                );
+                proof {
+                    lemma_peer_core_step_trans(old(core), &before, core, self.rdma.timeline_id);
+                    lemma_foreign_shares_trans(
+                        old(core),
+                        &before,
+                        core,
+                        old(self).rdma.active_leases@,
+                        before_rdma.active_leases@,
+                        self.rdma.active_leases@,
+                    );
+                    assert forall|j: int| 0 <= j < binds.len() implies {
+                        let b = #[trigger] binds[j];
+                        &&& b.valid(&self.rdma, core)
+                        &&& b.bind.id() < self.rdma.next_control_wr_id
+                        &&& (staged matches Some(p) ==> b.bind.id() < p.bind.id())
+                    } by {
+                        binds[j].lemma_preserved(&before_rdma, &self.rdma, &before, core);
+                    }
+                }
+            }
+            if let Some(bind) = staged {
+                binds.push(bind);
+            } else if let Err(e) = self.reject_fetch_request(core, request_id, Tracked(instance)) {
+                reply_error = Some(e);
+            }
+            i += 1;
+        }
+        let (posted, _) = self.rdma.post_prepared_lease_binds(core, binds);
+        if let Some(e) = reply_error {
+            Err(e)
+        } else {
+            Ok(posted)
+        }
+    }
+
+    /// Apply the built-in tier lookup policy used by the legacy duplex APIs.
     #[verifier::rlimit(250)]
     fn queue_pending_inbound_fetches(
         &mut self,
@@ -6187,15 +9125,17 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames.versions@ == old(core).frames.versions@,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines.count == old(core).timelines.count,
-            final(core).timelines.kinds == old(core).timelines.kinds,
-            final(core).timelines.events == old(core).timelines.events,
-            final(core).timelines.next_seq == old(core).timelines.next_seq,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -6206,6 +9146,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(self).rdma.timeline_id == old(self).rdma.timeline_id,
             final(self).rdma.peer_node == old(self).rdma.peer_node,
             final(self).rdma.qp == old(self).rdma.qp,
+            final(self).rdma.window_pool.pd() == old(self).rdma.window_pool.pd(),
             final(self).rdma.host_mr == old(self).rdma.host_mr,
             final(self).rdma.gpu_mr == old(self).rdma.gpu_mr,
             final(self).rdma.shared_host_mr == old(self).rdma.shared_host_mr,
@@ -6243,15 +9184,15 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 shares.well_formed(),
                 shares.id() == core.instance_id(),
                 shares.node() == core.node(),
-                core.node_id == old(core).node_id,
+                core.node_id_spec() == old(core).node_id_spec(),
                 core.instance_id() == old(core).instance_id(),
-                core.tiers == old(core).tiers,
-                core.frames.versions@ == old(core).frames.versions@,
-                core.version_registry == old(core).version_registry,
-                core.timelines.count == old(core).timelines.count,
-                core.timelines.kinds == old(core).timelines.kinds,
-                core.timelines.events == old(core).timelines.events,
-                core.timelines.next_seq == old(core).timelines.next_seq,
+                core.tiers_spec() == old(core).tiers_spec(),
+                core.frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+                core.version_registry_spec() == old(core).version_registry_spec(),
+                core.timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+                core.timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+                core.timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+                core.timelines_spec().next_seq_spec() == old(core).timelines_spec().next_seq_spec(),
                 peer_core_step(old(core), core, old(self).rdma.timeline_id),
                 peer_foreign_shares_preserved(
                     old(core),
@@ -6262,6 +9203,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 self.rdma.timeline_id == old(self).rdma.timeline_id,
                 self.rdma.peer_node == old(self).rdma.peer_node,
                 self.rdma.qp == old(self).rdma.qp,
+                self.rdma.window_pool.pd() == old(self).rdma.window_pool.pd(),
                 self.rdma.host_mr == old(self).rdma.host_mr,
                 self.rdma.gpu_mr == old(self).rdma.gpu_mr,
                 self.rdma.shared_host_mr == old(self).rdma.shared_host_mr,
@@ -6277,97 +9219,40 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             decreases self.pending_inbound_fetches@.len(),
         {
             let (request_id, key) = self.pending_inbound_fetches.remove(0);
-            let Some((frame, version)) = Self::lookup_serve_frame(
+            let grant_err = if let Some((frame, _)) = Self::lookup_serve_frame(
                 core,
                 key,
                 primary_tier,
                 fallback_tier,
-            ) else {
-                let _ = self.send_control(
+            ) {
+                let ghost before = *core;
+                let ghost before_leases = self.rdma.active_leases@;
+                let result = self.grant_fetch_from_frame(
                     core,
-                    ControlPayload::FetchMiss { request_id },
-                    Tracked(instance),
-                );
-                continue;
-            };
-            let ghost before_bind = *core;
-            let ghost before_bind_leases = self.rdma.active_leases@;
-            let Some((handle, bind_wr_id)) = self.serve_bind(
-                core,
-                frame,
-                Tracked(shares),
-                Tracked(instance),
-            ) else {
-                proof {
-                    reveal(FrameTable::same_directory);
-                    lemma_peer_core_step_trans(
-                        old(core),
-                        &before_bind,
-                        core,
-                        self.rdma.timeline_id,
-                    );
-                    lemma_foreign_shares_trans(
-                        old(core),
-                        &before_bind,
-                        core,
-                        old(self).rdma.active_leases@,
-                        before_bind_leases,
-                        self.rdma.active_leases@,
-                    );
-                }
-                let _ = self.send_control(
-                    core,
-                    ControlPayload::FetchMiss { request_id },
-                    Tracked(instance),
-                );
-                continue;
-            };
-            proof {
-                reveal(FrameTable::same_directory);
-                lemma_core_wf_facts(core);
-                lemma_published_frame_replica_valid(core, frame);
-                lemma_published_frame_slot_valid(core, frame);
-                lemma_initializing_frame_slot_valid(core, frame);
-                lemma_citations_closure(core);
-                lemma_peer_core_step_trans(old(core), &before_bind, core, self.rdma.timeline_id);
-                lemma_foreign_shares_trans(
-                    old(core),
-                    &before_bind,
-                    core,
-                    old(self).rdma.active_leases@,
-                    before_bind_leases,
-                    self.rdma.active_leases@,
-                );
-            }
-            let (_, frame_tier) = core.frames.bindings[frame.0 as usize];
-            let frame_size = core.tier_frame_size(frame_tier) as u64;
-            let ghost cert = core.frames.published(frame).unwrap().2;
-            let ghost bind_sub = core.ledger@.submitted;
-            let ghost bind_succ = core.ledger@.succeeded;
-            let tracked bind_revoked = instance.duplicate_revoked(&core.ledger.borrow().revoked);
-            let ghost bind_facts = core.citations();
-            let Tracked(version_binding) = core.version_binding_for(version);
-            proof {
-                lemma_replica_valid_to_statement(core.ledger@, core.node(), cert);
-            }
-            self.pending_outbound_grants.push(
-                PendingOutboundGrant {
                     request_id,
                     key,
                     frame,
-                    version,
-                    frame_size,
-                    handle,
-                    bind_wr_id,
-                    send_on_ready: true,
-                    cert: Ghost(cert),
-                    bind_sub: Ghost(bind_sub),
-                    bind_succ: Ghost(bind_succ),
-                    bind_revoked: Tracked(bind_revoked),
-                    bind_facts: Ghost(bind_facts),
-                    version_binding: Tracked(version_binding),
-                },
-            );
+                    Tracked(shares),
+                    Tracked(instance),
+                );
+                proof {
+                    lemma_peer_core_step_trans(old(core), &before, core, self.rdma.timeline_id);
+                    lemma_foreign_shares_trans(
+                        old(core),
+                        &before,
+                        core,
+                        old(self).rdma.active_leases@,
+                        before_leases,
+                        self.rdma.active_leases@,
+                    );
+                }
+                result.is_err()
+            } else {
+                true
+            };
+            if grant_err {
+                let _ = self.reject_fetch_request(core, request_id, Tracked(instance));
+            }
         }
         proof {
             reveal(pull_tracked_or_done_state);
@@ -6426,19 +9311,19 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                     p.cert@.writer,
                 ))
             },
-            p.frame.0 < core.frames.metas.len(),
+            p.frame.0 < core.frames_spec().metas_spec().len(),
             p.bind_revoked@.instance_id() == core.instance_id(),
-            p.bind_sub@.map().submap_of(core.ledger@.submitted.map()),
-            p.bind_succ@.dom().subset_of(core.ledger@.succeeded.dom()),
+            p.bind_sub@.map().submap_of(core.ledger_spec()@.submitted.map()),
+            p.bind_succ@.dom().subset_of(core.ledger_spec()@.succeeded.dom()),
             forall|e: TransferEvent| #[trigger]
-                p.bind_facts@.contains(e) ==> core.ledger@.submitted.map().contains_key(e)
-                    && core.ledger@.knows.set().contains((core.node(), e)),
+                p.bind_facts@.contains(e) ==> core.ledger_spec()@.submitted.map().contains_key(e)
+                    && core.ledger_spec()@.knows.set().contains((core.node(), e)),
             p.bind_facts@.contains(p.cert@.writer),
-            p.cert@.slot == core.frames.frame(p.frame).slot,
+            p.cert@.slot == core.frames_spec().frame(p.frame).slot,
             p.cert@.slot.is_full(),
             p.cert@.slot.well_formed(),
-            p.cert@.bytes.len() == core.frames.tier_frame_size(
-                core.frames.frame(p.frame).tier,
+            p.cert@.bytes.len() == core.frames_spec().tier_frame_size(
+                core.frames_spec().frame(p.frame).tier,
             ) as u64,
             super::protocol::statement_replica_valid(
                 p.bind_sub@,
@@ -6523,9 +9408,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         requires
             before.well_formed(before_core),
             after.rdma.well_formed(after_core),
-            after_core.node_id == before_core.node_id,
+            after_core.node_id_spec() == before_core.node_id_spec(),
             after_core.instance_id() == before_core.instance_id(),
-            after_core.frames.same_directory(&before_core.frames),
+            after_core.frames_spec().same_directory(&before_core.frames_spec()),
             *after_core == *before_core || peer_core_step(
                 before_core,
                 after_core,
@@ -6551,12 +9436,13 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 #[trigger] before.pending_outbound_grants@[k]).handle != handle,
         ensures
             after.well_formed(after_core),
-            after_core.frames.versions@ == before_core.frames.versions@,
+            after_core.frames_spec().versions_spec()@ == before_core.frames_spec().versions_spec()@,
     {
         hide(CacheCore::well_formed);
         hide(RdmaBackend::well_formed);
         hide(super::protocol::statement_replica_valid);
         reveal(peer_core_step_except);
+        reveal(core_transition);
         reveal(PeerSession::well_formed);
         reveal(PeerSession::session_queues_valid);
         reveal(PendingOutboundGrant::valid);
@@ -6569,7 +9455,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             reveal(RdmaBackend::well_formed);
             reveal(rdma_leases_valid);
         }
-        assert(after_core.frames.same_layout(&before_core.frames)) by {
+        assert(after_core.frames_spec().same_layout(&before_core.frames_spec())) by {
             reveal(FrameTable::same_directory);
             reveal(FrameTable::same_layout);
         }
@@ -6731,31 +9617,33 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             core.well_formed(),
             self.well_formed(core),
             grant_tag == self.next_grant_tag,
-            frame.0 < core.frames.metas.len(),
-            frame_tier == core.frames.bindings[frame.0 as int].1,
-            meta.frame_size == core.frames.tier_frame_size(frame_tier) as u64,
+            frame.0 < core.frames_spec().metas_spec().len(),
+            frame_tier == core.frames_spec().bindings_spec()[frame.0 as int].1,
+            meta.frame_size == core.frames_spec().tier_frame_size(frame_tier) as u64,
             meta_bytes == super::protocol::encode_read_grant_meta_spec(meta),
             cited == core.citations(),
             cap.well_formed(),
-            cap.slot_ref() == core.frames.frame(frame).slot,
+            cap.slot_ref() == core.frames_spec().frame(frame).slot,
             cap.access() == rdma::RemoteAccess::ReadOnly,
             cap.share() == Some(share_cap.share()),
-            share_cap.is_rdma_bound(),
+            share_cap.is_fenced(),
             share_cap.instance_id() == core.instance_id(),
             share_cap.loc() == cap.slot_ref().loc,
             share_cap.frontier().last_writer == Some(cert.writer),
             share_cap.frontier().readers == ISet::<TransferEvent>::empty(),
             revoked.instance_id() == core.instance_id(),
-            bind_sub.map().submap_of(core.ledger@.submitted.map()),
-            bind_succ.dom().subset_of(core.ledger@.succeeded.dom()),
+            bind_sub.map().submap_of(core.ledger_spec()@.submitted.map()),
+            bind_succ.dom().subset_of(core.ledger_spec()@.succeeded.dom()),
             forall|e: TransferEvent| #[trigger]
-                bind_facts.contains(e) ==> core.ledger@.submitted.map().contains_key(e)
-                    && core.ledger@.knows.set().contains((core.node(), e)),
+                bind_facts.contains(e) ==> core.ledger_spec()@.submitted.map().contains_key(e)
+                    && core.ledger_spec()@.knows.set().contains((core.node(), e)),
             bind_facts.contains(cert.writer),
-            cert.slot == core.frames.frame(frame).slot,
+            cert.slot == core.frames_spec().frame(frame).slot,
             cert.slot.is_full(),
             cert.slot.well_formed(),
-            cert.bytes.len() == core.frames.tier_frame_size(core.frames.frame(frame).tier) as u64,
+            cert.bytes.len() == core.frames_spec().tier_frame_size(
+                core.frames_spec().frame(frame).tier,
+            ) as u64,
             super::protocol::statement_replica_valid(
                 bind_sub,
                 bind_succ,
@@ -6779,17 +9667,18 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             self.channel.peer() == self.rdma.peer_node,
             !self.channel.sent().contains_key(grant_tag),
             cap.slot_ref().loc.node == self.channel.local(),
-            cited.subset_of(core.ledger@.submitted.dom()),
-            knowledge_of(self.channel.local(), cited).subset_of(core.ledger@.knows.set()),
+            cited.subset_of(core.ledger_spec()@.submitted.dom()),
+            knowledge_of(self.channel.local(), cited).subset_of(core.ledger_spec()@.knows.set()),
             ordered_or_absent(
                 share_cap.frontier().last_writer,
-                closure_from(core.ledger@.submitted.map(), cited),
+                closure_from(core.ledger_spec()@.submitted.map(), cited),
             ),
             forall|s: Statement|
                 s.submitted.instance_id() == self.channel.id() && s.submitted.map()
-                    == core.ledger@.submitted.map() && s.knows.instance_id() == self.channel.id()
-                    && s.knows.set() == core.ledger@.knows.set() && s.succeeded
-                    == core.ledger@.succeeded && s.facts == cited ==> #[trigger] att.valid(
+                    == core.ledger_spec()@.submitted.map() && s.knows.instance_id()
+                    == self.channel.id() && s.knows.set() == core.ledger_spec()@.knows.set()
+                    && s.succeeded == core.ledger_spec()@.succeeded && s.facts == cited
+                    ==> #[trigger] att.valid(
                     self.channel.id(),
                     self.channel.local(),
                     1,
@@ -6810,25 +9699,27 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         lemma_core_wf_facts(core);
         lemma_initializing_frame_slot_valid(core, frame);
         lemma_citations_closure(core);
-        assert(core.frames.bindings[frame.0 as int].1 == core.frames.frame(frame).tier);
+        assert(core.frames_spec().bindings_spec()[frame.0 as int].1 == core.frames_spec().frame(
+            frame,
+        ).tier);
         assert(meta.frame_size == cert.bytes.len());
         lemma_statement_replica_valid_monotone(
             bind_sub,
-            core.ledger@.submitted,
+            core.ledger_spec()@.submitted,
             bind_succ,
-            core.ledger@.succeeded,
+            core.ledger_spec()@.succeeded,
             revoked,
             bind_facts,
             cited,
             cert,
         );
-        assert(closure_from(core.ledger@.submitted.map(), cited).contains(cert.writer));
+        assert(closure_from(core.ledger_spec()@.submitted.map(), cited).contains(cert.writer));
         reveal(complete_receipts);
         assert forall|s: Statement|
             s.submitted.instance_id() == self.channel.id() && s.submitted.map()
-                == core.ledger@.submitted.map() && s.knows.instance_id() == self.channel.id()
-                && s.knows.set() == core.ledger@.knows.set() && s.succeeded
-                == core.ledger@.succeeded && s.facts == cited implies #[trigger] att.valid(
+                == core.ledger_spec()@.submitted.map() && s.knows.instance_id() == self.channel.id()
+                && s.knows.set() == core.ledger_spec()@.knows.set() && s.succeeded
+                == core.ledger_spec()@.succeeded && s.facts == cited implies #[trigger] att.valid(
             self.channel.id(),
             self.channel.local(),
             1,
@@ -6839,12 +9730,12 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             Some(share_cap.frontier()),
             s,
         ) by {
-            assert(s.submitted.dom() =~= core.ledger@.submitted.dom());
+            assert(s.submitted.dom() =~= core.ledger_spec()@.submitted.dom());
             assert(crate::provenance::complete_receipts_map(s.submitted));
             super::protocol::lemma_statement_replica_valid_ext(
-                core.ledger@.submitted,
+                core.ledger_spec()@.submitted,
                 s.submitted,
-                core.ledger@.succeeded,
+                core.ledger_spec()@.succeeded,
                 revoked,
                 cited,
                 cert,
@@ -6881,13 +9772,13 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             ),
             after.pending_outbound_grants == before.pending_outbound_grants,
             after.pending_inbound_grants == before.pending_inbound_grants,
-            frame.0 < core.frames.metas.len(),
+            frame.0 < core.frames_spec().metas_spec().len(),
             0 <= hidx < before.rdma.active_leases@.len(),
             before.rdma.lease_index_spec(handle) == Some(hidx),
             before.rdma.active_leases@[hidx].frame == frame,
             before.rdma.active_leases@[hidx].state == RemoteLeaseState::Bound,
             before.rdma.active_leases@[hidx].share@ == share_id,
-            cap_slot == core.frames.frame(frame).slot,
+            cap_slot == core.frames_spec().frame(frame).slot,
             forall|j: int|
                 0 <= j < before.active_grants@.len() ==> (
                 #[trigger] before.active_grants@[j]).handle != handle,
@@ -6923,14 +9814,14 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         assert forall|i: int| 0 <= i < after.active_grants@.len() implies {
             let g = #[trigger] after.active_grants@[i];
             &&& g.grant_tag < after.next_grant_tag
-            &&& g.frame.0 < core.frames.metas.len()
+            &&& g.frame.0 < core.frames_spec().metas_spec().len()
             &&& after.rdma.lease_index_spec(g.handle) matches Some(idx) && {
                 let lease = after.rdma.active_leases@[idx];
                 &&& lease.frame == g.frame
                 &&& lease.state == RemoteLeaseState::Bound
                 &&& after.channel.sent().contains_key(g.grant_tag)
                 &&& after.channel.sent()[g.grant_tag] == (GrantKind::ReadShare {
-                    slot: core.frames.frame(g.frame).slot,
+                    slot: core.frames_spec().frame(g.frame).slot,
                     share_id: lease.share@,
                 })
             }
@@ -7048,20 +9939,20 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             forall|k: int|
                 0 <= k < before.pending_outbound_grants@.len() ==> (
                 #[trigger] before.pending_outbound_grants@[k]).handle != item.handle,
-            item.frame.0 < core.frames.metas.len(),
-            item.frame_size == core.frames.tier_frame_size(
-                core.frames.frame(item.frame).tier,
+            item.frame.0 < core.frames_spec().metas_spec().len(),
+            item.frame_size == core.frames_spec().tier_frame_size(
+                core.frames_spec().frame(item.frame).tier,
             ) as u64,
-            item.cert@.slot == core.frames.frame(item.frame).slot,
+            item.cert@.slot == core.frames_spec().frame(item.frame).slot,
             item.cert@.slot.is_full(),
             item.cert@.slot.well_formed(),
             item.cert@.bytes.len() == item.frame_size,
             item.bind_revoked@.instance_id() == core.instance_id(),
-            item.bind_sub@.map().submap_of(core.ledger@.submitted.map()),
-            item.bind_succ@.dom().subset_of(core.ledger@.succeeded.dom()),
+            item.bind_sub@.map().submap_of(core.ledger_spec()@.submitted.map()),
+            item.bind_succ@.dom().subset_of(core.ledger_spec()@.succeeded.dom()),
             forall|e: TransferEvent| #[trigger]
-                item.bind_facts@.contains(e) ==> core.ledger@.submitted.map().contains_key(e)
-                    && core.ledger@.knows.set().contains((core.node(), e)),
+                item.bind_facts@.contains(e) ==> core.ledger_spec()@.submitted.map().contains_key(e)
+                    && core.ledger_spec()@.knows.set().contains((core.node(), e)),
             item.bind_facts@.contains(item.cert@.writer),
             super::protocol::statement_replica_valid(
                 item.bind_sub@,
@@ -7139,7 +10030,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 0 <= i < self.active_grants@.len() ==> {
                     let g = #[trigger] self.active_grants@[i];
                     &&& g.grant_tag < self.next_grant_tag
-                    &&& g.frame.0 < core.frames.metas.len()
+                    &&& g.frame.0 < core.frames_spec().metas_spec().len()
                     &&& self.rdma.lease_index_spec(g.handle) matches Some(idx) && {
                         let lease = self.rdma.active_leases@[idx];
                         &&& lease.frame == g.frame
@@ -7147,7 +10038,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                         &&& (g.grant_tag != grant_tag ==> self.channel.sent().contains_key(
                             g.grant_tag,
                         ) && self.channel.sent()[g.grant_tag] == (GrantKind::ReadShare {
-                            slot: core.frames.frame(g.frame).slot,
+                            slot: core.frames_spec().frame(g.frame).slot,
                             share_id: lease.share@,
                         }))
                     }
@@ -7162,14 +10053,14 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         assert forall|i: int| 0 <= i < self.active_grants@.len() implies {
             let g = #[trigger] self.active_grants@[i];
             &&& g.grant_tag < self.next_grant_tag
-            &&& g.frame.0 < core.frames.metas.len()
+            &&& g.frame.0 < core.frames_spec().metas_spec().len()
             &&& self.rdma.lease_index_spec(g.handle) matches Some(idx) && {
                 let lease = self.rdma.active_leases@[idx];
                 &&& lease.frame == g.frame
                 &&& lease.state == RemoteLeaseState::Bound
                 &&& self.channel.sent().contains_key(g.grant_tag)
                 &&& self.channel.sent()[g.grant_tag] == (GrantKind::ReadShare {
-                    slot: core.frames.frame(g.frame).slot,
+                    slot: core.frames_spec().frame(g.frame).slot,
                     share_id: lease.share@,
                 })
             }
@@ -7207,7 +10098,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 0 <= i < before.active_grants@.len() ==> {
                     let g = #[trigger] before.active_grants@[i];
                     &&& g.grant_tag < before.next_grant_tag
-                    &&& g.frame.0 < core.frames.metas.len()
+                    &&& g.frame.0 < core.frames_spec().metas_spec().len()
                     &&& before.rdma.lease_index_spec(g.handle) matches Some(idx) && {
                         let lease = before.rdma.active_leases@[idx];
                         &&& lease.frame == g.frame
@@ -7215,12 +10106,12 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                         &&& (g.grant_tag != grant_tag ==> before.channel.sent().contains_key(
                             g.grant_tag,
                         ) && before.channel.sent()[g.grant_tag] == (GrantKind::ReadShare {
-                            slot: core.frames.frame(g.frame).slot,
+                            slot: core.frames_spec().frame(g.frame).slot,
                             share_id: lease.share@,
                         }))
-                        &&& (g.grant_tag == grant_tag ==> share_cap.is_rdma_bound()
+                        &&& (g.grant_tag == grant_tag ==> share_cap.is_fenced()
                             && share_cap.instance_id() == core.instance_id() && share_cap.loc()
-                            == core.frames.frame(g.frame).slot.loc && share_cap.share()
+                            == core.frames_spec().frame(g.frame).slot.loc && share_cap.share()
                             == lease.share@ && transfer::transport::covers(
                             share_cap.frontier(),
                             stmt_closure,
@@ -7242,7 +10133,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         ensures
             after.well_formed(core),
             after.rdma.well_formed(core),
-            grant.frame.0 < core.frames.metas.len(),
+            grant.frame.0 < core.frames_spec().metas_spec().len(),
             after.rdma.lease_index_spec(grant.handle) matches Some(idx) && {
                 let lease = after.rdma.active_leases@[idx];
                 &&& 0 <= idx < after.rdma.active_leases@.len()
@@ -7250,9 +10141,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 &&& lease.state == RemoteLeaseState::Bound
                 &&& lease.share@ == share_cap.share()
             },
-            share_cap.is_rdma_bound(),
+            share_cap.is_fenced(),
             share_cap.instance_id() == core.instance_id(),
-            share_cap.loc() == core.frames.frame(grant.frame).slot.loc,
+            share_cap.loc() == core.frames_spec().frame(grant.frame).slot.loc,
             transfer::transport::covers(share_cap.frontier(), stmt_closure),
             forall|j: int|
                 0 <= j < after.active_grants@.len() ==> (#[trigger] after.active_grants@[j]).handle
@@ -7277,14 +10168,14 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         assert forall|i: int| 0 <= i < after.active_grants@.len() implies {
             let g = #[trigger] after.active_grants@[i];
             &&& g.grant_tag < after.next_grant_tag
-            &&& g.frame.0 < core.frames.metas.len()
+            &&& g.frame.0 < core.frames_spec().metas_spec().len()
             &&& after.rdma.lease_index_spec(g.handle) matches Some(idx) && {
                 let lease = after.rdma.active_leases@[idx];
                 &&& lease.frame == g.frame
                 &&& lease.state == RemoteLeaseState::Bound
                 &&& after.channel.sent().contains_key(g.grant_tag)
                 &&& after.channel.sent()[g.grant_tag] == (GrantKind::ReadShare {
-                    slot: core.frames.frame(g.frame).slot,
+                    slot: core.frames_spec().frame(g.frame).slot,
                     share_id: lease.share@,
                 })
             }
@@ -7320,26 +10211,30 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             before_core.well_formed(),
             after_core.well_formed(),
             self.well_formed(before_core),
-            after_core.node_id == before_core.node_id,
+            after_core.node_id_spec() == before_core.node_id_spec(),
             after_core.instance_id() == before_core.instance_id(),
-            after_core.tiers == before_core.tiers,
-            after_core.frames == before_core.frames,
-            after_core.catalog == before_core.catalog,
-            after_core.timelines == before_core.timelines,
-            after_core.active_leases == before_core.active_leases,
-            after_core.free_lease_slots == before_core.free_lease_slots,
-            after_core.next_version_seq == before_core.next_version_seq,
-            after_core.version_seq_limit == before_core.version_seq_limit,
-            after_core.version_registry == before_core.version_registry,
-            after_core.spec == before_core.spec,
-            before_core.ledger@.submitted.map().submap_of(after_core.ledger@.submitted.map()),
-            stmt_sub.map().submap_of(after_core.ledger@.submitted.map()),
-            before_core.ledger@.knows.set().subset_of(after_core.ledger@.knows.set()),
-            knowledge_of(before_core.node(), stmt_closure).subset_of(
-                after_core.ledger@.knows.set(),
+            after_core.tiers_spec() == before_core.tiers_spec(),
+            after_core.frames_spec() == before_core.frames_spec(),
+            after_core.catalog_spec() == before_core.catalog_spec(),
+            after_core.timelines_spec() == before_core.timelines_spec(),
+            after_core.active_leases_spec() == before_core.active_leases_spec(),
+            after_core.free_lease_slots_spec() == before_core.free_lease_slots_spec(),
+            after_core.next_version_seq_spec() == before_core.next_version_seq_spec(),
+            after_core.version_seq_limit_spec() == before_core.version_seq_limit_spec(),
+            after_core.version_registry_spec() == before_core.version_registry_spec(),
+            after_core.spec_spec() == before_core.spec_spec(),
+            before_core.ledger_spec()@.submitted.map().submap_of(
+                after_core.ledger_spec()@.submitted.map(),
             ),
-            before_core.ledger@.succeeded.dom().subset_of(after_core.ledger@.succeeded.dom()),
-            after_core.ledger@.revoked == before_core.ledger@.revoked,
+            stmt_sub.map().submap_of(after_core.ledger_spec()@.submitted.map()),
+            before_core.ledger_spec()@.knows.set().subset_of(after_core.ledger_spec()@.knows.set()),
+            knowledge_of(before_core.node(), stmt_closure).subset_of(
+                after_core.ledger_spec()@.knows.set(),
+            ),
+            before_core.ledger_spec()@.succeeded.dom().subset_of(
+                after_core.ledger_spec()@.succeeded.dom(),
+            ),
+            after_core.ledger_spec()@.revoked == before_core.ledger_spec()@.revoked,
             crate::provenance::complete_receipts_map(stmt_sub),
             stmt_facts.subset_of(stmt_sub.dom()),
             stmt_closure == closure_from(stmt_sub.map(), stmt_facts),
@@ -7348,7 +10243,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             self.rdma.well_formed(after_core),
             peer_core_step(before_core, after_core, self.rdma.timeline_id),
             stmt_closure.subset_of(after_core.citations()),
-            after_core.timelines.valid_ticket(Ticket::NONE),
+            after_core.timelines_spec().valid_ticket(Ticket::NONE),
     {
         hide(CacheCore::well_formed);
         hide(super::protocol::statement_replica_valid);
@@ -7362,27 +10257,27 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         lemma_rdma_window_after_fence_ledger(
             self.rdma.in_flight_ops,
             self.rdma.bitmap,
-            &after_core.timelines,
+            &after_core.timelines_spec(),
             self.rdma.timeline_id,
-            &before_core.ledger@,
-            &after_core.ledger@,
+            &before_core.ledger_spec()@,
+            &after_core.ledger_spec()@,
             rdma::CqSnapshot::of(self.rdma.cq),
             after_core.instance_id(),
             self.rdma.next_control_wr_id,
         );
         lemma_completed_pulls_after_step(
             self.rdma.completed_pulls,
-            &before_core.timelines,
-            &after_core.timelines,
+            &before_core.timelines_spec(),
+            &after_core.timelines_spec(),
             self.rdma.timeline_id,
             self.rdma.cq.observer(),
-            &before_core.ledger@,
-            &after_core.ledger@,
+            &before_core.ledger_spec()@,
+            &after_core.ledger_spec()@,
         );
-        assert(after_core.frames.same_directory(&before_core.frames)) by {
+        assert(after_core.frames_spec().same_directory(&before_core.frames_spec())) by {
             reveal(FrameTable::same_directory);
         };
-        assert(after_core.frames.same_layout(&before_core.frames)) by {
+        assert(after_core.frames_spec().same_layout(&before_core.frames_spec())) by {
             reveal(FrameTable::same_layout);
         };
         lemma_rdma_all_slabs_same_directory(
@@ -7426,6 +10321,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         }
         assert(peer_core_step(before_core, after_core, self.rdma.timeline_id)) by {
             reveal(peer_core_step_except);
+            reveal(core_transition);
             reveal(FrameTable::preserves_initializing);
         };
         assert(stmt_closure.subset_of(after_core.citations())) by {
@@ -7441,8 +10337,8 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                         assert(stmt_sub.map()[m].preds.subset_of(stmt_sub.dom()));
                     }
                 }
-                assert(after_core.ledger@.submitted.dom().contains(e));
-                assert(after_core.ledger@.knows.set().contains((after_core.node(), e)));
+                assert(after_core.ledger_spec()@.submitted.dom().contains(e));
+                assert(after_core.ledger_spec()@.knows.set().contains((after_core.node(), e)));
             }
         };
     }
@@ -7497,14 +10393,14 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         assert forall|i: int| 0 <= i < after.active_grants@.len() implies {
             let g = #[trigger] after.active_grants@[i];
             &&& g.grant_tag < after.next_grant_tag
-            &&& g.frame.0 < core.frames.metas.len()
+            &&& g.frame.0 < core.frames_spec().metas_spec().len()
             &&& after.rdma.lease_index_spec(g.handle) matches Some(idx) && {
                 let lease = after.rdma.active_leases@[idx];
                 &&& lease.frame == g.frame
                 &&& lease.state == RemoteLeaseState::Bound
                 &&& after.channel.sent().contains_key(g.grant_tag)
                 &&& after.channel.sent()[g.grant_tag] == (GrantKind::ReadShare {
-                    slot: core.frames.frame(g.frame).slot,
+                    slot: core.frames_spec().frame(g.frame).slot,
                     share_id: lease.share@,
                 })
             }
@@ -7537,14 +10433,18 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         requires
             before.well_formed(before_core),
             after.rdma.well_formed(after_core),
-            after_core.node_id == before_core.node_id,
+            after_core.node_id_spec() == before_core.node_id_spec(),
             after_core.instance_id() == before_core.instance_id(),
-            after_core.frames == before_core.frames,
-            after_core.ledger@.submitted == before_core.ledger@.submitted,
-            init_core.ledger@.knows.set().subset_of(before_core.ledger@.knows.set()),
-            before_core.ledger@.knows.set().subset_of(after_core.ledger@.knows.set()),
-            init_core.ledger@.succeeded.dom().subset_of(before_core.ledger@.succeeded.dom()),
-            before_core.ledger@.succeeded.dom().subset_of(after_core.ledger@.succeeded.dom()),
+            after_core.frames_spec() == before_core.frames_spec(),
+            after_core.ledger_spec()@.submitted == before_core.ledger_spec()@.submitted,
+            init_core.ledger_spec()@.knows.set().subset_of(before_core.ledger_spec()@.knows.set()),
+            before_core.ledger_spec()@.knows.set().subset_of(after_core.ledger_spec()@.knows.set()),
+            init_core.ledger_spec()@.succeeded.dom().subset_of(
+                before_core.ledger_spec()@.succeeded.dom(),
+            ),
+            before_core.ledger_spec()@.succeeded.dom().subset_of(
+                after_core.ledger_spec()@.succeeded.dom(),
+            ),
             after.rdma.peer_node == before.rdma.peer_node,
             after.channel == before.channel,
             after.next_grant_tag == before.next_grant_tag,
@@ -7567,44 +10467,51 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 )),
         ensures
             after.well_formed(after_core),
-            init_core.ledger@.knows.set().subset_of(after_core.ledger@.knows.set()),
-            init_core.ledger@.succeeded.dom().subset_of(after_core.ledger@.succeeded.dom()),
+            init_core.ledger_spec()@.knows.set().subset_of(after_core.ledger_spec()@.knows.set()),
+            init_core.ledger_spec()@.succeeded.dom().subset_of(
+                after_core.ledger_spec()@.succeeded.dom(),
+            ),
     {
         hide(CacheCore::well_formed);
         hide(RdmaBackend::well_formed);
         hide(super::protocol::statement_replica_valid);
         reveal(peer_core_step_except);
+        reveal(core_transition);
         reveal(PeerSession::well_formed);
         reveal(PeerSession::session_queues_valid);
         reveal(PendingOutboundGrant::valid);
         reveal(PendingInboundGrant::valid);
-        assert(init_core.ledger@.knows.set().subset_of(after_core.ledger@.knows.set())) by {
+        assert(init_core.ledger_spec()@.knows.set().subset_of(
+            after_core.ledger_spec()@.knows.set(),
+        )) by {
             assert forall|x| #[trigger]
-                init_core.ledger@.knows.set().contains(
+                init_core.ledger_spec()@.knows.set().contains(
                     x,
-                ) implies after_core.ledger@.knows.set().contains(x) by {
-                assert(before_core.ledger@.knows.set().contains(x));
+                ) implies after_core.ledger_spec()@.knows.set().contains(x) by {
+                assert(before_core.ledger_spec()@.knows.set().contains(x));
             }
         };
-        assert(init_core.ledger@.succeeded.dom().subset_of(after_core.ledger@.succeeded.dom())) by {
+        assert(init_core.ledger_spec()@.succeeded.dom().subset_of(
+            after_core.ledger_spec()@.succeeded.dom(),
+        )) by {
             assert forall|x| #[trigger]
-                init_core.ledger@.succeeded.dom().contains(
+                init_core.ledger_spec()@.succeeded.dom().contains(
                     x,
-                ) implies after_core.ledger@.succeeded.dom().contains(x) by {
-                assert(before_core.ledger@.succeeded.dom().contains(x));
+                ) implies after_core.ledger_spec()@.succeeded.dom().contains(x) by {
+                assert(before_core.ledger_spec()@.succeeded.dom().contains(x));
             }
         };
         assert forall|i: int| 0 <= i < after.active_grants@.len() implies {
             let g = #[trigger] after.active_grants@[i];
             &&& g.grant_tag < after.next_grant_tag
-            &&& g.frame.0 < after_core.frames.metas.len()
+            &&& g.frame.0 < after_core.frames_spec().metas_spec().len()
             &&& after.rdma.lease_index_spec(g.handle) matches Some(idx) && {
                 let lease = after.rdma.active_leases@[idx];
                 &&& lease.frame == g.frame
                 &&& lease.state == RemoteLeaseState::Bound
                 &&& after.channel.sent().contains_key(g.grant_tag)
                 &&& after.channel.sent()[g.grant_tag] == (GrantKind::ReadShare {
-                    slot: after_core.frames.frame(g.frame).slot,
+                    slot: after_core.frames_spec().frame(g.frame).slot,
                     share_id: lease.share@,
                 })
             }
@@ -7615,7 +10522,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             assert(before.rdma.active_leases@[oidx].state == RemoteLeaseState::Bound);
             assert(!before.rdma.active_leases@[oidx].has_active_wr());
         }
-        assert(after_core.frames.same_layout(&before_core.frames)) by {
+        assert(after_core.frames_spec().same_layout(&before_core.frames_spec())) by {
             reveal(FrameTable::same_layout);
         };
         assert forall|k: int| 0 <= k < after.pending_outbound_grants@.len() implies {
@@ -7672,17 +10579,19 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         requires
             before.well_formed(before_core),
             after.rdma.well_formed(after_core),
-            after_core.node_id == before_core.node_id,
+            after_core.node_id_spec() == before_core.node_id_spec(),
             after_core.instance_id() == before_core.instance_id(),
-            after_core.frames.same_directory(&before_core.frames),
+            after_core.frames_spec().same_directory(&before_core.frames_spec()),
             *after_core == *before_core || peer_core_step(
                 before_core,
                 after_core,
                 before.rdma.timeline_id,
-            ) || (before_core.ledger@.submitted.map().submap_of(after_core.ledger@.submitted.map())
-                && before_core.ledger@.knows.set().subset_of(after_core.ledger@.knows.set())
-                && before_core.ledger@.succeeded.dom().subset_of(
-                after_core.ledger@.succeeded.dom(),
+            ) || (before_core.ledger_spec()@.submitted.map().submap_of(
+                after_core.ledger_spec()@.submitted.map(),
+            ) && before_core.ledger_spec()@.knows.set().subset_of(
+                after_core.ledger_spec()@.knows.set(),
+            ) && before_core.ledger_spec()@.succeeded.dom().subset_of(
+                after_core.ledger_spec()@.succeeded.dom(),
             )),
             after.rdma.peer_node == before.rdma.peer_node,
             after.channel == before.channel,
@@ -7708,6 +10617,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         hide(RdmaBackend::well_formed);
         hide(super::protocol::statement_replica_valid);
         reveal(peer_core_step_except);
+        reveal(core_transition);
         reveal(PeerSession::well_formed);
         reveal(PeerSession::session_queues_valid);
         reveal(PendingOutboundGrant::valid);
@@ -7716,7 +10626,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             reveal(RdmaBackend::well_formed);
             reveal(rdma_leases_valid);
         }
-        assert(after_core.frames.same_layout(&before_core.frames)) by {
+        assert(after_core.frames_spec().same_layout(&before_core.frames_spec())) by {
             reveal(FrameTable::same_directory);
             reveal(FrameTable::same_layout);
         }
@@ -7791,15 +10701,17 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(core).well_formed(),
             final(core).all_versions_bound(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames.versions@ == old(core).frames.versions@,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines.count == old(core).timelines.count,
-            final(core).timelines.kinds == old(core).timelines.kinds,
-            final(core).timelines.events == old(core).timelines.events,
-            final(core).timelines.next_seq == old(core).timelines.next_seq,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -7849,15 +10761,15 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 self.rdma.qp.ready(),
                 self.rdma.qp.state() is ReadyToSend,
                 instance.id() == core.instance_id(),
-                core.node_id == old(core).node_id,
+                core.node_id_spec() == old(core).node_id_spec(),
                 core.instance_id() == old(core).instance_id(),
-                core.tiers == old(core).tiers,
-                core.frames.versions@ == old(core).frames.versions@,
-                core.version_registry == old(core).version_registry,
-                core.timelines.count == old(core).timelines.count,
-                core.timelines.kinds == old(core).timelines.kinds,
-                core.timelines.events == old(core).timelines.events,
-                core.timelines.next_seq == old(core).timelines.next_seq,
+                core.tiers_spec() == old(core).tiers_spec(),
+                core.frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+                core.version_registry_spec() == old(core).version_registry_spec(),
+                core.timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+                core.timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+                core.timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+                core.timelines_spec().next_seq_spec() == old(core).timelines_spec().next_seq_spec(),
                 peer_core_step(old(core), core, old(self).rdma.timeline_id),
                 peer_foreign_shares_preserved(
                     old(core),
@@ -7974,7 +10886,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                                 iter_leases,
                                 self.rdma.active_leases@,
                             );
-                            assert(core.frames.same_directory(&core.frames)) by {
+                            assert(core.frames_spec().same_directory(&core.frames_spec())) by {
                                 reveal(FrameTable::same_directory);
                             }
                             broadcast use {
@@ -8006,6 +10918,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                             Ok(inv_wr_id) => {
                                 proof {
                                     reveal(peer_core_step_except);
+                                    reveal(core_transition);
                                     Self::lemma_session_wf_after_outbound_lease_update(
                                         &pre_u_self,
                                         self,
@@ -8088,7 +11001,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                                         before_u_leases,
                                         self.rdma.active_leases@,
                                     );
-                                    assert(core.frames.same_directory(&before_u_core.frames)) by {
+                                    assert(core.frames_spec().same_directory(
+                                        &before_u_core.frames_spec(),
+                                    )) by {
                                         reveal(FrameTable::same_directory);
                                     }
                                     broadcast use {
@@ -8118,11 +11033,13 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                             },
                         }
                         if p.send_on_ready {
-                            let _ = self.send_control(
-                                core,
-                                ControlPayload::FetchMiss { request_id: p.request_id },
-                                Tracked(instance),
-                            );
+                            self.pending_inbound_fetches.push((p.request_id, p.key));
+                            proof {
+                                assert(self.well_formed(core)) by {
+                                    reveal(PeerSession::well_formed);
+                                    reveal(PeerSession::session_queues_valid);
+                                }
+                            }
                         }
                     }
                     if completed < usize::MAX {
@@ -8169,6 +11086,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                             );
                             assert(peer_core_step(&pre_fail_core, core, self.rdma.timeline_id)) by {
                                 reveal(peer_core_step_except);
+                                reveal(core_transition);
                                 reveal(FrameTable::same_directory);
                                 reveal(FrameTable::same_layout);
                                 reveal(FrameTable::preserves_initializing);
@@ -8196,11 +11114,13 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                         }
                     }
                     if p.send_on_ready {
-                        let _ = self.send_control(
-                            core,
-                            ControlPayload::FetchMiss { request_id: p.request_id },
-                            Tracked(instance),
-                        );
+                        self.pending_inbound_fetches.push((p.request_id, p.key));
+                        proof {
+                            assert(self.well_formed(core)) by {
+                                reveal(PeerSession::well_formed);
+                                reveal(PeerSession::session_queues_valid);
+                            }
+                        }
                     }
                     if completed < usize::MAX {
                         completed += 1;
@@ -8214,12 +11134,304 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         Ok(completed)
     }
 
+    /// Receive a burst of transport frames and respond to cooperative revokes.
+    fn pump_inbound_nonblocking(
+        &mut self,
+        core: &mut CacheCore,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<PeerProgress, CoreError>)
+        requires
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            old(self).rdma.qp.ready(),
+            old(self).rdma.qp.state() is ReadyToSend,
+            instance.id() == old(core).instance_id(),
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(self).well_formed(final(core)),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).instance_id() == old(core).instance_id(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
+            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
+            final(self).rdma.peer_node == old(self).rdma.peer_node,
+            final(self).rdma.qp == old(self).rdma.qp,
+            final(self).rdma.window_pool.pd() == old(self).rdma.window_pool.pd(),
+            final(self).rdma.host_mr == old(self).rdma.host_mr,
+            final(self).rdma.gpu_mr == old(self).rdma.gpu_mr,
+            final(self).rdma.shared_host_mr == old(self).rdma.shared_host_mr,
+            final(self).rdma.shared_gpu_mr == old(self).rdma.shared_gpu_mr,
+            final(self).channel.same_session(old(self).channel),
+            forall|seq: u64, writer: TransferEvent| #[trigger]
+                pull_tracked_or_done(&old(self).rdma, seq, writer) ==> pull_tracked_or_done(
+                    &final(self).rdma,
+                    seq,
+                    writer,
+                ),
+    {
+        hide(CacheCore::well_formed);
+        hide(replica_valid);
+        hide(complete_receipts);
+        let progress = self.drain_inbound_frames(core, Tracked(instance))?;
+        let ghost before = *core;
+        let ghost before_rdma = self.rdma;
+        let ack_result = self.send_pending_revoke_acks(core, Tracked(instance));
+        proof {
+            lemma_peer_core_step_trans(old(core), &before, core, self.rdma.timeline_id);
+            lemma_foreign_shares_trans(
+                old(core),
+                &before,
+                core,
+                old(self).rdma.active_leases@,
+                before_rdma.active_leases@,
+                self.rdma.active_leases@,
+            );
+            lemma_same_pulls_preserves_pull_tracked(&before_rdma, &self.rdma);
+            assert forall|seq: u64, writer: TransferEvent| #[trigger]
+                pull_tracked_or_done(&old(self).rdma, seq, writer) implies pull_tracked_or_done(
+                &self.rdma,
+                seq,
+                writer,
+            ) by {
+                assert(pull_tracked_or_done(&before_rdma, seq, writer));
+            }
+        }
+        let _ = ack_result?;
+        Ok(progress)
+    }
+
+    /// Retire binds and invalidations and replenish windows released by the protocol.
+    #[verifier::rlimit(250)]
+    pub(crate) fn pump_outbound_nonblocking(
+        &mut self,
+        core: &mut CacheCore,
+        pd: Option<&'a rdma::ProtectionDomain<'a>>,
+        tokens: &mut Vec<Tracked<EventSourceToken>>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<PeerProgress, CoreError>)
+        requires
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            old(self).rdma.qp.ready(),
+            old(self).rdma.qp.state() is ReadyToSend,
+            instance.id() == old(core).instance_id(),
+            pd matches Some(p) ==> p.id() == old(self).rdma.window_pool.pd() && p.node() == old(
+                core,
+            ).node(),
+            forall|k: int|
+                0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
+                    tokens,
+                )@[k]@.source().is_rdma_qp() && old(tokens)@[k]@.node() == old(core).node(),
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(self).well_formed(final(core)),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).instance_id() == old(core).instance_id(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
+            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
+            final(self).rdma.peer_node == old(self).rdma.peer_node,
+            final(self).rdma.qp == old(self).rdma.qp,
+            final(self).rdma.window_pool.pd() == old(self).rdma.window_pool.pd(),
+            final(self).rdma.host_mr == old(self).rdma.host_mr,
+            final(self).rdma.gpu_mr == old(self).rdma.gpu_mr,
+            final(self).rdma.shared_host_mr == old(self).rdma.shared_host_mr,
+            final(self).rdma.shared_gpu_mr == old(self).rdma.shared_gpu_mr,
+            final(self).channel.same_session(old(self).channel),
+            forall|k: int|
+                0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
+                    && final(tokens)@[k]@.source().is_rdma_qp() && final(tokens)@[k]@.node() == old(
+                    core,
+                ).node(),
+            forall|seq: u64, writer: TransferEvent| #[trigger]
+                pull_tracked_or_done(&old(self).rdma, seq, writer) ==> pull_tracked_or_done(
+                    &final(self).rdma,
+                    seq,
+                    writer,
+                ),
+    {
+        hide(CacheCore::well_formed);
+        hide(replica_valid);
+        hide(complete_receipts);
+        let mut progress = PeerProgress::empty();
+        progress.cq_processed = self.pump_session_cq(core, Tracked(instance))?;
+        let ghost before = *core;
+        let ghost before_rdma = self.rdma;
+        let grants = self.process_pending_outbound_grants(core, Tracked(instance));
+        proof {
+            lemma_peer_core_step_trans(old(core), &before, core, self.rdma.timeline_id);
+            lemma_foreign_shares_trans(
+                old(core),
+                &before,
+                core,
+                old(self).rdma.active_leases@,
+                before_rdma.active_leases@,
+                self.rdma.active_leases@,
+            );
+            assert forall|seq: u64, writer: TransferEvent| #[trigger]
+                pull_tracked_or_done(&old(self).rdma, seq, writer) implies pull_tracked_or_done(
+                &self.rdma,
+                seq,
+                writer,
+            ) by {
+                assert(pull_tracked_or_done(&before_rdma, seq, writer));
+            }
+        }
+        progress.grants_completed = grants?;
+        let ghost before_rdma = self.rdma;
+        progress.windows_replenished = if let Some(pd_ref) = pd {
+            self.replenish_acknowledged_windows(core, pd_ref, tokens)
+        } else {
+            let _ = self.acknowledge_pending_revoke_acks(core);
+            0
+        };
+        proof {
+            lemma_same_pulls_preserves_pull_tracked(&before_rdma, &self.rdma);
+            assert forall|seq: u64, writer: TransferEvent| #[trigger]
+                pull_tracked_or_done(&old(self).rdma, seq, writer) implies pull_tracked_or_done(
+                &self.rdma,
+                seq,
+                writer,
+            ) by {
+                assert(pull_tracked_or_done(&before_rdma, seq, writer));
+            }
+        }
+        Ok(progress)
+    }
+
+    /// Drive CQ and protocol progress and queue received fetches for caller admission.
+    pub(crate) fn pump_nonblocking(
+        &mut self,
+        core: &mut CacheCore,
+        pd: Option<&'a rdma::ProtectionDomain<'a>>,
+        tokens: &mut Vec<Tracked<EventSourceToken>>,
+        Tracked(instance): Tracked<&TransferInstance>,
+    ) -> (r: Result<PeerProgress, CoreError>)
+        requires
+            old(core).well_formed(),
+            old(core).all_versions_bound(),
+            old(self).well_formed(old(core)),
+            old(self).rdma.qp.ready(),
+            old(self).rdma.qp.state() is ReadyToSend,
+            instance.id() == old(core).instance_id(),
+            pd matches Some(p) ==> p.id() == old(self).rdma.window_pool.pd() && p.node() == old(
+                core,
+            ).node(),
+            forall|k: int|
+                0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
+                    tokens,
+                )@[k]@.source().is_rdma_qp() && old(tokens)@[k]@.node() == old(core).node(),
+        ensures
+            final(core).well_formed(),
+            final(core).all_versions_bound(),
+            final(self).well_formed(final(core)),
+            final(core).node_id_spec() == old(core).node_id_spec(),
+            final(core).instance_id() == old(core).instance_id(),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
+            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            peer_foreign_shares_preserved(
+                old(core),
+                final(core),
+                old(self).rdma.active_leases@,
+                final(self).rdma.active_leases@,
+            ),
+            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
+            final(self).rdma.peer_node == old(self).rdma.peer_node,
+            final(self).rdma.qp == old(self).rdma.qp,
+            final(self).rdma.window_pool.pd() == old(self).rdma.window_pool.pd(),
+            final(self).rdma.host_mr == old(self).rdma.host_mr,
+            final(self).rdma.gpu_mr == old(self).rdma.gpu_mr,
+            final(self).rdma.shared_host_mr == old(self).rdma.shared_host_mr,
+            final(self).rdma.shared_gpu_mr == old(self).rdma.shared_gpu_mr,
+            final(self).channel.same_session(old(self).channel),
+            forall|k: int|
+                0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
+                    && final(tokens)@[k]@.source().is_rdma_qp() && final(tokens)@[k]@.node() == old(
+                    core,
+                ).node(),
+            forall|seq: u64, writer: TransferEvent| #[trigger]
+                pull_tracked_or_done(&old(self).rdma, seq, writer) ==> pull_tracked_or_done(
+                    &final(self).rdma,
+                    seq,
+                    writer,
+                ),
+    {
+        hide(CacheCore::well_formed);
+        hide(replica_valid);
+        hide(complete_receipts);
+        let mut progress = self.pump_inbound_nonblocking(core, Tracked(instance))?;
+        let ghost before = *core;
+        let ghost before_rdma = self.rdma;
+        let outbound = self.pump_outbound_nonblocking(core, pd, tokens, Tracked(instance));
+        proof {
+            lemma_peer_core_step_trans(old(core), &before, core, self.rdma.timeline_id);
+            lemma_foreign_shares_trans(
+                old(core),
+                &before,
+                core,
+                old(self).rdma.active_leases@,
+                before_rdma.active_leases@,
+                self.rdma.active_leases@,
+            );
+            assert forall|seq: u64, writer: TransferEvent| #[trigger]
+                pull_tracked_or_done(&old(self).rdma, seq, writer) implies pull_tracked_or_done(
+                &self.rdma,
+                seq,
+                writer,
+            ) by {
+                assert(pull_tracked_or_done(&before_rdma, seq, writer));
+            }
+        }
+        progress.accumulate(outbound?);
+        Ok(progress)
+    }
+
     /// Full-duplex progress driver: drains CQEs + inbound channel frames, sends
     /// `RevokeAck`s, initiates async MW binds for inbound `FetchRequest`s, pumps
     /// freshly completed binds, completes outbound `BindReady` grants, and
     /// acknowledges/replenishes quarantined MWs.
     #[verifier::rlimit(250)]
-    pub fn poll_progress_multi(
+    pub(crate) fn poll_progress_multi(
         &mut self,
         core: &mut CacheCore,
         primary_tier: TierId,
@@ -8245,7 +11457,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             forall|k: int|
                 0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
                     tokens,
-                )@[k]@.source() is RdmaQueuePair && old(tokens)@[k]@.node() == old(core).node(),
+                )@[k]@.source().is_rdma_qp() && old(tokens)@[k]@.node() == old(core).node(),
         ensures
             final(core).well_formed(),
             final(core).all_versions_bound(),
@@ -8253,15 +11465,17 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames.versions@ == old(core).frames.versions@,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines.count == old(core).timelines.count,
-            final(core).timelines.kinds == old(core).timelines.kinds,
-            final(core).timelines.events == old(core).timelines.events,
-            final(core).timelines.next_seq == old(core).timelines.next_seq,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -8279,8 +11493,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(self).channel.same_session(old(self).channel),
             forall|k: int|
                 0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
-                    && final(tokens)@[k]@.source() is RdmaQueuePair && final(tokens)@[k]@.node()
-                    == old(core).node(),
+                    && final(tokens)@[k]@.source().is_rdma_qp() && final(tokens)@[k]@.node() == old(
+                    core,
+                ).node(),
             forall|seq: u64, writer: TransferEvent| #[trigger]
                 pull_tracked_or_done(&old(self).rdma, seq, writer) ==> pull_tracked_or_done(
                     &final(self).rdma,
@@ -8291,43 +11506,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         hide(CacheCore::well_formed);
         hide(replica_valid);
         hide(complete_receipts);
-        let mut progress = PeerProgress::empty();
-        let _ = self.pump_cq_and_channel_basic(core, Tracked(instance))?;
-        let ghost step1_core = *core;
-        let ghost step1_leases = self.rdma.active_leases@;
-        let ghost step1_rdma = self.rdma;
-        match self.send_pending_revoke_acks(core, Tracked(instance)) {
-            Ok(_) => {},
-            Err(e) => {
-                proof {
-                    lemma_peer_core_step_trans(old(core), &step1_core, core, self.rdma.timeline_id);
-                    lemma_foreign_shares_trans(
-                        old(core),
-                        &step1_core,
-                        core,
-                        old(self).rdma.active_leases@,
-                        step1_leases,
-                        self.rdma.active_leases@,
-                    );
-                    assert(self.rdma == step1_rdma);
-                }
-                return Err(e);
-            },
-        }
-        proof {
-            lemma_peer_core_step_trans(old(core), &step1_core, core, self.rdma.timeline_id);
-            lemma_foreign_shares_trans(
-                old(core),
-                &step1_core,
-                core,
-                old(self).rdma.active_leases@,
-                step1_leases,
-                self.rdma.active_leases@,
-            );
-        }
-        let ghost step2_core = *core;
-        let ghost step2_leases = self.rdma.active_leases@;
-        let ghost step2_rdma = self.rdma;
+        let mut progress = self.pump_inbound_nonblocking(core, Tracked(instance))?;
+        let ghost before = *core;
+        let ghost before_rdma = self.rdma;
         self.queue_pending_inbound_fetches(
             core,
             primary_tier,
@@ -8336,13 +11517,13 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             Tracked(instance),
         );
         proof {
-            lemma_peer_core_step_trans(old(core), &step2_core, core, self.rdma.timeline_id);
+            lemma_peer_core_step_trans(old(core), &before, core, self.rdma.timeline_id);
             lemma_foreign_shares_trans(
                 old(core),
-                &step2_core,
+                &before,
                 core,
                 old(self).rdma.active_leases@,
-                step2_leases,
+                before_rdma.active_leases@,
                 self.rdma.active_leases@,
             );
             assert forall|seq: u64, writer: TransferEvent| #[trigger]
@@ -8351,156 +11532,32 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 seq,
                 writer,
             ) by {
-                assert(pull_tracked_or_done(&step2_rdma, seq, writer));
+                assert(pull_tracked_or_done(&before_rdma, seq, writer));
             }
         }
-        let ghost step3_core = *core;
-        let ghost step3_leases = self.rdma.active_leases@;
-        let ghost step3_rdma = self.rdma;
-        let cq_n = match self.rdma.pump_cq_all(core, Tracked(instance)) {
-            Ok(n) => n,
-            Err(e) => {
-                proof {
-                    lemma_peer_core_step_trans(old(core), &step3_core, core, self.rdma.timeline_id);
-                    lemma_foreign_shares_trans(
-                        old(core),
-                        &step3_core,
-                        core,
-                        old(self).rdma.active_leases@,
-                        step3_leases,
-                        self.rdma.active_leases@,
-                    );
-                    lemma_pump_cq_all_preserves_pull_tracked(&step3_rdma, &self.rdma);
-                    assert forall|seq: u64, writer: TransferEvent| #[trigger]
-                        pull_tracked_or_done(
-                            &old(self).rdma,
-                            seq,
-                            writer,
-                        ) implies pull_tracked_or_done(&self.rdma, seq, writer) by {
-                        assert(pull_tracked_or_done(&step3_rdma, seq, writer));
-                    }
-                }
-                return Err(e);
-            },
-        };
-        progress.cq_processed = cq_n;
+        let ghost before = *core;
+        let ghost before_rdma = self.rdma;
+        let outbound = self.pump_outbound_nonblocking(core, pd, tokens, Tracked(instance));
         proof {
-            lemma_peer_core_step_trans(old(core), &step3_core, core, self.rdma.timeline_id);
+            lemma_peer_core_step_trans(old(core), &before, core, self.rdma.timeline_id);
             lemma_foreign_shares_trans(
                 old(core),
-                &step3_core,
+                &before,
                 core,
                 old(self).rdma.active_leases@,
-                step3_leases,
+                before_rdma.active_leases@,
                 self.rdma.active_leases@,
             );
-            assert forall|i: int| 0 <= i < self.active_grants@.len() implies {
-                let g = #[trigger] self.active_grants@[i];
-                &&& g.grant_tag < self.next_grant_tag
-                &&& g.frame.0 < core.frames.metas.len()
-                &&& self.rdma.lease_index_spec(g.handle) matches Some(idx) && {
-                    let lease = self.rdma.active_leases@[idx];
-                    &&& lease.frame == g.frame
-                    &&& lease.state == RemoteLeaseState::Bound
-                    &&& self.channel.sent().contains_key(g.grant_tag)
-                    &&& self.channel.sent()[g.grant_tag] == (GrantKind::ReadShare {
-                        slot: core.frames.frame(g.frame).slot,
-                        share_id: lease.share@,
-                    })
-                }
-            } by {
-                reveal(rdma_leases_valid);
-                let g = self.active_grants@[i];
-                let oidx = rdma_lease_index_spec(step3_leases, g.handle).unwrap();
-                assert(step3_leases[oidx].state == RemoteLeaseState::Bound);
-                assert(!step3_leases[oidx].has_active_wr());
-            }
-            assert(core.frames.same_layout(&step3_core.frames)) by {
-                reveal(FrameTable::same_layout);
-            }
-            lemma_outbound_grants_preserved(
-                self.pending_outbound_grants@,
-                step3_leases,
-                self.rdma.active_leases@,
-                &step3_core,
-                core,
-            );
-            lemma_pump_cq_all_preserves_pull_tracked(&step3_rdma, &self.rdma);
             assert forall|seq: u64, writer: TransferEvent| #[trigger]
                 pull_tracked_or_done(&old(self).rdma, seq, writer) implies pull_tracked_or_done(
                 &self.rdma,
                 seq,
                 writer,
             ) by {
-                assert(pull_tracked_or_done(&step3_rdma, seq, writer));
+                assert(pull_tracked_or_done(&before_rdma, seq, writer));
             }
         }
-        let ghost step4_core = *core;
-        let ghost step4_leases = self.rdma.active_leases@;
-        let ghost step4_rdma = self.rdma;
-        match self.process_pending_outbound_grants(core, Tracked(instance)) {
-            Ok(n) => {
-                progress.grants_completed = n;
-                proof {
-                    lemma_peer_core_step_trans(old(core), &step4_core, core, self.rdma.timeline_id);
-                    lemma_foreign_shares_trans(
-                        old(core),
-                        &step4_core,
-                        core,
-                        old(self).rdma.active_leases@,
-                        step4_leases,
-                        self.rdma.active_leases@,
-                    );
-                    assert forall|seq: u64, writer: TransferEvent| #[trigger]
-                        pull_tracked_or_done(
-                            &old(self).rdma,
-                            seq,
-                            writer,
-                        ) implies pull_tracked_or_done(&self.rdma, seq, writer) by {
-                        assert(pull_tracked_or_done(&step4_rdma, seq, writer));
-                    }
-                }
-            },
-            Err(e) => {
-                proof {
-                    lemma_peer_core_step_trans(old(core), &step4_core, core, self.rdma.timeline_id);
-                    lemma_foreign_shares_trans(
-                        old(core),
-                        &step4_core,
-                        core,
-                        old(self).rdma.active_leases@,
-                        step4_leases,
-                        self.rdma.active_leases@,
-                    );
-                    assert forall|seq: u64, writer: TransferEvent| #[trigger]
-                        pull_tracked_or_done(
-                            &old(self).rdma,
-                            seq,
-                            writer,
-                        ) implies pull_tracked_or_done(&self.rdma, seq, writer) by {
-                        assert(pull_tracked_or_done(&step4_rdma, seq, writer));
-                    }
-                }
-                return Err(e);
-            },
-        }
-        let ghost step5_rdma = self.rdma;
-        progress.windows_replenished = if let Some(pd_ref) = pd {
-            self.replenish_acknowledged_windows(core, pd_ref, tokens)
-        } else {
-            let _ = self.acknowledge_pending_revoke_acks(core);
-            0
-        };
-        proof {
-            assert forall|seq: u64, writer: TransferEvent| #[trigger]
-                pull_tracked_or_done(&old(self).rdma, seq, writer) implies pull_tracked_or_done(
-                &self.rdma,
-                seq,
-                writer,
-            ) by {
-                assert(pull_tracked_or_done(&step5_rdma, seq, writer));
-            }
-        }
+        progress.accumulate(outbound?);
         Ok(progress)
     }
 
@@ -8523,42 +11580,44 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             old(core).well_formed(),
             old(core).all_versions_bound(),
             old(self).well_formed(old(core)),
-            old(self).rdma.qp.ready(),
-            old(self).rdma.qp.state() is ReadyToSend,
-            old(self).rdma.qp.source().well_formed(),
-            old(self).rdma.qp.effective_max_rd_atomic() > 0,
-            old(self).rdma.peer_node != old(core).node(),
-            old(self).next_request_id < u64::MAX,
-            old(core).frames.tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
+            old(self).rdma_spec().qp_spec().ready(),
+            old(self).rdma_spec().qp_spec().state() is ReadyToSend,
+            old(self).rdma_spec().qp_spec().source().well_formed(),
+            old(self).rdma_spec().qp_spec().effective_max_rd_atomic() > 0,
+            old(self).rdma_spec().peer_node_spec() != old(core).node(),
+            old(self).next_request_id_spec() < u64::MAX,
+            old(core).frames_spec().tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
             instance.id() == old(core).instance_id(),
             match target {
-                PullTarget::Host => old(self).rdma.effective_host_mr_spec() matches Some(s)
-                    && s.tier == dst_tier && s.mr.access().local_write
-                    && s.mr.gpu_device_spec().is_none(),
-                PullTarget::GpuGdr => old(self).rdma.effective_gpu_mr_spec() matches Some(s)
-                    && s.tier == dst_tier && s.mr.access().local_write
-                    && s.mr.gpu_device_spec() is Some,
+                PullTarget::Host => old(self).rdma_spec().effective_host_mr_spec() matches Some(s)
+                    && s.tier_spec() == dst_tier && s.mr_spec().access().local_write
+                    && s.mr_spec().gpu_device_spec().is_none(),
+                PullTarget::GpuGdr => old(self).rdma_spec().effective_gpu_mr_spec() matches Some(s)
+                    && s.tier_spec() == dst_tier && s.mr_spec().access().local_write
+                    && s.mr_spec().gpu_device_spec() is Some,
             },
         ensures
             final(core).well_formed(),
             final(core).all_versions_bound(),
             final(self).well_formed(final(core)),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            peer_core_step(old(core), final(core), old(self).rdma_spec().timeline_id_spec()),
             peer_foreign_shares_preserved(
                 old(core),
                 final(core),
-                old(self).rdma.active_leases@,
-                final(self).rdma.active_leases@,
+                old(self).rdma_spec().active_leases_spec()@,
+                final(self).rdma_spec().active_leases_spec()@,
             ),
-            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
-            final(self).rdma.peer_node == old(self).rdma.peer_node,
-            final(self).rdma.qp.ready(),
-            final(self).rdma.qp.state() is ReadyToSend,
-            final(self).rdma.qp.source().well_formed(),
-            final(self).rdma.qp.source().source() == old(self).rdma.qp.source().source(),
+            final(self).rdma_spec().timeline_id_spec() == old(self).rdma_spec().timeline_id_spec(),
+            final(self).rdma_spec().peer_node_spec() == old(self).rdma_spec().peer_node_spec(),
+            final(self).rdma_spec().qp_spec().ready(),
+            final(self).rdma_spec().qp_spec().state() is ReadyToSend,
+            final(self).rdma_spec().qp_spec().source().well_formed(),
+            final(self).rdma_spec().qp_spec().source().source() == old(
+                self,
+            ).rdma_spec().qp_spec().source().source(),
     {
         hide(CacheCore::well_formed);
         hide(PeerSession::well_formed);
@@ -8597,17 +11656,17 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 self.rdma.qp.source().well_formed(),
                 self.rdma.qp.effective_max_rd_atomic() > 0,
                 self.rdma.peer_node != core.node(),
-                core.frames.tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
+                core.frames_spec().tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
                 instance.id() == core.instance_id(),
-                core.node_id == old(core).node_id,
+                core.node_id_spec() == old(core).node_id_spec(),
                 core.instance_id() == old(core).instance_id(),
-                core.tiers == old(core).tiers,
-                core.frames.versions@ == old(core).frames.versions@,
-                core.version_registry == old(core).version_registry,
-                core.timelines.count == old(core).timelines.count,
-                core.timelines.kinds == old(core).timelines.kinds,
-                core.timelines.events == old(core).timelines.events,
-                core.timelines.next_seq == old(core).timelines.next_seq,
+                core.tiers_spec() == old(core).tiers_spec(),
+                core.frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+                core.version_registry_spec() == old(core).version_registry_spec(),
+                core.timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+                core.timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+                core.timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+                core.timelines_spec().next_seq_spec() == old(core).timelines_spec().next_seq_spec(),
                 peer_core_step(old(core), core, old(self).rdma.timeline_id),
                 peer_foreign_shares_preserved(
                     old(core),
@@ -8658,8 +11717,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 match self.pump_cq_and_channel_step(core, Tracked(instance)) {
                     Ok(_) => {
                         proof {
-                            assert(core.frames.same_layout(&step_core.frames)) by {
+                            assert(core.frames_spec().same_layout(&step_core.frames_spec())) by {
                                 reveal(peer_core_step_except);
+                                reveal(core_transition);
                                 reveal(FrameTable::same_layout);
                             };
                             lemma_peer_core_step_trans(
@@ -8707,14 +11767,14 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         proof {
             self.lemma_peer_wf_lease_facts(core);
             self.rdma.lemma_effective_slabs_wf(core);
-            assert(dst_tier.valid(core.tiers.len()));
+            assert(dst_tier.valid(core.tiers_spec().len()));
             reveal(PendingInboundGrant::valid);
             assert(self.channel.id() == core.instance_id() && self.channel.local() == core.node())
                 by {
                 reveal(PeerSession::well_formed);
             };
         }
-        if g.meta.frame_size != core.tier_frame_size(dst_tier) as u64 {
+        if g.meta.frame_size != core.registered_tier_frame_size(dst_tier) as u64 {
             let ghost before_m = *core;
             let ghost before_m_leases = self.rdma.active_leases@;
             let tracked stmt = g.statement.get();
@@ -8839,7 +11899,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     /// peers can safely call `fetch_remote_frame_duplex` against each other
     /// simultaneously even over blocking `TcpTransport`.
     #[verifier::rlimit(350)]
-    pub fn fetch_remote_frame_duplex_multi(
+    pub(crate) fn fetch_remote_frame_duplex_multi(
         &mut self,
         core: &mut CacheCore,
         primary_tier: TierId,
@@ -8862,7 +11922,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             old(self).rdma.qp.effective_max_rd_atomic() > 0,
             old(self).rdma.peer_node != old(core).node(),
             old(self).next_request_id < u64::MAX,
-            old(core).frames.tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
+            old(core).frames_spec().tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
             instance.id() == old(core).instance_id(),
             old(shares).well_formed(),
             old(shares).id() == old(core).instance_id(),
@@ -8873,7 +11933,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             forall|k: int|
                 0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
                     tokens,
-                )@[k]@.source() is RdmaQueuePair && old(tokens)@[k]@.node() == old(core).node(),
+                )@[k]@.source().is_rdma_qp() && old(tokens)@[k]@.node() == old(core).node(),
             match target {
                 PullTarget::Host => old(self).rdma.effective_host_mr_spec() matches Some(s)
                     && s.tier == dst_tier && s.mr.access().local_write
@@ -8889,9 +11949,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
+            final(core).tiers_spec() == old(core).tiers_spec(),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -8907,8 +11967,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(self).rdma.qp.source().source() == old(self).rdma.qp.source().source(),
             forall|k: int|
                 0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
-                    && final(tokens)@[k]@.source() is RdmaQueuePair && final(tokens)@[k]@.node()
-                    == old(core).node(),
+                    && final(tokens)@[k]@.source().is_rdma_qp() && final(tokens)@[k]@.node() == old(
+                    core,
+                ).node(),
     {
         hide(CacheCore::well_formed);
         hide(replica_valid);
@@ -8945,17 +12006,17 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 self.rdma.qp.source().well_formed(),
                 self.rdma.qp.effective_max_rd_atomic() > 0,
                 self.rdma.peer_node != core.node(),
-                core.frames.tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
+                core.frames_spec().tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
                 instance.id() == core.instance_id(),
-                core.node_id == old(core).node_id,
+                core.node_id_spec() == old(core).node_id_spec(),
                 core.instance_id() == old(core).instance_id(),
-                core.tiers == old(core).tiers,
-                core.frames.versions@ == old(core).frames.versions@,
-                core.version_registry == old(core).version_registry,
-                core.timelines.count == old(core).timelines.count,
-                core.timelines.kinds == old(core).timelines.kinds,
-                core.timelines.events == old(core).timelines.events,
-                core.timelines.next_seq == old(core).timelines.next_seq,
+                core.tiers_spec() == old(core).tiers_spec(),
+                core.frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+                core.version_registry_spec() == old(core).version_registry_spec(),
+                core.timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+                core.timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+                core.timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+                core.timelines_spec().next_seq_spec() == old(core).timelines_spec().next_seq_spec(),
                 peer_core_step(old(core), core, old(self).rdma.timeline_id),
                 peer_foreign_shares_preserved(
                     old(core),
@@ -8982,8 +12043,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                     == core.node(),
                 forall|k: int|
                     0 <= k < tokens@.len() ==> (#[trigger] tokens@[k])@.well_formed()
-                        && tokens@[k]@.source() is RdmaQueuePair && tokens@[k]@.node()
-                        == core.node(),
+                        && tokens@[k]@.source().is_rdma_qp() && tokens@[k]@.node() == core.node(),
                 chosen_grant matches Some(g) ==> g.meta.request_id == req_id && g.valid(
                     core,
                     &self.channel,
@@ -9085,14 +12145,14 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                     assert forall|i: int| 0 <= i < self.active_grants@.len() implies {
                         let g = #[trigger] self.active_grants@[i];
                         &&& g.grant_tag < self.next_grant_tag
-                        &&& g.frame.0 < core.frames.metas.len()
+                        &&& g.frame.0 < core.frames_spec().metas_spec().len()
                         &&& self.rdma.lease_index_spec(g.handle) matches Some(idx) && {
                             let lease = self.rdma.active_leases@[idx];
                             &&& lease.frame == g.frame
                             &&& lease.state == RemoteLeaseState::Bound
                             &&& self.channel.sent().contains_key(g.grant_tag)
                             &&& self.channel.sent()[g.grant_tag] == (GrantKind::ReadShare {
-                                slot: core.frames.frame(g.frame).slot,
+                                slot: core.frames_spec().frame(g.frame).slot,
                                 share_id: lease.share@,
                             })
                         }
@@ -9102,7 +12162,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                         assert(step3_leases[oidx].state == RemoteLeaseState::Bound);
                         assert(!step3_leases[oidx].has_active_wr());
                     }
-                    assert(core.frames.same_layout(&step3_core.frames)) by {
+                    assert(core.frames_spec().same_layout(&step3_core.frames_spec())) by {
                         reveal(FrameTable::same_layout);
                     }
                     lemma_outbound_grants_preserved(
@@ -9190,9 +12250,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
         };
         proof {
             self.rdma.lemma_effective_slabs_wf(core);
-            assert(dst_tier.valid(core.tiers.len()));
+            assert(dst_tier.valid(core.tiers_spec().len()));
         }
-        if g.meta.frame_size != core.tier_frame_size(dst_tier) as u64 {
+        if g.meta.frame_size != core.registered_tier_frame_size(dst_tier) as u64 {
             let ghost before_m = *core;
             let ghost before_m_leases = self.rdma.active_leases@;
             let tracked stmt = g.statement.get();
@@ -9209,27 +12269,27 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 lemma_rdma_window_after_fence_ledger(
                     self.rdma.in_flight_ops,
                     self.rdma.bitmap,
-                    &core.timelines,
+                    &core.timelines_spec(),
                     self.rdma.timeline_id,
-                    &before_m.ledger@,
-                    &core.ledger@,
+                    &before_m.ledger_spec()@,
+                    &core.ledger_spec()@,
                     rdma::CqSnapshot::of(self.rdma.cq),
                     core.instance_id(),
                     self.rdma.next_control_wr_id,
                 );
                 lemma_completed_pulls_after_step(
                     self.rdma.completed_pulls,
-                    &before_m.timelines,
-                    &core.timelines,
+                    &before_m.timelines_spec(),
+                    &core.timelines_spec(),
                     self.rdma.timeline_id,
                     self.rdma.cq.observer(),
-                    &before_m.ledger@,
-                    &core.ledger@,
+                    &before_m.ledger_spec()@,
+                    &core.ledger_spec()@,
                 );
-                assert(core.frames.same_directory(&before_m.frames)) by {
+                assert(core.frames_spec().same_directory(&before_m.frames_spec())) by {
                     reveal(FrameTable::same_directory);
                 }
-                assert(core.frames.same_layout(&before_m.frames)) by {
+                assert(core.frames_spec().same_layout(&before_m.frames_spec())) by {
                     reveal(FrameTable::same_layout);
                 }
                 lemma_rdma_all_slabs_same_directory(
@@ -9257,6 +12317,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 );
                 assert(peer_core_step(&before_m, core, self.rdma.timeline_id)) by {
                     reveal(peer_core_step_except);
+                    reveal(core_transition);
                     reveal(FrameTable::preserves_initializing);
                 }
                 lemma_peer_core_step_trans(old(core), &before_m, core, self.rdma.timeline_id);
@@ -9281,8 +12342,8 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                                 assert(stmt_sub.map()[m].preds.subset_of(stmt_sub.dom()));
                             }
                         }
-                        assert(core.ledger@.submitted.dom().contains(e));
-                        assert(core.ledger@.knows.set().contains((core.node(), e)));
+                        assert(core.ledger_spec()@.submitted.dom().contains(e));
+                        assert(core.ledger_spec()@.knows.set().contains((core.node(), e)));
                     }
                 }
                 assert(transfer::transport::covers(g.share@.frontier(), core.citations()));
@@ -9360,9 +12421,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 self.rdma.qp.source().well_formed(),
                 self.rdma.qp.source().source() == old(self).rdma.qp.source().source(),
                 instance.id() == core.instance_id(),
-                core.node_id == old(core).node_id,
+                core.node_id_spec() == old(core).node_id_spec(),
                 core.instance_id() == old(core).instance_id(),
-                core.tiers == old(core).tiers,
+                core.tiers_spec() == old(core).tiers_spec(),
                 peer_core_step(&after_post, core, self.rdma.timeline_id),
                 peer_foreign_shares_preserved(
                     old(core),
@@ -9392,8 +12453,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                     == core.node(),
                 forall|k: int|
                     0 <= k < tokens@.len() ==> (#[trigger] tokens@[k])@.well_formed()
-                        && tokens@[k]@.source() is RdmaQueuePair && tokens@[k]@.node()
-                        == core.node(),
+                        && tokens@[k]@.source().is_rdma_qp() && tokens@[k]@.node() == core.node(),
             decreases 1_000_000 - pull_spins,
         {
             if self.rdma.has_completed_pull(pull.wr_id) {
@@ -9413,7 +12473,14 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                     pstep1_leases,
                     self.rdma.active_leases@,
                 );
-                lemma_pull_valid_after_peer_step(&pstep1_rdma, &self.rdma, &pstep1, core, &pull);
+                lemma_pull_valid_after_peer_step(
+                    &pstep1_rdma,
+                    &self.rdma,
+                    &pstep1,
+                    core,
+                    &pull,
+                    None,
+                );
             }
             if revoke_ack_res.is_err() {
                 break;
@@ -9438,7 +12505,14 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                     pstep2_leases,
                     self.rdma.active_leases@,
                 );
-                lemma_pull_valid_after_peer_step(&pstep2_rdma, &self.rdma, &pstep2, core, &pull);
+                lemma_pull_valid_after_peer_step(
+                    &pstep2_rdma,
+                    &self.rdma,
+                    &pstep2,
+                    core,
+                    &pull,
+                    None,
+                );
             }
             let ghost pstep3 = *core;
             let ghost pstep3_leases = self.rdma.active_leases@;
@@ -9456,18 +12530,25 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                     pstep3_leases,
                     self.rdma.active_leases@,
                 );
-                lemma_pull_valid_after_peer_step(&pstep3_rdma, &self.rdma, &pstep3, core, &pull);
+                lemma_pull_valid_after_peer_step(
+                    &pstep3_rdma,
+                    &self.rdma,
+                    &pstep3,
+                    core,
+                    &pull,
+                    None,
+                );
                 assert forall|i: int| 0 <= i < self.active_grants@.len() implies {
                     let ag = #[trigger] self.active_grants@[i];
                     &&& ag.grant_tag < self.next_grant_tag
-                    &&& ag.frame.0 < core.frames.metas.len()
+                    &&& ag.frame.0 < core.frames_spec().metas_spec().len()
                     &&& self.rdma.lease_index_spec(ag.handle) matches Some(idx) && {
                         let lease = self.rdma.active_leases@[idx];
                         &&& lease.frame == ag.frame
                         &&& lease.state == RemoteLeaseState::Bound
                         &&& self.channel.sent().contains_key(ag.grant_tag)
                         &&& self.channel.sent()[ag.grant_tag] == (GrantKind::ReadShare {
-                            slot: core.frames.frame(ag.frame).slot,
+                            slot: core.frames_spec().frame(ag.frame).slot,
                             share_id: lease.share@,
                         })
                     }
@@ -9503,7 +12584,14 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                     pstep4_leases,
                     self.rdma.active_leases@,
                 );
-                lemma_pull_valid_after_peer_step(&pstep4_rdma, &self.rdma, &pstep4, core, &pull);
+                lemma_pull_valid_after_peer_step(
+                    &pstep4_rdma,
+                    &self.rdma,
+                    &pstep4,
+                    core,
+                    &pull,
+                    None,
+                );
             }
             if ob_res.is_err() {
                 break;
@@ -9530,7 +12618,14 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                     pstep5_leases,
                     self.rdma.active_leases@,
                 );
-                lemma_pull_valid_after_peer_step(&pstep5_rdma, &self.rdma, &pstep5, core, &pull);
+                lemma_pull_valid_after_peer_step(
+                    &pstep5_rdma,
+                    &self.rdma,
+                    &pstep5,
+                    core,
+                    &pull,
+                    None,
+                );
                 assert(self.channel.received().contains_key(g.tag));
             }
             if step_res.is_err() {
@@ -9583,7 +12678,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     /// Donor: mark an active grant as `soft_revoking` and send a cooperative
     /// `ControlPayload::RevokeNotice { grant_tag }` advising the peer to return
     /// `ReadRelease` promptly before unilateral MW invalidation escalates.
-    pub fn send_soft_revoke_notice(
+    pub(crate) fn send_soft_revoke_notice(
         &mut self,
         core: &CacheCore,
         grant_tag: GrantTag,
@@ -9638,10 +12733,10 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     /// escalates cleanly to unilateral fenced MW invalidation (`Ok(Some(mw_slot))`)
     /// if the grace window expires or the channel closes.
     #[verifier::rlimit(250)]
-    pub fn revoke_lease_cooperative_first(
+    pub(crate) fn revoke_lease_cooperative_first(
         &mut self,
         core: &mut CacheCore,
-        host: &mut HostContext,
+        host: &mut SyncContext,
         grant_tag: GrantTag,
         spin_budget: u32,
         Tracked(instance): Tracked<&TransferInstance>,
@@ -9658,11 +12753,11 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(self).well_formed(final(core)),
             final(host).ready(final(core).instance_id(), final(core).node()),
             final(host).source@.source() == old(host).source@.source(),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames.versions@ == old(core).frames.versions@,
-            final(core).version_registry == old(core).version_registry,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -9701,11 +12796,11 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 host.ready(core.instance_id(), core.node()),
                 host.source@.source() == old(host).source@.source(),
                 instance.id() == core.instance_id(),
-                core.node_id == old(core).node_id,
+                core.node_id_spec() == old(core).node_id_spec(),
                 core.instance_id() == old(core).instance_id(),
-                core.tiers == old(core).tiers,
-                core.frames.versions@ == old(core).frames.versions@,
-                core.version_registry == old(core).version_registry,
+                core.tiers_spec() == old(core).tiers_spec(),
+                core.frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+                core.version_registry_spec() == old(core).version_registry_spec(),
                 peer_core_step(old(core), core, old(self).rdma.timeline_id),
                 peer_foreign_shares_preserved(
                     old(core),
@@ -9799,10 +12894,10 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     /// in-flight `PendingOutboundGrant` for `frame` as cancelled `send_on_ready = false`,
     /// pumping to complete pending binds if ready, then cooperatively-first revoking
     /// every active grant for `frame`).
-    pub fn drain_and_evict_frame_leases(
+    pub(crate) fn drain_and_evict_frame_leases(
         &mut self,
         core: &mut CacheCore,
-        host: &mut HostContext,
+        host: &mut SyncContext,
         frame: FrameId,
         spin_budget: u32,
         Tracked(instance): Tracked<&TransferInstance>,
@@ -9821,11 +12916,11 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(self).well_formed(final(core)),
             final(host).ready(final(core).instance_id(), final(core).node()),
             final(host).source@.source() == old(host).source@.source(),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames.versions@ == old(core).frames.versions@,
-            final(core).version_registry == old(core).version_registry,
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -9859,15 +12954,15 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 host.ready(core.instance_id(), core.node()),
                 host.source@.source() == old(host).source@.source(),
                 instance.id() == core.instance_id(),
-                core.node_id == old(core).node_id,
+                core.node_id_spec() == old(core).node_id_spec(),
                 core.instance_id() == old(core).instance_id(),
-                core.tiers == old(core).tiers,
-                core.frames.versions@ == old(core).frames.versions@,
-                core.version_registry == old(core).version_registry,
-                core.timelines.count == old(core).timelines.count,
-                core.timelines.kinds == old(core).timelines.kinds,
-                core.timelines.events == old(core).timelines.events,
-                core.timelines.next_seq == old(core).timelines.next_seq,
+                core.tiers_spec() == old(core).tiers_spec(),
+                core.frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+                core.version_registry_spec() == old(core).version_registry_spec(),
+                core.timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+                core.timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+                core.timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+                core.timelines_spec().next_seq_spec() == old(core).timelines_spec().next_seq_spec(),
                 peer_core_step(old(core), core, old(self).rdma.timeline_id),
                 peer_foreign_shares_preserved(
                     old(core),
@@ -9879,7 +12974,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 self.rdma.qp == old(self).rdma.qp,
             decreases self.pending_outbound_grants@.len() - p_idx,
         {
-            if self.pending_outbound_grants[p_idx].frame == frame {
+            let grant = &self.pending_outbound_grants[p_idx];
+            if grant.frame == frame && grant.send_on_ready {
+                self.pending_inbound_fetches.push((grant.request_id, grant.key));
                 self.pending_outbound_grants[p_idx].send_on_ready = false;
             }
             p_idx += 1;
@@ -9898,11 +12995,11 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 host.ready(core.instance_id(), core.node()),
                 host.source@.source() == old(host).source@.source(),
                 instance.id() == core.instance_id(),
-                core.node_id == old(core).node_id,
+                core.node_id_spec() == old(core).node_id_spec(),
                 core.instance_id() == old(core).instance_id(),
-                core.tiers == old(core).tiers,
-                core.frames.versions@ == old(core).frames.versions@,
-                core.version_registry == old(core).version_registry,
+                core.tiers_spec() == old(core).tiers_spec(),
+                core.frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+                core.version_registry_spec() == old(core).version_registry_spec(),
                 peer_core_step(old(core), core, old(self).rdma.timeline_id),
                 peer_foreign_shares_preserved(
                     old(core),
@@ -9985,11 +13082,11 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 host.ready(core.instance_id(), core.node()),
                 host.source@.source() == old(host).source@.source(),
                 instance.id() == core.instance_id(),
-                core.node_id == old(core).node_id,
+                core.node_id_spec() == old(core).node_id_spec(),
                 core.instance_id() == old(core).instance_id(),
-                core.tiers == old(core).tiers,
-                core.frames.versions@ == old(core).frames.versions@,
-                core.version_registry == old(core).version_registry,
+                core.tiers_spec() == old(core).tiers_spec(),
+                core.frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+                core.version_registry_spec() == old(core).version_registry_spec(),
                 peer_core_step(old(core), core, old(self).rdma.timeline_id),
                 peer_foreign_shares_preserved(
                     old(core),
@@ -10090,7 +13187,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     pub fn reset_and_reconnect(
         &mut self,
         core: &mut CacheCore,
-        host: &mut HostContext,
+        host: &mut SyncContext,
         local_endpoint: &rdma::QueuePairEndpoint,
         psn: u32,
         Tracked(instance): Tracked<&TransferInstance>,
@@ -10099,13 +13196,19 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             old(core).well_formed(),
             old(self).well_formed(old(core)),
             old(host).ready(old(core).instance_id(), old(core).node()),
-            old(self).rdma.cq.in_flight().is_empty(),
-            old(self).rdma.qp.state() is ReadyToSend || old(self).rdma.qp.state() is Error,
-            old(self).rdma.qp.peer() == old(self).rdma.peer_node,
-            old(self).rdma.qp.pd_id() == old(self).rdma.window_pool.pd(),
-            old(self).rdma.qp.source().well_formed(),
-            old(self).rdma.qp.source().source() is RdmaQueuePair,
-            old(self).rdma.qp.source().node() != old(self).rdma.peer_node,
+            old(self).rdma_spec().cq_spec().in_flight().is_empty(),
+            old(self).rdma_spec().qp_spec().state() is ReadyToSend || old(
+                self,
+            ).rdma_spec().qp_spec().state() is Error,
+            old(self).rdma_spec().qp_spec().peer() == old(self).rdma_spec().peer_node_spec(),
+            old(self).rdma_spec().qp_spec().pd_id() == old(
+                self,
+            ).rdma_spec().window_pool_spec().pd(),
+            old(self).rdma_spec().qp_spec().source().well_formed(),
+            old(self).rdma_spec().qp_spec().source().source().is_rdma_qp(),
+            old(self).rdma_spec().qp_spec().source().node() != old(
+                self,
+            ).rdma_spec().peer_node_spec(),
             local_endpoint.node() == old(core).node(),
             psn <= 0xffffff,
             instance.id() == old(core).instance_id(),
@@ -10114,27 +13217,34 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(self).well_formed(final(core)),
             final(host).ready(final(core).instance_id(), final(core).node()),
             final(host).source@.source() == old(host).source@.source(),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames.versions@ == old(core).frames.versions@,
-            final(core).version_registry == old(core).version_registry,
-            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            peer_core_step(old(core), final(core), old(self).rdma_spec().timeline_id_spec()),
             peer_foreign_shares_preserved(
                 old(core),
                 final(core),
-                old(self).rdma.active_leases@,
-                final(self).rdma.active_leases@,
+                old(self).rdma_spec().active_leases_spec()@,
+                final(self).rdma_spec().active_leases_spec()@,
             ),
-            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
-            final(self).rdma.peer_node == old(self).rdma.peer_node,
-            final(self).rdma.window_pool.pd() == old(self).rdma.window_pool.pd(),
-            final(self).rdma.qp.peer() == old(self).rdma.peer_node,
-            final(self).rdma.qp.pd_id() == old(self).rdma.window_pool.pd(),
-            final(self).rdma.qp.source().well_formed(),
-            final(self).rdma.qp.source().source() is RdmaQueuePair,
-            final(self).rdma.qp.source().node() != old(self).rdma.peer_node,
-            r.is_ok() ==> final(self).rdma.qp.ready() && final(self).rdma.qp.state() is ReadyToSend,
+            final(self).rdma_spec().timeline_id_spec() == old(self).rdma_spec().timeline_id_spec(),
+            final(self).rdma_spec().peer_node_spec() == old(self).rdma_spec().peer_node_spec(),
+            final(self).rdma_spec().window_pool_spec().pd() == old(
+                self,
+            ).rdma_spec().window_pool_spec().pd(),
+            final(self).rdma_spec().qp_spec().peer() == old(self).rdma_spec().peer_node_spec(),
+            final(self).rdma_spec().qp_spec().pd_id() == old(
+                self,
+            ).rdma_spec().window_pool_spec().pd(),
+            final(self).rdma_spec().qp_spec().source().well_formed(),
+            final(self).rdma_spec().qp_spec().source().source().is_rdma_qp(),
+            final(self).rdma_spec().qp_spec().source().node() != old(
+                self,
+            ).rdma_spec().peer_node_spec(),
+            r.is_ok() ==> final(self).rdma_spec().qp_spec().ready()
+                && final(self).rdma_spec().qp_spec().state() is ReadyToSend,
     {
         hide(CacheCore::well_formed);
         hide(replica_valid);
@@ -10198,11 +13308,11 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 host.ready(core.instance_id(), core.node()),
                 host.source@.source() == old(host).source@.source(),
                 instance.id() == core.instance_id(),
-                core.node_id == old(core).node_id,
+                core.node_id_spec() == old(core).node_id_spec(),
                 core.instance_id() == old(core).instance_id(),
-                core.tiers == old(core).tiers,
-                core.frames.versions@ == old(core).frames.versions@,
-                core.version_registry == old(core).version_registry,
+                core.tiers_spec() == old(core).tiers_spec(),
+                core.frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+                core.version_registry_spec() == old(core).version_registry_spec(),
                 peer_core_step(old(core), core, old(self).rdma.timeline_id),
                 peer_foreign_shares_preserved(
                     old(core),
@@ -10217,7 +13327,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
                 self.rdma.qp.peer() == self.rdma.peer_node,
                 self.rdma.qp.pd_id() == self.rdma.window_pool.pd(),
                 self.rdma.qp.source().well_formed(),
-                self.rdma.qp.source().source() is RdmaQueuePair,
+                self.rdma.qp.source().source().is_rdma_qp(),
                 self.rdma.qp.source().node() != self.rdma.peer_node,
                 peer_ep_opt matches Some(ep) ==> ep.node() == self.rdma.peer_node,
             decreases 1_000_000 - spins,
@@ -10293,7 +13403,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     pub fn shutdown(
         &mut self,
         core: &mut CacheCore,
-        host: &mut HostContext,
+        host: &mut SyncContext,
         Tracked(instance): Tracked<&TransferInstance>,
     ) -> (r: Result<(), CoreError>)
         requires
@@ -10306,33 +13416,35 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(self).well_formed(final(core)),
             final(host).ready(final(core).instance_id(), final(core).node()),
             final(host).source@.source() == old(host).source@.source(),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames.versions@ == old(core).frames.versions@,
-            final(core).version_registry == old(core).version_registry,
-            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            peer_core_step(old(core), final(core), old(self).rdma_spec().timeline_id_spec()),
             peer_foreign_shares_preserved(
                 old(core),
                 final(core),
-                old(self).rdma.active_leases@,
-                final(self).rdma.active_leases@,
+                old(self).rdma_spec().active_leases_spec()@,
+                final(self).rdma_spec().active_leases_spec()@,
             ),
-            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
-            final(self).rdma.peer_node == old(self).rdma.peer_node,
-            final(self).rdma.window_pool.pd() == old(self).rdma.window_pool.pd(),
+            final(self).rdma_spec().timeline_id_spec() == old(self).rdma_spec().timeline_id_spec(),
+            final(self).rdma_spec().peer_node_spec() == old(self).rdma_spec().peer_node_spec(),
+            final(self).rdma_spec().window_pool_spec().pd() == old(
+                self,
+            ).rdma_spec().window_pool_spec().pd(),
             r.is_ok() ==> {
-                &&& final(self).rdma.active_leases@.len() == 0
-                &&& final(self).rdma.qp.state() == rdma::QueuePairState::Reset
-                &&& final(self).rdma.cq.in_flight().is_empty()
-                &&& final(self).rdma.window_pool.free@.len() == 0
-                &&& final(self).rdma.host_mr is None
-                &&& final(self).rdma.gpu_mr is None
-                &&& final(self).rdma.shared_host_mr is None
-                &&& final(self).rdma.shared_gpu_mr is None
-                &&& final(self).active_grants@.len() == 0
-                &&& final(self).pending_outbound_grants@.len() == 0
-                &&& final(self).pending_inbound_grants@.len() == 0
+                &&& final(self).rdma_spec().active_leases_spec()@.len() == 0
+                &&& final(self).rdma_spec().qp_spec().state() == rdma::QueuePairState::Reset
+                &&& final(self).rdma_spec().cq_spec().in_flight().is_empty()
+                &&& final(self).rdma_spec().window_pool_spec().free_spec()@.len() == 0
+                &&& final(self).rdma_spec().host_mr_spec() is None
+                &&& final(self).rdma_spec().gpu_mr_spec() is None
+                &&& final(self).rdma_spec().shared_host_mr_spec() is None
+                &&& final(self).rdma_spec().shared_gpu_mr_spec() is None
+                &&& final(self).active_grants_spec()@.len() == 0
+                &&& final(self).pending_outbound_grants_spec()@.len() == 0
+                &&& final(self).pending_inbound_grants_spec()@.len() == 0
             },
     {
         hide(CacheCore::well_formed);
@@ -10378,9 +13490,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             old(core).well_formed(),
             old(core).all_versions_bound(),
             old(self).well_formed(old(core)),
-            old(self).rdma.qp.ready(),
-            old(self).rdma.qp.state() is ReadyToSend,
-            old(self).next_grant_tag < u64::MAX,
+            old(self).rdma_spec().qp_spec().ready(),
+            old(self).rdma_spec().qp_spec().state() is ReadyToSend,
+            old(self).next_grant_tag_spec() < u64::MAX,
             instance.id() == old(core).instance_id(),
             old(shares).well_formed(),
             old(shares).id() == old(core).instance_id(),
@@ -10392,19 +13504,19 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).version_registry == old(core).version_registry,
-            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            peer_core_step(old(core), final(core), old(self).rdma_spec().timeline_id_spec()),
             peer_foreign_shares_preserved(
                 old(core),
                 final(core),
-                old(self).rdma.active_leases@,
-                final(self).rdma.active_leases@,
+                old(self).rdma_spec().active_leases_spec()@,
+                final(self).rdma_spec().active_leases_spec()@,
             ),
-            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
-            final(self).rdma.qp == old(self).rdma.qp,
+            final(self).rdma_spec().timeline_id_spec() == old(self).rdma_spec().timeline_id_spec(),
+            final(self).rdma_spec().qp_spec() == old(self).rdma_spec().qp_spec(),
     {
         self.serve_fetch_request_multi(
             core,
@@ -10431,19 +13543,18 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             old(core).well_formed(),
             old(core).all_versions_bound(),
             old(self).well_formed(old(core)),
-            old(self).rdma.qp.ready(),
-            old(self).rdma.qp.state() is ReadyToSend,
+            old(self).rdma_spec().qp_spec().ready(),
+            old(self).rdma_spec().qp_spec().state() is ReadyToSend,
             instance.id() == old(core).instance_id(),
             old(shares).well_formed(),
             old(shares).id() == old(core).instance_id(),
             old(shares).node() == old(core).node(),
-            pd matches Some(p) ==> p.id() == old(self).rdma.window_pool.pd() && p.node() == old(
-                core,
-            ).node(),
+            pd matches Some(p) ==> p.id() == old(self).rdma_spec().window_pool_spec().pd()
+                && p.node() == old(core).node(),
             forall|k: int|
                 0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
                     tokens,
-                )@[k]@.source() is RdmaQueuePair && old(tokens)@[k]@.node() == old(core).node(),
+                )@[k]@.source().is_rdma_qp() && old(tokens)@[k]@.node() == old(core).node(),
         ensures
             final(core).well_formed(),
             final(core).all_versions_bound(),
@@ -10451,37 +13562,44 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
-            final(core).frames.versions@ == old(core).frames.versions@,
-            final(core).version_registry == old(core).version_registry,
-            final(core).timelines.count == old(core).timelines.count,
-            final(core).timelines.kinds == old(core).timelines.kinds,
-            final(core).timelines.events == old(core).timelines.events,
-            final(core).timelines.next_seq == old(core).timelines.next_seq,
-            peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
+            final(core).tiers_spec() == old(core).tiers_spec(),
+            final(core).frames_spec().versions_spec()@ == old(core).frames_spec().versions_spec()@,
+            final(core).version_registry_spec() == old(core).version_registry_spec(),
+            final(core).timelines_spec().count_spec() == old(core).timelines_spec().count_spec(),
+            final(core).timelines_spec().kinds_spec() == old(core).timelines_spec().kinds_spec(),
+            final(core).timelines_spec().events_spec() == old(core).timelines_spec().events_spec(),
+            final(core).timelines_spec().next_seq_spec() == old(
+                core,
+            ).timelines_spec().next_seq_spec(),
+            peer_core_step(old(core), final(core), old(self).rdma_spec().timeline_id_spec()),
             peer_foreign_shares_preserved(
                 old(core),
                 final(core),
-                old(self).rdma.active_leases@,
-                final(self).rdma.active_leases@,
+                old(self).rdma_spec().active_leases_spec()@,
+                final(self).rdma_spec().active_leases_spec()@,
             ),
-            final(self).rdma.timeline_id == old(self).rdma.timeline_id,
-            final(self).rdma.peer_node == old(self).rdma.peer_node,
-            final(self).rdma.qp == old(self).rdma.qp,
-            final(self).rdma.host_mr == old(self).rdma.host_mr,
-            final(self).rdma.gpu_mr == old(self).rdma.gpu_mr,
-            final(self).rdma.shared_host_mr == old(self).rdma.shared_host_mr,
-            final(self).rdma.shared_gpu_mr == old(self).rdma.shared_gpu_mr,
-            final(self).channel.same_session(old(self).channel),
+            final(self).rdma_spec().timeline_id_spec() == old(self).rdma_spec().timeline_id_spec(),
+            final(self).rdma_spec().peer_node_spec() == old(self).rdma_spec().peer_node_spec(),
+            final(self).rdma_spec().qp_spec() == old(self).rdma_spec().qp_spec(),
+            final(self).rdma_spec().host_mr_spec() == old(self).rdma_spec().host_mr_spec(),
+            final(self).rdma_spec().gpu_mr_spec() == old(self).rdma_spec().gpu_mr_spec(),
+            final(self).rdma_spec().shared_host_mr_spec() == old(
+                self,
+            ).rdma_spec().shared_host_mr_spec(),
+            final(self).rdma_spec().shared_gpu_mr_spec() == old(
+                self,
+            ).rdma_spec().shared_gpu_mr_spec(),
+            final(self).channel_spec().same_session(old(self).channel_spec()),
             forall|k: int|
                 0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
-                    && final(tokens)@[k]@.source() is RdmaQueuePair && final(tokens)@[k]@.node()
-                    == old(core).node(),
+                    && final(tokens)@[k]@.source().is_rdma_qp() && final(tokens)@[k]@.node() == old(
+                    core,
+                ).node(),
             forall|seq: u64, writer: TransferEvent| #[trigger]
-                pull_tracked_or_done(&old(self).rdma, seq, writer) ==> pull_tracked_or_done(
-                    &final(self).rdma,
+                pull_tracked_or_done(&old(self).rdma_spec(), seq, writer) ==> pull_tracked_or_done(
+                    &final(self).rdma_spec(),
                     seq,
                     writer,
                 ),
@@ -10498,7 +13616,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
     }
 
     /// Single-tier compatibility wrapper over `fetch_remote_frame_duplex_multi`.
-    pub fn fetch_remote_frame_duplex(
+    pub(crate) fn fetch_remote_frame_duplex(
         &mut self,
         core: &mut CacheCore,
         serve_tier: TierId,
@@ -10520,7 +13638,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             old(self).rdma.qp.effective_max_rd_atomic() > 0,
             old(self).rdma.peer_node != old(core).node(),
             old(self).next_request_id < u64::MAX,
-            old(core).frames.tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
+            old(core).frames_spec().tier_frame_size(dst_tier) as u64 <= rdma::MAX_RDMA_MSG_LEN,
             instance.id() == old(core).instance_id(),
             old(shares).well_formed(),
             old(shares).id() == old(core).instance_id(),
@@ -10531,7 +13649,7 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             forall|k: int|
                 0 <= k < old(tokens)@.len() ==> (#[trigger] old(tokens)@[k])@.well_formed() && old(
                     tokens,
-                )@[k]@.source() is RdmaQueuePair && old(tokens)@[k]@.node() == old(core).node(),
+                )@[k]@.source().is_rdma_qp() && old(tokens)@[k]@.node() == old(core).node(),
             match target {
                 PullTarget::Host => old(self).rdma.effective_host_mr_spec() matches Some(s)
                     && s.tier == dst_tier && s.mr.access().local_write
@@ -10547,9 +13665,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(shares).well_formed(),
             final(shares).id() == old(shares).id(),
             final(shares).node() == old(shares).node(),
-            final(core).node_id == old(core).node_id,
+            final(core).node_id_spec() == old(core).node_id_spec(),
             final(core).instance_id() == old(core).instance_id(),
-            final(core).tiers == old(core).tiers,
+            final(core).tiers_spec() == old(core).tiers_spec(),
             peer_core_step(old(core), final(core), old(self).rdma.timeline_id),
             peer_foreign_shares_preserved(
                 old(core),
@@ -10565,8 +13683,9 @@ impl<'a, T: ByteTransport> PeerSession<'a, T> {
             final(self).rdma.qp.source().source() == old(self).rdma.qp.source().source(),
             forall|k: int|
                 0 <= k < final(tokens)@.len() ==> (#[trigger] final(tokens)@[k])@.well_formed()
-                    && final(tokens)@[k]@.source() is RdmaQueuePair && final(tokens)@[k]@.node()
-                    == old(core).node(),
+                    && final(tokens)@[k]@.source().is_rdma_qp() && final(tokens)@[k]@.node() == old(
+                    core,
+                ).node(),
     {
         self.fetch_remote_frame_duplex_multi(
             core,

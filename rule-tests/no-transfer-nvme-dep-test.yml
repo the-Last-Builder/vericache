@@ -1,0 +1,22 @@
+id: no-transfer-nvme-dep
+valid:
+  - |
+    use super::*;
+    use crate::memory::HostSlice;
+    use transfer_core::transport::QueuePairEndpoint;
+  - |
+    // use crate::nvme;
+    mod nvme;
+invalid:
+  - |
+    use crate::nvme::Buffer;
+  - |
+    pub use crate::{memory::HostSlice, nvme as driver};
+  - |
+    use super::super::nvme::Buffer;
+  - |
+    verus! {
+        fn cross_driver(_: crate::nvme::Buffer) {}
+    }
+  - |
+    use crate::*;

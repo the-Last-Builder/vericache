@@ -2,6 +2,7 @@
 use super::common::*;
 use std::time::{Duration, Instant};
 use transfer::context::*;
+#[cfg(feature = "cuda")]
 use transfer::cuda::{self, CudaBuffer, CudaHostBuffer, CudaSlice, CudaStream};
 use transfer::domain::{MemorySpace, NodeId, SlotLoc, TransferEvent};
 use transfer::host::{self, Completion, HostBuffer, HostSlice};
@@ -52,6 +53,7 @@ impl Mode {
     }
 }
 
+#[cfg(feature = "cuda")]
 fn gpu_index(node: u64) -> u32 {
     let key = if node == 0 {
         "VERICACHE_GDR_DONOR_GPU"
@@ -180,6 +182,7 @@ impl Ledger {
         msg.capability
     }
 
+    #[cfg(feature = "cuda")]
     fn copy(&mut self, _node: &mut Node, gpu: u32, dst: &CudaSlice, src: &CudaSlice) {
         let tracked mut src_perm = ReadPerm::Owned(
             self.owned.borrow_mut().tracked_remove(src.slot_ref().loc),
@@ -188,7 +191,7 @@ impl Ledger {
         let tracked s = self.citations.borrow_mut();
         let mut stream = CudaStream::new(
             gpu,
-            Tracked(_node.sources.borrow_mut().mint(EventSourceKind::CudaStream)),
+            Tracked(_node.sources.borrow_mut().mint(EventSourceKind::cuda_stream())),
         ).unwrap();
         let (_, _submitted) = cuda::memcpy_async(
             &mut stream,
@@ -274,10 +277,12 @@ impl Ledger {
 
 enum Buffer {
     Host(HostBuffer),
+    #[cfg(feature = "cuda")]
     Gpu { device: CudaBuffer, staging: CudaHostBuffer, gpu: u32 },
 }
 
 impl Buffer {
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     fn new(
         node: &mut Node,
         ledger: &mut Ledger,
@@ -285,9 +290,10 @@ impl Buffer {
         num_slots: usize,
         slot_len: usize,
     ) -> Self {
+        #[cfg(feature = "cuda")]
         if mode.gpu() {
             let gpu = gpu_index(node.id);
-            if num_slots == 1 {
+            return if num_slots == 1 {
                 let (device, tok) = cuda::alloc_device(
                     Tracked(node.alloc.borrow_mut()),
                     gpu,
@@ -315,8 +321,9 @@ impl Buffer {
                 ).unwrap();
                 ledger.add_slab(tokens, num_slots);
                 Self::Gpu { device, staging, gpu }
-            }
-        } else if num_slots == 1 {
+            };
+        }
+        if num_slots == 1 {
             let (host, tok) = node.buffer(slot_len);
             ledger.add_slot(tok);
             Self::Host(host)
@@ -330,6 +337,7 @@ impl Buffer {
     fn num_slots(&self) -> usize {
         match self {
             Self::Host(b) => b.num_slots_val(),
+            #[cfg(feature = "cuda")]
             Self::Gpu { device, .. } => device.num_slots_val(),
         }
     }
@@ -337,20 +345,26 @@ impl Buffer {
     fn slot_len(&self) -> usize {
         match self {
             Self::Host(b) => b.slot_len_val(),
+            #[cfg(feature = "cuda")]
             Self::Gpu { device, .. } => device.slot_len_val(),
         }
     }
 
-    fn registration(&self) -> RegistrationBuffer<'_> {
+    fn register<'a>(&'a self, pd: &'a ProtectionDomain<'a>, flags: AccessFlags) -> Result<
+        MemoryRegion<'a>,
+        RdmaError,
+    > {
         match self {
-            Self::Host(b) => RegistrationBuffer::Host(b),
-            Self::Gpu { device, .. } => RegistrationBuffer::Cuda(device),
+            Self::Host(b) => register_memory(pd, b, flags),
+            #[cfg(feature = "cuda")]
+            Self::Gpu { device, .. } => register_memory(pd, device, flags),
         }
     }
 
     fn host_slot(&self, idx: usize) -> HostSlice<'_> {
         match self {
             Self::Host(b) => b.slot_slice(idx),
+            #[cfg(feature = "cuda")]
             Self::Gpu { staging, .. } => staging.host_slot_slice(idx),
         }
     }
@@ -377,6 +391,7 @@ impl Buffer {
         }
     }
 
+    #[cfg(feature = "cuda")]
     fn upload(&self, node: &mut Node, ledger: &mut Ledger) {
         if let Self::Gpu { device, staging, gpu } = self {
             for idx in 0..device.num_slots_val() {
@@ -388,6 +403,7 @@ impl Buffer {
     fn read_all(&self, node: &mut Node, ledger: &mut Ledger) -> Vec<u8> {
         let count = self.num_slots();
         let stride = self.slot_len();
+        #[cfg(feature = "cuda")]
         if let Self::Gpu { device, staging, gpu } = self {
             for idx in 0..count {
                 ledger.copy(node, *gpu, &staging.slot_slice(idx), &device.slot_slice(idx));
@@ -452,6 +468,7 @@ impl Buffer {
                     ledger.record(done);
                 }
             },
+            #[cfg(feature = "cuda")]
             Self::Gpu { device, staging, .. } => {
                 if count == 1 {
                     let tok = ledger.take_slot(Ghost(device.slot_loc(0)));
@@ -527,12 +544,11 @@ fn donor(
     let mut ledger = Ledger::new(node);
     let buf = Buffer::new(node, &mut ledger, mode, 1, n);
     buf.write(node, &mut ledger, &pattern(n, 17));
+    #[cfg(feature = "cuda")]
     buf.upload(node, &mut ledger);
-    let mr = register_memory(
-        pd,
-        buf.registration(),
-        AccessFlags { local_write: true, mw_bind: true },
-    ).expect("register donor allocation");
+    let mr = buf.register(pd, AccessFlags { local_write: true, mw_bind: true }).expect(
+        "register donor allocation",
+    );
     let mut mw = alloc_window(pd, node.name()).unwrap();
     if mode != Mode::ScatterGather {
         // Only the gather test needs write permission on donor memory.
@@ -947,11 +963,10 @@ fn initiator(
     let tag = grant.tag;
     let cap = ledger.receive(grant).unwrap();
     let flags = AccessFlags { local_write: true, mw_bind: false };
-    let mr = register_memory(pd, buf.registration(), flags).expect("register initiator allocation");
-    let even_mr = even_buf.as_ref().map(
-        |b| register_memory(pd, b.registration(), flags).expect("register even slab"),
-    );
+    let mr = buf.register(pd, flags).expect("register initiator allocation");
+    let even_mr = even_buf.as_ref().map(|b| b.register(pd, flags).expect("register even slab"));
     transfer_blocks(node, qp, cq, &mr, even_mr.as_ref(), &cap, &mut ledger, mode, serial, true);
+    #[cfg(feature = "cuda")]
     if mode.gpu() {
         if let Some(cuda::GdrWritesOrdering::None) = mr.gdr_ordering() {
             mr.flush_gdr_writes().expect("flush GDR writes");
@@ -1061,6 +1076,7 @@ fn exercise(node: &mut Node, dev: &DeviceContext, t: TcpTransport, mode: Mode) {
 pub fn run(test: &str, mode: Mode) {
     match std::env::var(ROLE).as_deref() {
         Ok("donor") => {
+            #[cfg(feature = "cuda")]
             if mode.gpu() {
                 let count = match cuda::device_count() {
                     Ok(n) => n,
@@ -1080,9 +1096,11 @@ pub fn run(test: &str, mode: Mode) {
             if let Some(dev) = device(&mut node, mode.gpu()) {
                 let (transport, mut child) = start_peer(test);
                 exercise(&mut node, &dev, transport, mode);
+                #[cfg(feature = "cuda")]
                 let hca = mode.gpu().then(|| dev.name());
                 dev.close().unwrap();
                 assert!(child.wait().unwrap().success());
+                #[cfg(feature = "cuda")]
                 if let Some(hca) = hca {
                     let wrs = mode.blocks();
                     let sges: usize = (0..wrs).map(|i| mode.segments(i, false)).sum();
