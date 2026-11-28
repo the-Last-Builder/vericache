@@ -27,6 +27,7 @@ class VeriCacheConfigC(ctypes.Structure):
         ("nvme_frames", ctypes.c_uint32),
         ("rdma_device", ctypes.c_char_p),
         ("rdma_gid_index", ctypes.c_uint8),
+        ("rdma_max_rd_atomic", ctypes.c_uint8),
         ("rdma_windows_per_peer", ctypes.c_size_t),
         ("peers", ctypes.POINTER(VeriCachePeerSpecC)),
         ("num_peers", ctypes.c_size_t),

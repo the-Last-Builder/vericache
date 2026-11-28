@@ -94,14 +94,14 @@ fn admit_within_bind_budget(bind_budget: &mut usize) -> bool {
 }
 
 /// Compute requester-side per-peer pipelined fetch concurrency with `LOCAL_INV` turnaround
-/// headroom (`3/4` of peer Type-2B MW pool, at least 1, capped at `rd_cap`, `tier_cap`, `16`).
+/// headroom (`3/4` of peer Type-2B MW pool, at least 1, capped at `rd_cap`, `tier_cap`, `64`).
 #[inline]
 fn requester_peer_pipeline_cap(win_cap: usize, rd_cap: usize, tier_cap: usize) -> usize {
     if win_cap == 0 || rd_cap == 0 {
         return 0;
     }
     let headroom_cap = (win_cap * 3 / 4).max(1);
-    headroom_cap.min(rd_cap).min(tier_cap).min(16).max(1)
+    headroom_cap.min(rd_cap).min(tier_cap).min(64)
 }
 
 const PEER_NVME_WARM_CAP: usize = 64;
@@ -136,6 +136,7 @@ struct ActiveReadChunk {
     slot: usize,
     held: Vec<(ReadLeaseHandle, Tracked<ShareCap>)>,
     transient_nvme: Vec<(ObjectKey, FrameId)>,
+    transient_remote: Vec<(ObjectKey, TierKind, FrameId)>,
     remote_nvme_warm_hits: u64,
 }
 
@@ -144,6 +145,8 @@ struct RemoteBatchHit {
     node_id: u64,
     gdr: bool,
     donor_nvme_warmed: bool,
+    frame: FrameId,
+    dst_kind: TierKind,
 }
 
 /// Source memory address of a verified leased frame yielded by [`VeriCache::with_gpu_read_batch`].
@@ -245,6 +248,9 @@ where
     pending_peer_nvme_fetches: Vec<PendingPeerNvmeFetch>,
     deferred_peer_grants: Vec<(usize, u64, ObjectKey)>,
     deferred_peer_nvme_fetches: Vec<(usize, u64, ObjectKey)>,
+    transient_remote_frames: HashSet<FrameId>,
+    deferred_transient_remote: Vec<(ObjectKey, TierKind, FrameId)>,
+    transient_donor_nvme: HashMap<FrameId, (ObjectKey, bool)>,
     local_index: HashMap<ObjectKey, [Option<FrameId>; 3]>,
     nvme_promo_filter: NvmePromoFilter,
     probe_buf: Vec<usize>,
@@ -301,6 +307,9 @@ where
             pending_peer_nvme_fetches: Vec::new(),
             deferred_peer_grants: Vec::new(),
             deferred_peer_nvme_fetches: Vec::new(),
+            transient_remote_frames: HashSet::new(),
+            deferred_transient_remote: Vec::new(),
+            transient_donor_nvme: HashMap::new(),
             local_index: HashMap::new(),
             nvme_promo_filter: NvmePromoFilter::new(),
             probe_buf: Vec::new(),
@@ -365,6 +374,27 @@ where
 
     pub fn peer_metas(&self) -> &[PeerMeta] {
         &self.peer_metas
+    }
+
+    /// Effective outgoing RDMA READ depth negotiated with each peer.
+    pub fn peer_effective_max_rd_atomic(&self) -> Vec<(u64, u8)> {
+        self.peer_metas
+            .iter()
+            .zip(&self.engine.peers)
+            .map(|(meta, peer)| (meta.node_id, peer.rdma.qp.effective_max_rd_atomic_exec()))
+            .collect()
+    }
+
+    /// Peer requests or completions that still need progress from the worker.
+    pub fn has_pending_peer_work(&self) -> bool {
+        !self.pending_peer_nvme_fetches.is_empty()
+            || !self.deferred_peer_grants.is_empty()
+            || !self.deferred_peer_nvme_fetches.is_empty()
+            || self.engine.peers.iter().any(|peer| {
+                !peer.pending_inbound_fetches.is_empty()
+                    || !peer.pending_outbound_grants.is_empty()
+                    || peer.rdma.cq.in_flight_count() > 0
+            })
     }
 
     pub fn set_cooperative_revoke_spin_budget(&mut self, budget: u32) {
@@ -560,6 +590,7 @@ where
         // 1. Local Host DRAM (1-hop direct read)
         if let Some(frame) = self.lookup_tier_fast(key, TierKind::HostDram, host_tier) {
             let ver = self.read_host_frame_raw(frame, dst)?;
+            self.promote_donor_nvme_frame(key, frame);
             self.policy
                 .eviction
                 .on_access(TierKind::HostDram, key, frame);
@@ -622,8 +653,10 @@ where
         }
 
         // 4. Remote Peers (full-duplex RDMA pull into Host DRAM -> dst)
-        if let Some((dram_frame, node_id)) = self.fetch_from_peers(key, DataDomain::Host)? {
-            let ver = self.read_host_frame_raw(dram_frame, dst)?;
+        if let Some((dram_frame, node_id)) = self.fetch_from_peers(key)? {
+            let read = self.read_host_frame_raw(dram_frame, dst);
+            self.reclaim_transient_remote_frames([(key, TierKind::HostDram, dram_frame)]);
+            let ver = read?;
             self.stats.remote_hits += 1;
             return Ok(Some(ReadHit {
                 version: ver,
@@ -676,6 +709,7 @@ where
 
         // 2. Local Pinned Host DRAM (optional promote to HBM or direct 1-hop H2D)
         if let Some(dram_frame) = self.lookup_tier_fast(key, TierKind::HostDram, host_tier) {
+            self.promote_donor_nvme_frame(key, dram_frame);
             self.policy
                 .eviction
                 .on_access(TierKind::HostDram, key, dram_frame);
@@ -754,8 +788,15 @@ where
 
         // 4. Remote Peers (GPUDirect RDMA direct into HBM or Host RDMA -> H2D)
         if let Some((frame, node_id, used_gdr)) = self.fetch_from_peers_for_gpu(key)? {
-            let (ver, ticket) =
-                call_get_into_gpu_frame(&mut self.engine, &mut self.caps, frame, stream, slot)?;
+            let kind = if used_gdr {
+                TierKind::GpuVram
+            } else {
+                TierKind::HostDram
+            };
+            let read = call_get_into_gpu_frame(&mut self.engine, &mut self.caps, frame, stream, slot);
+            // The verified copy path returns the lease with the DMA completion ticket.
+            self.reclaim_transient_remote_frames([(key, kind, frame)]);
+            let (ver, ticket) = read?;
             self.stats.remote_hits += 1;
             return Ok(Some(GpuReadHit {
                 version: ver,
@@ -781,8 +822,10 @@ where
         let _ = self.poll_peers_nonblocking();
 
         let host_tier = self.engine.host_tier();
+        let mut remote_frame = None;
         let location = if let Some(frame) = self.lookup_tier_fast(key, TierKind::HostDram, host_tier)
         {
+            self.promote_donor_nvme_frame(key, frame);
             self.policy
                 .eviction
                 .on_access(TierKind::HostDram, key, frame);
@@ -830,7 +873,8 @@ where
                     .on_insert(TierKind::HostDram, key, dram_frame);
                 self.stats.nvme_hits += 1;
                 HitLocation::LocalNvme
-            } else if let Some((_frame, node_id)) = self.fetch_from_peers(key, DataDomain::Host)? {
+            } else if let Some((frame, node_id)) = self.fetch_from_peers(key)? {
+                remote_frame = Some((key, TierKind::HostDram, frame));
                 self.stats.remote_hits += 1;
                 HitLocation::RemotePeer {
                     node_id,
@@ -842,14 +886,13 @@ where
             }
         };
 
-        let lease = self
-            .engine
-            .get_lease_host(
-                Tracked(self.caps.instance.borrow()),
-                Tracked(self.caps.shares.borrow_mut()),
-                key,
-            )
-            .map_err(CacheError::Core)?;
+        let lease = self.engine.get_lease_host(
+            Tracked(self.caps.instance.borrow()),
+            Tracked(self.caps.shares.borrow_mut()),
+            key,
+        );
+        self.reclaim_transient_remote_frames(remote_frame);
+        let lease = lease.map_err(CacheError::Core)?;
         Ok(lease.map(|l| HostLeaseGuard::new(self, l, location)))
     }
 
@@ -869,6 +912,7 @@ where
         let _ = self.poll_peers_nonblocking();
 
         let host_tier = self.engine.host_tier();
+        let mut remote_frame = None;
         let location = if let Some(gpu_frame) =
             self.lookup_tier_fast(key, TierKind::GpuVram, gpu_tier)
         {
@@ -878,6 +922,7 @@ where
             self.stats.gpu_hits += 1;
             HitLocation::LocalGpu
         } else if let Some(dram_frame) = self.lookup_tier_fast(key, TierKind::HostDram, host_tier) {
+            self.promote_donor_nvme_frame(key, dram_frame);
             self.policy
                 .eviction
                 .on_access(TierKind::HostDram, key, dram_frame);
@@ -912,9 +957,14 @@ where
                 self.stats.nvme_hits += 1;
                 HitLocation::LocalNvme
             } else if let Some((frame, node_id, used_gdr)) = self.fetch_from_peers_for_gpu(key)? {
-                if !used_gdr {
-                    let _ = self.try_promote_dram_to_gpu(key, frame)?;
-                }
+                let gpu_frame = if used_gdr {
+                    frame
+                } else {
+                    let promoted = self.try_promote_dram_to_gpu(key, frame);
+                    self.reclaim_transient_remote_frames([(key, TierKind::HostDram, frame)]);
+                    promoted?
+                };
+                remote_frame = Some((key, TierKind::GpuVram, gpu_frame));
                 self.stats.remote_hits += 1;
                 HitLocation::RemotePeer {
                     node_id,
@@ -926,14 +976,13 @@ where
             }
         };
 
-        let lease = self
-            .engine
-            .get_lease_gpu(
-                Tracked(self.caps.instance.borrow()),
-                Tracked(self.caps.shares.borrow_mut()),
-                key,
-            )
-            .map_err(CacheError::Core)?;
+        let lease = self.engine.get_lease_gpu(
+            Tracked(self.caps.instance.borrow()),
+            Tracked(self.caps.shares.borrow_mut()),
+            key,
+        );
+        self.reclaim_transient_remote_frames(remote_frame);
+        let lease = lease.map_err(CacheError::Core)?;
         Ok(lease.map(|l| GpuLeaseGuard::new(self, l, location)))
     }
 
@@ -943,7 +992,7 @@ where
     /// - Prefetches all NVMe-resident keys in the chunk concurrently via async `io_uring`
     ///   (`warm_host_from_nvme`, up to 64 in-flight) instead of serial QD=1 reads.
     /// - Pipelines remote RDMA / GPUDirect RDMA pulls concurrently across the chunk
-    ///   (up to `min(windows_per_peer, max_rd_atomic, 16)` in-flight per peer) while
+    ///   (up to `min(window headroom, max_rd_atomic, tier capacity, 64)` in-flight per peer) while
     ///   serving inbound peer fetches full-duplex (including on-demand peer NVMe warming).
     /// - Acquires verified local leases (`GpuLease` for HBM/GDR hits, `HostLease` for
     ///   CUDA-pinned DRAM/NVMe/Host-RDMA hits — zero HBM promotion/eviction write amplification!).
@@ -1093,9 +1142,19 @@ where
                             remote_candidates.retain(|&(li, _)| li < limit_len);
                         }
                     }
-                    remote_hits = self.prefetch_remote_batch_for_gpu(&remote_candidates)?;
+                    remote_hits = self.prefetch_remote_batch_for_gpu(&remote_candidates);
                 }
             }
+
+            let retain_remote = self.policy.tiering.retain_remote_fetches();
+            let transient_remote = if retain_remote {
+                Vec::new()
+            } else {
+                remote_hits
+                    .iter()
+                    .map(|(&key, hit)| (key, hit.dst_kind, hit.frame))
+                    .collect()
+            };
 
             // Phase 2: Acquire verified leases across chunk and enqueue async copies.
             let mut held: Vec<(ReadLeaseHandle, Tracked<ShareCap>)> =
@@ -1127,7 +1186,7 @@ where
                             held.push((lease.handle, lease.cap));
                             if let Some(addr) = addr_opt {
                                 let loc = match remote_meta {
-                                    Some(RemoteBatchHit { node_id, gdr: true, donor_nvme_warmed }) => {
+                                    Some(RemoteBatchHit { node_id, gdr: true, donor_nvme_warmed, .. }) => {
                                         remote_nvme_warm_hits += u64::from(donor_nvme_warmed);
                                         self.stats.remote_hits += 1;
                                         HitLocation::RemotePeer { node_id, gdr: true }
@@ -1162,8 +1221,9 @@ where
                         let ver = lease.version;
                         let addr = lease.slice.addr();
                         held.push((lease.handle, lease.cap));
+                        self.promote_donor_nvme_frame(k, lease.handle.frame);
                         let loc = match remote_meta {
-                            Some(RemoteBatchHit { node_id, gdr, donor_nvme_warmed }) => {
+                            Some(RemoteBatchHit { node_id, gdr, donor_nvme_warmed, .. }) => {
                                 remote_nvme_warm_hits += u64::from(donor_nvme_warmed);
                                 self.stats.remote_hits += 1;
                                 HitLocation::RemotePeer { node_id, gdr }
@@ -1200,17 +1260,14 @@ where
             } else {
                 Ok(())
             };
-            for (handle, cap) in held {
-                let _ = self.release_local_lease_raw(handle, cap, Ticket::NONE);
-            }
-            self.reclaim_transient_nvme_frames(transient_nvme);
+            self.finish_gpu_read_chunk(held, transient_nvme, transient_remote);
             if let Some(e) = callback_err {
                 return Err(e);
             }
             flush_res?;
             self.stats.remote_nvme_warm_hits += remote_nvme_warm_hits;
 
-            if promoted_nvme || !remote_hits.is_empty() {
+            if promoted_nvme || (retain_remote && !remote_hits.is_empty()) {
                 let _ = self.kick_async_spills();
             }
             let _ = self.poll_peers_nonblocking();
@@ -1230,6 +1287,7 @@ where
     /// - Calls `on_chunk_sync(prev_slot)` to wait for the previously emitted slot's GPU event,
     ///   immediately releasing `prev_slot`'s verified leases and reclaiming 1st-hit transient NVMe
     ///   DRAM frames before `prev_slot` can ever be reused.
+    /// - Calls `on_chunk_sync(slot)` after an emit error so the caller can drain partially queued DMA.
     /// - Guarantees zero leaked leases on every error or early-exit path.
     pub fn with_gpu_read_batch_pipelined<FEmit, FWait>(
         &mut self,
@@ -1270,10 +1328,7 @@ where
                     if sync_res.is_ok() {
                         self.stats.remote_nvme_warm_hits += prev.remote_nvme_warm_hits;
                     }
-                    for (handle, cap) in prev.held {
-                        let _ = self.release_local_lease_raw(handle, cap, Ticket::NONE);
-                    }
-                    self.reclaim_transient_nvme_frames(prev.transient_nvme);
+                    self.finish_gpu_read_chunk(prev.held, prev.transient_nvme, prev.transient_remote);
                     sync_res?;
                 }
             }
@@ -1405,22 +1460,19 @@ where
                             remote_candidates.retain(|&(li, _)| li < limit_len);
                         }
                     }
-                    match self.prefetch_remote_batch_for_gpu(&remote_candidates) {
-                        Ok(hits) => remote_hits = hits,
-                        Err(e) => {
-                            if let Some(prev) = active_prev.take() {
-                                let _ = on_chunk_sync(prev.slot);
-                                for (handle, cap) in prev.held {
-                                    let _ = self.release_local_lease_raw(handle, cap, Ticket::NONE);
-                                }
-                                self.reclaim_transient_nvme_frames(prev.transient_nvme);
-                            }
-                            self.reclaim_transient_nvme_frames(transient_nvme);
-                            return Err(e);
-                        }
-                    }
+                    remote_hits = self.prefetch_remote_batch_for_gpu(&remote_candidates);
                 }
             }
+
+            let retain_remote = self.policy.tiering.retain_remote_fetches();
+            let transient_remote = if retain_remote {
+                Vec::new()
+            } else {
+                remote_hits
+                    .iter()
+                    .map(|(&key, hit)| (key, hit.dst_kind, hit.frame))
+                    .collect()
+            };
 
             // Phase 2: Acquire verified leases for chunk `k` and build `(key_idx, BatchReadSource)` slice.
             let mut held: Vec<(ReadLeaseHandle, Tracked<ShareCap>)> =
@@ -1452,7 +1504,7 @@ where
                             held.push((lease.handle, lease.cap));
                             if let Some(addr) = addr_opt {
                                 let loc = match remote_meta {
-                                    Some(RemoteBatchHit { node_id, gdr: true, donor_nvme_warmed }) => {
+                                    Some(RemoteBatchHit { node_id, gdr: true, donor_nvme_warmed, .. }) => {
                                         remote_nvme_warm_hits += u64::from(donor_nvme_warmed);
                                         self.stats.remote_hits += 1;
                                         HitLocation::RemotePeer { node_id, gdr: true }
@@ -1484,8 +1536,9 @@ where
                         let ver = lease.version;
                         let addr = lease.slice.addr();
                         held.push((lease.handle, lease.cap));
+                        self.promote_donor_nvme_frame(k, lease.handle.frame);
                         let loc = match remote_meta {
-                            Some(RemoteBatchHit { node_id, gdr, donor_nvme_warmed }) => {
+                            Some(RemoteBatchHit { node_id, gdr, donor_nvme_warmed, .. }) => {
                                 remote_nvme_warm_hits += u64::from(donor_nvme_warmed);
                                 self.stats.remote_hits += 1;
                                 HitLocation::RemotePeer { node_id, gdr }
@@ -1517,19 +1570,14 @@ where
             if !chunk_entries.is_empty() {
                 let slot = next_slot;
                 if let Err(e) = on_chunk_emit(slot, &chunk_entries) {
+                    let _ = on_chunk_sync(slot);
                     if let Some(prev) = active_prev.take() {
                         if on_chunk_sync(prev.slot).is_ok() {
                             self.stats.remote_nvme_warm_hits += prev.remote_nvme_warm_hits;
                         }
-                        for (handle, cap) in prev.held {
-                            let _ = self.release_local_lease_raw(handle, cap, Ticket::NONE);
-                        }
-                        self.reclaim_transient_nvme_frames(prev.transient_nvme);
+                        self.finish_gpu_read_chunk(prev.held, prev.transient_nvme, prev.transient_remote);
                     }
-                    for (handle, cap) in held {
-                        let _ = self.release_local_lease_raw(handle, cap, Ticket::NONE);
-                    }
-                    self.reclaim_transient_nvme_frames(transient_nvme);
+                    self.finish_gpu_read_chunk(held, transient_nvme, transient_remote);
                     return Err(e);
                 }
 
@@ -1538,16 +1586,10 @@ where
                     if sync_res.is_ok() {
                         self.stats.remote_nvme_warm_hits += prev.remote_nvme_warm_hits;
                     }
-                    for (handle, cap) in prev.held {
-                        let _ = self.release_local_lease_raw(handle, cap, Ticket::NONE);
-                    }
-                    self.reclaim_transient_nvme_frames(prev.transient_nvme);
+                    self.finish_gpu_read_chunk(prev.held, prev.transient_nvme, prev.transient_remote);
                     if let Err(e) = sync_res {
                         let _ = on_chunk_sync(slot);
-                        for (handle, cap) in held {
-                            let _ = self.release_local_lease_raw(handle, cap, Ticket::NONE);
-                        }
-                        self.reclaim_transient_nvme_frames(transient_nvme);
+                        self.finish_gpu_read_chunk(held, transient_nvme, transient_remote);
                         return Err(e);
                     }
                 }
@@ -1556,18 +1598,16 @@ where
                     slot,
                     held,
                     transient_nvme,
+                    transient_remote,
                     remote_nvme_warm_hits,
                 });
                 next_slot ^= 1;
             } else {
                 // Chunk had 0 hits: release any defensive handles/transient frames without touching active_prev.
-                for (handle, cap) in held {
-                    let _ = self.release_local_lease_raw(handle, cap, Ticket::NONE);
-                }
-                self.reclaim_transient_nvme_frames(transient_nvme);
+                self.finish_gpu_read_chunk(held, transient_nvme, transient_remote);
             }
 
-            if promoted_nvme || !remote_hits.is_empty() {
+            if promoted_nvme || (retain_remote && !remote_hits.is_empty()) {
                 let _ = self.kick_async_spills();
             }
             let _ = self.poll_peers_nonblocking();
@@ -1577,10 +1617,7 @@ where
         // Drain the final in-flight slot before returning.
         if let Some(last) = active_prev.take() {
             let sync_res = on_chunk_sync(last.slot);
-            for (handle, cap) in last.held {
-                let _ = self.release_local_lease_raw(handle, cap, Ticket::NONE);
-            }
-            self.reclaim_transient_nvme_frames(last.transient_nvme);
+            self.finish_gpu_read_chunk(last.held, last.transient_nvme, last.transient_remote);
             sync_res?;
             self.stats.remote_nvme_warm_hits += last.remote_nvme_warm_hits;
         }
@@ -1798,10 +1835,14 @@ where
         let Some(frame) = self.lookup_tier_fast(key, tier, tid) else {
             return Ok(false);
         };
+        if tier == TierKind::LocalNvme {
+            if let Some(df) = self.lookup_tier_fast(key, TierKind::HostDram, self.engine.host_tier()) {
+                self.promote_donor_nvme_frame(key, df);
+            }
+        }
         let _ = self.drain_victim(frame);
         let _ = self.reclaim_draining(tid, 16);
-        self.index_remove(tier, key, frame);
-        self.policy.eviction.on_remove(tier, key, frame);
+        self.remove_evicted_frame(key, tier, frame);
         Ok(true)
     }
 
@@ -1815,6 +1856,15 @@ where
         let Some(dram_frame) = self.lookup_tier_fast(key, TierKind::HostDram, host_tier) else {
             return Ok(false);
         };
+        if self.transient_remote_frames.contains(&dram_frame) {
+            return Ok(false);
+        }
+        if self.donor_frame_is_serving(key, dram_frame) {
+            return Ok(false);
+        }
+        if self.try_drop_transient_victim(key, TierKind::HostDram, host_tier, dram_frame)? {
+            return Ok(true);
+        }
         self.ensure_tier_space(TierKind::LocalNvme)?;
         let _ = self.submit_staged_nvme();
         let nvme_frame = self
@@ -1832,10 +1882,7 @@ where
             .on_insert(TierKind::LocalNvme, key, nvme_frame);
         let _ = self.drain_victim(dram_frame);
         let _ = self.reclaim_draining(host_tier, 16);
-        self.index_remove(TierKind::HostDram, key, dram_frame);
-        self.policy
-            .eviction
-            .on_remove(TierKind::HostDram, key, dram_frame);
+        self.remove_evicted_frame(key, TierKind::HostDram, dram_frame);
         Ok(true)
     }
 
@@ -1844,12 +1891,15 @@ where
     pub fn poll(&mut self) -> Result<PollSummary, CacheError> {
         let mut summary = PollSummary::default();
         summary.nvme_spills_retired = self.reap_completed_spills();
-        if !self.peer_metas.is_empty() {
-            let p = self.poll_peers_nonblocking()?;
-            summary.peer_cq_processed = p.cq_processed;
-            summary.peer_grants_completed = p.grants_completed;
-            summary.peer_windows_replenished = p.windows_replenished;
+        let peer_progress = self.poll_peers_nonblocking();
+        if self.peer_metas.is_empty() {
+            self.reclaim_completed_donor_nvme_frames(true);
         }
+        self.reclaim_transient_remote_frames([]);
+        let p = peer_progress?;
+        summary.peer_cq_processed = p.cq_processed;
+        summary.peer_grants_completed = p.grants_completed;
+        summary.peer_windows_replenished = p.windows_replenished;
         let host = self.engine.host_tier().as_index();
         let free_before = self.engine.core.frames.ready_queue[host].len();
         summary.reclaimed_frames = self.engine.reclaim_all_draining();
@@ -1995,6 +2045,9 @@ where
 
     #[inline]
     fn index_insert(&mut self, kind: TierKind, key: ObjectKey, frame: FrameId) {
+        // A recycled frame ID must not inherit the previous occupant's lifetime.
+        self.forget_transient_remote_frame(frame);
+        self.transient_donor_nvme.remove(&frame);
         if let Some(slot) = Self::tier_slot(kind) {
             self.local_index.entry(key).or_insert([None; 3])[slot] = Some(frame);
         }
@@ -2157,6 +2210,221 @@ where
         }
     }
 
+    fn index_remote_fetch(&mut self, key: ObjectKey, kind: TierKind, frame: FrameId) {
+        self.index_insert(kind, key, frame);
+        if self.policy.tiering.retain_remote_fetches() {
+            self.policy.eviction.on_insert(kind, key, frame);
+        } else {
+            self.transient_remote_frames.insert(frame);
+            self.policy.eviction.on_insert_transient(kind, key, frame);
+        }
+    }
+
+    fn remove_evicted_frame(&mut self, key: ObjectKey, kind: TierKind, frame: FrameId) {
+        self.index_remove(kind, key, frame);
+        let remote = self.forget_transient_remote_frame(frame);
+        if self.transient_donor_nvme.remove(&frame).is_some() || remote {
+            self.policy.eviction.on_remove_transient(kind, key, frame);
+        } else {
+            self.policy.eviction.on_remove(kind, key, frame);
+        }
+    }
+
+    fn forget_transient_remote_frame(&mut self, frame: FrameId) -> bool {
+        if self.transient_remote_frames.remove(&frame) {
+            self.deferred_transient_remote
+                .retain(|&(_, _, pending)| pending != frame);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn frame_has_active_leases(&self, frame: FrameId) -> bool {
+        let meta = &self.engine.core.frames.metas[frame.0 as usize];
+        meta.active_local_reads > 0 || meta.active_remote_leases > 0
+    }
+
+    fn finish_gpu_read_chunk(
+        &mut self,
+        held: Vec<(ReadLeaseHandle, Tracked<ShareCap>)>,
+        transient_nvme: Vec<(ObjectKey, FrameId)>,
+        transient_remote: Vec<(ObjectKey, TierKind, FrameId)>,
+    ) {
+        for (handle, cap) in held {
+            let _ = self.release_local_lease_raw(handle, cap, Ticket::NONE);
+        }
+        self.reclaim_transient_nvme_frames(transient_nvme);
+        self.reclaim_transient_remote_frames(transient_remote);
+    }
+
+    pub(crate) fn reclaim_transient_remote_frames(
+        &mut self,
+        frames: impl IntoIterator<Item = (ObjectKey, TierKind, FrameId)>,
+    ) {
+        let mut deferred = core::mem::take(&mut self.deferred_transient_remote);
+        deferred.extend(frames);
+        let mut reclaim_host = false;
+        let mut reclaim_gpu = false;
+        deferred.retain(|&(key, kind, frame)| {
+            if !self.transient_remote_frames.contains(&frame) {
+                return false;
+            }
+            let Some(tier) = self.tier_id_for(kind) else {
+                return false;
+            };
+            if !self.frame_matches_key_tier(key, frame, tier) {
+                // An earlier pull can have been evicted and its frame reused by
+                // another pull before this chunk collected its results.
+                if self.engine.core.frames.metas[frame.0 as usize].state != STATE_PUBLISHED {
+                    self.transient_remote_frames.remove(&frame);
+                }
+                return false;
+            }
+            if self.frame_has_active_leases(frame) || self.drain_victim(frame).is_err() {
+                return true;
+            }
+            self.remove_evicted_frame(key, kind, frame);
+            reclaim_host |= kind == TierKind::HostDram;
+            reclaim_gpu |= kind == TierKind::GpuVram;
+            false
+        });
+        self.deferred_transient_remote = deferred;
+        if reclaim_host {
+            self.reclaim_draining(self.engine.host_tier(), 128);
+        }
+        if reclaim_gpu {
+            if let Some(tier) = self.engine.gpu_tier() {
+                self.reclaim_draining(tier, 128);
+            }
+        }
+    }
+
+    fn promote_donor_nvme_frame(&mut self, key: ObjectKey, frame: FrameId) {
+        if self.transient_donor_nvme.remove(&frame).is_some() {
+            self.policy.eviction.on_insert(TierKind::HostDram, key, frame);
+        }
+    }
+
+    fn has_matching_nvme_replica(&self, key: ObjectKey, frame: FrameId) -> bool {
+        self.engine
+            .nvme_tier()
+            .and_then(|tier| self.lookup_tier_fast(key, TierKind::LocalNvme, tier))
+            .is_some_and(|nf| {
+                let metas = &self.engine.core.frames.metas;
+                metas[nf.0 as usize].version_packed == metas[frame.0 as usize].version_packed
+            })
+    }
+
+    fn pending_donor_keys(&self) -> impl Iterator<Item = ObjectKey> + '_ {
+        self.pending_peer_nvme_fetches
+            .iter()
+            .map(|f| f.key)
+            .chain(self.deferred_peer_grants.iter().map(|&(_, _, key)| key))
+            .chain(self.deferred_peer_nvme_fetches.iter().map(|&(_, _, key)| key))
+            .chain(self.engine.peers.iter().flat_map(|p| {
+                p.pending_inbound_fetches
+                    .iter()
+                    .map(|&(_, key)| key)
+                    .chain(p.pending_outbound_grants.iter().map(|g| g.key))
+            }))
+    }
+
+    fn reclaim_completed_donor_nvme_frames(&mut self, phase2_completed: bool) {
+        if self.transient_donor_nvme.is_empty() {
+            return;
+        }
+        let host_tier = self.engine.host_tier();
+        let pending_keys: HashSet<_> = self.pending_donor_keys().collect();
+        let mut reclaim = Vec::new();
+        self.transient_donor_nvme.retain(|&frame, (key, seen_leased)| {
+            let idx = frame.0 as usize;
+            let meta = &self.engine.core.frames.metas[idx];
+            if meta.state != STATE_PUBLISHED
+                || self.engine.core.frames.bindings[idx] != (*key, host_tier)
+            {
+                return false;
+            }
+            *seen_leased |= meta.active_remote_leases > 0;
+            if (*seen_leased || phase2_completed)
+                && meta.active_local_reads == 0
+                && meta.active_remote_leases == 0
+                && !pending_keys.contains(key)
+            {
+                reclaim.push((*key, frame));
+            }
+            true
+        });
+        let mut reclaimed = false;
+        for (key, frame) in reclaim {
+            // After Phase 2, a warm with no queued request can also be reclaimed
+            // if it never acquired a lease (e.g. serving the request from HBM).
+            if !self.has_matching_nvme_replica(key, frame) {
+                self.promote_donor_nvme_frame(key, frame);
+            } else if self.drain_victim(frame).is_ok() {
+                self.remove_evicted_frame(key, TierKind::HostDram, frame);
+                reclaimed = true;
+            }
+        }
+        if reclaimed {
+            self.reclaim_draining(host_tier, 128);
+        }
+    }
+
+    fn select_evictable_victim(&mut self, kind: TierKind) -> Option<(ObjectKey, FrameId)> {
+        if kind != TierKind::HostDram || self.transient_donor_nvme.is_empty() {
+            return self.policy.eviction.select_victim(kind);
+        }
+        let mut serving_donors = Vec::new();
+        let victim = loop {
+            let Some((key, frame)) = self.policy.eviction.select_victim(kind) else {
+                break None;
+            };
+            if self.donor_frame_is_serving(key, frame) {
+                if serving_donors.contains(&(key, frame)) {
+                    break None;
+                }
+                serving_donors.push((key, frame));
+            } else {
+                break Some((key, frame));
+            }
+        };
+        for (key, frame) in serving_donors {
+            self.policy.eviction.on_insert_transient(kind, key, frame);
+        }
+        victim
+    }
+
+    fn donor_frame_is_serving(&self, key: ObjectKey, frame: FrameId) -> bool {
+        self.transient_donor_nvme
+            .get(&frame)
+            .is_some_and(|&(tracked, _)| tracked == key)
+            && (self.frame_has_active_leases(frame) || self.pending_donor_keys().any(|k| k == key))
+    }
+
+    /// Drop temporary victims directly. A donor warm without NVMe backing
+    /// goes through the regular demotion path.
+    fn try_drop_transient_victim(
+        &mut self,
+        key: ObjectKey,
+        kind: TierKind,
+        tier: TierId,
+        frame: FrameId,
+    ) -> Result<bool, CacheError> {
+        let donor_replica = self.transient_donor_nvme.contains_key(&frame)
+            && self.has_matching_nvme_replica(key, frame);
+        if !self.transient_remote_frames.contains(&frame) && !donor_replica {
+            return Ok(false);
+        }
+        if let Err(e) = self.drain_victim(frame) {
+            self.policy.eviction.on_insert_transient(kind, key, frame);
+            return Err(CacheError::Core(e));
+        }
+        self.remove_evicted_frame(key, kind, frame);
+        self.reclaim_draining(tier, 128);
+        Ok(true)
+    }
+
     fn serve_tier_pair(&self) -> (TierId, Option<TierId>) {
         let host_tier = self.engine.host_tier();
         match self.engine.gpu_tier() {
@@ -2230,6 +2498,11 @@ where
                             Tracked(self.caps.shares.borrow_mut()),
                             k,
                         ) {
+                            if self.transient_donor_nvme.contains_key(&df) {
+                                warmed.push(tag);
+                                submitted_end += 1;
+                                continue;
+                            }
                             self.index_insert(TierKind::HostDram, k, df);
                             self.policy.eviction.on_access(TierKind::LocalNvme, k, nf);
                             let promote = self.nvme_promo_filter.record_hit_and_should_promote(k);
@@ -2274,6 +2547,10 @@ where
                     }
                     warmed.push(tag);
                 } else if let Some((actual_df, _)) = self.engine.lookup_tier(k, host_tier) {
+                    if self.transient_donor_nvme.contains_key(&actual_df) {
+                        warmed.push(tag);
+                        continue;
+                    }
                     self.index_insert(TierKind::HostDram, k, actual_df);
                     self.policy.eviction.on_access(TierKind::LocalNvme, k, nf);
                     let promote = self.nvme_promo_filter.record_hit_and_should_promote(k);
@@ -2327,17 +2604,13 @@ where
                             .version_packed;
                         telemetry.lock().unwrap().mark_donor_warm(f.req_id, address, version);
                     }
-                    self.index_insert(TierKind::HostDram, f.key, f.dram_frame);
-                    self.policy
-                        .eviction
-                        .on_access(TierKind::LocalNvme, f.key, f.nvme_frame);
-                    // Insert at MRU (not cold tail) so subsequent `ensure_tier_space(HostDram)`
-                    // in Phase 3 does not immediately evict or revoke the freshly granted peer
-                    // NVMe frame before the requester finishes its RDMA READ. Because `f.key`
-                    // already has its NVMe replica, later eviction drops DRAM with 0 NVMe writes.
-                    self.policy
-                        .eviction
-                        .on_insert(TierKind::HostDram, f.key, f.dram_frame);
+                    if self.lookup_tier_fast(f.key, TierKind::HostDram, host_tier) != Some(f.dram_frame) {
+                        self.index_insert(TierKind::HostDram, f.key, f.dram_frame);
+                        self.policy.eviction.on_access(TierKind::LocalNvme, f.key, f.nvme_frame);
+                        // Keep the warm at MRU until Phase 2 can bind the grant.
+                        self.policy.eviction.on_insert_transient(TierKind::HostDram, f.key, f.dram_frame);
+                        self.transient_donor_nvme.insert(f.dram_frame, (f.key, false));
+                    }
                 }
                 if f.peer_idx < self.engine.peers.len() {
                     self.engine.peers[f.peer_idx]
@@ -2628,7 +2901,7 @@ where
         // `FetchRequest`s CANNOT sneak past Phase 1 into `queue_pending_inbound_fetches`
         // and trigger fake `FetchMiss`es!
         let (primary, fallback) = self.serve_tier_pair();
-        self.ensure_replenish_tokens(4);
+        self.ensure_replenish_tokens(16);
         let mut progress_res = {
             let _recv_pause = RecvPauseGuard::new(&self.peer_recv_paused);
             self.engine
@@ -2645,6 +2918,7 @@ where
         if let Ok(ref mut p) = progress_res {
             p.cq_processed += pre_cq_processed;
         }
+        self.reclaim_completed_donor_nvme_frames(progress_res.is_ok());
 
         // Phase 3: Stage new async NVMe warms safely AFTER grants are bound.
         if can_stage_nvme {
@@ -2817,13 +3091,13 @@ where
     }
 
     /// Pipelined multi-window remote RDMA / GPUDirect RDMA batch fetch across a chunk.
-    /// Keeps up to `min(windows_per_peer, max_rd_atomic, 16)` remote fetches in flight
+    /// Keeps up to `min(window headroom, max_rd_atomic, tier capacity, 64)` remote fetches in flight
     /// per peer while driving full-duplex peer serving (including peer NVMe warm-and-serve).
     #[cfg_attr(not(verus_only), allow(unused_variables, non_shorthand_field_patterns))]
     fn prefetch_remote_batch_for_gpu(
         &mut self,
         candidates: &[(usize, ObjectKey)],
-    ) -> Result<HashMap<ObjectKey, RemoteBatchHit>, CacheError> {
+    ) -> HashMap<ObjectKey, RemoteBatchHit> {
         enum RemoteState {
             PendingSend {
                 probe_pos: usize,
@@ -2861,7 +3135,7 @@ where
 
         let mut resolved: HashMap<ObjectKey, RemoteBatchHit> = HashMap::new();
         if self.peer_metas.is_empty() || candidates.is_empty() {
-            return Ok(resolved);
+            return resolved;
         }
 
         let host_tier = self.engine.host_tier();
@@ -2933,7 +3207,7 @@ where
         self.probe_buf = order;
 
         if active_count == 0 {
-            return Ok(resolved);
+            return resolved;
         }
 
         let mut in_flight_per_peer = vec![0usize; num_peers];
@@ -3223,10 +3497,9 @@ where
                 match res {
                     Ok(FetchOutcome::Hit { frame, .. }) => {
                         let meta = self.peer_metas[peer_idx];
-                        self.index_insert(dst_kind, item.key, frame);
+                        self.index_remote_fetch(item.key, dst_kind, frame);
                         self.policy.routing.on_remote_hit(item.key, peer_idx);
-                        self.policy.eviction.on_insert(dst_kind, item.key, frame);
-                        resolved.insert(item.key, RemoteBatchHit { node_id: meta.node_id, gdr: use_gdr, donor_nvme_warmed });
+                        resolved.insert(item.key, RemoteBatchHit { node_id: meta.node_id, gdr: use_gdr, donor_nvme_warmed, frame, dst_kind });
                         active_count -= 1;
                     }
                     _ => {
@@ -3308,10 +3581,9 @@ where
                                 )
                             {
                                 let meta = self.peer_metas[peer_idx];
-                                self.index_insert(dst_kind, item.key, frame);
+                                self.index_remote_fetch(item.key, dst_kind, frame);
                                 self.policy.routing.on_remote_hit(item.key, peer_idx);
-                                self.policy.eviction.on_insert(dst_kind, item.key, frame);
-                                resolved.insert(item.key, RemoteBatchHit { node_id: meta.node_id, gdr: use_gdr, donor_nvme_warmed });
+                                resolved.insert(item.key, RemoteBatchHit { node_id: meta.node_id, gdr: use_gdr, donor_nvme_warmed, frame, dst_kind });
                             }
                         }
                     }
@@ -3332,7 +3604,7 @@ where
             }
         }
 
-        Ok(resolved)
+        resolved
     }
 
     fn copy_hop_internal(
@@ -3367,17 +3639,18 @@ where
             .ok_or(CacheError::Core(CoreError::UnsupportedTier))?;
         self.ensure_tier_space(TierKind::GpuVram)?;
         let (_ver, gpu_frame) = self.copy_hop_internal(dram_frame, gpu_tier)?;
-        self.index_insert(TierKind::GpuVram, key, gpu_frame);
-        self.policy
-            .eviction
-            .on_insert(TierKind::GpuVram, key, gpu_frame);
+        if self.transient_remote_frames.contains(&dram_frame) {
+            self.index_remote_fetch(key, TierKind::GpuVram, gpu_frame);
+        } else {
+            self.index_insert(TierKind::GpuVram, key, gpu_frame);
+            self.policy.eviction.on_insert(TierKind::GpuVram, key, gpu_frame);
+        }
         Ok(gpu_frame)
     }
 
     fn fetch_from_peers(
         &mut self,
         key: ObjectKey,
-        consumer: DataDomain,
     ) -> Result<Option<(FrameId, u64)>, CacheError> {
         if self.peer_metas.is_empty() {
             return Ok(None);
@@ -3400,7 +3673,7 @@ where
                 continue;
             }
             self.ensure_tier_space(TierKind::HostDram)?;
-            self.ensure_replenish_tokens(4);
+            self.ensure_replenish_tokens(16);
             let outcome = self
                 .engine
                 .fetch_from_peer_duplex_multi(
@@ -3418,11 +3691,8 @@ where
                 .map_err(CacheError::Core)?;
             match outcome {
                 FetchOutcome::Hit { frame, .. } => {
-                    self.index_insert(TierKind::HostDram, key, frame);
+                    self.index_remote_fetch(key, TierKind::HostDram, frame);
                     self.policy.routing.on_remote_hit(key, peer_idx);
-                    self.policy
-                        .eviction
-                        .on_insert(TierKind::HostDram, key, frame);
                     hit = Some((frame, meta.node_id));
                     break;
                 }
@@ -3431,7 +3701,6 @@ where
                 }
             }
         }
-        let _ = consumer;
         self.probe_buf = order;
         Ok(hit)
     }
@@ -3466,7 +3735,7 @@ where
                 (host_tier, TierKind::HostDram, PullTarget::Host)
             };
             self.ensure_tier_space(dst_kind)?;
-            self.ensure_replenish_tokens(4);
+            self.ensure_replenish_tokens(16);
             let outcome = self
                 .engine
                 .fetch_from_peer_duplex_multi(
@@ -3484,9 +3753,8 @@ where
                 .map_err(CacheError::Core)?;
             match outcome {
                 FetchOutcome::Hit { frame, .. } => {
-                    self.index_insert(dst_kind, key, frame);
+                    self.index_remote_fetch(key, dst_kind, frame);
                     self.policy.routing.on_remote_hit(key, peer_idx);
-                    self.policy.eviction.on_insert(dst_kind, key, frame);
                     hit = Some((frame, meta.node_id, use_gdr));
                     break;
                 }
@@ -3529,10 +3797,7 @@ where
                     if self.frame_valid_published_on_tier(sp.key, sp.dram_frame, host_tier) {
                         let _ = self.drain_victim(sp.dram_frame);
                         let _ = self.reclaim_draining(host_tier, 32);
-                        self.index_remove(TierKind::HostDram, sp.key, sp.dram_frame);
-                        self.policy
-                            .eviction
-                            .on_remove(TierKind::HostDram, sp.key, sp.dram_frame);
+                        self.remove_evicted_frame(sp.key, TierKind::HostDram, sp.dram_frame);
                     }
                 } else {
                     // Spill failed or was aborted: keep the DRAM copy tracked in LRU.
@@ -3568,9 +3833,9 @@ where
         let Some(wm) = self.policy.tiering.dram_spill_watermark() else {
             return Ok(());
         };
-        let Some(nvme_tier) = self.engine.nvme_tier() else {
+        if self.engine.nvme_tier().is_none() {
             return Ok(());
-        };
+        }
         let host_tier = self.engine.host_tier();
         self.reap_completed_spills();
         let _ = self.reclaim_draining(host_tier, 32);
@@ -3579,19 +3844,21 @@ where
             <= wm.high_water_free_frames
             && self.pending_spills.len() < wm.max_in_flight
         {
-            let Some((dk, df)) = self.policy.eviction.select_victim(TierKind::HostDram) else {
+            let Some((dk, df)) = self.select_evictable_victim(TierKind::HostDram) else {
                 break;
             };
             if !self.frame_valid_published_on_tier(dk, df, host_tier) {
                 self.stats.policy_victims_rejected += 1;
                 continue;
             }
+            if self.try_drop_transient_victim(dk, TierKind::HostDram, host_tier, df)? {
+                continue;
+            }
             // If key already has a replica on NVMe, drop the DRAM copy immediately (zero NVMe write).
-            if self.lookup_tier_fast(dk, TierKind::LocalNvme, nvme_tier).is_some() {
+            if self.has_matching_nvme_replica(dk, df) {
                 let _ = self.drain_victim(df);
                 let _ = self.reclaim_draining(host_tier, 32);
-                self.index_remove(TierKind::HostDram, dk, df);
-                self.policy.eviction.on_remove(TierKind::HostDram, dk, df);
+                self.remove_evicted_frame(dk, TierKind::HostDram, df);
                 continue;
             }
             if self.ensure_tier_space(TierKind::LocalNvme).is_err() {
@@ -3688,7 +3955,7 @@ where
                 }
             }
 
-            let Some((vkey, vframe)) = self.policy.eviction.select_victim(tier_kind) else {
+            let Some((vkey, vframe)) = self.select_evictable_victim(tier_kind) else {
                 let _ = self.poll_peers_nonblocking_inner(false);
                 let _ = self.reclaim_draining(tier_id, 16);
                 if !self.engine.core.frames.ready_queue[tier_id.as_index()].is_empty() {
@@ -3706,6 +3973,17 @@ where
             if !self.frame_valid_published_on_tier(vkey, vframe, tier_id) {
                 self.stats.policy_victims_rejected += 1;
                 continue;
+            }
+
+            if self.try_drop_transient_victim(vkey, tier_kind, tier_id, vframe)? {
+                continue;
+            }
+
+            // Preserve a peer-warmed DRAM replica if its backing NVMe frame is evicted.
+            if tier_kind == TierKind::LocalNvme {
+                if let Some(df) = self.lookup_tier_fast(vkey, TierKind::HostDram, self.engine.host_tier()) {
+                    self.promote_donor_nvme_frame(vkey, df);
+                }
             }
 
             // Optional cascading demotion to colder tier before evicting victim.
@@ -3727,10 +4005,8 @@ where
                         }
                     }
                     (TierKind::HostDram, TierKind::LocalNvme) => {
-                        if let Some(nvme_tier) = self.engine.nvme_tier() {
-                            if self
-                                .lookup_tier_fast(vkey, TierKind::LocalNvme, nvme_tier)
-                                .is_none()
+                        if self.engine.nvme_tier().is_some() {
+                            if !self.has_matching_nvme_replica(vkey, vframe)
                                 && self.ensure_tier_space(TierKind::LocalNvme).is_ok()
                             {
                                 let _ = self.submit_staged_nvme();
@@ -3748,9 +4024,7 @@ where
                                     ));
                                     let _ = self.reap_completed_spills();
                                     if self.frame_matches_key_tier(vkey, vframe, tier_id)
-                                        && self
-                                            .lookup_tier_fast(vkey, TierKind::LocalNvme, nvme_tier)
-                                            .is_none()
+                                        && !self.has_matching_nvme_replica(vkey, vframe)
                                         && self.ensure_tier_space(TierKind::LocalNvme).is_ok()
                                     {
                                         spilled = self.engine.spill_host_to_nvme_sync(
@@ -3777,11 +4051,9 @@ where
             // Verified Enforcement Check 2: fence active remote RDMA leases and transition
             // to Draining, then reclaim only when CacheCore proves zero active leases remain.
             let _ = self.drain_victim(vframe);
+            self.remove_evicted_frame(vkey, tier_kind, vframe);
             let _ = self.poll_peers_nonblocking_inner(false);
             let _ = self.reclaim_draining(tier_id, 16);
-
-            self.index_remove(tier_kind, vkey, vframe);
-            self.policy.eviction.on_remove(tier_kind, vkey, vframe);
 
             if self.engine.core.frames.metas[vframe.0 as usize].state != STATE_EMPTY {
                 // Victim is still held by an active local lease or unresolved fence.
@@ -3798,7 +4070,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::DefaultPolicy;
+    use crate::policy::{CascadeTiering, DefaultPolicy, LruEviction, ProbeAllPeers};
     use crate::resources::{NvmeConfig, StorageConfig};
     use crate::transport::NoTransport;
     use std::path::PathBuf;
@@ -3820,6 +4092,108 @@ mod tests {
 
     fn key(id: u64) -> ObjectKey {
         ObjectKey([id, id.wrapping_mul(0x9e37_79b9_7f4a_7c15), 0xabcd, 0x1234])
+    }
+
+    verus! {
+    // Publish a verified host frame and register it exactly as a completed RDMA pull.
+    fn publish_transient_remote(
+        cache: &mut VeriCache<'_, NoTransport, LruEviction, CascadeTiering, ProbeAllPeers>,
+        key: ObjectKey,
+    ) -> Result<FrameId, CacheError> {
+        let (_, frame) = cache.engine.put_host(Tracked(cache.caps.instance.borrow()), key, &[0x42; 4096])?;
+        cache.index_remote_fetch(key, TierKind::HostDram, frame);
+        Ok(frame)
+    }
+    #[test]
+    fn stale_remote_hit_does_not_reclaim_recycled_frame() {
+        VeriCache::<NoTransport, _, _, _>::with_session(
+            StorageConfig::new(0, 4096, 1),
+            Vec::new(),
+            DefaultPolicy::default(),
+            |cache| {
+                let old = key(0);
+                let frame = publish_transient_remote(cache, old)?;
+                cache.ensure_tier_space(TierKind::HostDram)?;
+                assert_eq!(cache.contains_local(old), None);
+
+                let new = key(1);
+                assert_eq!(publish_transient_remote(cache, new)?, frame);
+                cache.reclaim_transient_remote_frames([(old, TierKind::HostDram, frame)]);
+                assert!(cache.transient_remote_frames.contains(&frame));
+                assert_eq!(cache.contains_local(new), Some(HitLocation::LocalDram));
+                cache.reclaim_transient_remote_frames([(new, TierKind::HostDram, frame)]);
+                assert_eq!(cache.contains_local(new), None);
+                assert!(cache.transient_remote_frames.is_empty());
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn remote_fetch_reclaim_waits_for_overlapping_lease_then_releases_frame() {
+        VeriCache::<NoTransport, _, _, _>::with_session(
+            StorageConfig::new(0, 4096, 1),
+            Vec::new(),
+            DefaultPolicy::default(),
+            |cache| {
+                let k = key(0);
+                let frame = publish_transient_remote(cache, k)?;
+                let lease = cache.engine.get_lease_host(
+                    Tracked(cache.caps.instance.borrow()),
+                    Tracked(cache.caps.shares.borrow_mut()),
+                    k,
+                )?.expect("overlapping chunk lease");
+
+                cache.reclaim_transient_remote_frames([(k, TierKind::HostDram, frame)]);
+                assert_eq!(cache.deferred_transient_remote, [(k, TierKind::HostDram, frame)]);
+                cache.poll()?;
+                assert_eq!(cache.contains_local(k), Some(HitLocation::LocalDram));
+                cache.release_local_lease_raw(lease.handle, lease.cap, Ticket::NONE)?;
+                cache.poll()?;
+                assert_eq!(cache.contains_local(k), None);
+                assert!(cache.transient_remote_frames.is_empty());
+                assert!(cache.deferred_transient_remote.is_empty());
+                let host = cache.engine.host_tier().as_index();
+                assert_eq!(cache.engine.core.frames.ready_queue[host].len(), 1);
+                Ok(())
+            },
+        ).unwrap();
+    }
+    } // verus!
+
+    #[test]
+    fn remote_fetches_drop_without_nvme_writes_under_both_eviction_paths() {
+        let nvme_dir = temp_nvme_dir("remote_no_spill");
+        let cfg = StorageConfig::new(0, 4096, 1).with_nvme(NvmeConfig::new(&nvme_dir, 4));
+        let res = VeriCache::<NoTransport, _, _, _>::with_session(
+            cfg,
+            Vec::new(),
+            DefaultPolicy::default(),
+            |cache| {
+                let k = key(0);
+                let frame = publish_transient_remote(cache, k)?;
+                cache.reclaim_transient_remote_frames([(k, TierKind::HostDram, frame)]);
+                assert_eq!(cache.contains_local(k), None);
+
+                publish_transient_remote(cache, k)?;
+                cache.ensure_tier_space(TierKind::HostDram)?;
+                assert_eq!(cache.contains_local(k), None);
+
+                publish_transient_remote(cache, k)?;
+                cache.policy.tiering = CascadeTiering::serving_dram_first(1, 4);
+                cache.kick_async_spills()?;
+                assert!(cache.pending_spills.is_empty());
+                assert_eq!(cache.contains_local(k), None);
+                assert_eq!(cache.stats.nvme_spills, 0);
+                assert!(cache.transient_remote_frames.is_empty());
+                let nvme = cache.engine.nvme_tier().unwrap().as_index();
+                assert_eq!(cache.engine.core.frames.ready_queue[nvme].len(), 4);
+                Ok(())
+            },
+        );
+        let _ = std::fs::remove_dir_all(nvme_dir);
+        res.unwrap();
     }
 
     #[test]
@@ -4367,11 +4741,69 @@ mod tests {
         res.expect("peer_nvme_reaped_frame_survives_dram_pressure_and_preserves_arrivals");
     }
 
+    verus! {
+    #[test]
+    fn donor_nvme_warm_is_reclaimed_after_pending_request_and_grant_release() {
+        let nvme_dir = temp_nvme_dir("donor_nvme_grant_release");
+        let cfg = StorageConfig::new(0, 4096, 2).with_nvme(NvmeConfig::new(&nvme_dir, 4));
+        let res = VeriCache::<NoTransport, _, _, _>::with_session(
+            cfg,
+            Vec::new(),
+            DefaultPolicy::default(),
+            |cache| {
+                let k = key(0);
+                cache.put_host(k, &[0x42; 4096])?;
+                assert!(cache.spill_key_to_nvme(k)?);
+                let nvme_tier = cache.engine.nvme_tier().unwrap();
+                let nf = cache.lookup_tier_fast(k, TierKind::LocalNvme, nvme_tier).unwrap();
+                let (df, ticket) = cache.stage_nvme_to_dram_one(nf)?;
+                cache.pending_peer_nvme_fetches.push(PendingPeerNvmeFetch {
+                    peer_idx: 0, req_id: 1, key: k, nvme_frame: nf, dram_frame: df, ticket,
+                });
+                cache.drain_background_io();
+                assert_eq!(cache.transient_donor_nvme.get(&df), Some(&(k, false)));
+                assert_eq!(cache.contains_local(k), Some(HitLocation::LocalDram));
+
+                cache.deferred_peer_grants.push((0, 1, k));
+                cache.poll()?;
+                assert_eq!(cache.contains_local(k), Some(HitLocation::LocalDram));
+                cache.deferred_peer_grants.clear();
+
+                let (_, _, cap) = cache.engine.core.pin_remote_lease(
+                    df,
+                    0,
+                    1,
+                    Tracked(cache.caps.shares.borrow_mut()),
+                    Tracked(cache.caps.instance.borrow()),
+                )?;
+                cache.poll()?;
+                assert_eq!(cache.transient_donor_nvme.get(&df), Some(&(k, true)));
+                cache.engine.core.unpin_remote_lease(
+                    df, 0, 1, cap, Ticket::NONE, Tracked(cache.caps.instance.borrow()),
+                ).map_err(|(err, _)| CacheError::Core(err))?;
+
+                cache.poll()?;
+                assert_eq!(cache.contains_local(k), Some(HitLocation::LocalNvme));
+                assert!(cache.transient_donor_nvme.is_empty());
+                assert_eq!(cache.stats.nvme_spills, 1);
+                let host = cache.engine.host_tier().as_index();
+                assert_eq!(cache.engine.core.frames.ready_queue[host].len(), 2);
+                Ok(())
+            },
+        );
+        let _ = std::fs::remove_dir_all(nvme_dir);
+        res.unwrap();
+    }
+    } // verus!
+
     #[test]
     fn window_aware_donor_throttle_and_requester_headroom_prevent_fake_misses() {
         // 1. Requester-side headroom leaves 25% of Type-2B windows free for LOCAL_INV CQE turnaround.
         assert_eq!(requester_peer_pipeline_cap(16, 16, 585), 12);
         assert_eq!(requester_peer_pipeline_cap(32, 16, 585), 16);
+        assert_eq!(requester_peer_pipeline_cap(64, 32, 585), 32);
+        assert_eq!(requester_peer_pipeline_cap(128, 128, 585), 64);
+        assert_eq!(requester_peer_pipeline_cap(64, 32, 7), 7);
         assert_eq!(requester_peer_pipeline_cap(4, 16, 585), 3);
         assert_eq!(requester_peer_pipeline_cap(1, 16, 585), 1);
         assert_eq!(requester_peer_pipeline_cap(0, 16, 585), 0);

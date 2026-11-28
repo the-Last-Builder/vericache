@@ -66,6 +66,13 @@ pub trait EvictionPolicy {
     }
     fn on_access(&mut self, tier: TierKind, key: ObjectKey, frame: FrameId);
     fn on_remove(&mut self, tier: TierKind, key: ObjectKey, frame: FrameId);
+    /// Track a temporary frame for eviction without advertising a resident replica.
+    fn on_insert_transient(&mut self, tier: TierKind, key: ObjectKey, frame: FrameId) {
+        self.on_insert(tier, key, frame);
+    }
+    fn on_remove_transient(&mut self, tier: TierKind, key: ObjectKey, frame: FrameId) {
+        self.on_remove(tier, key, frame);
+    }
     fn select_victim(&mut self, tier: TierKind) -> Option<(ObjectKey, FrameId)>;
 }
 
@@ -76,6 +83,11 @@ pub trait EvictionPolicy {
 /// Controls cross-tier movement (promotion on cold hit, demotion on eviction,
 /// and proactive async DRAM -> NVMe spilling).
 pub trait TieringPolicy {
+    /// Keep a local replica after a remote fetch has been consumed.
+    fn retain_remote_fetches(&self) -> bool {
+        false
+    }
+
     /// When `get` hits a cold/remote location, optionally promote into a hotter local tier.
     fn promote_on_hit(&self, from: HitLocation, consumer: DataDomain) -> Option<TierKind>;
 
@@ -467,6 +479,7 @@ impl EvictionPolicy for NoEviction {
 /// - Optional proactive async NVMe spill watermark for DRAM.
 #[derive(Clone, Copy, Debug)]
 pub struct CascadeTiering {
+    pub retain_remote_fetches: bool,
     pub promote_gpu_on_cold_hit: bool,
     pub demote_gpu_to_dram: bool,
     pub demote_dram_to_nvme: bool,
@@ -476,6 +489,7 @@ pub struct CascadeTiering {
 impl Default for CascadeTiering {
     fn default() -> Self {
         Self {
+            retain_remote_fetches: false,
             promote_gpu_on_cold_hit: true,
             demote_gpu_to_dram: true,
             demote_dram_to_nvme: true,
@@ -501,6 +515,7 @@ impl CascadeTiering {
             None
         };
         Self {
+            retain_remote_fetches: false,
             promote_gpu_on_cold_hit: false,
             demote_gpu_to_dram: true,
             demote_dram_to_nvme: true,
@@ -510,6 +525,10 @@ impl CascadeTiering {
 }
 
 impl TieringPolicy for CascadeTiering {
+    fn retain_remote_fetches(&self) -> bool {
+        self.retain_remote_fetches
+    }
+
     fn promote_on_hit(&self, from: HitLocation, consumer: DataDomain) -> Option<TierKind> {
         if !self.promote_gpu_on_cold_hit {
             return None;

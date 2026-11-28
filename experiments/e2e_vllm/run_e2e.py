@@ -431,7 +431,7 @@ class ClusterContext:
                         "max_cached_blocks": max_cached_blocks,
                         "rdma_device": rdma_devs[nid],
                         "rdma_gid_index": args.rdma_gid_index,
-                        "rdma_windows_per_peer": 16,
+                        "rdma_windows_per_peer": 32,
                         "directory_addr": f"127.0.0.1:{dir_port}",
                         "async_io": True,
                         "lazy_offload": bool(args.vericache_lazy_offload),

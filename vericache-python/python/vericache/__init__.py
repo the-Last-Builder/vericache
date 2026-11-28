@@ -171,9 +171,12 @@ class VeriCacheClient:
         nvme_frames: int = 0,
         rdma_device: str | None = None,
         rdma_gid_index: int = 0,
-        rdma_windows_per_peer: int = 8,
+        rdma_windows_per_peer: int = 32,
+        rdma_max_rd_atomic: int = 16,
         peers: Sequence[PeerSpec] = (),
     ) -> None:
+        if not 0 <= rdma_max_rd_atomic <= 255:
+            raise ValueError("rdma_max_rd_atomic must be between 0 and 255")
         # A CUDA device also enables pinned-host DMA when hbm_frames is zero.
         self._lib = load_lib()
         self._frame_size = int(frame_size)
@@ -202,6 +205,7 @@ class VeriCacheClient:
             nvme_frames=nvme_frames,
             rdma_device=rdma_bytes,
             rdma_gid_index=rdma_gid_index,
+            rdma_max_rd_atomic=rdma_max_rd_atomic,
             rdma_windows_per_peer=rdma_windows_per_peer,
             peers=peers_arr if peers_arr is not None else ctypes.POINTER(VeriCachePeerSpecC)(),
             num_peers=len(peers),

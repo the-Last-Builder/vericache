@@ -82,6 +82,7 @@ where
             let _ = self
                 .cache
                 .release_local_lease_raw(lease.handle, lease.cap, Ticket::NONE);
+            self.cache.reclaim_transient_remote_frames([]);
         }
     }
 }
@@ -165,6 +166,7 @@ where
             let _ =
                 self.cache
                     .release_local_lease_raw(lease.handle, lease.cap, self.release_ticket);
+            self.cache.reclaim_transient_remote_frames([]);
         }
     }
 }

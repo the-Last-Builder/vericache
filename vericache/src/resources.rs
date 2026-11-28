@@ -14,8 +14,8 @@ use transfer::cuda::{self, CudaBuffer, CudaHostBuffer, CudaHostRegistration, Cud
 use transfer::domain::DeviceId;
 use transfer::host::{self, HostContext};
 use transfer::rdma::{
-    AccessFlags, CompletionQueue, DeviceContext, ProtectionDomain, RdmaError,
-    UnconnectedQueuePair, alloc_window, connect_rc, dealloc_window,
+    AccessFlags, CompletionQueue, DeviceAttributes, DeviceContext, ProtectionDomain,
+    QueuePairConfig, RdmaError, UnconnectedQueuePair, alloc_window, connect_rc, dealloc_window,
 };
 use transfer::transport::{ByteTransport, Channel};
 use vericache_core::backends::cuda::CudaBackend;
@@ -471,6 +471,10 @@ pub struct RdmaConfig {
     pub windows_per_peer: usize,
     pub cq_depth: usize,
     pub qp_depth: usize,
+    /// Outstanding RDMA reads initiated by this QP. Zero selects 16 before device clamping.
+    pub max_rd_atomic: u8,
+    /// Outstanding RDMA reads served by this QP. Zero selects 16 before device clamping.
+    pub max_dest_rd_atomic: u8,
 }
 
 impl Default for RdmaConfig {
@@ -478,9 +482,126 @@ impl Default for RdmaConfig {
         Self {
             device_name: None,
             gid_index: 0,
-            windows_per_peer: 8,
-            cq_depth: 128,
-            qp_depth: 64,
+            windows_per_peer: 32,
+            cq_depth: 256,
+            qp_depth: 128,
+            max_rd_atomic: 16,
+            max_dest_rd_atomic: 16,
+        }
+    }
+}
+
+fn resolve_qp_config(
+    rcfg: &RdmaConfig,
+    dev_attr: DeviceAttributes,
+) -> Result<QueuePairConfig, CacheError> {
+    if dev_attr.max_qp_init_rd_atomic == 0 || dev_attr.max_qp_rd_atomic == 0 {
+        return Err(CacheError::Init(format!(
+            "RDMA device must support outgoing and incoming RDMA reads (max_qp_init_rd_atomic={}, max_qp_rd_atomic={})",
+            dev_attr.max_qp_init_rd_atomic, dev_attr.max_qp_rd_atomic,
+        )));
+    }
+    let req_init = if rcfg.max_rd_atomic == 0 {
+        16
+    } else {
+        rcfg.max_rd_atomic
+    };
+    let req_resp = if rcfg.max_dest_rd_atomic == 0 {
+        16
+    } else {
+        rcfg.max_dest_rd_atomic
+    };
+    Ok(QueuePairConfig {
+        send_depth: u32::try_from(rcfg.qp_depth)
+            .unwrap_or(u32::MAX)
+            .min(dev_attr.max_qp_wr)
+            .max(1),
+        max_send_sge: 1,
+        max_rd_atomic: req_init.min(dev_attr.max_qp_init_rd_atomic),
+        max_dest_rd_atomic: req_resp.min(dev_attr.max_qp_rd_atomic),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEVICE: DeviceAttributes = DeviceAttributes {
+        supports_type_2: true,
+        max_qp_wr: 256,
+        max_send_sge: 4,
+        max_read_sge: 4,
+        max_qp_init_rd_atomic: 32,
+        max_qp_rd_atomic: 64,
+    };
+
+    #[test]
+    fn qp_defaults_and_zero_auto_request_16() {
+        let cfg = RdmaConfig::default();
+        assert_eq!(cfg.windows_per_peer, 32);
+        assert_eq!(cfg.cq_depth, 256);
+        assert_eq!(cfg.qp_depth, 128);
+        let expected = QueuePairConfig {
+            send_depth: 128,
+            max_send_sge: 1,
+            max_rd_atomic: 16,
+            max_dest_rd_atomic: 16,
+        };
+        assert_eq!(resolve_qp_config(&cfg, DEVICE).unwrap(), expected);
+        let auto = RdmaConfig {
+            max_rd_atomic: 0,
+            max_dest_rd_atomic: 0,
+            ..cfg
+        };
+        assert_eq!(resolve_qp_config(&auto, DEVICE).unwrap(), expected);
+    }
+
+    #[test]
+    fn qp_limits_are_clamped_independently() {
+        let cfg = RdmaConfig {
+            qp_depth: usize::MAX,
+            max_rd_atomic: 0,
+            max_dest_rd_atomic: 48,
+            ..RdmaConfig::default()
+        };
+        let device = DeviceAttributes {
+            max_qp_wr: 63,
+            max_qp_init_rd_atomic: 8,
+            max_qp_rd_atomic: 32,
+            ..DEVICE
+        };
+        let qp = resolve_qp_config(&cfg, device).unwrap();
+        assert_eq!(qp.send_depth, 63);
+        assert_eq!(qp.max_rd_atomic, 8);
+        assert_eq!(qp.max_dest_rd_atomic, 32);
+        let cfg = RdmaConfig {
+            qp_depth: 0,
+            max_rd_atomic: 1,
+            max_dest_rd_atomic: 2,
+            ..cfg
+        };
+        let qp = resolve_qp_config(&cfg, device).unwrap();
+        assert_eq!(qp.send_depth, 1);
+        assert_eq!(qp.max_rd_atomic, 1);
+        assert_eq!(qp.max_dest_rd_atomic, 2);
+    }
+
+    #[test]
+    fn qp_rejects_either_missing_read_capability() {
+        for device in [
+            DeviceAttributes {
+                max_qp_init_rd_atomic: 0,
+                ..DEVICE
+            },
+            DeviceAttributes {
+                max_qp_rd_atomic: 0,
+                ..DEVICE
+            },
+        ] {
+            assert!(matches!(
+                resolve_qp_config(&RdmaConfig::default(), device),
+                Err(CacheError::Init(_)),
+            ));
         }
     }
 }
@@ -756,6 +877,10 @@ impl<'s> AttachedStorage<'s> {
             let dev = self
                 .rdma_device
                 .ok_or_else(|| CacheError::Init("RDMA device not initialized".into()))?;
+            let dev_attr = dev.attributes().map_err(|e| {
+                CacheError::Init(format!("DeviceContext::attributes failed: {e:?}"))
+            })?;
+            let qp_config = resolve_qp_config(rcfg, dev_attr)?;
             let pd = self
                 .pd
                 .as_ref()
@@ -771,16 +896,18 @@ impl<'s> AttachedStorage<'s> {
                 let psn = link
                     .psn_hint
                     .wrapping_add(((self.config.node_id as u32) << 8) + idx as u32);
-                let reset = UnconnectedQueuePair::new(
+                let reset = UnconnectedQueuePair::new_with_config(
                     pd,
                     &cq,
-                    rcfg.qp_depth as u32,
+                    qp_config,
                     1,
                     rcfg.gid_index,
                     psn,
                     caps.mint_rdma(),
                 )
-                .map_err(|e| CacheError::Init(format!("UnconnectedQueuePair::new failed: {e:?}")))?;
+                .map_err(|e| {
+                    CacheError::Init(format!("UnconnectedQueuePair::new_with_config failed: {e:?}"))
+                })?;
                 let mut channel: Channel<T, VeriCacheAttachment> = Channel::new_with_protocol(
                     link.transport,
                     self.config.node_id,

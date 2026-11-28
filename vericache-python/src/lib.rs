@@ -89,6 +89,8 @@ pub struct VeriCacheConfigC {
     /// Null-terminated verbs device name (e.g. `"mlx5_0"`), or null for auto/disabled.
     pub rdma_device: *const c_char,
     pub rdma_gid_index: u8,
+    /// Zero selects the default outgoing RDMA READ depth of 16.
+    pub rdma_max_rd_atomic: u8,
     pub rdma_windows_per_peer: usize,
     pub peers: *const VeriCachePeerSpecC,
     pub num_peers: usize,
@@ -715,6 +717,14 @@ impl EvictionPolicy for MirroredLruEviction {
         self.clear_if_current(tier, key, frame);
     }
 
+    fn on_insert_transient(&mut self, tier: TierKind, key: ObjectKey, frame: FrameId) {
+        self.inner.on_insert(tier, key, frame);
+    }
+
+    fn on_remove_transient(&mut self, tier: TierKind, key: ObjectKey, frame: FrameId) {
+        self.inner.on_remove(tier, key, frame);
+    }
+
     fn select_victim(&mut self, tier: TierKind) -> Option<(ObjectKey, FrameId)> {
         // Do NOT clear `LocalKeyMirror` here: `kick_async_spills` and `ensure_tier_space`
         // call `select_victim` BEFORE the frame finishes spilling/demoting to a colder tier.
@@ -1323,18 +1333,25 @@ fn worker_loop(
             let stats = cache.stats();
             stats_mirror.sync_from(stats);
             eprintln!(
-                "[VeriCache][node={}] hbm_frames={} dram_frames={} nvme_frames={} is_host_pinned={} direct_slab_dma={} host_rdma={} gdr_enabled={} frame_bytes={}",
+                "[VeriCache][node={}] hbm_frames={} dram_frames={} nvme_frames={} is_host_pinned={} direct_slab_dma={} host_rdma={} gdr_enabled={} frame_bytes={} rdma_max_rd_atomic={:?}",
                 cache.node_id(), stats.hbm_frames, stats.dram_frames, stats.nvme_frames,
                 cache.is_host_pinned(), cache.is_host_pinned(), !cache.peer_metas().is_empty(),
-                stats.gdr_enabled != 0, cache.frame_size(),
+                stats.gdr_enabled != 0, cache.frame_size(), cache.peer_effective_max_rd_atomic(),
             );
             if let Some(tx) = ready_tx.take() {
                 let _ = tx.send(Ok(()));
             }
 
             let idle_poll = Duration::from_micros(100);
+            let burst_poll = Duration::from_micros(10);
+            let mut burst_until = Instant::now();
             loop {
-                match queue.recv_timeout(idle_poll) {
+                let timeout = if Instant::now() < burst_until || cache.has_pending_peer_work() {
+                    burst_poll
+                } else {
+                    idle_poll
+                };
+                match queue.recv_timeout(timeout) {
                     NextWork::High(cmd) => {
                         exec_high_cmd(cache, cmd, &mut load_sync_events, &load_batch_bufs);
                         stats_mirror.sync_from(cache.stats());
@@ -2200,7 +2217,13 @@ fn worker_loop(
                     }
                     }
                     NextWork::Timeout => {
-                        let _ = cache.poll();
+                        if cache.poll().is_ok_and(|p| {
+                            p.peer_cq_processed > 0
+                                || p.peer_grants_completed > 0
+                                || p.peer_windows_replenished > 0
+                        }) {
+                            burst_until = Instant::now() + Duration::from_millis(1);
+                        }
                         stats_mirror.sync_from(cache.stats());
                     }
                     NextWork::Disconnected => {
@@ -2317,14 +2340,18 @@ pub unsafe extern "C" fn vericache_create(cfg: *const VeriCacheConfigC) -> *mut 
         let win = if c.rdma_windows_per_peer > 0 {
             c.rdma_windows_per_peer
         } else {
-            8
+            32
         };
+        let qp_depth = win.saturating_mul(4).max(128);
+        let cq_depth = qp_depth.saturating_mul(2).max(256);
         storage = storage.with_rdma(RdmaConfig {
             device_name: rdma_dev,
             gid_index: c.rdma_gid_index,
             windows_per_peer: win,
-            cq_depth: 128,
-            qp_depth: 64,
+            cq_depth,
+            qp_depth,
+            max_rd_atomic: c.rdma_max_rd_atomic,
+            max_dest_rd_atomic: c.rdma_max_rd_atomic,
         });
         let raw_peers = unsafe { core::slice::from_raw_parts(c.peers, c.num_peers) };
         for p in raw_peers {
@@ -3453,6 +3480,37 @@ mod tests {
         }
         assert_eq!(locs, [0]);
         assert_eq!(flags, [0]);
+    }
+
+    #[test]
+    fn mirrored_lru_transient_frames_do_not_advertise_or_unregister_keys() {
+        let mirror = Arc::new(LocalKeyMirror::new());
+        let mut policy = MirroredLruEviction::new(Arc::clone(&mirror));
+        let remote = ObjectKey([1, 0, 0, 0]);
+        let donor = ObjectKey([2, 0, 0, 0]);
+        let mut evicted = [0u8; 64];
+        let host = TierKind::HostDram;
+
+        policy.on_insert_transient(host, remote, FrameId(1));
+        policy.on_access(host, remote, FrameId(1));
+        assert_eq!(mirror.lookup_loc(remote), 0);
+        assert_eq!(policy.select_victim(host), Some((remote, FrameId(1))));
+        policy.on_remove_transient(host, remote, FrameId(1));
+        assert!(policy.key_frames.is_empty());
+        assert_eq!(mirror.take_evicted(&mut evicted, 2), 0);
+
+        policy.on_insert(TierKind::LocalNvme, donor, FrameId(10));
+        policy.on_insert_transient(host, donor, FrameId(2));
+        policy.on_access(host, donor, FrameId(2));
+        assert_eq!(mirror.lookup_loc(donor), 3);
+        policy.on_remove_transient(host, donor, FrameId(2));
+        assert_eq!(mirror.lookup_loc(donor), 3);
+        assert_eq!(mirror.take_evicted(&mut evicted, 2), 0);
+
+        policy.on_insert_transient(host, donor, FrameId(3));
+        policy.on_insert(host, donor, FrameId(3));
+        assert_eq!(mirror.lookup_loc(donor), 2);
+        assert_eq!(mirror.take_evicted(&mut evicted, 2), 0);
     }
 
     #[test]

@@ -527,6 +527,7 @@ fn run_distributed_donor(rdma_dev: String, dev: DeviceId) {
             windows_per_peer: 8,
             cq_depth: 128,
             qp_depth: 64,
+            ..RdmaConfig::default()
         });
 
     let res = VeriCache::with_session(
@@ -592,6 +593,7 @@ fn run_distributed_initiator(rdma_dev: String, dev: DeviceId) {
             windows_per_peer: 8,
             cq_depth: 128,
             qp_depth: 64,
+            ..RdmaConfig::default()
         });
 
     let res = VeriCache::with_session(
@@ -647,6 +649,7 @@ fn run_distributed_initiator(rdma_dev: String, dev: DeviceId) {
                 }
             );
             assert_eq!(host_buf, p_remote_dram);
+            assert_eq!(cache.contains_local(k_remote_dram), None);
 
             // Exact same `cache.get(key, GpuDst)` resolves Local HBM and Remote Donor HBM
             // via 2-GPU GPUDirect RDMA with ZERO location awareness!
@@ -673,6 +676,7 @@ fn run_distributed_initiator(rdma_dev: String, dev: DeviceId) {
             cache.synchronize_stream(&mut stream, g_remote_gdr.ticket)?;
             cache.read_gpu_slot(&mut gpu_slot, &mut stream, &mut gpu_check)?;
             assert_eq!(gpu_check, p_remote_gpu);
+            assert_eq!(cache.contains_local(k_remote_gpu), None);
 
             // Tell donor we are done.
             sync_sock.write_all(&[1u8]).unwrap();

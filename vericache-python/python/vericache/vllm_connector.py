@@ -710,7 +710,8 @@ class _VeriCacheHmaWorker:
 
         rdma_device = self.extra_config.get("rdma_device")
         rdma_gid_index = int(self.extra_config.get("rdma_gid_index", 0))
-        rdma_windows = int(self.extra_config.get("rdma_windows_per_peer", 8))
+        rdma_windows = int(self.extra_config.get("rdma_windows_per_peer", 32))
+        rdma_max_rd_atomic = int(self.extra_config.get("rdma_max_rd_atomic", 16))
         raw_peers = self.extra_config.get("peers") or ()
         peers = [
             PeerSpec(
@@ -754,6 +755,7 @@ class _VeriCacheHmaWorker:
             rdma_device=rdma_device,
             rdma_gid_index=rdma_gid_index,
             rdma_windows_per_peer=rdma_windows,
+            rdma_max_rd_atomic=rdma_max_rd_atomic,
             peers=peers,
         )
 
